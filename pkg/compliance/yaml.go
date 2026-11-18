@@ -2,6 +2,7 @@ package compliance
 
 import (
 	"embed"
+	"encoding/json"
 	"fmt"
 	"math"
 	"strconv"
@@ -1404,6 +1405,67 @@ func isBareInfOrNaN(s string) bool {
 	return strings.EqualFold(s, "inf") || strings.EqualFold(s, "infinity") || strings.EqualFold(s, "nan")
 }
 
+func isValidRFC8259FloatNumber(s string) bool {
+	if s == "" {
+		return false
+	}
+	i := 0
+	if s[i] == '-' {
+		i++
+		if i >= len(s) {
+			return false
+		}
+	}
+	if s[i] == '0' {
+		i++
+	} else if s[i] >= '1' && s[i] <= '9' {
+		for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+			i++
+		}
+	} else {
+		return false
+	}
+
+	hasFloatMarker := false
+	if i < len(s) && s[i] == '.' {
+		hasFloatMarker = true
+		i++
+		fracStart := i
+		for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+			i++
+		}
+		if i == fracStart {
+			return false
+		}
+	}
+	if i < len(s) && (s[i] == 'e' || s[i] == 'E') {
+		hasFloatMarker = true
+		i++
+		if i < len(s) && (s[i] == '+' || s[i] == '-') {
+			i++
+		}
+		expStart := i
+		for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+			i++
+		}
+		if i == expStart {
+			return false
+		}
+	}
+	return hasFloatMarker && i == len(s)
+}
+
+func parseYAMLFloatNumber(raw string, fv float64) json.Number {
+	if isValidRFC8259FloatNumber(raw) {
+		return json.Number(raw)
+	}
+	formatted := strconv.FormatFloat(fv, 'g', -1, 64)
+	if !strings.ContainsAny(formatted, ".eE") {
+		formatted += ".0"
+	}
+	return json.Number(formatted)
+}
+
 func parseScalar(s string) (any, error) {
 	s = strings.TrimSpace(s)
 	if s == "" || s == "null" || s == "Null" || s == "NULL" || s == "~" {
@@ -1437,7 +1499,7 @@ func parseScalar(s string) (any, error) {
 		}
 	}
 	if fv, err := strconv.ParseFloat(s, 64); err == nil && !math.IsNaN(fv) && !math.IsInf(fv, 0) {
-		return fv, nil
+		return parseYAMLFloatNumber(s, fv), nil
 	}
 	return s, nil
 }
@@ -1810,7 +1872,7 @@ func splitFlowKeyValue(s string) (string, string, bool) {
 			depthBracket--
 		case ':':
 			if depthBrace == 0 && depthBracket == 0 {
-				if afterQuotedKey || i+1 == len(s) || s[i+1] == ' ' || s[i+1] == '\t' || s[i+1] == ',' || s[i+1] == '}' || s[i+1] == ']' {
+				if afterQuotedKey || i+1 == len(s) || s[i+1] == ' ' || s[i+1] == '\t' || s[i+1] == ',' || s[i+1] == '}' || s[i+1] == ']' || s[i+1] == '{' || s[i+1] == '[' {
 					return strings.TrimSpace(s[:i]), strings.TrimSpace(s[i+1:]), true
 				}
 			}
@@ -1938,7 +2000,7 @@ func scanLineForUnclosedQuote(line string, startIdx int, nodeStart, justClosedQu
 			justClosedQuote = false
 		case ':':
 			isSep := justClosedQuote || i+1 == len(line) || line[i+1] == ' ' || line[i+1] == '\t' ||
-				(flowDepth > 0 && (line[i+1] == ',' || line[i+1] == '}'))
+				(flowDepth > 0 && (line[i+1] == ',' || line[i+1] == '}' || line[i+1] == '{' || line[i+1] == '['))
 			if isSep {
 				nodeStart = true
 			}

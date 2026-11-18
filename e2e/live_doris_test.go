@@ -1804,6 +1804,199 @@ func TestLiveApacheDoris_E2E(t *testing.T) {
 		t.Fatalf("unexpected R37 simulated doc: %+v", r37SimDoc)
 	}
 
-	// Step 31: Upstream Elasticsearch / OpenSearch rest-api-spec YAML Compliance Test Suite
+	// Step 31: Round-62 Live Doris 4.1.3 Dialect & Nereids Parity Subtests (F10)
+	doR62Req := func(st *testing.T, method, path, body string) (int, []byte) {
+		st.Helper()
+		var rdr io.Reader
+		if body != "" {
+			rdr = strings.NewReader(body)
+		}
+		req, reqErr := http.NewRequest(method, ts.URL+path, rdr)
+		if reqErr != nil {
+			st.Fatalf("%s %s request build error: %v", method, path, reqErr)
+		}
+		if body != "" {
+			if strings.Contains(path, "/_bulk") {
+				req.Header.Set("Content-Type", "application/x-ndjson")
+			} else {
+				req.Header.Set("Content-Type", "application/json")
+			}
+		}
+		res, doErr := http.DefaultClient.Do(req)
+		if doErr != nil {
+			st.Fatalf("%s %s transport error: %v", method, path, doErr)
+		}
+		raw, _ := io.ReadAll(res.Body)
+		_ = res.Body.Close()
+		return res.StatusCode, raw
+	}
+
+	t.Run("Round62_GroupedExactQuantiles_Percentiles_Boxplot_MAD", func(st *testing.T) {
+		code, raw := doR62Req(st, http.MethodPut, "/r62_quantiles", `{
+			"mappings": {
+				"properties": {
+					"grp": {"type": "keyword"},
+					"latency": {"type": "double"}
+				}
+			}
+		}`)
+		if code != http.StatusOK {
+			st.Fatalf("PUT /r62_quantiles failed: status=%d body=%s", code, string(raw))
+		}
+		bulk := strings.Join([]string{
+			`{"index":{"_index":"r62_quantiles","_id":"1"}}`,
+			`{"grp":"alpha","latency":10.0}`,
+			`{"index":{"_index":"r62_quantiles","_id":"2"}}`,
+			`{"grp":"alpha","latency":20.0}`,
+			`{"index":{"_index":"r62_quantiles","_id":"3"}}`,
+			`{"grp":"alpha","latency":30.0}`,
+			`{"index":{"_index":"r62_quantiles","_id":"4"}}`,
+			`{"grp":"beta","latency":100.0}`,
+			"",
+		}, "\n")
+		if bCode, bRaw := doR62Req(st, http.MethodPost, "/_bulk?refresh=true", bulk); bCode != http.StatusOK {
+			st.Fatalf("POST /_bulk r62_quantiles failed: status=%d body=%s", bCode, string(bRaw))
+		}
+		sCode, sRaw := doR62Req(st, http.MethodPost, "/r62_quantiles/_search", `{
+			"size": 0,
+			"aggs": {
+				"by_grp": {
+					"terms": {"field": "grp"},
+					"aggs": {
+						"p_lat": {"percentiles": {"field": "latency", "percents": [50, 95]}},
+						"box_lat": {"boxplot": {"field": "latency"}},
+						"mad_lat": {"median_absolute_deviation": {"field": "latency"}}
+					}
+				}
+			}
+		}`)
+		if sCode != http.StatusOK {
+			st.Fatalf("grouped quantiles _search failed: status=%d body=%s", sCode, string(sRaw))
+		}
+		var sRes map[string]any
+		if err := json.Unmarshal(sRaw, &sRes); err != nil {
+			st.Fatalf("unmarshal grouped quantiles response: %v", err)
+		}
+		buckets := sRes["aggregations"].(map[string]any)["by_grp"].(map[string]any)["buckets"].([]any)
+		if len(buckets) != 2 {
+			st.Fatalf("expected 2 group buckets, got %d: %s", len(buckets), string(sRaw))
+		}
+		b0 := buckets[0].(map[string]any)
+		if b0["box_lat"].(map[string]any)["q2"].(float64) != 20.0 || b0["mad_lat"].(map[string]any)["value"] == nil {
+			st.Fatalf("unexpected alpha boxplot/mad values: %s", string(sRaw))
+		}
+	})
+
+	t.Run("Round62_NestedKNN_Float_HexByte_Bit", func(st *testing.T) {
+		code, raw := doR62Req(st, http.MethodPut, "/r62_nested_knn", `{
+			"mappings": {
+				"properties": {
+					"title": {"type": "keyword"},
+					"passages": {
+						"type": "nested",
+						"properties": {
+							"fvec": {"type": "dense_vector", "dims": 2, "similarity": "cosine"},
+							"bvec": {"type": "dense_vector", "dims": 2, "element_type": "byte", "similarity": "l2_norm"},
+							"bitvec": {"type": "dense_vector", "dims": 8, "element_type": "bit", "similarity": "l2_norm"}
+						}
+					}
+				}
+			}
+		}`)
+		if code != http.StatusOK {
+			st.Fatalf("PUT /r62_nested_knn failed: status=%d body=%s", code, string(raw))
+		}
+		bulk := strings.Join([]string{
+			`{"index":{"_index":"r62_nested_knn","_id":"d1"}}`,
+			`{"title":"doc1","passages":[{"fvec":[1.0,0.0],"bvec":"7f00","bitvec":"f0"}]}`,
+			`{"index":{"_index":"r62_nested_knn","_id":"d2"}}`,
+			`{"title":"doc2","passages":[{"fvec":[0.0,1.0],"bvec":"007f","bitvec":"0f"}]}`,
+			"",
+		}, "\n")
+		if bCode, bRaw := doR62Req(st, http.MethodPost, "/_bulk?refresh=true", bulk); bCode != http.StatusOK {
+			st.Fatalf("POST /_bulk r62_nested_knn failed: status=%d body=%s", bCode, string(bRaw))
+		}
+		for _, knnQuery := range []string{
+			`{"knn": {"field": "passages.fvec", "query_vector": [1.0, 0.0], "k": 1, "num_candidates": 4, "boost": 0.00001}}`,
+			`{"knn": {"field": "passages.bvec", "query_vector": "7f00", "k": 1, "num_candidates": 4}}`,
+			`{"knn": {"field": "passages.bitvec", "query_vector": "f0", "k": 1, "num_candidates": 4}}`,
+		} {
+			kCode, kRaw := doR62Req(st, http.MethodPost, "/r62_nested_knn/_search", knnQuery)
+			if kCode != http.StatusOK {
+				st.Fatalf("nested knn failed for %s: status=%d body=%s", knnQuery, kCode, string(kRaw))
+			}
+			var kRes map[string]any
+			_ = json.Unmarshal(kRaw, &kRes)
+			hits := kRes["hits"].(map[string]any)["hits"].([]any)
+			if len(hits) != 1 || hits[0].(map[string]any)["_id"] != "d1" {
+				st.Fatalf("expected top hit d1 for %s, got %s", knnQuery, string(kRaw))
+			}
+		}
+	})
+
+	t.Run("Round62_SubSecond100ms_And_HalfOpen_DateRange_DateHistogram", func(st *testing.T) {
+		code, raw := doR62Req(st, http.MethodPut, "/r62_date_range", `{
+			"mappings": {
+				"properties": {
+					"win": {"type": "date_range"},
+					"val": {"type": "double"}
+				}
+			}
+		}`)
+		if code != http.StatusOK {
+			st.Fatalf("PUT /r62_date_range failed: status=%d body=%s", code, string(raw))
+		}
+		bulk := strings.Join([]string{
+			`{"index":{"_index":"r62_date_range","_id":"r1"}}`,
+			`{"win":{"gte":"2026-06-01T12:00:00.000Z","lte":"2026-06-01T12:00:00.250Z"},"val":10}`,
+			`{"index":{"_index":"r62_date_range","_id":"r2"}}`,
+			`{"win":{"gte":"2026-06-01T12:00:00.200Z"},"val":30}`,
+			"",
+		}, "\n")
+		if bCode, bRaw := doR62Req(st, http.MethodPost, "/_bulk?refresh=true", bulk); bCode != http.StatusOK {
+			st.Fatalf("POST /_bulk r62_date_range failed: status=%d body=%s", bCode, string(bRaw))
+		}
+		sCode, sRaw := doR62Req(st, http.MethodPost, "/r62_date_range/_search", `{
+			"size": 0,
+			"aggs": {
+				"subsec": {
+					"date_histogram": {
+						"field": "win",
+						"fixed_interval": "100ms",
+						"hard_bounds": {"min": "2026-06-01T12:00:00.000Z", "max": "2026-06-01T12:00:00.400Z"}
+					},
+					"aggs": {
+						"sum_v": {"sum": {"field": "val"}}
+					}
+				}
+			}
+		}`)
+		if sCode != http.StatusOK {
+			st.Fatalf("100ms date_range date_histogram failed: status=%d body=%s", sCode, string(sRaw))
+		}
+		var sRes map[string]any
+		_ = json.Unmarshal(sRaw, &sRes)
+		buckets := sRes["aggregations"].(map[string]any)["subsec"].(map[string]any)["buckets"].([]any)
+		if len(buckets) < 3 {
+			st.Fatalf("expected >= 3 100ms buckets on 2026 date_range, got %d: %s", len(buckets), string(sRaw))
+		}
+	})
+
+	t.Run("Round62_CatSegments", func(st *testing.T) {
+		txtCode, txtRaw := doR62Req(st, http.MethodGet, "/_cat/segments?v=true", "")
+		if txtCode != http.StatusOK || !strings.Contains(string(txtRaw), "segment") {
+			st.Fatalf("GET /_cat/segments?v=true failed: status=%d body=%s", txtCode, string(txtRaw))
+		}
+		jsCode, jsRaw := doR62Req(st, http.MethodGet, "/_cat/segments/r62_quantiles?format=json", "")
+		if jsCode != http.StatusOK {
+			st.Fatalf("GET /_cat/segments/r62_quantiles?format=json failed: status=%d body=%s", jsCode, string(jsRaw))
+		}
+		var segs []map[string]any
+		if err := json.Unmarshal(jsRaw, &segs); err != nil || len(segs) == 0 {
+			st.Fatalf("expected non-empty JSON segment list for r62_quantiles, err=%v body=%s", err, string(jsRaw))
+		}
+	})
+
+	// Step 32: Upstream Elasticsearch / OpenSearch rest-api-spec YAML Compliance Test Suite
 	compliance.RunEmbeddedSuite(t, ts.URL)
 }

@@ -390,8 +390,21 @@ func (v *SpecSchemaValidator) ValidateHTTPResponse(endpoint string, statusCode i
 	if !ok {
 		return fmt.Errorf("endpoint %q ($): expected JSON object error envelope on HTTP %d, got %s", epName, statusCode, describeJSONKind(root))
 	}
-	if _, hasErr := obj["error"]; !hasErr {
+	errVal, hasErr := obj["error"]
+	if !hasErr {
 		return fmt.Errorf("endpoint %q ($): expected \"error\" field in HTTP %d response", epName, statusCode)
+	}
+	if errBaseDef, hasErrBase := v.types[specTypeKey{Namespace: "_types", Name: "ErrorResponseBase"}]; hasErrBase {
+		if _, isLegacyStr := errVal.(string); !isLegacyStr {
+			if err := v.validateNamedType("$", root, errBaseDef, nil, 0); err != nil {
+				return fmt.Errorf("endpoint %q (HTTP %d): %w", epName, statusCode, err)
+			}
+			if statusField, hasStatus := obj["status"]; hasStatus {
+				if sf, sOk := toNumericFloat64(statusField); sOk && int(sf) != statusCode {
+					return fmt.Errorf("endpoint %q ($): HTTP %d error payload status=%d mismatch", epName, statusCode, int(sf))
+				}
+			}
+		}
 	}
 	return nil
 }
@@ -695,6 +708,11 @@ func (v *SpecSchemaValidator) validateTypeExpr(path string, val any, expr specTy
 		if expr.Type.Namespace == "_builtins" {
 			return validateBuiltinType(path, val, expr.Type.Name)
 		}
+		if expr.Type.Namespace == "_types" && expr.Type.Name == "EsqlColumns" {
+			if obj, isObj := val.(map[string]any); isObj {
+				return validateEsqlColumnsJSON(path, obj)
+			}
+		}
 		if expr.Type.Namespace == "_types" {
 			if err := validateIntegralConstraint(path, val, expr.Type.Name); err != nil {
 				return err
@@ -892,8 +910,9 @@ func (v *SpecSchemaValidator) validateObjectShape(
 	}
 
 	// 1. Verify all required properties are present (under canonical name or a declared alias).
+	defKey := def.Name.key()
 	for _, prop := range props {
-		if !prop.Required {
+		if !prop.Required || isConditionallyOmittedSpecProperty(defKey, prop.Name) {
 			continue
 		}
 		matchedKey := ""
@@ -954,6 +973,73 @@ func (v *SpecSchemaValidator) validateObjectShape(
 	}
 
 	return nil
+}
+
+func validateEsqlColumnsJSON(path string, obj map[string]any) error {
+	colsRaw, hasCols := obj["columns"]
+	if !hasCols {
+		return fmt.Errorf("%s: missing required property \"columns\" on EsqlColumns JSON payload", path)
+	}
+	cols, ok := colsRaw.([]any)
+	if !ok {
+		return fmt.Errorf("%s.columns: expected JSON array, got %s", path, describeJSONKind(colsRaw))
+	}
+	for i, c := range cols {
+		cm, ok := c.(map[string]any)
+		if !ok {
+			return fmt.Errorf("%s.columns[%d]: expected JSON object, got %s", path, i, describeJSONKind(c))
+		}
+		if _, okName := cm["name"].(string); !okName {
+			return fmt.Errorf("%s.columns[%d].name: expected string", path, i)
+		}
+		if _, okType := cm["type"].(string); !okType {
+			return fmt.Errorf("%s.columns[%d].type: expected string", path, i)
+		}
+	}
+	valsRaw, hasVals := obj["values"]
+	if !hasVals {
+		return fmt.Errorf("%s: missing required property \"values\" on EsqlColumns JSON payload", path)
+	}
+	vals, ok := valsRaw.([]any)
+	if !ok {
+		return fmt.Errorf("%s.values: expected JSON array, got %s", path, describeJSONKind(valsRaw))
+	}
+	for i, row := range vals {
+		if _, okRow := row.([]any); !okRow {
+			return fmt.Errorf("%s.values[%d]: expected JSON row array, got %s", path, i, describeJSONKind(row))
+		}
+	}
+	return nil
+}
+
+// isConditionallyOmittedSpecProperty identifies telemetry/metadata fields that
+// elastic/elasticsearch-specification 8.15 marks required even when omitted by default
+// (such as segment file_sizes when include_segment_file_sizes=false, non-tiered node role counts,
+// ILM/DLM transition fields on plain data streams, or unscored rank_eval hits).
+func isConditionallyOmittedSpecProperty(tKey specTypeKey, propName string) bool {
+	switch tKey {
+	case specTypeKey{Namespace: "_types", Name: "SegmentsStats"}:
+		return propName == "file_sizes"
+	case specTypeKey{Namespace: "cluster.stats", Name: "ClusterNodes"}:
+		return propName == "indexing_pressure"
+	case specTypeKey{Namespace: "cluster.stats", Name: "ClusterNodeCount"}:
+		switch propName {
+		case "data_cold", "data_content", "data_hot", "data_warm", "ml", "transform", "voting_only":
+			return true
+		}
+	case specTypeKey{Namespace: "cluster.stats", Name: "ClusterOperatingSystem"}:
+		return propName == "pretty_names"
+	case specTypeKey{Namespace: "indices._types", Name: "DataStream"}:
+		switch propName {
+		case "next_generation_managed_by", "prefer_ilm", "template":
+			return true
+		}
+	case specTypeKey{Namespace: "indices._types", Name: "DataStreamIndex"}:
+		return propName == "managed_by" || propName == "prefer_ilm"
+	case specTypeKey{Namespace: "_global.rank_eval", Name: "RankEvalHit"}:
+		return propName == "_score"
+	}
+	return false
 }
 
 func validateBuiltinType(path string, val any, builtinName string) error {

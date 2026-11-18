@@ -436,16 +436,17 @@ func TestRound39_F28_F29_F30_EnrichQueryAndRangePolicyAndAnalyzeUnicodeOffsets(t
 		t.Fatalf("analyze failed: %d %s", wAn.Code, wAn.Body.String())
 	}
 	tokens := mAn["tokens"].([]any)
-	if len(tokens) != 2 {
-		t.Fatalf("expected 2 tokens, got %+v", tokens)
+	if len(tokens) != 3 {
+		t.Fatalf("expected 3 tokens, got %+v", tokens)
 	}
 	tok0 := tokens[0].(map[string]any)
 	tok1 := tokens[1].(map[string]any)
-	if tok0["start_offset"] != float64(0) || tok0["end_offset"] != float64(2) {
-		t.Fatalf("expected '日本' rune offsets [0, 2], got %+v", tok0)
+	tok2 := tokens[2].(map[string]any)
+	if tok0["start_offset"] != float64(0) || tok0["end_offset"] != float64(1) || tok1["start_offset"] != float64(1) || tok1["end_offset"] != float64(2) {
+		t.Fatalf("expected '日','本' rune offsets [0,1],[1,2], got %+v %+v", tok0, tok1)
 	}
-	if tok1["start_offset"] != float64(3) || tok1["end_offset"] != float64(7) {
-		t.Fatalf("expected 'test' rune offsets [3, 7], got %+v", tok1)
+	if tok2["start_offset"] != float64(3) || tok2["end_offset"] != float64(7) {
+		t.Fatalf("expected 'test' rune offsets [3, 7], got %+v", tok2)
 	}
 
 	_ = bytes.NewReader(nil)

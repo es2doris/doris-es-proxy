@@ -22,14 +22,18 @@ import (
 	"bytes"
 	"context"
 	"crypto/md5" // #nosec G501 -- used only to emulate Doris MD5() SQL function in MemoryBackend
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
 	"math"
 	"math/big"
+	"math/bits"
 	"math/rand"
 	"net"
+	"net/netip"
 	"regexp"
 	"sort"
 	"strconv"
@@ -198,34 +202,90 @@ func (m *MemoryBackend) Ping(_ context.Context) error {
 	return nil
 }
 
+func mergeMissingDocKeysIntoSourceMap(dst, src map[string]any) bool {
+	if dst == nil || len(src) == 0 {
+		return false
+	}
+	changed := false
+	for k, sv := range src {
+		dv, exists := dst[k]
+		if !exists {
+			dst[k] = sv
+			changed = true
+			continue
+		}
+		dm, okD := dv.(map[string]any)
+		sm, okS := sv.(map[string]any)
+		if okD && okS && mergeMissingDocKeysIntoSourceMap(dm, sm) {
+			changed = true
+		}
+	}
+	return changed
+}
+
+func mergeSourceWithDocVariantJSON(srcRaw json.RawMessage, docRaw json.RawMessage) json.RawMessage {
+	srcTrim := bytes.TrimSpace(srcRaw)
+	docTrim := bytes.TrimSpace(docRaw)
+	if len(srcTrim) == 0 {
+		if len(docTrim) > 0 {
+			return docRaw
+		}
+		return nil
+	}
+	if len(docTrim) == 0 || bytes.Equal(srcTrim, docTrim) {
+		return srcRaw
+	}
+	var srcMap map[string]any
+	decS := json.NewDecoder(bytes.NewReader(srcTrim))
+	decS.UseNumber()
+	if err := decS.Decode(&srcMap); err != nil || srcMap == nil {
+		return srcRaw
+	}
+	var docMap map[string]any
+	decD := json.NewDecoder(bytes.NewReader(docTrim))
+	decD.UseNumber()
+	if err := decD.Decode(&docMap); err != nil || len(docMap) == 0 {
+		return srcRaw
+	}
+	if !mergeMissingDocKeysIntoSourceMap(srcMap, docMap) {
+		return srcRaw
+	}
+	if merged, err := json.Marshal(srcMap); err == nil {
+		return json.RawMessage(merged)
+	}
+	return srcRaw
+}
+
 func memExtractRawDocJSON(row map[string]any) json.RawMessage {
 	if row == nil {
 		return nil
 	}
+	var docBytes json.RawMessage
 	if docVal, hasDoc := row["_doc"]; hasDoc && docVal != nil {
 		switch dv := docVal.(type) {
 		case string:
 			if dv != "" {
-				return json.RawMessage(dv)
+				docBytes = json.RawMessage(dv)
 			}
 		case json.RawMessage:
 			if len(dv) > 0 {
-				return dv
+				docBytes = dv
 			}
 		case []byte:
 			if len(dv) > 0 {
-				return json.RawMessage(dv)
+				docBytes = json.RawMessage(dv)
 			}
 		default:
 			if b, err := json.Marshal(dv); err == nil {
-				return json.RawMessage(b)
+				docBytes = json.RawMessage(b)
 			}
 		}
 	}
+	var srcBytes json.RawMessage
 	if srcStr, ok := row["_source"].(string); ok && srcStr != "" {
-		return json.RawMessage(srcStr)
+		srcBytes = json.RawMessage(srcStr)
 	}
-	return nil
+	return mergeSourceWithDocVariantJSON(srcBytes, docBytes)
 }
 
 func (m *MemoryBackend) GetDocByID(_ context.Context, _, table, id string) (*HitRow, bool, error) {
@@ -549,17 +609,20 @@ func (m *MemoryBackend) QueryAggs(_ context.Context, sqlStr string) ([]AggRow, e
 		if strings.Contains(branch, "ROW_NUMBER() OVER (ORDER BY ") {
 			branch = resolveKNNTopKSubqueries(tbl, branch)
 		}
+		branch = resolveRound62AggSubqueriesR62Mem(baseRows, branch)
 		rows := evalAggBranch(baseRows, branch)
 		out = append(out, rows...)
 	}
 	return out, nil
 }
 
+const docCountAggExprPatR62Mem = `(?:COUNT\(\*\)|COALESCE\(SUM\(COALESCE\(CAST\(json_extract_string\(` + "`_source`" + `, '\$\._doc_count'\) AS BIGINT\), 1\)\), 0\))`
+
 var (
 	reAggArrayExplode           = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, CAST\\((.+?) AS STRING\\) AS `_bucket_key`, CAST\\((?:COUNT\\(\\*\\)|COUNT\\(DISTINCT `_id`\\)) AS DOUBLE\\) AS `_doc_count` FROM `base_matched` LATERAL VIEW EXPLODE\\(`([^`]+)`\\) `_t` AS `_elem` WHERE (?:\\((.+)\\) AND )?`_elem` IS NOT NULL GROUP BY (?:`_elem`|`_bucket_key`) ORDER BY `_doc_count` DESC, `_bucket_key` ASC LIMIT (\\d+)")
 	reAggArrayExplodeMissing    = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, COALESCE\\(CAST\\((.+?) AS STRING\\), ('(?:''|[^'])*')\\) AS `_bucket_key`, CAST\\((?:COUNT\\(\\*\\)|COUNT\\(DISTINCT `_id`\\)) AS DOUBLE\\) AS `_doc_count` FROM `base_matched` LATERAL VIEW EXPLODE\\(CASE WHEN `([^`]+)` IS NULL.+?\\) `_t` AS `_elem`(?: WHERE (.+?))? GROUP BY `_bucket_key` ORDER BY `_doc_count` DESC, `_bucket_key` ASC LIMIT (\\d+)")
-	reAggScalarTerms            = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, CAST\\((.+?) AS STRING\\) AS `_bucket_key`, CAST\\(COUNT\\(\\*\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched` WHERE (.+?) IS NOT NULL GROUP BY .+? ORDER BY `_doc_count` DESC, `_bucket_key` ASC LIMIT (\\d+)")
-	reAggScalarTermsMissing     = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, COALESCE\\(CAST\\((.+?) AS STRING\\), ('(?:''|[^'])*')\\) AS `_bucket_key`, CAST\\(COUNT\\(\\*\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched`(?: WHERE (.+?))? GROUP BY `_bucket_key` ORDER BY `_doc_count` DESC, `_bucket_key` ASC LIMIT (\\d+)")
+	reAggScalarTerms            = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, CAST\\((.+?) AS STRING\\) AS `_bucket_key`, CAST\\(" + docCountAggExprPatR62Mem + " AS DOUBLE\\) AS `_doc_count` FROM `base_matched` WHERE (.+?) IS NOT NULL GROUP BY .+? ORDER BY `_doc_count` DESC, `_bucket_key` ASC LIMIT (\\d+)")
+	reAggScalarTermsMissing     = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, COALESCE\\(CAST\\((.+?) AS STRING\\), ('(?:''|[^'])*')\\) AS `_bucket_key`, CAST\\(" + docCountAggExprPatR62Mem + " AS DOUBLE\\) AS `_doc_count` FROM `base_matched`(?: WHERE (.+?))? GROUP BY `_bucket_key` ORDER BY `_doc_count` DESC, `_bucket_key` ASC LIMIT (\\d+)")
 	reAggNestedTerms            = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, (?:json_extract_string\\(`_nel`, '\\$\\.([^']+)'\\)|CAST\\((.+?) AS STRING\\)) AS `_bucket_key`, CAST\\(COUNT\\(\\*\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched` LATERAL VIEW EXPLODE\\(`([^`]+)`\\) `_nt` AS `_nel` WHERE (?:\\((.+)\\) AND )?(?:json_extract_string\\(`_nel`, '\\$\\.[^']+'\\)|CAST\\(.+? AS STRING\\)) IS NOT NULL GROUP BY `_bucket_key` ORDER BY `_doc_count` DESC, `_bucket_key` ASC LIMIT (\\d+)")
 	reAggNestedTermsMissing     = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, COALESCE\\((?:json_extract_string\\(`_nel`, '\\$\\.([^']+)'\\)|CAST\\((.+?) AS STRING\\)), ('(?:''|[^'])*')\\) AS `_bucket_key`, CAST\\(COUNT\\(\\*\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched` LATERAL VIEW EXPLODE\\((?:CASE WHEN )?`([^`]+)`(?: IS NULL.+?)?\\) `_nt` AS `_nel`(?: WHERE (.+?))? GROUP BY `_bucket_key` ORDER BY `_doc_count` DESC, `_bucket_key` ASC LIMIT (\\d+)")
 	reAggNestedMetric           = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, '(_metric|_nested_doc_count|_stats_[a-z_]+)' AS `_bucket_key`, CAST\\((?:COALESCE\\((AVG|SUM|MIN|MAX|COUNT|STDDEV_POP)\\((.+?)\\), 0\\)|(COUNT)\\((DISTINCT )?(.+?)\\)) AS DOUBLE\\) AS `_doc_count` FROM (`base_matched` LATERAL VIEW EXPLODE\\(.+?\\) `_(?:nt|t|ht)` AS `_(?:nel|elem|helem)`)(?: WHERE (.+))?$")
@@ -571,7 +634,7 @@ var (
 	reAggSubPercentileWeighted  = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, (.+?) AS `_bucket_key`, CAST\\(COALESCE\\(PERCENTILE_APPROX_WEIGHTED\\((.+?)\\), 0\\) AS DOUBLE\\) AS `_doc_count` FROM (.+) WHERE (.+?) GROUP BY `_bucket_key`$")
 	reAggSubExactHistPercentile = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, `_bucket_key`, CAST\\(COALESCE\\(MIN\\(CASE WHEN `_cum_w` \\+ 0\\.000000001 >= ([0-9.]+) \\* `_tot_w` .+ FROM \\(SELECT (.+?) AS `_bucket_key`, (.+?) AS `_hv`, SUM\\((.+?)\\) AS `_hw` FROM (.+) WHERE (.+?) GROUP BY `_bucket_key`, `_hv`\\) `_hbins`\\) `_hwcum` GROUP BY `_bucket_key`$")
 	reAggSubPercentileRankWgt   = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, (.+?) AS `_bucket_key`, CAST\\(COALESCE\\(100\\.0 \\* SUM\\(CASE WHEN (.+?) <= ([0-9.eE+-]+) THEN (.+?) ELSE 0\\.0 END\\) / NULLIF\\(SUM\\((.+?)\\), 0\\), 0\\) AS DOUBLE\\) AS `_doc_count` FROM (.+) WHERE (.+?) GROUP BY `_bucket_key`$")
-	reAggFilter                 = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, '(_filter|_global|_reverse_nested|_sampler)' AS `_bucket_key`, CAST\\(COUNT\\(\\*\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched`(?: WHERE (.+))?$")
+	reAggFilter                 = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, '(_filter|_global|_reverse_nested|_sampler|_children|_parent)' AS `_bucket_key`, CAST\\(" + docCountAggExprPatR62Mem + " AS DOUBLE\\) AS `_doc_count` FROM `base_matched`(?: WHERE (.+))?$")
 	reAggMissing                = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, '_missing' AS `_bucket_key`, CAST\\(COUNT\\(\\*\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched` WHERE (?:\\((.+)\\) AND )?NOT \\((.+)\\)$")
 	reAggCardArray              = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, '_metric' AS `_bucket_key`, CAST\\(COUNT\\(DISTINCT `_elem`\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched` LATERAL VIEW EXPLODE\\(`([^`]+)`\\) `_t` AS `_elem` WHERE (?:\\((.+)\\) AND )?`_elem` IS NOT NULL$")
 	reAggCardScalar             = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, '_metric' AS `_bucket_key`, CAST\\(COUNT\\(DISTINCT (.+?)\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched`(?: WHERE (.+))?$")
@@ -582,17 +645,17 @@ var (
 	reAggPercentileRank         = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, '([^']+)' AS `_bucket_key`, CAST\\(COALESCE\\(AVG\\(CASE WHEN (.+?) <= ([0-9.eE+-]+) THEN 100\\.0 ELSE 0\\.0 END\\), 0\\) AS DOUBLE\\) AS `_doc_count` FROM (`base_matched`(?: LATERAL VIEW EXPLODE\\(.+?\\) `_(?:nt|t)` AS `_(?:nel|elem)`)?)(?: WHERE (.+))?$")
 	reAggDateHist               = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, CAST\\(CAST\\(FLOOR\\((?:\\((.+?) \\+ (-?\\d+)\\)|(.+?)) / (\\d+)\\) \\* \\d+(?: - -?\\d+)? AS BIGINT\\) AS STRING\\) AS `_bucket_key`, CAST\\((?:COUNT\\(\\*\\)|COUNT\\(DISTINCT `_id`\\)) AS DOUBLE\\) AS `_doc_count` FROM (`base_matched`(?: LATERAL VIEW EXPLODE\\((?:CASE WHEN .+ END|`[^`]+`)\\) `_t` AS `_elem`)?) WHERE (?:(?:\\((.+)\\) AND )?(?:`[^`]+`|CAST\\([^)]+\\)|`_doc`\\[[^\\]]+\\]) IS NOT NULL|(.+?)) GROUP BY `_bucket_key` ORDER BY CAST\\(`_bucket_key` AS BIGINT\\) ASC")
 	reAggDateHistGeneric        = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, (.+?) AS `_bucket_key`, CAST\\((?:COUNT\\(\\*\\)|COUNT\\(DISTINCT `_id`\\)) AS DOUBLE\\) AS `_doc_count` FROM (.+?) WHERE (.+?) GROUP BY `_bucket_key` ORDER BY CAST\\(`_bucket_key` AS BIGINT\\) ASC")
-	reAggHist                   = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, CAST\\(FLOOR\\(\\((.+?) - ([^)]+)\\) / ([^)]+)\\) \\* [^)]+ \\+ [^)]+ AS STRING\\) AS `_bucket_key`, CAST\\((?:COUNT\\(\\*\\)|COUNT\\(DISTINCT `_id`\\)|COALESCE\\(SUM\\((.+?)\\), 0\\)) AS DOUBLE\\) AS `_doc_count` FROM (`base_matched`(?: LATERAL VIEW EXPLODE\\(.+?\\) `_(?:t|ht|rng_t)` AS `_(?:elem|helem|bidx)`)?) WHERE (?:(?:\\((.+)\\) AND )?(?:`[^`]+`|CAST\\([^)]+\\)|`_doc`\\[[^\\]]+\\]) IS NOT NULL|(.+?)) GROUP BY `_bucket_key` ORDER BY CAST\\(`_bucket_key` AS DOUBLE\\) ASC")
-	reAggRawValues              = regexp.MustCompile(`^SELECT '(__raw_vals__(?:''|[^'])*)' AS ` + "`_agg_name`, CONCAT\\('_vals:', COALESCE\\(ARRAY_JOIN\\(COLLECT_LIST\\(CAST\\((.+?) AS DOUBLE\\)\\), ','\\), ''\\)\\) AS `_bucket_key`, CAST\\(COUNT\\(.+?\\) AS DOUBLE\\) AS `_doc_count` FROM (.+)$")
-	reAggSubRawValues           = regexp.MustCompile(`^SELECT '(__raw_vals__(?:''|[^'])*)' AS ` + "`_agg_name`, CONCAT\\(CAST\\((.+?) AS STRING\\), '\\\\x1f_vals:', COALESCE\\(ARRAY_JOIN\\(COLLECT_LIST\\(CAST\\((.+?) AS DOUBLE\\)\\), ','\\), ''\\)\\) AS `_bucket_key`, CAST\\(COUNT\\(.+?\\) AS DOUBLE\\) AS `_doc_count` FROM (.+)$")
-	reAggRange                  = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, '([^']+)' AS `_bucket_key`, CAST\\(COUNT\\(\\*\\) AS DOUBLE\\) AS `_doc_count` FROM (`base_matched`(?: LATERAL VIEW EXPLODE\\(`[^`]+`\\) `_t` AS `_elem`)?) WHERE (.+)$")
+	reAggHist                   = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, CAST\\(FLOOR\\(\\((.+?) - ([^)]+)\\) / ([^)]+)\\) \\* [^)]+ \\+ [^)]+ AS STRING\\) AS `_bucket_key`, CAST\\((?:COUNT\\(\\*\\)|COUNT\\(DISTINCT `_id`\\)|COALESCE\\(SUM\\((.+?)\\), 0\\)) AS DOUBLE\\) AS `_doc_count` FROM (`base_matched`(?: LATERAL VIEW EXPLODE\\(.+?\\) `_(?:t|ht|rng_t)` AS `_(?:elem|helem|bidx|off)`)?) WHERE (?:(?:\\((.+)\\) AND )?(?:`[^`]+`|CAST\\([^)]+\\)|`_doc`\\[[^\\]]+\\]) IS NOT NULL|(.+?)) GROUP BY `_bucket_key` ORDER BY CAST\\(`_bucket_key` AS DOUBLE\\) ASC")
+	reAggRawValues              = regexp.MustCompile(`^SELECT '(__raw_vals__(?:''|[^'])*)' AS ` + "`_agg_name`, CONCAT\\('_vals:', (?:IF\\(COUNT\\(.+?\\) <= 50000, )?COALESCE\\(ARRAY_JOIN\\(COLLECT_LIST\\(CAST\\((.+?) AS DOUBLE\\)\\), ','\\), ''\\)(?:, ':OVERFLOW:'\\))?\\) AS `_bucket_key`, CAST\\(COUNT\\(.+?\\) AS DOUBLE\\) AS `_doc_count` FROM (.+)$")
+	reAggSubRawValues           = regexp.MustCompile(`^SELECT '(__raw_vals__(?:''|[^'])*)' AS ` + "`_agg_name`, CONCAT\\(CAST\\((.+?) AS STRING\\), '\\\\x1f(?:', '_vals:|_vals:)', (?:IF\\(COUNT\\(.+?\\) <= 50000, )?COALESCE\\(ARRAY_JOIN\\(COLLECT_LIST\\(CAST\\((.+?) AS DOUBLE\\)\\), ','\\), ''\\)(?:, ':OVERFLOW:'\\))?\\) AS `_bucket_key`, CAST\\(COUNT\\(.+?\\) AS DOUBLE\\) AS `_doc_count` FROM (.+)$")
+	reAggRange                  = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, '([^']+)' AS `_bucket_key`, CAST\\(" + docCountAggExprPatR62Mem + " AS DOUBLE\\) AS `_doc_count` FROM (`base_matched`(?: LATERAL VIEW EXPLODE\\(`[^`]+`\\) `_t` AS `_elem`)?) WHERE (.+)$")
 	reAggSubMetric              = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, (.+?) AS `_bucket_key`, CAST\\((?:COALESCE\\((AVG|SUM|MIN|MAX|COUNT|STDDEV_POP)\\((.+?)\\), 0\\)|(COUNT)\\((DISTINCT )?(.+?)\\)) AS DOUBLE\\) AS `_doc_count` FROM (.+) WHERE (.+?) GROUP BY `_bucket_key`$")
 	reAggSubPercentile          = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, (.+?) AS `_bucket_key`, CAST\\(COALESCE\\(PERCENTILE_APPROX\\((.+?), ([0-9.]+)\\), 0\\) AS DOUBLE\\) AS `_doc_count` FROM (.+) WHERE (.+?) GROUP BY `_bucket_key`$")
 	reAggSubPercentileRank      = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, (.+?) AS `_bucket_key`, CAST\\(COALESCE\\(AVG\\(CASE WHEN (.+?) <= ([0-9.eE+-]+) THEN 100\\.0 ELSE 0\\.0 END\\), 0\\) AS DOUBLE\\) AS `_doc_count` FROM (.+) WHERE (.+?) GROUP BY `_bucket_key`$")
 	reAggSubTerms               = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, (CONCAT\\(.+?\\)) AS `_bucket_key`, CAST\\((?:COUNT\\(\\*\\)|COUNT\\(DISTINCT `_id`\\)) AS DOUBLE\\) AS `_doc_count` FROM (.+) WHERE (.+?) GROUP BY `_bucket_key` ORDER BY `_doc_count` (DESC|ASC), `_bucket_key` ASC")
 	reAggTopHits                = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, `_id` AS `_bucket_key`, CAST\\(1 AS DOUBLE\\) AS `_doc_count` FROM `base_matched`(?: WHERE (.+?))? ORDER BY (.+?) LIMIT (\\d+)")
 	reAggSubTopHits             = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, CONCAT\\((.+?), '\\\\x1f', `_id`\\) AS `_bucket_key`, CAST\\(ROW_NUMBER\\(\\) OVER \\(PARTITION BY .+? ORDER BY (.+?)\\) AS DOUBLE\\) AS `_doc_count` FROM (.+) WHERE (.+?)\\) `_agg_sub_\\d+` WHERE `_doc_count` <= (\\d+)")
-	reAggComposite              = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, (.+?) AS `_bucket_key`, CAST\\((?:COUNT\\(\\*\\)|COUNT\\(DISTINCT `_id`\\)) AS DOUBLE\\) AS `_doc_count` FROM (.+?)(?: WHERE (.+?))? GROUP BY `_bucket_key` ORDER BY `_bucket_key` ASC LIMIT (\\d+)")
+	reAggComposite              = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, (.+?) AS `_bucket_key`, CAST\\((?:" + docCountAggExprPatR62Mem + "|COUNT\\(DISTINCT `_id`\\)) AS DOUBLE\\) AS `_doc_count` FROM (.+?)(?: WHERE (.+?))? GROUP BY `_bucket_key` ORDER BY `_bucket_key` ASC LIMIT (\\d+)")
 	reAggGenericGroupedBuckets  = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, (.+?) AS `_bucket_key`, CAST\\((?:COUNT\\(\\*\\)|COUNT\\(DISTINCT `_id`\\)) AS DOUBLE\\) AS `_doc_count` FROM (.+?)(?: WHERE (.+?))? GROUP BY `_bucket_key` ORDER BY `_doc_count` (DESC|ASC), `_bucket_key` ASC LIMIT (\\d+)")
 )
 
@@ -777,9 +840,13 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 				continue
 			}
 			cnt := int64(len(parts))
+			rawJoined := strings.Join(parts, ",")
+			if cnt > 50000 {
+				rawJoined = ":OVERFLOW:"
+			}
 			rows = append(rows, AggRow{
 				AggName:   aggName,
-				BucketKey: bKey + "\x1f_vals:" + strings.Join(parts, ","),
+				BucketKey: bKey + "\x1f_vals:" + rawJoined,
 				DocCount:  cnt,
 				Value:     float64(cnt),
 				Weight:    cnt,
@@ -807,13 +874,21 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 		if cnt == 0 && hasHavingCountGtZero {
 			return nil
 		}
+		rawJoined := strings.Join(parts, ",")
+		if cnt > 50000 {
+			rawJoined = ":OVERFLOW:"
+		}
 		return filterHaving([]AggRow{{
 			AggName:   aggName,
-			BucketKey: "_vals:" + strings.Join(parts, ","),
+			BucketKey: "_vals:" + rawJoined,
 			DocCount:  cnt,
 			Value:     float64(cnt),
 			Weight:    cnt,
 		}})
+	}
+
+	if rows, handled := evalRound62AggBranchR62Mem(baseRows, branch, filterHaving); handled {
+		return rows
 	}
 
 	if m := reAggArrayExplode.FindStringSubmatch(branch); m != nil {
@@ -1173,6 +1248,7 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 		missingVal := unquoteSQLLiteral(missingLit)
 		limit, _ := strconv.Atoi(m[5])
 		counts := make(map[string]int64)
+		useDocCnt := strings.Contains(branch, "$._doc_count")
 		for _, row := range baseRows {
 			if extraWhere != "" && !evalWhereExpr(row, extraWhere) {
 				continue
@@ -1186,7 +1262,7 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 				s = missingVal
 			}
 			if s != "" {
-				counts[s]++
+				counts[s] += rowDocCountWeightR62Mem(row, useDocCnt)
 			}
 		}
 		return topFilteredBuckets(aggName, counts, limit)
@@ -1204,6 +1280,7 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 		}
 		limit, _ := strconv.Atoi(m[4])
 		counts := make(map[string]int64)
+		useDocCnt := strings.Contains(branch, "$._doc_count")
 		for _, row := range baseRows {
 			if extraWhere != "" && !evalWhereExpr(row, extraWhere) {
 				continue
@@ -1212,7 +1289,7 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 			if val != nil {
 				s := fmt.Sprintf("%v", val)
 				if s != "" {
-					counts[s]++
+					counts[s] += rowDocCountWeightR62Mem(row, useDocCnt)
 				}
 			}
 		}
@@ -1222,9 +1299,10 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 	if m := reAggFilter.FindStringSubmatch(branch); m != nil {
 		aggName, bKey, filterWhere := m[1], m[2], m[3]
 		var cnt int64
+		useDocCnt := strings.Contains(branch, "$._doc_count")
 		for _, row := range baseRows {
 			if filterWhere == "" || evalWhereExpr(row, filterWhere) {
-				cnt++
+				cnt += rowDocCountWeightR62Mem(row, useDocCnt)
 			}
 		}
 		return []AggRow{{AggName: aggName, BucketKey: bKey, DocCount: cnt, Value: float64(cnt)}}
@@ -1785,7 +1863,9 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 		counts := make(map[string]int64)
 		seenDocBucket := make(map[string]bool)
 		isDistinctDoc := strings.Contains(branch, "COUNT(DISTINCT `_id`)")
+		useDocCnt := !isDistinctDoc && strings.Contains(branch, "$._doc_count")
 		for _, row := range expanded {
+			w := rowDocCountWeightR62Mem(row, useDocCnt)
 			for _, bKey := range evalBucketKeyExprs(row, bucketKeyExpr) {
 				if bKey != "" {
 					if isDistinctDoc {
@@ -1795,7 +1875,7 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 						}
 						seenDocBucket[dk] = true
 					}
-					counts[bKey]++
+					counts[bKey] += w
 				}
 			}
 		}
@@ -1826,7 +1906,9 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 		counts := make(map[string]int64)
 		seenDocBucket := make(map[string]bool)
 		isDistinctDoc := strings.Contains(branch, "COUNT(DISTINCT `_id`)")
+		useDocCnt := !isDistinctDoc && strings.Contains(branch, "$._doc_count")
 		for _, row := range expanded {
+			w := rowDocCountWeightR62Mem(row, useDocCnt)
 			for _, bKey := range evalBucketKeyExprs(row, bucketKeyExpr) {
 				if bKey != "" {
 					if isDistinctDoc {
@@ -1836,7 +1918,7 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 						}
 						seenDocBucket[dk] = true
 					}
-					counts[bKey]++
+					counts[bKey] += w
 				}
 			}
 		}
@@ -1853,7 +1935,9 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 		counts := make(map[string]int64)
 		seenDocBucket := make(map[string]bool)
 		isDistinctDoc := strings.Contains(branch, "COUNT(DISTINCT `_id`)")
+		useDocCnt := !isDistinctDoc && strings.Contains(branch, "$._doc_count")
 		for _, row := range expanded {
+			w := rowDocCountWeightR62Mem(row, useDocCnt)
 			for _, bKey := range evalBucketKeyExprs(row, bucketKeyExpr) {
 				if bKey != "" {
 					if isDistinctDoc {
@@ -1863,7 +1947,7 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 						}
 						seenDocBucket[dk] = true
 					}
-					counts[bKey]++
+					counts[bKey] += w
 				}
 			}
 		}
@@ -2191,9 +2275,14 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 	if m := reAggRange.FindStringSubmatch(branch); m != nil {
 		aggName, bkey, fromClause, rangeWhere := m[1], m[2], m[3], m[4]
 		if bkey != "_filter" && bkey != "_missing" && bkey != "_metric" && bkey != "_count" &&
-			bkey != "_global" && bkey != "_reverse_nested" && bkey != "_sampler" {
+			bkey != "_global" && bkey != "_reverse_nested" && bkey != "_sampler" &&
+			bkey != "_children" && bkey != "_parent" {
 			expanded := expandFromClauseRows(baseRows, fromClause, rangeWhere)
-			cnt := int64(len(expanded))
+			useDocCnt := strings.Contains(branch, "$._doc_count")
+			var cnt int64
+			for _, r := range expanded {
+				cnt += rowDocCountWeightR62Mem(r, useDocCnt)
+			}
 			return []AggRow{{AggName: aggName, BucketKey: bkey, DocCount: cnt, Value: float64(cnt)}}
 		}
 	}
@@ -2248,7 +2337,7 @@ func sortRowsByOrderClause(rows []map[string]any, orderByClause string) {
 
 var (
 	reCaseWhenExplodeCol = regexp.MustCompile("^CASE WHEN `([^`]+)` IS NULL.+END$")
-	reDedupSelectInner   = regexp.MustCompile("^SELECT DISTINCT `_id` AS `_rn_id(?:_\\d+)?`, (.+?) AS `(_rn_bkey(?:_\\d+)?)` FROM (.+)$")
+	reDedupSelectInner   = regexp.MustCompile("^SELECT DISTINCT (?:`base_matched`\\.)?`_id` AS `_rn_id(?:_\\d+)?`, (.+?) AS `(_rn_bkey(?:_\\d+)?)` FROM (.+)$")
 	reDedupJoinTail      = regexp.MustCompile("^\\s*`_rn_dedup(?:_\\d+)?` ON `base_matched`\\.`_id` = `_rn_dedup(?:_\\d+)?`\\.`_rn_id(?:_\\d+)?`(.*)$")
 )
 
@@ -2432,6 +2521,10 @@ func expandFromClauseRows(baseRows []map[string]any, fromClause, whereClause str
 			}
 		}
 		currRows = deduped
+		fromClause = tailFrom
+	}
+	if joinedRows, tailFrom, ok := expandRound62LeadingJoinR62Mem(baseRows, currRows, fromClause); ok {
+		currRows = joinedRows
 		fromClause = tailFrom
 	}
 	explodes := parseLateralViewExplodes(fromClause)
@@ -2624,14 +2717,16 @@ func evalBucketKeyExprs(row map[string]any, expr string) []string {
 		inner := unwrapped[len("json_extract_string(") : len(unwrapped)-1]
 		if commaIdx := strings.IndexByte(inner, ','); commaIdx > 0 {
 			varName := strings.Trim(strings.TrimSpace(inner[:commaIdx]), "`")
-			jsonPath := strings.TrimPrefix(unquoteSQLLiteral(strings.TrimSpace(inner[commaIdx+1:])), "$.")
-			elemJSON, _ := row[varName].(string)
-			res := extractJSONPathFromStr(elemJSON, strings.Split(jsonPath, "."))
+			rawPathLit := unquoteSQLLiteral(strings.TrimSpace(inner[commaIdx+1:]))
+			elemJSON := extractRowJSONStringR62Mem(row, varName)
+			res := extractJSONPathRawR62Mem(elemJSON, rawPathLit)
 			if arr, ok := res.([]any); ok {
 				var out []string
+				seen := make(map[string]bool, len(arr))
 				for _, item := range arr {
 					if item != nil {
-						if s := fmt.Sprintf("%v", item); s != "" {
+						if s := fmt.Sprintf("%v", item); s != "" && !seen[s] {
+							seen[s] = true
 							out = append(out, s)
 						}
 					}
@@ -3353,6 +3448,14 @@ func evalNumericExpr(row map[string]any, expr string) float64 {
 		return f
 	}
 
+	if parts := splitTopLevelBinaryMath(expr, '&'); len(parts) >= 2 {
+		acc := int64(math.Trunc(evalNumericExpr(row, parts[0])))
+		for _, p := range parts[1:] {
+			acc &= int64(math.Trunc(evalNumericExpr(row, p)))
+		}
+		return float64(acc)
+	}
+
 	if parts := splitTopLevelBinaryMath(expr, '+'); len(parts) > 1 {
 		sum := 0.0
 		for _, p := range parts {
@@ -4017,11 +4120,16 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 			return strings.ToUpper(new(big.Int).Add(big.NewInt(iv), twoPow64).Text(16))
 		}
 		if v := resolveColumnValue(row, inner); v != nil {
+			if rawBytes, okB := v.([]byte); okB {
+				return strings.ToUpper(hex.EncodeToString(rawBytes))
+			}
 			switch sliceVal := v.(type) {
 			case []any, []string:
 				var out []any
 				for _, elem := range asSliceOrSingle(sliceVal) {
-					if iv, ok := toInt64(elem); ok {
+					if rb, okB := elem.([]byte); okB {
+						out = append(out, strings.ToUpper(hex.EncodeToString(rb)))
+					} else if iv, ok := toInt64(elem); ok {
 						out = append(out, formatHexInt(iv))
 					}
 				}
@@ -4093,9 +4201,9 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 		commaIdx := strings.IndexByte(inner, ',')
 		if commaIdx > 0 {
 			varName := strings.Trim(strings.TrimSpace(inner[:commaIdx]), "`")
-			jsonPath := strings.TrimPrefix(unquoteSQLLiteral(strings.TrimSpace(inner[commaIdx+1:])), "$.")
-			elemJSON, _ := row[varName].(string)
-			res := extractJSONPathFromStr(elemJSON, strings.Split(jsonPath, "."))
+			rawPathLit := unquoteSQLLiteral(strings.TrimSpace(inner[commaIdx+1:]))
+			elemJSON := extractRowJSONStringR62Mem(row, varName)
+			res := extractJSONPathRawR62Mem(elemJSON, rawPathLit)
 			if rv, ok := res.(map[string]any); ok {
 				if b, err := json.Marshal(rv); err == nil {
 					return string(b)
@@ -4110,22 +4218,18 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 		if len(args) == 2 {
 			varExpr := strings.TrimSpace(args[0])
 			varName := strings.Trim(varExpr, "`")
-			jsonPath := strings.TrimPrefix(unquoteSQLLiteral(strings.TrimSpace(args[1])), "$.")
-			var elemJSON string
-			if rawElem, ok := row[varName]; ok && rawElem != nil {
-				if s, okS := rawElem.(string); okS {
-					elemJSON = s
-				} else if jb, err := json.Marshal(rawElem); err == nil {
-					elemJSON = string(jb)
-				}
-			} else if resolved := resolveColumnValue(row, varExpr); resolved != nil {
-				if s, okS := resolved.(string); okS {
-					elemJSON = s
-				} else if jb, err := json.Marshal(resolved); err == nil {
-					elemJSON = string(jb)
+			rawPathLit := unquoteSQLLiteral(strings.TrimSpace(args[1]))
+			elemJSON := extractRowJSONStringR62Mem(row, varName)
+			if elemJSON == "" {
+				if resolved := resolveColumnValue(row, varExpr); resolved != nil {
+					if s, okS := resolved.(string); okS {
+						elemJSON = s
+					} else if jb, err := json.Marshal(resolved); err == nil {
+						elemJSON = string(jb)
+					}
 				}
 			}
-			return extractJSONPathFromStr(elemJSON, strings.Split(jsonPath, "."))
+			return extractJSONPathRawR62Mem(elemJSON, rawPathLit)
 		}
 	}
 	if strings.HasPrefix(colExpr, "CAST(`_doc`") && hasMatchingOuterParens(colExpr, 4) {
@@ -4391,6 +4495,9 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 		if len(args) == 2 {
 			docVec := resolveVectorValue(row, args[0])
 			qVec := parseVectorLiteral(args[1])
+			if len(qVec) == 0 {
+				qVec = resolveVectorValue(row, args[1])
+			}
 			if len(docVec) > 0 && len(docVec) == len(qVec) {
 				if isL2 {
 					return computeL2Distance(docVec, qVec)
@@ -4802,7 +4909,7 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 		}
 		if strings.HasSuffix(colExpr, " AS ARRAY<STRING>)") {
 			inner := strings.TrimSpace(colExpr[len("CAST(") : len(colExpr)-len(" AS ARRAY<STRING>)")])
-			return toStringSlice(resolveColumnValue(row, inner))
+			return coerceCastArrayOfStringR62Mem(resolveColumnValue(row, inner))
 		}
 		if strings.HasSuffix(colExpr, " AS ARRAY<LARGEINT>)") {
 			inner := strings.TrimSpace(colExpr[len("CAST(") : len(colExpr)-len(" AS ARRAY<LARGEINT>)")])
@@ -4849,6 +4956,9 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 	}
 	if trimmedCase := trimOuterParens(colExpr); strings.HasPrefix(trimmedCase, "CASE WHEN ") && strings.HasSuffix(trimmedCase, " END") {
 		return evalCaseWhenValue(row, trimmedCase)
+	}
+	if v, handled := evalColumnFuncR62Mem(row, colExpr); handled {
+		return v
 	}
 	if isArithmeticSQLExpr(colExpr) {
 		if hasUnwrappedNullColumnRef(row, colExpr) {
@@ -5026,12 +5136,12 @@ func isArithmeticSQLExpr(expr string) bool {
 	if strings.EqualFold(trimmed, "PI()") {
 		return true
 	}
-	for _, fn := range []string{"CASE ", "ST_Distance_Sphere(", "GREATEST(", "LEAST(", "POW(", "LOG10(", "LN(", "EXP(", "SQRT(", "SIN(", "COS(", "TAN(", "ASIN(", "ACOS(", "ATAN2(", "ATAN(", "FLOOR(", "CEIL(", "ROUND(", "TRUNCATE(", "ABS(", "UNIX_TIMESTAMP(", "TIMESTAMPDIFF("} {
+	for _, fn := range []string{"CASE ", "ST_Distance_Sphere(", "GREATEST(", "LEAST(", "POW(", "LOG10(", "LN(", "EXP(", "SQRT(", "SIN(", "COS(", "TAN(", "ASIN(", "ACOS(", "ATAN2(", "ATAN(", "FLOOR(", "CEIL(", "ROUND(", "TRUNCATE(", "ABS(", "UNIX_TIMESTAMP(", "TIMESTAMPDIFF(", "MURMUR_HASH3_32(", "CONV("} {
 		if strings.HasPrefix(trimmed, fn) {
 			return true
 		}
 	}
-	for _, op := range []byte{'+', '-', '*', '/', '%'} {
+	for _, op := range []byte{'&', '+', '-', '*', '/', '%'} {
 		if len(splitTopLevelBinaryMath(trimmed, op)) > 1 {
 			return true
 		}
@@ -5539,6 +5649,12 @@ func resolveVectorValue(row map[string]any, expr string) []float64 {
 			}
 		}
 		return out
+	case string:
+		trimmed := strings.TrimSpace(s)
+		if strings.HasPrefix(trimmed, "[") && strings.HasSuffix(trimmed, "]") {
+			return parseVectorLiteral(trimmed)
+		}
+		return nil
 	default:
 		return nil
 	}
@@ -6420,4 +6536,949 @@ func resolveKNNTopKSubqueries(tbl map[string]map[string]any, sqlExpr string) str
 		sqlExpr = sqlExpr[:idx] + replacement + sqlExpr[closeIn+1:]
 	}
 	return sqlExpr
+}
+
+// ----------------------------------------------------------------------------
+// Round-62 MemoryBackend Pushdown Helpers (all symbols suffixed with `R62Mem`)
+// ----------------------------------------------------------------------------
+
+var (
+	reWrappedOrderedAggSubR62Mem = regexp.MustCompile(`^SELECT ` + "`_agg_name`, `_bucket_key`, `_doc_count` FROM \\(SELECT '((?:''|[^'])+)' AS `_agg_name`, (.+?) AS `_bucket_key`, CAST\\((.+?) AS DOUBLE\\) AS `_doc_count` FROM (.+) GROUP BY (.+?) ORDER BY (.+?) (ASC|DESC) LIMIT (\\d+)\\) `_agg_sub_\\d+`$")
+	reGroupedJoinEmptyAggR62Mem  = regexp.MustCompile(`^SELECT '((?:''|[^'])+)' AS ` + "`_agg_name`, .+ AS `_bucket_key`, CAST\\(0 AS DOUBLE\\) AS `_doc_count` FROM .+ WHERE FALSE GROUP BY `_bucket_key`$")
+	reGroupedJoinCountAggR62Mem  = regexp.MustCompile(`^SELECT '((?:''|[^'])+)' AS ` + "`_agg_name`, (`_(?:jp|jc)_\\d+`\\.`_(?:jp|jc)_bkey_\\d+`) AS `_bucket_key`, CAST\\(COUNT\\(DISTINCT `base_matched`\\.`_id`\\) AS DOUBLE\\) AS `_doc_count` FROM (.+) GROUP BY `_bucket_key`$")
+	reTSTopSubSelectR62Mem       = regexp.MustCompile("^SELECT `__tsid` AS `(_ts_id_\\d+)`, (.+?) AS `(_ts_bkey_\\d+)` FROM `base_matched` WHERE (.+?) GROUP BY `__tsid`, `__tsid_key` ORDER BY (.+?) ASC LIMIT (\\d+)$")
+	reTSTopJoinTailR62Mem        = regexp.MustCompile("^\\s*`_ts_top_\\d+` ON `base_matched`\\.`__tsid` = `_ts_top_\\d+`\\.`_ts_id_\\d+`(.*)$")
+	reJPSubSelectR62Mem          = regexp.MustCompile("^SELECT DISTINCT `_id` AS `(_jp_id_\\d+)`, (.+?) AS `(_jp_bkey_\\d+)` FROM (.+)$")
+	reJPJoinTailR62Mem           = regexp.MustCompile("^\\s*`(_jp_\\d+)` ON \\((.+?)\\)(.*)$")
+	reJCSubSelectR62Mem          = regexp.MustCompile("^SELECT DISTINCT (.+?) AS `(_jc_pid_\\d+)`, (.+?) AS `(_jc_bkey_\\d+)` FROM (.+)$")
+	reJCJoinTailR62Mem           = regexp.MustCompile("^\\s*`(_jc_\\d+)` ON `base_matched`\\.`_id` = `_jc_\\d+`\\.`_jc_pid_\\d+`(.*)$")
+)
+
+func rowDocCountWeightR62Mem(row map[string]any, useDocCount bool) int64 {
+	if !useDocCount {
+		return 1
+	}
+	srcJSON := extractRowJSONStringR62Mem(row, "_source")
+	if srcJSON != "" {
+		if v := extractJSONPathFromStr(srcJSON, []string{"_doc_count"}); v != nil {
+			if iv, ok := toInt64(v); ok && iv >= 1 {
+				return iv
+			}
+		}
+	}
+	return 1
+}
+
+func extractRowJSONStringR62Mem(row map[string]any, varName string) string {
+	if rawElem, ok := row[varName]; ok && rawElem != nil {
+		if s, okS := rawElem.(string); okS {
+			return s
+		}
+		if jb, err := json.Marshal(rawElem); err == nil {
+			return string(jb)
+		}
+	}
+	if varName == "_source" {
+		return string(memExtractRawDocJSON(row))
+	}
+	return ""
+}
+
+func extractJSONPathRawR62Mem(rawJSON, rawPath string) any {
+	if rawJSON == "" {
+		return nil
+	}
+	clean := strings.TrimSpace(rawPath)
+	if strings.HasPrefix(clean, `$."`) && strings.HasSuffix(clean, `"`) && len(clean) >= 4 {
+		litKey := strings.ReplaceAll(clean[3:len(clean)-1], `\"`, `"`)
+		return extractJSONPathFromStr(rawJSON, []string{litKey})
+	}
+	clean = strings.TrimPrefix(clean, "$.")
+	if clean == "" || clean == "$" {
+		return nil
+	}
+	return extractJSONPathFromStr(rawJSON, strings.Split(clean, "."))
+}
+
+func coerceCastArrayOfStringR62Mem(v any) []string {
+	if s, ok := v.(string); ok {
+		trimmed := strings.TrimSpace(s)
+		if strings.HasPrefix(trimmed, "[") && strings.HasSuffix(trimmed, "]") {
+			var arr []any
+			dec := json.NewDecoder(strings.NewReader(trimmed))
+			dec.UseNumber()
+			if err := dec.Decode(&arr); err == nil {
+				return toStringSlice(arr)
+			}
+		}
+	}
+	return toStringSlice(v)
+}
+
+func resolveRound62AggSubqueriesR62Mem(baseRows []map[string]any, sqlExpr string) string {
+	// 1. Plain `sampler` top-N subquery
+	const smpPrefix = "`_id` IN (SELECT `_id` FROM (SELECT `_id` FROM `base_matched` WHERE "
+	for guard := 0; guard < 32; guard++ {
+		idx := strings.Index(sqlExpr, smpPrefix)
+		if idx < 0 {
+			break
+		}
+		closeIn := memFindMatchingParen(sqlExpr, idx+len("`_id` IN "))
+		closeInner := memFindMatchingParen(sqlExpr, idx+len("`_id` IN (SELECT `_id` FROM "))
+		if closeIn < 0 || closeInner < 0 || closeInner >= closeIn {
+			break
+		}
+		innerBody := sqlExpr[idx+len(smpPrefix) : closeInner]
+		orderIdx := strings.LastIndex(innerBody, " ORDER BY CAST(")
+		limitIdx := strings.LastIndex(innerBody, " LIMIT ")
+		if orderIdx < 0 || limitIdx <= orderIdx {
+			break
+		}
+		baseFilter := strings.TrimSpace(innerBody[:orderIdx])
+		scoreHeader := innerBody[orderIdx+len(" ORDER BY CAST(") : limitIdx]
+		const scoreSuffix = " AS DOUBLE) DESC, `_id` ASC"
+		if !strings.HasSuffix(scoreHeader, scoreSuffix) {
+			break
+		}
+		scoreExpr := strings.TrimSpace(scoreHeader[:len(scoreHeader)-len(scoreSuffix)])
+		shardSize, err := strconv.Atoi(strings.TrimSpace(innerBody[limitIdx+len(" LIMIT "):]))
+		if err != nil || shardSize <= 0 {
+			sqlExpr = sqlExpr[:idx] + "FALSE" + sqlExpr[closeIn+1:]
+			continue
+		}
+		baseFilter = resolveRound62AggSubqueriesR62Mem(baseRows, baseFilter)
+		type smpDoc struct {
+			id    string
+			score float64
+		}
+		var docs []smpDoc
+		for _, r := range baseRows {
+			if evalWhereExpr(r, baseFilter) {
+				sc := evalNumericExpr(r, scoreExpr)
+				if math.IsNaN(sc) || math.IsInf(sc, 0) {
+					sc = 0
+				}
+				docs = append(docs, smpDoc{id: fmt.Sprintf("%v", r["_id"]), score: sc})
+			}
+		}
+		sort.Slice(docs, func(i, j int) bool {
+			if docs[i].score != docs[j].score {
+				return docs[i].score > docs[j].score
+			}
+			return docs[i].id < docs[j].id
+		})
+		if len(docs) > shardSize {
+			docs = docs[:shardSize]
+		}
+		ids := make([]string, len(docs))
+		for i, d := range docs {
+			ids[i] = d.id
+		}
+		sqlExpr = sqlExpr[:idx] + formatIDInListR62Mem("`_id`", ids) + sqlExpr[closeIn+1:]
+	}
+
+	// 2. `diversified_sampler` partitioned window subquery
+	const divPrefix = "`_id` IN (SELECT `_id` FROM (SELECT `_id`, ROW_NUMBER() OVER (PARTITION BY `_ds_key` ORDER BY `_ds_score` DESC, `_id` ASC) AS `_ds_rn` FROM (SELECT `_id`, "
+	for guard := 0; guard < 32; guard++ {
+		idx := strings.Index(sqlExpr, divPrefix)
+		if idx < 0 {
+			break
+		}
+		closeIn := memFindMatchingParen(sqlExpr, idx+len("`_id` IN "))
+		closeOuter := memFindMatchingParen(sqlExpr, idx+len("`_id` IN (SELECT `_id` FROM "))
+		fromIdx := strings.Index(sqlExpr[idx:], "FROM (SELECT `_id`, ")
+		if closeIn < 0 || closeOuter < 0 || fromIdx < 0 {
+			break
+		}
+		innerOpen := idx + fromIdx + len("FROM ")
+		closeInner := memFindMatchingParen(sqlExpr, innerOpen)
+		if closeInner < 0 || closeInner >= closeOuter || closeOuter >= closeIn {
+			break
+		}
+		innerSelect := sqlExpr[innerOpen+len("(SELECT `_id`, ") : closeInner]
+		keySplit := strings.Index(innerSelect, " AS `_ds_key`, CAST(")
+		fromSplit := strings.Index(innerSelect, " AS DOUBLE) AS `_ds_score` FROM `base_matched` WHERE ")
+		orderSplit := strings.LastIndex(innerSelect, " ORDER BY `_ds_score` DESC, `_id` ASC LIMIT ")
+		if keySplit < 0 || fromSplit <= keySplit || orderSplit <= fromSplit {
+			break
+		}
+		partExpr := strings.TrimSpace(innerSelect[:keySplit])
+		scoreExpr := strings.TrimSpace(innerSelect[keySplit+len(" AS `_ds_key`, CAST(") : fromSplit])
+		baseFilter := strings.TrimSpace(innerSelect[fromSplit+len(" AS DOUBLE) AS `_ds_score` FROM `base_matched` WHERE ") : orderSplit])
+		shardSize, err1 := strconv.Atoi(strings.TrimSpace(innerSelect[orderSplit+len(" ORDER BY `_ds_score` DESC, `_id` ASC LIMIT "):]))
+		tail := sqlExpr[closeOuter+1 : closeIn]
+		rnSplit := strings.LastIndex(tail, " WHERE `_ds_rn` <= ")
+		if err1 != nil || rnSplit < 0 {
+			break
+		}
+		maxDocs, err2 := strconv.Atoi(strings.TrimSpace(tail[rnSplit+len(" WHERE `_ds_rn` <= "):]))
+		if err2 != nil || shardSize <= 0 || maxDocs <= 0 {
+			sqlExpr = sqlExpr[:idx] + "FALSE" + sqlExpr[closeIn+1:]
+			continue
+		}
+		baseFilter = resolveRound62AggSubqueriesR62Mem(baseRows, baseFilter)
+		type divDoc struct {
+			id    string
+			key   string
+			score float64
+		}
+		var docs []divDoc
+		for _, r := range baseRows {
+			if evalWhereExpr(r, baseFilter) {
+				idStr := fmt.Sprintf("%v", r["_id"])
+				kv := resolveColumnValue(r, partExpr)
+				keyStr := "__null_id__:" + idStr
+				if kv != nil && fmt.Sprintf("%v", kv) != "" {
+					keyStr = fmt.Sprintf("%v", kv)
+				}
+				sc := evalNumericExpr(r, scoreExpr)
+				if math.IsNaN(sc) || math.IsInf(sc, 0) {
+					sc = 0
+				}
+				docs = append(docs, divDoc{id: idStr, key: keyStr, score: sc})
+			}
+		}
+		sort.Slice(docs, func(i, j int) bool {
+			if docs[i].score != docs[j].score {
+				return docs[i].score > docs[j].score
+			}
+			return docs[i].id < docs[j].id
+		})
+		if len(docs) > shardSize {
+			docs = docs[:shardSize]
+		}
+		seenPerKey := make(map[string]int)
+		var keptIDs []string
+		for _, d := range docs {
+			if seenPerKey[d.key] < maxDocs {
+				seenPerKey[d.key]++
+				keptIDs = append(keptIDs, d.id)
+			}
+		}
+		sqlExpr = sqlExpr[:idx] + formatIDInListR62Mem("`_id`", keptIDs) + sqlExpr[closeIn+1:]
+	}
+
+	// 3. `children` agg parent-ID subquery: `<lhs> IN (SELECT `_id` FROM `base_matched` WHERE <pCond>)`
+	const childMarker = " IN (SELECT `_id` FROM `base_matched` WHERE "
+	for guard := 0; guard < 32; guard++ {
+		mIdx := strings.Index(sqlExpr, childMarker)
+		if mIdx < 0 {
+			break
+		}
+		openParen := mIdx + len(" IN ")
+		closeParen := memFindMatchingParen(sqlExpr, openParen)
+		if closeParen < 0 {
+			break
+		}
+		// Locate start of `<lhs>` (either start of string or after `(`, `AND `, `OR `)
+		lhsStart := findComparisonLHSStartR62Mem(sqlExpr, mIdx)
+		lhsExpr := strings.TrimSpace(sqlExpr[lhsStart:mIdx])
+		pCond := strings.TrimSpace(sqlExpr[mIdx+len(childMarker) : closeParen])
+		pCond = resolveRound62AggSubqueriesR62Mem(baseRows, pCond)
+		var parentIDs []string
+		for _, r := range baseRows {
+			if evalWhereExpr(r, pCond) {
+				parentIDs = append(parentIDs, fmt.Sprintf("%v", r["_id"]))
+			}
+		}
+		sqlExpr = sqlExpr[:lhsStart] + formatIDInListR62Mem(lhsExpr, parentIDs) + sqlExpr[closeParen+1:]
+	}
+
+	// 4. `parent` agg child-parent-ID subquery: `` `_id` IN (SELECT DISTINCT <pExpr> FROM `base_matched` WHERE <cWhere>) ``
+	const parentMarker = "`_id` IN (SELECT DISTINCT "
+	for guard := 0; guard < 32; guard++ {
+		pIdx := strings.Index(sqlExpr, parentMarker)
+		if pIdx < 0 {
+			break
+		}
+		openParen := pIdx + len("`_id` IN ")
+		closeParen := memFindMatchingParen(sqlExpr, openParen)
+		if closeParen < 0 {
+			break
+		}
+		subBody := sqlExpr[pIdx+len(parentMarker) : closeParen]
+		fromMarker := " FROM `base_matched` WHERE "
+		fIdx := strings.Index(subBody, fromMarker)
+		if fIdx < 0 {
+			break
+		}
+		parentColExpr := strings.TrimSpace(subBody[:fIdx])
+		cWhere := strings.TrimSpace(subBody[fIdx+len(fromMarker):])
+		cWhere = resolveRound62AggSubqueriesR62Mem(baseRows, cWhere)
+		seenPID := make(map[string]bool)
+		var parentIDs []string
+		for _, r := range baseRows {
+			if evalWhereExpr(r, cWhere) {
+				if pv := resolveColumnValue(r, parentColExpr); pv != nil {
+					ps := fmt.Sprintf("%v", pv)
+					if ps != "" && !seenPID[ps] {
+						seenPID[ps] = true
+						parentIDs = append(parentIDs, ps)
+					}
+				}
+			}
+		}
+		sqlExpr = sqlExpr[:pIdx] + formatIDInListR62Mem("`_id`", parentIDs) + sqlExpr[closeParen+1:]
+	}
+
+	return sqlExpr
+}
+
+func findComparisonLHSStartR62Mem(sqlExpr string, opIdx int) int {
+	depth := 0
+	inQuote := false
+	inBacktick := false
+	for i := opIdx - 1; i >= 0; i-- {
+		ch := sqlExpr[i]
+		if ch == '\'' && !inBacktick {
+			inQuote = !inQuote
+			continue
+		}
+		if ch == '`' && !inQuote {
+			inBacktick = !inBacktick
+			continue
+		}
+		if inQuote || inBacktick {
+			continue
+		}
+		if ch == ')' {
+			depth++
+		} else if ch == '(' {
+			if depth == 0 {
+				return i + 1
+			}
+			depth--
+		} else if depth == 0 {
+			if i >= 4 && sqlExpr[i-4:i+1] == " AND " {
+				return i + 1
+			}
+			if i >= 3 && sqlExpr[i-3:i+1] == " OR " {
+				return i + 1
+			}
+		}
+	}
+	return 0
+}
+
+func formatIDInListR62Mem(lhsExpr string, ids []string) string {
+	if len(ids) == 0 {
+		return "FALSE"
+	}
+	quoted := make([]string, len(ids))
+	for i, id := range ids {
+		quoted[i] = "'" + memEscapeSQLString(id) + "'"
+	}
+	return lhsExpr + " IN (" + strings.Join(quoted, ", ") + ")"
+}
+
+func evalRound62AggBranchR62Mem(
+	baseRows []map[string]any,
+	branch string,
+	filterHaving func([]AggRow) []AggRow,
+) ([]AggRow, bool) {
+	if reGroupedJoinEmptyAggR62Mem.MatchString(branch) {
+		return nil, true
+	}
+
+	if m := reWrappedOrderedAggSubR62Mem.FindStringSubmatch(branch); m != nil {
+		aggName := strings.ReplaceAll(m[1], "''", "'")
+		keySQL := strings.TrimSpace(m[2])
+		cntExpr := strings.TrimSpace(m[3])
+		fromAndWhere := strings.TrimSpace(m[4])
+		sortExpr := strings.TrimSpace(m[6])
+		dir := strings.ToUpper(strings.TrimSpace(m[7]))
+		limit, _ := strconv.Atoi(m[8])
+
+		fromClause, whereClause := splitTopLevelFromAndWhere(fromAndWhere)
+		expanded := expandFromClauseRows(baseRows, fromClause, whereClause)
+
+		isDistinctID := strings.Contains(cntExpr, "COUNT(DISTINCT `_id`)")
+		useDocCnt := !isDistinctID && strings.Contains(cntExpr, "$._doc_count")
+
+		type ordBucket struct {
+			key     string
+			sortKey string
+			count   int64
+		}
+		byKey := make(map[string]*ordBucket)
+		seenDocKey := make(map[string]bool)
+
+		for _, row := range expanded {
+			w := rowDocCountWeightR62Mem(row, useDocCnt)
+			bKeys := evalBucketKeyExprs(row, keySQL)
+			for _, bKey := range bKeys {
+				if bKey == "" {
+					continue
+				}
+				if isDistinctID {
+					dk := fmt.Sprintf("%v\x00%s", row["_id"], bKey)
+					if seenDocKey[dk] {
+						continue
+					}
+					seenDocKey[dk] = true
+				}
+				ob, exists := byKey[bKey]
+				if !exists {
+					sk := bKey
+					if sv := resolveColumnValue(row, sortExpr); sv != nil {
+						if s := fmt.Sprintf("%v", sv); s != "" {
+							sk = s
+						}
+					}
+					ob = &ordBucket{key: bKey, sortKey: sk}
+					byKey[bKey] = ob
+				}
+				ob.count += w
+			}
+		}
+
+		items := make([]*ordBucket, 0, len(byKey))
+		for _, ob := range byKey {
+			items = append(items, ob)
+		}
+		sort.Slice(items, func(i, j int) bool {
+			if items[i].sortKey != items[j].sortKey {
+				if dir == "DESC" {
+					return items[i].sortKey > items[j].sortKey
+				}
+				return items[i].sortKey < items[j].sortKey
+			}
+			return items[i].key < items[j].key
+		})
+
+		rows := make([]AggRow, 0, len(items))
+		for _, ob := range items {
+			rows = append(rows, AggRow{
+				AggName:   aggName,
+				BucketKey: ob.key,
+				DocCount:  ob.count,
+				Value:     float64(ob.count),
+			})
+		}
+		rows = filterHaving(rows)
+		if limit > 0 && len(rows) > limit {
+			rows = rows[:limit]
+		}
+		return rows, true
+	}
+
+	if m := reGroupedJoinCountAggR62Mem.FindStringSubmatch(branch); m != nil {
+		aggName := strings.ReplaceAll(m[1], "''", "'")
+		bKeyCol := strings.TrimSpace(m[2])
+		fromAndWhere := strings.TrimSpace(m[3])
+		fromClause, whereClause := splitTopLevelFromAndWhere(fromAndWhere)
+		expanded := expandFromClauseRows(baseRows, fromClause, whereClause)
+
+		counts := make(map[string]int64)
+		seen := make(map[string]bool)
+		for _, row := range expanded {
+			bKey := evalBucketKeyExpr(row, bKeyCol)
+			if bKey == "" {
+				continue
+			}
+			dk := fmt.Sprintf("%v\x00%s", row["_id"], bKey)
+			if seen[dk] {
+				continue
+			}
+			seen[dk] = true
+			counts[bKey]++
+		}
+		keys := make([]string, 0, len(counts))
+		for k := range counts {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		rows := make([]AggRow, 0, len(keys))
+		for _, k := range keys {
+			rows = append(rows, AggRow{
+				AggName:   aggName,
+				BucketKey: k,
+				DocCount:  counts[k],
+				Value:     float64(counts[k]),
+			})
+		}
+		return filterHaving(rows), true
+	}
+
+	return nil, false
+}
+
+func expandRound62LeadingJoinR62Mem(
+	baseRows []map[string]any,
+	currRows []map[string]any,
+	fromClause string,
+) ([]map[string]any, string, bool) {
+	const prefix = "`base_matched` INNER JOIN ("
+	trimmed := strings.TrimSpace(fromClause)
+	if !strings.HasPrefix(trimmed, prefix) {
+		return nil, "", false
+	}
+	openIdx := len(prefix) - 1
+	closeIdx := memFindMatchingParen(trimmed, openIdx)
+	if closeIdx <= openIdx {
+		return nil, "", false
+	}
+	subquery := trimmed[openIdx+1 : closeIdx]
+	afterParen := trimmed[closeIdx+1:]
+
+	// 1. `_ts_top_<N>` (`time_series` sub-aggregation series limiter)
+	if tm := reTSTopJoinTailR62Mem.FindStringSubmatch(afterParen); tm != nil {
+		if sm := reTSTopSubSelectR62Mem.FindStringSubmatch(subquery); sm != nil {
+			bkeyAlias := sm[3]
+			tsBucketExpr := sm[2]
+			wCond := sm[4]
+			sortExpr := sm[5]
+			limit, _ := strconv.Atoi(sm[6])
+			tailFrom := tm[1]
+
+			type tsEntry struct {
+				tsid    string
+				bkey    string
+				sortHex string
+			}
+			byTSID := make(map[string]tsEntry)
+			for _, r := range baseRows {
+				if !evalWhereExpr(r, wCond) {
+					continue
+				}
+				tsidVal := r["__tsid"]
+				if tsidVal == nil {
+					continue
+				}
+				tsidStr := fmt.Sprintf("%v", tsidVal)
+				if tsidStr == "" {
+					continue
+				}
+				if _, exists := byTSID[tsidStr]; !exists {
+					bk := evalBucketKeyExpr(r, tsBucketExpr)
+					sh := tsidStr
+					if sv := resolveColumnValue(r, sortExpr); sv != nil {
+						sh = fmt.Sprintf("%v", sv)
+					}
+					byTSID[tsidStr] = tsEntry{tsid: tsidStr, bkey: bk, sortHex: sh}
+				}
+			}
+			entries := make([]tsEntry, 0, len(byTSID))
+			for _, e := range byTSID {
+				entries = append(entries, e)
+			}
+			sort.Slice(entries, func(i, j int) bool {
+				if entries[i].sortHex != entries[j].sortHex {
+					return entries[i].sortHex < entries[j].sortHex
+				}
+				return entries[i].tsid < entries[j].tsid
+			})
+			if limit > 0 && len(entries) > limit {
+				entries = entries[:limit]
+			}
+			allowed := make(map[string]string, len(entries))
+			for _, e := range entries {
+				allowed[e.tsid] = e.bkey
+			}
+			var joined []map[string]any
+			for _, r := range currRows {
+				tsidStr := fmt.Sprintf("%v", r["__tsid"])
+				if bKey, ok := allowed[tsidStr]; ok {
+					cp := copyRowMapR62Mem(r)
+					cp[bkeyAlias] = bKey
+					joined = append(joined, cp)
+				}
+			}
+			return joined, tailFrom, true
+		}
+	}
+
+	// 2. `_jp_<N>` (grouped `children` sub-agg join: child `base_matched` joined to parent `_jp_N`)
+	if tm := reJPJoinTailR62Mem.FindStringSubmatch(afterParen); tm != nil {
+		if sm := reJPSubSelectR62Mem.FindStringSubmatch(subquery); sm != nil {
+			jpAlias := tm[1]
+			onCond := tm[2]
+			tailFrom := tm[3]
+			jpIDCol := sm[1]
+			parentBucketExpr := sm[2]
+			jpBKeyCol := sm[3]
+			innerFrom, innerWhere := splitTopLevelFromAndWhere(sm[4])
+
+			pRows := expandFromClauseRows(baseRows, innerFrom, innerWhere)
+			type jpPair struct {
+				pid  string
+				bkey string
+			}
+			seenPair := make(map[string]bool)
+			var pairs []jpPair
+			for _, pr := range pRows {
+				pid := fmt.Sprintf("%v", pr["_id"])
+				for _, bk := range evalBucketKeyExprs(pr, parentBucketExpr) {
+					if bk == "" {
+						continue
+					}
+					pk := pid + "\x00" + bk
+					if !seenPair[pk] {
+						seenPair[pk] = true
+						pairs = append(pairs, jpPair{pid: pid, bkey: bk})
+					}
+				}
+			}
+
+			qualID := fmt.Sprintf("`%s`.`%s`", jpAlias, jpIDCol)
+			qualBKey := fmt.Sprintf("`%s`.`%s`", jpAlias, jpBKeyCol)
+			var joined []map[string]any
+			for _, cr := range currRows {
+				for _, pp := range pairs {
+					probe := copyRowMapR62Mem(cr)
+					probe[jpIDCol] = pp.pid
+					probe[qualID] = pp.pid
+					probe[jpBKeyCol] = pp.bkey
+					probe[qualBKey] = pp.bkey
+					if evalWhereExpr(probe, onCond) {
+						joined = append(joined, probe)
+					}
+				}
+			}
+			return joined, tailFrom, true
+		}
+	}
+
+	// 3. `_jc_<N>` (grouped `parent` sub-agg join: parent `base_matched` joined to child `_jc_N`)
+	if tm := reJCJoinTailR62Mem.FindStringSubmatch(afterParen); tm != nil {
+		if sm := reJCSubSelectR62Mem.FindStringSubmatch(subquery); sm != nil {
+			jcAlias := tm[1]
+			tailFrom := tm[2]
+			parentIDExpr := sm[1]
+			jcPIDCol := sm[2]
+			parentBucketExpr := sm[3]
+			jcBKeyCol := sm[4]
+			innerFrom, innerWhere := splitTopLevelFromAndWhere(sm[5])
+
+			cRows := expandFromClauseRows(baseRows, innerFrom, innerWhere)
+			byPID := make(map[string][]string)
+			seenPair := make(map[string]bool)
+			for _, cr := range cRows {
+				pv := resolveColumnValue(cr, parentIDExpr)
+				if pv == nil {
+					continue
+				}
+				pid := fmt.Sprintf("%v", pv)
+				if pid == "" {
+					continue
+				}
+				for _, bk := range evalBucketKeyExprs(cr, parentBucketExpr) {
+					if bk == "" {
+						continue
+					}
+					pk := pid + "\x00" + bk
+					if !seenPair[pk] {
+						seenPair[pk] = true
+						byPID[pid] = append(byPID[pid], bk)
+					}
+				}
+			}
+
+			qualPID := fmt.Sprintf("`%s`.`%s`", jcAlias, jcPIDCol)
+			qualBKey := fmt.Sprintf("`%s`.`%s`", jcAlias, jcBKeyCol)
+			var joined []map[string]any
+			for _, pr := range currRows {
+				pid := fmt.Sprintf("%v", pr["_id"])
+				for _, bk := range byPID[pid] {
+					cp := copyRowMapR62Mem(pr)
+					cp[jcPIDCol] = pid
+					cp[qualPID] = pid
+					cp[jcBKeyCol] = bk
+					cp[qualBKey] = bk
+					joined = append(joined, cp)
+				}
+			}
+			return joined, tailFrom, true
+		}
+	}
+
+	return nil, "", false
+}
+
+func copyRowMapR62Mem(src map[string]any) map[string]any {
+	cp := make(map[string]any, len(src)+4)
+	for k, v := range src {
+		cp[k] = v
+	}
+	return cp
+}
+
+func evalColumnFuncR62Mem(row map[string]any, colExpr string) (any, bool) {
+	// 1. Table-qualified `base_matched`.<rest> and `CAST(`base_matched`.`_doc`... AS ...)`
+	if strings.HasPrefix(colExpr, "`base_matched`.") {
+		return resolveColumnValue(row, strings.TrimPrefix(colExpr, "`base_matched`.")), true
+	}
+	if strings.HasPrefix(colExpr, "CAST(`base_matched`.`_doc`") {
+		rewritten := "CAST(`_doc`" + colExpr[len("CAST(`base_matched`.`_doc`"):]
+		return resolveColumnValue(row, rewritten), true
+	}
+	// Joined alias column lookup (`_jp_1`.`_jp_bkey_1`, `_jc_1`.`_jc_bkey_1`, `_ts_top_1`.`_ts_bkey_1`)
+	if dotIdx := strings.Index(colExpr, "`.`"); dotIdx > 1 && strings.HasPrefix(colExpr, "`") && strings.HasSuffix(colExpr, "`") {
+		if v, ok := row[colExpr]; ok {
+			return v, true
+		}
+		shortCol := colExpr[dotIdx+3 : len(colExpr)-1]
+		if v, ok := row[shortCol]; ok {
+			return v, true
+		}
+	}
+
+	// 2. Unwrapped `_doc`['a']['b'] path extraction (used in IS NOT NULL predicates)
+	if strings.HasPrefix(colExpr, "`_doc`['") && strings.HasSuffix(colExpr, "']") {
+		pathPart := colExpr[len("`_doc`"):]
+		var segs []string
+		for _, p := range strings.Split(pathPart, "['") {
+			p = strings.TrimSuffix(p, "']")
+			if p != "" {
+				p = strings.ReplaceAll(p, "''", "'")
+				p = strings.ReplaceAll(p, `\\`, `\`)
+				segs = append(segs, p)
+			}
+		}
+		srcStr := extractRowJSONStringR62Mem(row, "_doc")
+		if srcStr == "" {
+			srcStr = extractRowJSONStringR62Mem(row, "_source")
+		}
+		return extractJSONPathFromStr(srcStr, segs), true
+	}
+
+	// 3. Single-element / dynamic array literal `[expr]`
+	if strings.HasPrefix(colExpr, "[") && strings.HasSuffix(colExpr, "]") {
+		inner := strings.TrimSpace(colExpr[1 : len(colExpr)-1])
+		if inner == "" || strings.EqualFold(inner, "NULL") {
+			return []any{nil}, true
+		}
+		args := splitTopLevelArgs(inner)
+		if len(args) == 1 {
+			v := resolveColumnValue(row, strings.TrimSpace(args[0]))
+			if v == nil {
+				return nil, true
+			}
+			switch v.(type) {
+			case []any, []string:
+				return toStringSlice(v), true
+			default:
+				return []string{fmt.Sprintf("%v", v)}, true
+			}
+		}
+	}
+
+	// 4. `RIGHT(str, n)`
+	if (strings.HasPrefix(colExpr, "RIGHT(") || strings.HasPrefix(colExpr, "right(")) && strings.HasSuffix(colExpr, ")") && hasMatchingOuterParens(colExpr, len("RIGHT")) {
+		args := splitTopLevelArgs(colExpr[len("RIGHT(") : len(colExpr)-1])
+		if len(args) == 2 {
+			sv := resolveColumnValue(row, strings.TrimSpace(args[0]))
+			n := int(evalNumericExpr(row, strings.TrimSpace(args[1])))
+			if sv == nil || n <= 0 {
+				if sv == nil {
+					return nil, true
+				}
+				return "", true
+			}
+			s := fmt.Sprintf("%v", sv)
+			if n >= len(s) {
+				return s, true
+			}
+			return s[len(s)-n:], true
+		}
+		return nil, true
+	}
+
+	// 5. `RPAD(str, len, pad)`
+	if (strings.HasPrefix(colExpr, "RPAD(") || strings.HasPrefix(colExpr, "rpad(")) && strings.HasSuffix(colExpr, ")") && hasMatchingOuterParens(colExpr, len("RPAD")) {
+		args := splitTopLevelArgs(colExpr[len("RPAD(") : len(colExpr)-1])
+		if len(args) == 3 {
+			sv := resolveColumnValue(row, strings.TrimSpace(args[0]))
+			targetLen := int(evalNumericExpr(row, strings.TrimSpace(args[1])))
+			padStr := unquoteSQLLiteral(strings.TrimSpace(args[2]))
+			if sv == nil || targetLen < 0 {
+				return nil, true
+			}
+			s := fmt.Sprintf("%v", sv)
+			if len(s) >= targetLen {
+				return s[:targetLen], true
+			}
+			if padStr == "" {
+				return s, true
+			}
+			var sb strings.Builder
+			sb.WriteString(s)
+			for sb.Len() < targetLen {
+				rem := targetLen - sb.Len()
+				if rem >= len(padStr) {
+					sb.WriteString(padStr)
+				} else {
+					sb.WriteString(padStr[:rem])
+				}
+			}
+			return sb.String(), true
+		}
+		return nil, true
+	}
+
+	// 6. `REPLACE(str, old, new)`
+	if (strings.HasPrefix(colExpr, "REPLACE(") || strings.HasPrefix(colExpr, "replace(")) && strings.HasSuffix(colExpr, ")") && hasMatchingOuterParens(colExpr, len("REPLACE")) {
+		args := splitTopLevelArgs(colExpr[len("REPLACE(") : len(colExpr)-1])
+		if len(args) == 3 {
+			sv := resolveColumnValue(row, strings.TrimSpace(args[0]))
+			if sv == nil {
+				return nil, true
+			}
+			oldSub := unquoteSQLLiteral(strings.TrimSpace(args[1]))
+			newSub := unquoteSQLLiteral(strings.TrimSpace(args[2]))
+			return strings.ReplaceAll(fmt.Sprintf("%v", sv), oldSub, newSub), true
+		}
+		return nil, true
+	}
+
+	// 7. `CONV(str, fromBase, toBase)`
+	if (strings.HasPrefix(colExpr, "CONV(") || strings.HasPrefix(colExpr, "conv(")) && strings.HasSuffix(colExpr, ")") && hasMatchingOuterParens(colExpr, len("CONV")) {
+		args := splitTopLevelArgs(colExpr[len("CONV(") : len(colExpr)-1])
+		if len(args) == 3 {
+			sv := resolveColumnValue(row, strings.TrimSpace(args[0]))
+			fromBase, err1 := strconv.Atoi(strings.TrimSpace(args[1]))
+			toBase, err2 := strconv.Atoi(strings.TrimSpace(args[2]))
+			if sv == nil || err1 != nil || err2 != nil || fromBase < 2 || fromBase > 36 || toBase < 2 || toBase > 36 {
+				return nil, true
+			}
+			u, err := strconv.ParseUint(strings.TrimSpace(fmt.Sprintf("%v", sv)), fromBase, 64)
+			if err != nil {
+				return nil, true
+			}
+			if toBase == 10 && u <= math.MaxInt64 {
+				return int64(u), true
+			}
+			return strings.ToUpper(strconv.FormatUint(u, toBase)), true
+		}
+		return nil, true
+	}
+
+	// 8. `UNHEX(hexStr)` and `FROM_BASE64(b64Str)`
+	if (strings.HasPrefix(colExpr, "UNHEX(") || strings.HasPrefix(colExpr, "unhex(")) && strings.HasSuffix(colExpr, ")") && hasMatchingOuterParens(colExpr, len("UNHEX")) {
+		inner := strings.TrimSpace(colExpr[len("UNHEX(") : len(colExpr)-1])
+		sv := resolveColumnValue(row, inner)
+		if sv == nil {
+			return nil, true
+		}
+		b, err := hex.DecodeString(strings.TrimSpace(fmt.Sprintf("%v", sv)))
+		if err != nil {
+			return nil, true
+		}
+		return b, true
+	}
+	if (strings.HasPrefix(colExpr, "FROM_BASE64(") || strings.HasPrefix(colExpr, "from_base64(")) && strings.HasSuffix(colExpr, ")") && hasMatchingOuterParens(colExpr, len("FROM_BASE64")) {
+		inner := strings.TrimSpace(colExpr[len("FROM_BASE64(") : len(colExpr)-1])
+		sv := resolveColumnValue(row, inner)
+		if sv == nil {
+			return nil, true
+		}
+		b, err := base64.StdEncoding.DecodeString(strings.TrimSpace(fmt.Sprintf("%v", sv)))
+		if err != nil {
+			return nil, true
+		}
+		return b, true
+	}
+
+	// 9. `IPV4_NUM_TO_STRING(num)` & `IPV6_NUM_TO_STRING(bytes)` & `IPV6_STRING_TO_NUM_OR_NULL(str)`
+	if strings.HasPrefix(colExpr, "IPV4_NUM_TO_STRING(") && strings.HasSuffix(colExpr, ")") && hasMatchingOuterParens(colExpr, len("IPV4_NUM_TO_STRING")) {
+		inner := strings.TrimSpace(colExpr[len("IPV4_NUM_TO_STRING(") : len(colExpr)-1])
+		nv := resolveColumnValue(row, inner)
+		if nv == nil && isArithmeticSQLExpr(inner) {
+			nv = int64(math.Trunc(evalNumericExpr(row, inner)))
+		}
+		if iv, ok := toInt64(nv); ok && iv >= 0 && iv <= 0xffffffff {
+			var b4 [4]byte
+			// #nosec G115 -- explicit range guard `0 <= iv <= 0xffffffff` above
+			binary.BigEndian.PutUint32(b4[:], uint32(iv))
+			return netip.AddrFrom4(b4).String(), true
+		}
+		return nil, true
+	}
+	if strings.HasPrefix(colExpr, "IPV6_NUM_TO_STRING(") && strings.HasSuffix(colExpr, ")") && hasMatchingOuterParens(colExpr, len("IPV6_NUM_TO_STRING")) {
+		inner := strings.TrimSpace(colExpr[len("IPV6_NUM_TO_STRING(") : len(colExpr)-1])
+		bv := resolveColumnValue(row, inner)
+		if rawBytes, ok := bv.([]byte); ok && len(rawBytes) == 16 {
+			var b16 [16]byte
+			copy(b16[:], rawBytes)
+			return netip.AddrFrom16(b16).String(), true
+		}
+		return nil, true
+	}
+	if strings.HasPrefix(colExpr, "IPV6_STRING_TO_NUM_OR_NULL(") && strings.HasSuffix(colExpr, ")") && hasMatchingOuterParens(colExpr, len("IPV6_STRING_TO_NUM_OR_NULL")) {
+		inner := strings.TrimSpace(colExpr[len("IPV6_STRING_TO_NUM_OR_NULL(") : len(colExpr)-1])
+		sv := resolveColumnValue(row, inner)
+		if sv != nil {
+			s := strings.TrimSpace(fmt.Sprintf("%v", sv))
+			if strings.Contains(s, ":") {
+				if ip := net.ParseIP(s); ip != nil {
+					if ip16 := ip.To16(); len(ip16) == 16 {
+						out := make([]byte, 16)
+						copy(out, ip16)
+						return out, true
+					}
+				}
+			}
+		}
+		return nil, true
+	}
+
+	// 10. `MURMUR_HASH3_32(arg1, arg2, ...)`
+	if (strings.HasPrefix(colExpr, "MURMUR_HASH3_32(") || strings.HasPrefix(colExpr, "murmur_hash3_32(")) && strings.HasSuffix(colExpr, ")") && hasMatchingOuterParens(colExpr, len("MURMUR_HASH3_32")) {
+		args := splitTopLevelArgs(colExpr[len("MURMUR_HASH3_32(") : len(colExpr)-1])
+		var buf []byte
+		for _, a := range args {
+			av := resolveColumnValue(row, strings.TrimSpace(a))
+			if av == nil {
+				return nil, true
+			}
+			buf = append(buf, []byte(fmt.Sprintf("%v", av))...)
+		}
+		return int64(murmurHash3x8632R62Mem(buf, 104729)), true
+	}
+
+	return nil, false
+}
+
+// murmurHash3x8632R62Mem emulates Doris's `MURMUR_HASH3_32(...)` function (`MURMUR_SEED = 104729`).
+func murmurHash3x8632R62Mem(data []byte, seed uint32) int32 {
+	const (
+		c1 uint32 = 0xcc9e2d51
+		c2 uint32 = 0x1b873593
+	)
+	h1 := seed
+	nblocks := len(data) / 4
+	for i := 0; i < nblocks; i++ {
+		k1 := binary.LittleEndian.Uint32(data[i*4 : (i+1)*4])
+		k1 *= c1
+		k1 = bits.RotateLeft32(k1, 15)
+		k1 *= c2
+		h1 ^= k1
+		h1 = bits.RotateLeft32(h1, 13)
+		h1 = h1*5 + 0xe6546b64
+	}
+	tail := data[nblocks*4:]
+	var k1 uint32
+	switch len(tail) {
+	case 3:
+		k1 ^= uint32(tail[2]) << 16
+		fallthrough
+	case 2:
+		k1 ^= uint32(tail[1]) << 8
+		fallthrough
+	case 1:
+		k1 ^= uint32(tail[0])
+		k1 *= c1
+		k1 = bits.RotateLeft32(k1, 15)
+		k1 *= c2
+		h1 ^= k1
+	}
+	// #nosec G115 -- MurmurHash3 32-bit length finalizer
+	h1 ^= uint32(len(data))
+	h1 ^= h1 >> 16
+	h1 *= 0x85ebca6b
+	h1 ^= h1 >> 13
+	h1 *= 0xc2b2ae35
+	h1 ^= h1 >> 16
+	// #nosec G115 -- Doris MURMUR_HASH3_32 returns signed 32-bit INT
+	return int32(h1)
 }

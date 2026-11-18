@@ -174,6 +174,61 @@ func (c *StreamLoadCoalescer) Submit(ctx context.Context, table string, ndjson [
 	}
 }
 
+func batchContainsDocID(b *coalesceBatch, docID string) bool {
+	if b == nil || docID == "" {
+		return false
+	}
+	idNeedle, err := json.Marshal(docID)
+	if err != nil {
+		return true
+	}
+	for _, sub := range b.submissions {
+		if sub == nil || sub.canceled || !bytes.Contains(sub.data, idNeedle) {
+			continue
+		}
+		for _, line := range bytes.Split(sub.data, []byte{'\n'}) {
+			line = bytes.TrimSpace(line)
+			if len(line) == 0 || !bytes.Contains(line, idNeedle) {
+				continue
+			}
+			var probe struct {
+				ID string `json:"_id"`
+			}
+			if json.Unmarshal(line, &probe) == nil && probe.ID == docID {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// FlushTableIfDocPending flushes any buffered or in-flight batch for `table` only when `docID`
+// is present in that batch, preserving group-commit coalescing across distinct document IDs while
+// guaranteeing linearizable `_version` / OCC reads on same-`_id` concurrent writes.
+func (c *StreamLoadCoalescer) FlushTableIfDocPending(ctx context.Context, table, docID string) error {
+	if docID == "" {
+		return c.FlushTable(ctx, table)
+	}
+	c.mu.Lock()
+	needFlush := false
+	if b, exists := c.batches[table]; exists && batchContainsDocID(b, docID) {
+		needFlush = true
+	}
+	if !needFlush {
+		for ib, tbl := range c.inflight {
+			if tbl == table && batchContainsDocID(ib, docID) {
+				needFlush = true
+				break
+			}
+		}
+	}
+	c.mu.Unlock()
+	if !needFlush {
+		return nil
+	}
+	return c.FlushTable(ctx, table)
+}
+
 // FlushTable stops any pending group-commit timer for `table`, synchronously flushes its buffered
 // batch, and waits for any in-flight flush to complete so subsequent point-lookups observe all
 // previously submitted writes.

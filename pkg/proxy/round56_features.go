@@ -407,6 +407,25 @@ func (s *Server) handleExplainDataLifecycle(w http.ResponseWriter, r *http.Reque
 			"time_since_index_creation": "0ms",
 		}
 	}
+	if !s.explicitTargetESVersion && target != "" {
+		if _, isDS := s.dataStreams[target]; isDS && indicesOut[target] == nil {
+			lcObj := map[string]any{}
+			managed := false
+			if lc := backingToLifecycle[target]; len(lc) > 0 {
+				lcObj = lc
+				managed = true
+				if en, ok := lc["enabled"].(bool); ok {
+					managed = en
+				}
+			}
+			indicesOut[target] = map[string]any{
+				"index":                     target,
+				"managed_by_lifecycle":      managed,
+				"lifecycle":                 lcObj,
+				"time_since_index_creation": "0ms",
+			}
+		}
+	}
 	s.mu.RUnlock()
 
 	if len(matchedIndices) == 0 && !allowNoIndices {
@@ -4712,7 +4731,8 @@ func (s *Server) executeESQLQueryEngine(w http.ResponseWriter, r *http.Request, 
 	if s.esqlAsyncQueries == nil {
 		s.esqlAsyncQueries = make(map[string]map[string]any)
 	}
-	queryID := fmt.Sprintf("esql-query-%d", len(s.esqlAsyncQueries)+1)
+	evictBoundedAsyncRegistryLockedR62Admin(s.esqlAsyncQueries)
+	queryID := nextESQLAsyncQueryIDR62Admin()
 	respObj := map[string]any{
 		"id":         queryID,
 		"is_running": false,

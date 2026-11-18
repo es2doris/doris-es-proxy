@@ -47,6 +47,14 @@ COMMON_ES_MODULE_TEST_PATHS=(
   "modules/reindex/src/yamlRestTest"
 )
 
+V7_EXTRA_MODULE_TEST_PATHS=(
+  "modules/analysis-common/src/yamlRestTest"
+  "modules/mapper-extras/src/yamlRestTest"
+  "modules/parent-join/src/yamlRestTest"
+  "modules/lang-expression/src/yamlRestTest"
+  "modules/geo/src/yamlRestTest"
+)
+
 ES8_EXTRA_MODULE_TEST_PATHS=(
   "modules/rest-root/src/yamlRestTest"
   "modules/aggregations/src/yamlRestTest"
@@ -56,6 +64,15 @@ ES8_EXTRA_MODULE_TEST_PATHS=(
   "modules/mapper-extras/src/yamlRestTest"
   "modules/parent-join/src/yamlRestTest"
   "modules/lang-expression/src/yamlRestTest"
+  "modules/ingest-user-agent/src/yamlRestTest"
+  "modules/ingest-geoip/src/yamlRestTest"
+  "modules/ingest-attachment/src/yamlRestTest"
+  "modules/transport-netty4/src/yamlRestTest"
+  "x-pack/plugin/mapper-unsigned-long/src/yamlRestTest"
+  "x-pack/plugin/mapper-constant-keyword/src/yamlRestTest"
+  "x-pack/plugin/mapper-version/src/yamlRestTest"
+  "x-pack/plugin/wildcard/src/yamlRestTest"
+  "x-pack/plugin/rank-rrf/src/yamlRestTest"
 )
 
 sparse_clone_or_reuse() {
@@ -109,14 +126,15 @@ sparse_clone_or_reuse() {
 main() {
   mkdir -p "${CACHE_DIR}"
 
-  # 1. Elasticsearch v7.10.2 YAML REST test corpus (Apache-2.0, 522 YAML files)
+  # 1. Elasticsearch v7.10.2 YAML REST test corpus (Apache-2.0)
   sparse_clone_or_reuse \
     "es-v7.10.2" \
     "${ES_REPO_URL}" \
     "v7.10.2" \
     "rest-api-spec/src/main/resources/rest-api-spec/test" \
     "rest-api-spec/src/main/resources/rest-api-spec/test" \
-    "${COMMON_ES_MODULE_TEST_PATHS[@]}"
+    "${COMMON_ES_MODULE_TEST_PATHS[@]}" \
+    "${V7_EXTRA_MODULE_TEST_PATHS[@]}"
 
   # 2. Elasticsearch v8.15.5 YAML REST test corpus (fetched strictly out-of-tree into gitignored .cache/)
   sparse_clone_or_reuse \

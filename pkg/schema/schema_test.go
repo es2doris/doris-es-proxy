@@ -1608,15 +1608,18 @@ func TestRound47SchemaAndShredderSpecCompliance(t *testing.T) {
 		}
 	}
 
-	// F6: search_as_you_type subfields resolve to base field
+	// F6 (upgraded in Round 62 F17): search_as_you_type virtual subfields resolve to dedicated ARRAY<STRING> columns
 	for _, sub := range []string{"sayt._index_prefix", "sayt._2gram", "sayt._3gram"} {
+		wantCol := "f__" + SanitizeDorisIdentifier(sub)
 		b := sch.ResolveField(sub)
-		if b.ColumnName != "f__sayt" {
-			t.Fatalf("F6 expected %s to resolve to f__sayt, got %+v", sub, b)
+		if b.ColumnName != wantCol || b.Kind != StoragePromotedArray {
+			t.Fatalf("F6/R62 expected %s to resolve to %s (StoragePromotedArray), got %+v", sub, wantCol, b)
 		}
-		eb := sch.ResolveEffectiveField(sub, false)
-		if eb.ColumnName != "f__sayt" {
-			t.Fatalf("F6 expected effective field for %s to resolve to f__sayt, got %+v", sub, eb)
+		if sub != "sayt._index_prefix" {
+			eb := sch.ResolveEffectiveField(sub, false)
+			if eb.ColumnName != "f__sayt" {
+				t.Fatalf("F6 expected non-keyword effective field for %s to resolve to f__sayt, got %+v", sub, eb)
+			}
 		}
 	}
 
@@ -3094,7 +3097,7 @@ func TestRound57SchemaAndShredderValidation(t *testing.T) {
 	// F15: dynamic_templates validation
 	badDynTemplates := []string{
 		`{"dynamic_templates":[{"t1":{"match":123,"mapping":{"type":"keyword"}}}]}`,
-		`{"dynamic_templates":[{"t1":{"unmatch":["a"],"mapping":{"type":"keyword"}}}]}`,
+		`{"dynamic_templates":[{"t1":{"unmatch":[123],"mapping":{"type":"keyword"}}}]}`,
 		`{"dynamic_templates":[{"t1":{"path_match":true,"mapping":{"type":"keyword"}}}]}`,
 		`{"dynamic_templates":[{"t1":{"path_unmatch":{},"mapping":{"type":"keyword"}}}]}`,
 		`{"dynamic_templates":[{"t1":{"match_pattern":"regex","path_match":"[unclosed","mapping":{"type":"keyword"}}}]}`,

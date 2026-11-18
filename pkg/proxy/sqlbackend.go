@@ -33,16 +33,51 @@ import (
 	"github.com/go-sql-driver/mysql"
 )
 
+func stripRawDSNMultiStatements(dsn string) string {
+	qIdx := strings.IndexByte(dsn, '?')
+	if qIdx < 0 {
+		return dsn
+	}
+	base := dsn[:qIdx]
+	rawQuery := dsn[qIdx+1:]
+	var kept []string
+	for _, part := range strings.Split(rawQuery, "&") {
+		if part == "" {
+			continue
+		}
+		k, _, _ := strings.Cut(part, "=")
+		if strings.EqualFold(strings.TrimSpace(k), "multiStatements") {
+			continue
+		}
+		kept = append(kept, part)
+	}
+	if len(kept) == 0 {
+		return base
+	}
+	return base + "?" + strings.Join(kept, "&")
+}
+
+func sanitizeAndEscapeDorisIdent(ident string) string {
+	return strings.ReplaceAll(schema.SanitizeDorisIdentifier(ident), "`", "``")
+}
+
+func escapeDorisDBIdent(db string) string {
+	clean := strings.ReplaceAll(strings.TrimSpace(db), "\x00", "")
+	return strings.ReplaceAll(clean, "`", "``")
+}
+
 // ApplyDSNAuth injects `user` and `password` into a go-sql-driver/mysql DSN when the DSN does
-// not already specify an explicit password (or contains an unexpanded `$(DORIS_PASSWORD)` placeholder).
+// not already specify an explicit password (or contains an unexpanded `$(DORIS_PASSWORD)` placeholder),
+// and unconditionally strips `multiStatements=true` to prevent stacked-query execution.
 func ApplyDSNAuth(dsn, user, password string) string {
 	if strings.TrimSpace(dsn) == "" {
 		return dsn
 	}
 	cfg, err := mysql.ParseDSN(dsn)
 	if err != nil {
-		return dsn
+		return stripRawDSNMultiStatements(dsn)
 	}
+	cfg.MultiStatements = false
 	if user != "" && (cfg.User == "" || cfg.User == "root") {
 		cfg.User = user
 	}
@@ -51,6 +86,11 @@ func ApplyDSNAuth(dsn, user, password string) string {
 	}
 	if cfg.Params == nil {
 		cfg.Params = make(map[string]string, 1)
+	}
+	for k := range cfg.Params {
+		if strings.EqualFold(k, "multiStatements") {
+			delete(cfg.Params, k)
+		}
 	}
 	if _, hasTZ := cfg.Params["time_zone"]; !hasTZ {
 		cfg.Params["time_zone"] = "'+00:00'"
@@ -104,8 +144,8 @@ func (b *DorisSQLBackend) ExecDDL(ctx context.Context, ddl string) error {
 	return err
 }
 
-// NormalizeDorisSQL rewrites internal transpiler markers (`__DORIS_DELETE_SIGN__`, `'\x1f'`, and
-// two-argument `array_exists(lambda, col)`) into Apache Doris 2.1/3.x/4.x FE-executable SQL.
+// NormalizeDorisSQL rewrites internal transpiler markers (`__DORIS_DELETE_SIGN__`, `'\x1f'`,
+// `'\x1f_vals:'`, and two-argument `array_exists(lambda, col)`) into Apache Doris 2.1/3.x/4.x FE-executable SQL.
 func NormalizeDorisSQL(q string) string {
 	return normalizeDorisSQL(q)
 }
@@ -113,9 +153,134 @@ func NormalizeDorisSQL(q string) string {
 func normalizeDorisSQL(q string) string {
 	q = strings.ReplaceAll(q, "`__DORIS_DELETE_SIGN__` = 0 AND ", "")
 	q = strings.ReplaceAll(q, "`__DORIS_DELETE_SIGN__` = 0", "1=1")
-	q = strings.ReplaceAll(q, `'\x1f'`, "CHAR(31)")
-	q = strings.ReplaceAll(q, "'\x1f'", "CHAR(31)")
+	q = rewriteDorisUnitSepLiterals(q)
 	return rewriteDorisArrayExists(q)
+}
+
+func rewriteDorisUnitSepLiterals(q string) string {
+	if !strings.Contains(q, `\x1f`) && !strings.Contains(q, "\x1f") && !strings.Contains(q, `\x1F`) {
+		return q
+	}
+	var out strings.Builder
+	out.Grow(len(q) + 32)
+	inDoubleQuote := false
+	inBacktick := false
+	i := 0
+	for i < len(q) {
+		ch := q[i]
+		if inDoubleQuote {
+			if ch == '\\' && i+1 < len(q) {
+				out.WriteString(q[i : i+2])
+				i += 2
+				continue
+			}
+			if ch == '"' {
+				inDoubleQuote = false
+			}
+			out.WriteByte(ch)
+			i++
+			continue
+		}
+		if inBacktick {
+			if ch == '`' {
+				if i+1 < len(q) && q[i+1] == '`' {
+					out.WriteString("``")
+					i += 2
+					continue
+				}
+				inBacktick = false
+			}
+			out.WriteByte(ch)
+			i++
+			continue
+		}
+		if ch == '"' {
+			inDoubleQuote = true
+			out.WriteByte(ch)
+			i++
+			continue
+		}
+		if ch == '`' {
+			inBacktick = true
+			out.WriteByte(ch)
+			i++
+			continue
+		}
+		if ch != '\'' {
+			out.WriteByte(ch)
+			i++
+			continue
+		}
+		// Scan single-quoted SQL string literal `'...'`.
+		j := i + 1
+		closed := false
+		for j < len(q) {
+			c := q[j]
+			if c == '\\' && j+1 < len(q) {
+				j += 2
+				continue
+			}
+			if c == '\'' {
+				if j+1 < len(q) && q[j+1] == '\'' {
+					j += 2
+					continue
+				}
+				closed = true
+				break
+			}
+			j++
+		}
+		if !closed {
+			out.WriteString(q[i:])
+			break
+		}
+		inner := q[i+1 : j]
+		if !strings.Contains(inner, `\x1f`) && !strings.Contains(inner, "\x1f") && !strings.Contains(inner, `\x1F`) {
+			out.WriteString(q[i : j+1])
+			i = j + 1
+			continue
+		}
+		var exprParts []string
+		segStart := 0
+		k := 0
+		for k < len(inner) {
+			if inner[k] == 0x1f {
+				if k > segStart {
+					exprParts = append(exprParts, "'"+inner[segStart:k]+"'")
+				}
+				exprParts = append(exprParts, "CHAR(31)")
+				k++
+				segStart = k
+				continue
+			}
+			if k+4 <= len(inner) && inner[k] == '\\' && (inner[k+1] == 'x' || inner[k+1] == 'X') && inner[k+2] == '1' && (inner[k+3] == 'f' || inner[k+3] == 'F') {
+				if k > segStart {
+					exprParts = append(exprParts, "'"+inner[segStart:k]+"'")
+				}
+				exprParts = append(exprParts, "CHAR(31)")
+				k += 4
+				segStart = k
+				continue
+			}
+			if inner[k] == '\\' && k+1 < len(inner) {
+				k += 2
+				continue
+			}
+			k++
+		}
+		if segStart < len(inner) {
+			exprParts = append(exprParts, "'"+inner[segStart:]+"'")
+		}
+		if len(exprParts) == 1 {
+			out.WriteString(exprParts[0])
+		} else {
+			out.WriteString("CONCAT(")
+			out.WriteString(strings.Join(exprParts, ", "))
+			out.WriteByte(')')
+		}
+		i = j + 1
+	}
+	return out.String()
 }
 
 func rewriteDorisArrayExists(q string) string {
@@ -419,7 +584,7 @@ func (b *DorisSQLBackend) QueryHits(ctx context.Context, querySQL string) ([]Hit
 		}
 		h.Source = json.RawMessage(nullSrc.String)
 		if nullRawDoc.Valid && strings.TrimSpace(nullRawDoc.String) != "" {
-			h.RawSource = json.RawMessage(nullRawDoc.String)
+			h.RawSource = mergeSourceWithDocVariantJSON(h.Source, json.RawMessage(nullRawDoc.String))
 		}
 		hits = append(hits, h)
 	}
@@ -469,8 +634,8 @@ func (b *DorisSQLBackend) GetDocByID(ctx context.Context, dbName, table, id stri
 	if b.db == nil {
 		return nil, false, nil
 	}
-	safeDB := schema.SanitizeDorisIdentifier(dbName)
-	safeTable := schema.SanitizeDorisIdentifier(table)
+	safeDB := escapeDorisDBIdent(dbName)
+	safeTable := sanitizeAndEscapeDorisIdent(table)
 	// #nosec G201 -- identifiers are strictly sanitized via schema.SanitizeDorisIdentifier
 	q := fmt.Sprintf(
 		"SELECT `_id`, `_version`, `_source`, CAST(`_doc` AS STRING) AS `_raw_doc`, `__DORIS_DELETE_SIGN__` FROM `%s`.`%s` WHERE `_id` = ? ORDER BY `_version` DESC LIMIT 1",
@@ -539,7 +704,7 @@ func (b *DorisSQLBackend) GetDocByID(ctx context.Context, dbName, table, id stri
 		best = h
 		best.Source = json.RawMessage(srcStr)
 		if nullRawDoc.Valid && strings.TrimSpace(nullRawDoc.String) != "" {
-			best.RawSource = json.RawMessage(nullRawDoc.String)
+			best.RawSource = mergeSourceWithDocVariantJSON(best.Source, json.RawMessage(nullRawDoc.String))
 		}
 		best.Score = 1.0
 		if hasDelSignCol && delSign.Valid {
@@ -560,41 +725,65 @@ func (b *DorisSQLBackend) GetDocByID(ctx context.Context, dbName, table, id stri
 	return &best, true, nil
 }
 
+const getDocsBatchChunkSize = 4096
+
 func (b *DorisSQLBackend) GetDocsByIDs(ctx context.Context, dbName, table string, ids []string) (map[string]HitRow, error) {
 	out := make(map[string]HitRow, len(ids))
 	if b.db == nil || len(ids) == 0 {
 		return out, nil
 	}
-	safeDB := schema.SanitizeDorisIdentifier(dbName)
-	safeTable := schema.SanitizeDorisIdentifier(table)
-	placeholders := make([]string, len(ids))
-	args := make([]any, len(ids))
-	for i, id := range ids {
+	safeDB := escapeDorisDBIdent(dbName)
+	safeTable := sanitizeAndEscapeDorisIdent(table)
+	maxVer := make(map[string]int64, len(ids))
+	for start := 0; start < len(ids); start += getDocsBatchChunkSize {
+		end := start + getDocsBatchChunkSize
+		if end > len(ids) {
+			end = len(ids)
+		}
+		chunk := ids[start:end]
+		if err := b.queryDocsBatchChunk(ctx, safeDB, safeTable, chunk, out, maxVer); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+func (b *DorisSQLBackend) queryDocsBatchChunk(
+	ctx context.Context,
+	safeDB, safeTable string,
+	chunk []string,
+	out map[string]HitRow,
+	maxVer map[string]int64,
+) error {
+	placeholders := make([]string, len(chunk))
+	args := make([]any, len(chunk))
+	for i, id := range chunk {
 		placeholders[i] = "?"
 		args[i] = id
 	}
-	// #nosec G201 -- identifiers are strictly sanitized and values are bound via ? placeholders
+	inClause := strings.Join(placeholders, ",")
+	// #nosec G201 -- identifiers are strictly sanitized/backtick-escaped and values are bound via ? placeholders
 	q := fmt.Sprintf(
 		"SELECT `_id`, `_version`, `_source`, CAST(`_doc` AS STRING) AS `_raw_doc`, `__DORIS_DELETE_SIGN__` FROM `%s`.`%s` WHERE `_id` IN (%s) ORDER BY `_version` ASC",
-		safeDB, safeTable, strings.Join(placeholders, ","),
+		safeDB, safeTable, inClause,
 	)
 	// #nosec G701 -- parameterized IN query on strictly sanitized identifier
 	rows, err := b.db.QueryContext(ctx, q, args...)
 	if err != nil {
-		// #nosec G201 -- identifiers are strictly sanitized and values are bound via ? placeholders
+		// #nosec G201 -- identifiers are strictly sanitized/backtick-escaped and values are bound via ? placeholders
 		qNoDoc := fmt.Sprintf(
 			"SELECT `_id`, `_version`, `_source`, `__DORIS_DELETE_SIGN__` FROM `%s`.`%s` WHERE `_id` IN (%s) ORDER BY `_version` ASC",
-			safeDB, safeTable, strings.Join(placeholders, ","),
+			safeDB, safeTable, inClause,
 		)
 		// #nosec G701 -- parameterized IN query on strictly sanitized identifier
 		if fbRows, fbErr := b.db.QueryContext(ctx, qNoDoc, args...); fbErr == nil {
 			rows = fbRows
 			err = nil
 		} else {
-			// #nosec G201 -- identifiers are strictly sanitized and values are bound via ? placeholders
+			// #nosec G201 -- identifiers are strictly sanitized/backtick-escaped and values are bound via ? placeholders
 			qFallback := fmt.Sprintf(
 				"SELECT `_id`, `_version`, `_source` FROM `%s`.`%s` WHERE `_id` IN (%s) ORDER BY `_version` ASC",
-				safeDB, safeTable, strings.Join(placeholders, ","),
+				safeDB, safeTable, inClause,
 			)
 			// #nosec G701 -- parameterized IN query on strictly sanitized identifier
 			if fbRows2, fbErr2 := b.db.QueryContext(ctx, qFallback, args...); fbErr2 == nil {
@@ -604,11 +793,10 @@ func (b *DorisSQLBackend) GetDocsByIDs(ctx context.Context, dbName, table string
 		}
 	}
 	if err != nil {
-		return nil, err
+		return err
 	}
 	defer func() { _ = rows.Close() }()
 	cols, _ := rows.Columns()
-	maxVer := make(map[string]int64, len(ids))
 	for rows.Next() {
 		var h HitRow
 		var nullSrc sql.NullString
@@ -619,16 +807,16 @@ func (b *DorisSQLBackend) GetDocsByIDs(ctx context.Context, dbName, table string
 		case len(cols) >= 5:
 			hasDelSignCol = true
 			if err := rows.Scan(&h.ID, &h.Version, &nullSrc, &nullRawDoc, &delSign); err != nil {
-				return nil, err
+				return err
 			}
 		case len(cols) == 4:
 			hasDelSignCol = true
 			if err := rows.Scan(&h.ID, &h.Version, &nullSrc, &delSign); err != nil {
-				return nil, err
+				return err
 			}
 		default:
 			if err := rows.Scan(&h.ID, &h.Version, &nullSrc); err != nil {
-				return nil, err
+				return err
 			}
 		}
 		if prevVer, seen := maxVer[h.ID]; seen && h.Version < prevVer {
@@ -648,12 +836,12 @@ func (b *DorisSQLBackend) GetDocsByIDs(ctx context.Context, dbName, table string
 		}
 		h.Source = json.RawMessage(srcStr)
 		if nullRawDoc.Valid && strings.TrimSpace(nullRawDoc.String) != "" {
-			h.RawSource = json.RawMessage(nullRawDoc.String)
+			h.RawSource = mergeSourceWithDocVariantJSON(h.Source, json.RawMessage(nullRawDoc.String))
 		}
 		h.Score = 1.0
 		out[h.ID] = h
 	}
-	return out, rows.Err()
+	return rows.Err()
 }
 
 func (b *DorisSQLBackend) StreamLoad(ctx context.Context, table string, ndjson []byte, syncRefresh bool) error {
@@ -667,7 +855,7 @@ func (b *DorisSQLBackend) InitCatalog(ctx context.Context, dbName string) error 
 	if b.db == nil {
 		return nil
 	}
-	safeDB := schema.SanitizeDorisIdentifier(dbName)
+	safeDB := escapeDorisDBIdent(dbName)
 	ddl := fmt.Sprintf(
 		"CREATE TABLE IF NOT EXISTS `%s`.`_es_catalog` (\n"+
 			"  `entity_type` VARCHAR(32) NOT NULL COMMENT 'index | alias | template',\n"+
@@ -694,8 +882,8 @@ func (b *DorisSQLBackend) UpsertCatalogEntry(ctx context.Context, dbName string,
 	if b.db == nil {
 		return nil
 	}
-	safeDB := schema.SanitizeDorisIdentifier(dbName)
-	// #nosec G201 -- safeDB is strictly sanitized via schema.SanitizeDorisIdentifier
+	safeDB := escapeDorisDBIdent(dbName)
+	// #nosec G201 -- safeDB is strictly sanitized via sanitizeAndEscapeDorisIdent
 	q := fmt.Sprintf(
 		"INSERT INTO `%s`.`_es_catalog` (`entity_type`, `entity_key`, `payload_json`, `updated_epoch_ms`) VALUES (?, ?, ?, ?)",
 		safeDB,
@@ -708,8 +896,8 @@ func (b *DorisSQLBackend) DeleteCatalogEntry(ctx context.Context, dbName, entity
 	if b.db == nil {
 		return nil
 	}
-	safeDB := schema.SanitizeDorisIdentifier(dbName)
-	// #nosec G201 -- safeDB is strictly sanitized via schema.SanitizeDorisIdentifier
+	safeDB := escapeDorisDBIdent(dbName)
+	// #nosec G201 -- safeDB is strictly sanitized via sanitizeAndEscapeDorisIdent
 	q := fmt.Sprintf(
 		"DELETE FROM `%s`.`_es_catalog` WHERE `entity_type` = ? AND `entity_key` = ?",
 		safeDB,
@@ -722,8 +910,8 @@ func (b *DorisSQLBackend) LoadCatalogEntries(ctx context.Context, dbName string)
 	if b.db == nil {
 		return nil, nil
 	}
-	safeDB := schema.SanitizeDorisIdentifier(dbName)
-	// #nosec G201 -- safeDB is strictly sanitized via schema.SanitizeDorisIdentifier
+	safeDB := escapeDorisDBIdent(dbName)
+	// #nosec G201 -- safeDB is strictly sanitized via sanitizeAndEscapeDorisIdent
 	q := fmt.Sprintf(
 		"SELECT `entity_type`, `entity_key`, `payload_json`, `updated_epoch_ms` FROM `%s`.`_es_catalog` ORDER BY `updated_epoch_ms` ASC",
 		safeDB,
@@ -751,8 +939,8 @@ func (b *DorisSQLBackend) DeleteDocsByIDs(ctx context.Context, dbName, table str
 	if b.db == nil || len(ids) == 0 {
 		return nil
 	}
-	safeDB := schema.SanitizeDorisIdentifier(dbName)
-	safeTable := schema.SanitizeDorisIdentifier(table)
+	safeDB := escapeDorisDBIdent(dbName)
+	safeTable := sanitizeAndEscapeDorisIdent(table)
 	if len(ids) == 1 {
 		// #nosec G201 -- safeDB and safeTable are strictly sanitized via schema.SanitizeDorisIdentifier
 		q := prependSQLTraceComment(ctx, fmt.Sprintf("DELETE FROM `%s`.`%s` WHERE `_id` = ?", safeDB, safeTable))
@@ -1063,7 +1251,7 @@ func (b *DorisSQLBackend) ShowDataTelemetry(ctx context.Context, dbName string) 
 
 	var queries []string
 	if trimmedDB := strings.TrimSpace(dbName); trimmedDB != "" {
-		safeDB := schema.SanitizeDorisIdentifier(trimmedDB)
+		safeDB := escapeDorisDBIdent(trimmedDB)
 		queries = append(queries, fmt.Sprintf("SHOW DATA FROM `%s`", safeDB))
 	}
 	queries = append(queries, "SHOW DATA")

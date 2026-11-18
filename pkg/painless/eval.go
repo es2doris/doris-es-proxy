@@ -2620,10 +2620,10 @@ var (
 	reLocalArrayRemoveIf   = regexp.MustCompile(`^([a-zA-Z_$][a-zA-Z0-9_$]*(?:\.[a-zA-Z0-9_$_.@/:?\x00-\x08\x10-\x1f\x7f-]+)*)\.removeIf\(\s*\(?\s*(?:[a-zA-Z_$][a-zA-Z0-9_$<>[\]]*\s+)?([a-zA-Z0-9_$]+)\s*\)?\s*->\s*(.+)\s*\)$`)
 	reLocalCompoundAssign  = regexp.MustCompile(`(?s)^([a-zA-Z_$][a-zA-Z0-9_$]*\??(?:\.[a-zA-Z0-9_$_.@/:?\x00-\x08\x10-\x1f\x7f-]+)*)\s*(\+=|-=|\*=|/=|%=|&=|\|=|\^=|<<=|>>>=|>>=)\s*(.+)$`)
 	reLocalPropAssign      = regexp.MustCompile(`(?s)^([a-zA-Z_$][a-zA-Z0-9_$]*)\??\.([a-zA-Z0-9_$_.@/:?\x00-\x08\x10-\x1f\x7f-]+)\s*=\s*(.+)$`)
-	reLocalVarAssign       = regexp.MustCompile(`(?s)^(?:(?:def|boolean|Boolean|int|Integer|long|Long|double|Double|float|Float|Number|Short|short|Byte|byte|Character|char|String|CharSequence|Object|Map\.Entry|Map|HashMap|LinkedHashMap|TreeMap|NavigableMap|SortedMap|List|ArrayList|LinkedList|Set|HashSet|LinkedHashSet|TreeSet|NavigableSet|SortedSet|Deque|ArrayDeque|Queue|PriorityQueue|Collection|ZonedDateTime|OffsetDateTime|Instant|LocalDateTime|LocalDate|(?:java\.time\.)?LocalTime|(?:java\.time\.)?OffsetTime|(?:java\.time\.)?Clock|(?:java\.math\.)?BigDecimal|(?:java\.math\.)?BigInteger|(?:java\.math\.)?MathContext|(?:java\.math\.)?RoundingMode|YearMonth|(?:java\.time\.)?Year|(?:java\.time\.)?MonthDay|(?:java\.time\.temporal\.)?ChronoField|(?:java\.time\.temporal\.)?IsoFields|(?:java\.time\.temporal\.)?ValueRange|(?:java\.time\.temporal\.)?TemporalAdjuster|(?:java\.time\.temporal\.)?TemporalAdjusters|DayOfWeek|DayOfWeekEnum|Month|DateTimeFormatter|Duration|Period|ChronoUnit|ZoneId|ZoneOffset|Pattern|Matcher|(?:java\.util\.regex\.)?MatchResult|(?:java\.util\.function\.)?(?:Predicate|BiPredicate|Supplier|IntSupplier|LongSupplier|DoubleSupplier|BooleanSupplier|Function|BiFunction|IntFunction|LongFunction|DoubleFunction|UnaryOperator|BinaryOperator|Consumer|BiConsumer)|Runnable|Metadata|UpdateMetadata|GeoPoint|GeoBoundingBox|IPAddress|DenseVector|DenseVectorField|BytesRef|ByteBuffer|(?:java\.net\.)?URI|(?:java\.net\.)?URL|StringBuilder|StringBuffer|(?:java\.lang\.)?Class|(?:java\.util\.)?UUID|(?:java\.util\.)?HexFormat|(?:java\.util\.)?Comparator|(?:java\.util\.)?BitSet|(?:java\.util\.)?StringJoiner|Optional|OptionalInt|OptionalLong|OptionalDouble|Stream|IntStream|LongStream|DoubleStream|Charset|IntSummaryStatistics|LongSummaryStatistics|DoubleSummaryStatistics)(?:\s*<[^=;]*>)?(?:\s*\[\s*\])*\s+)?([a-zA-Z_$][a-zA-Z0-9_$]*)\s*=\s*(.+)$`)
-	reNullVarDecl          = regexp.MustCompile(`^(?:def|boolean|Boolean|int|Integer|long|Long|double|Double|float|Float|Number|Short|short|Byte|byte|Character|char|String|CharSequence|Object|Map\.Entry|Map|HashMap|LinkedHashMap|TreeMap|NavigableMap|SortedMap|List|ArrayList|LinkedList|Set|HashSet|LinkedHashSet|TreeSet|NavigableSet|SortedSet|Deque|ArrayDeque|Queue|PriorityQueue|Collection|ZonedDateTime|OffsetDateTime|Instant|LocalDateTime|LocalDate|(?:java\.time\.)?LocalTime|(?:java\.time\.)?OffsetTime|(?:java\.time\.)?Clock|(?:java\.math\.)?BigDecimal|(?:java\.math\.)?BigInteger|(?:java\.math\.)?MathContext|(?:java\.math\.)?RoundingMode|YearMonth|(?:java\.time\.)?Year|(?:java\.time\.)?MonthDay|(?:java\.time\.temporal\.)?ChronoField|(?:java\.time\.temporal\.)?IsoFields|(?:java\.time\.temporal\.)?ValueRange|(?:java\.time\.temporal\.)?TemporalAdjuster|(?:java\.time\.temporal\.)?TemporalAdjusters|DayOfWeek|DayOfWeekEnum|Month|DateTimeFormatter|Duration|Period|ChronoUnit|ZoneId|ZoneOffset|Pattern|Matcher|(?:java\.util\.regex\.)?MatchResult|(?:java\.util\.function\.)?(?:Predicate|BiPredicate|Supplier|IntSupplier|LongSupplier|DoubleSupplier|BooleanSupplier|Function|BiFunction|IntFunction|LongFunction|DoubleFunction|UnaryOperator|BinaryOperator|Consumer|BiConsumer)|Runnable|Metadata|UpdateMetadata|GeoPoint|GeoBoundingBox|IPAddress|DenseVector|DenseVectorField|BytesRef|ByteBuffer|(?:java\.net\.)?URI|(?:java\.net\.)?URL|StringBuilder|StringBuffer|(?:java\.lang\.)?Class|(?:java\.util\.)?UUID|(?:java\.util\.)?HexFormat|(?:java\.util\.)?Comparator|(?:java\.util\.)?BitSet|(?:java\.util\.)?StringJoiner|Optional|OptionalInt|OptionalLong|OptionalDouble|Stream|IntStream|LongStream|DoubleStream|Charset|IntSummaryStatistics|LongSummaryStatistics|DoubleSummaryStatistics)(?:\s*<[^=;]*>)?(?:\s*\[\s*\])*\s+([a-zA-Z_$][a-zA-Z0-9_$]*)$`)
-	reVarTypeDeclPrefix    = regexp.MustCompile(`(?s)^((?:def|boolean|Boolean|int|Integer|long|Long|double|Double|float|Float|Number|Short|short|Byte|byte|Character|char|String|CharSequence|Object|Map\.Entry|Map|HashMap|LinkedHashMap|TreeMap|NavigableMap|SortedMap|List|ArrayList|LinkedList|Set|HashSet|LinkedHashSet|TreeSet|NavigableSet|SortedSet|Deque|ArrayDeque|Queue|PriorityQueue|Collection|ZonedDateTime|OffsetDateTime|Instant|LocalDateTime|LocalDate|(?:java\.time\.)?LocalTime|(?:java\.time\.)?OffsetTime|(?:java\.time\.)?Clock|(?:java\.math\.)?BigDecimal|(?:java\.math\.)?BigInteger|(?:java\.math\.)?MathContext|(?:java\.math\.)?RoundingMode|YearMonth|(?:java\.time\.)?Year|(?:java\.time\.)?MonthDay|(?:java\.time\.temporal\.)?ChronoField|(?:java\.time\.temporal\.)?IsoFields|(?:java\.time\.temporal\.)?ValueRange|(?:java\.time\.temporal\.)?TemporalAdjuster|(?:java\.time\.temporal\.)?TemporalAdjusters|DayOfWeek|DayOfWeekEnum|Month|DateTimeFormatter|Duration|Period|ChronoUnit|ZoneId|ZoneOffset|Pattern|Matcher|(?:java\.util\.regex\.)?MatchResult|(?:java\.util\.function\.)?(?:Predicate|BiPredicate|Supplier|IntSupplier|LongSupplier|DoubleSupplier|BooleanSupplier|Function|BiFunction|IntFunction|LongFunction|DoubleFunction|UnaryOperator|BinaryOperator|Consumer|BiConsumer)|Runnable|Metadata|UpdateMetadata|GeoPoint|GeoBoundingBox|IPAddress|DenseVector|DenseVectorField|BytesRef|ByteBuffer|(?:java\.net\.)?URI|(?:java\.net\.)?URL|StringBuilder|StringBuffer|(?:java\.lang\.)?Class|(?:java\.util\.)?UUID|(?:java\.util\.)?HexFormat|(?:java\.util\.)?Comparator|(?:java\.util\.)?BitSet|(?:java\.util\.)?StringJoiner|Optional|OptionalInt|OptionalLong|OptionalDouble|Stream|IntStream|LongStream|DoubleStream|Charset|IntSummaryStatistics|LongSummaryStatistics|DoubleSummaryStatistics)(?:\s*<[^=;]*>)?(?:\s*\[\s*\])*)\s+(.+)$`)
-	reUserFuncHeaderPrefix = regexp.MustCompile(`^(void|def|boolean|Boolean|int|Integer|long|Long|double|Double|float|Float|Number|Short|short|Byte|byte|Character|char|String|CharSequence|Object|Map\.Entry|Map|HashMap|LinkedHashMap|TreeMap|NavigableMap|SortedMap|List|ArrayList|LinkedList|Set|HashSet|LinkedHashSet|TreeSet|NavigableSet|SortedSet|Deque|ArrayDeque|Queue|PriorityQueue|Collection|ZonedDateTime|OffsetDateTime|Instant|LocalDateTime|LocalDate|(?:java\.time\.)?LocalTime|(?:java\.time\.)?OffsetTime|(?:java\.time\.)?Clock|(?:java\.math\.)?BigDecimal|(?:java\.math\.)?BigInteger|(?:java\.math\.)?MathContext|(?:java\.math\.)?RoundingMode|YearMonth|(?:java\.time\.)?Year|(?:java\.time\.)?MonthDay|(?:java\.time\.temporal\.)?ChronoField|(?:java\.time\.temporal\.)?IsoFields|(?:java\.time\.temporal\.)?ValueRange|(?:java\.time\.temporal\.)?TemporalAdjuster|(?:java\.time\.temporal\.)?TemporalAdjusters|DayOfWeek|DayOfWeekEnum|Month|DateTimeFormatter|Duration|Period|ChronoUnit|ZoneId|ZoneOffset|Pattern|Matcher|(?:java\.util\.regex\.)?MatchResult|(?:java\.util\.function\.)?(?:Predicate|BiPredicate|Supplier|IntSupplier|LongSupplier|DoubleSupplier|BooleanSupplier|Function|BiFunction|IntFunction|LongFunction|DoubleFunction|UnaryOperator|BinaryOperator|Consumer|BiConsumer)|Runnable|Metadata|UpdateMetadata|GeoPoint|GeoBoundingBox|IPAddress|DenseVector|DenseVectorField|BytesRef|ByteBuffer|(?:java\.net\.)?URI|(?:java\.net\.)?URL|StringBuilder|StringBuffer|(?:java\.lang\.)?Class|(?:java\.util\.)?UUID|(?:java\.util\.)?HexFormat|(?:java\.util\.)?Comparator|(?:java\.util\.)?BitSet|(?:java\.util\.)?StringJoiner|Optional|OptionalInt|OptionalLong|OptionalDouble|Stream|IntStream|LongStream|DoubleStream|Charset|IntSummaryStatistics|LongSummaryStatistics|DoubleSummaryStatistics|[a-zA-Z_$][a-zA-Z0-9_$]*)(?:\s*<[^>]*>)?(?:\s*\[\s*\])*\s+([a-zA-Z_$][a-zA-Z0-9_$]*)$`)
+	reLocalVarAssign       = regexp.MustCompile(`(?s)^(?:(?:def|boolean|Boolean|int|Integer|long|Long|double|Double|float|Float|Number|Short|short|Byte|byte|Character|char|String|CharSequence|Object|Map\.Entry|Map|HashMap|LinkedHashMap|TreeMap|NavigableMap|SortedMap|List|ArrayList|LinkedList|Set|HashSet|LinkedHashSet|TreeSet|NavigableSet|SortedSet|Deque|ArrayDeque|Queue|PriorityQueue|Collection|ZonedDateTime|OffsetDateTime|Instant|LocalDateTime|LocalDate|(?:java\.time\.)?LocalTime|(?:java\.time\.)?OffsetTime|(?:java\.time\.)?Clock|(?:java\.math\.)?BigDecimal|(?:java\.math\.)?BigInteger|(?:java\.math\.)?MathContext|(?:java\.math\.)?RoundingMode|YearMonth|(?:java\.time\.)?Year|(?:java\.time\.)?MonthDay|(?:java\.time\.temporal\.)?ChronoField|(?:java\.time\.temporal\.)?IsoFields|(?:java\.time\.temporal\.)?ValueRange|(?:java\.time\.temporal\.)?TemporalAdjuster|(?:java\.time\.temporal\.)?TemporalAdjusters|DayOfWeek|DayOfWeekEnum|Month|MonthEnum|DateTimeFormatter|TextStyle|Locale|Duration|Period|ChronoUnit|ZoneId|ZoneOffset|Pattern|Matcher|(?:java\.util\.regex\.)?MatchResult|(?:java\.util\.function\.)?(?:Predicate|BiPredicate|Supplier|IntSupplier|LongSupplier|DoubleSupplier|BooleanSupplier|Function|BiFunction|IntFunction|LongFunction|DoubleFunction|UnaryOperator|BinaryOperator|Consumer|BiConsumer)|Runnable|Metadata|UpdateMetadata|GeoPoint|GeoBoundingBox|IPAddress|DenseVector|DenseVectorField|DenseVectorDocValue|Grok|Dissect|BytesRef|ByteBuffer|(?:java\.net\.)?URI|(?:java\.net\.)?URL|StringBuilder|StringBuffer|(?:java\.lang\.)?Class|(?:java\.util\.)?UUID|(?:java\.util\.)?HexFormat|(?:java\.util\.)?Comparator|(?:java\.util\.)?BitSet|(?:java\.util\.)?StringJoiner|Optional|OptionalInt|OptionalLong|OptionalDouble|Stream|IntStream|LongStream|DoubleStream|Charset|IntSummaryStatistics|LongSummaryStatistics|DoubleSummaryStatistics)(?:\s*<[^=;]*>)?(?:\s*\[\s*\])*\s+)?([a-zA-Z_$][a-zA-Z0-9_$]*)\s*=\s*(.+)$`)
+	reNullVarDecl          = regexp.MustCompile(`^(?:def|boolean|Boolean|int|Integer|long|Long|double|Double|float|Float|Number|Short|short|Byte|byte|Character|char|String|CharSequence|Object|Map\.Entry|Map|HashMap|LinkedHashMap|TreeMap|NavigableMap|SortedMap|List|ArrayList|LinkedList|Set|HashSet|LinkedHashSet|TreeSet|NavigableSet|SortedSet|Deque|ArrayDeque|Queue|PriorityQueue|Collection|ZonedDateTime|OffsetDateTime|Instant|LocalDateTime|LocalDate|(?:java\.time\.)?LocalTime|(?:java\.time\.)?OffsetTime|(?:java\.time\.)?Clock|(?:java\.math\.)?BigDecimal|(?:java\.math\.)?BigInteger|(?:java\.math\.)?MathContext|(?:java\.math\.)?RoundingMode|YearMonth|(?:java\.time\.)?Year|(?:java\.time\.)?MonthDay|(?:java\.time\.temporal\.)?ChronoField|(?:java\.time\.temporal\.)?IsoFields|(?:java\.time\.temporal\.)?ValueRange|(?:java\.time\.temporal\.)?TemporalAdjuster|(?:java\.time\.temporal\.)?TemporalAdjusters|DayOfWeek|DayOfWeekEnum|Month|MonthEnum|DateTimeFormatter|TextStyle|Locale|Duration|Period|ChronoUnit|ZoneId|ZoneOffset|Pattern|Matcher|(?:java\.util\.regex\.)?MatchResult|(?:java\.util\.function\.)?(?:Predicate|BiPredicate|Supplier|IntSupplier|LongSupplier|DoubleSupplier|BooleanSupplier|Function|BiFunction|IntFunction|LongFunction|DoubleFunction|UnaryOperator|BinaryOperator|Consumer|BiConsumer)|Runnable|Metadata|UpdateMetadata|GeoPoint|GeoBoundingBox|IPAddress|DenseVector|DenseVectorField|DenseVectorDocValue|Grok|Dissect|BytesRef|ByteBuffer|(?:java\.net\.)?URI|(?:java\.net\.)?URL|StringBuilder|StringBuffer|(?:java\.lang\.)?Class|(?:java\.util\.)?UUID|(?:java\.util\.)?HexFormat|(?:java\.util\.)?Comparator|(?:java\.util\.)?BitSet|(?:java\.util\.)?StringJoiner|Optional|OptionalInt|OptionalLong|OptionalDouble|Stream|IntStream|LongStream|DoubleStream|Charset|IntSummaryStatistics|LongSummaryStatistics|DoubleSummaryStatistics)(?:\s*<[^=;]*>)?(?:\s*\[\s*\])*\s+([a-zA-Z_$][a-zA-Z0-9_$]*)$`)
+	reVarTypeDeclPrefix    = regexp.MustCompile(`(?s)^((?:def|boolean|Boolean|int|Integer|long|Long|double|Double|float|Float|Number|Short|short|Byte|byte|Character|char|String|CharSequence|Object|Map\.Entry|Map|HashMap|LinkedHashMap|TreeMap|NavigableMap|SortedMap|List|ArrayList|LinkedList|Set|HashSet|LinkedHashSet|TreeSet|NavigableSet|SortedSet|Deque|ArrayDeque|Queue|PriorityQueue|Collection|ZonedDateTime|OffsetDateTime|Instant|LocalDateTime|LocalDate|(?:java\.time\.)?LocalTime|(?:java\.time\.)?OffsetTime|(?:java\.time\.)?Clock|(?:java\.math\.)?BigDecimal|(?:java\.math\.)?BigInteger|(?:java\.math\.)?MathContext|(?:java\.math\.)?RoundingMode|YearMonth|(?:java\.time\.)?Year|(?:java\.time\.)?MonthDay|(?:java\.time\.temporal\.)?ChronoField|(?:java\.time\.temporal\.)?IsoFields|(?:java\.time\.temporal\.)?ValueRange|(?:java\.time\.temporal\.)?TemporalAdjuster|(?:java\.time\.temporal\.)?TemporalAdjusters|DayOfWeek|DayOfWeekEnum|Month|MonthEnum|DateTimeFormatter|TextStyle|Locale|Duration|Period|ChronoUnit|ZoneId|ZoneOffset|Pattern|Matcher|(?:java\.util\.regex\.)?MatchResult|(?:java\.util\.function\.)?(?:Predicate|BiPredicate|Supplier|IntSupplier|LongSupplier|DoubleSupplier|BooleanSupplier|Function|BiFunction|IntFunction|LongFunction|DoubleFunction|UnaryOperator|BinaryOperator|Consumer|BiConsumer)|Runnable|Metadata|UpdateMetadata|GeoPoint|GeoBoundingBox|IPAddress|DenseVector|DenseVectorField|DenseVectorDocValue|Grok|Dissect|BytesRef|ByteBuffer|(?:java\.net\.)?URI|(?:java\.net\.)?URL|StringBuilder|StringBuffer|(?:java\.lang\.)?Class|(?:java\.util\.)?UUID|(?:java\.util\.)?HexFormat|(?:java\.util\.)?Comparator|(?:java\.util\.)?BitSet|(?:java\.util\.)?StringJoiner|Optional|OptionalInt|OptionalLong|OptionalDouble|Stream|IntStream|LongStream|DoubleStream|Charset|IntSummaryStatistics|LongSummaryStatistics|DoubleSummaryStatistics)(?:\s*<[^=;]*>)?(?:\s*\[\s*\])*)\s+(.+)$`)
+	reUserFuncHeaderPrefix = regexp.MustCompile(`^(void|def|boolean|Boolean|int|Integer|long|Long|double|Double|float|Float|Number|Short|short|Byte|byte|Character|char|String|CharSequence|Object|Map\.Entry|Map|HashMap|LinkedHashMap|TreeMap|NavigableMap|SortedMap|List|ArrayList|LinkedList|Set|HashSet|LinkedHashSet|TreeSet|NavigableSet|SortedSet|Deque|ArrayDeque|Queue|PriorityQueue|Collection|ZonedDateTime|OffsetDateTime|Instant|LocalDateTime|LocalDate|(?:java\.time\.)?LocalTime|(?:java\.time\.)?OffsetTime|(?:java\.time\.)?Clock|(?:java\.math\.)?BigDecimal|(?:java\.math\.)?BigInteger|(?:java\.math\.)?MathContext|(?:java\.math\.)?RoundingMode|YearMonth|(?:java\.time\.)?Year|(?:java\.time\.)?MonthDay|(?:java\.time\.temporal\.)?ChronoField|(?:java\.time\.temporal\.)?IsoFields|(?:java\.time\.temporal\.)?ValueRange|(?:java\.time\.temporal\.)?TemporalAdjuster|(?:java\.time\.temporal\.)?TemporalAdjusters|DayOfWeek|DayOfWeekEnum|Month|MonthEnum|DateTimeFormatter|TextStyle|Locale|Duration|Period|ChronoUnit|ZoneId|ZoneOffset|Pattern|Matcher|(?:java\.util\.regex\.)?MatchResult|(?:java\.util\.function\.)?(?:Predicate|BiPredicate|Supplier|IntSupplier|LongSupplier|DoubleSupplier|BooleanSupplier|Function|BiFunction|IntFunction|LongFunction|DoubleFunction|UnaryOperator|BinaryOperator|Consumer|BiConsumer)|Runnable|Metadata|UpdateMetadata|GeoPoint|GeoBoundingBox|IPAddress|DenseVector|DenseVectorField|DenseVectorDocValue|Grok|Dissect|BytesRef|ByteBuffer|(?:java\.net\.)?URI|(?:java\.net\.)?URL|StringBuilder|StringBuffer|(?:java\.lang\.)?Class|(?:java\.util\.)?UUID|(?:java\.util\.)?HexFormat|(?:java\.util\.)?Comparator|(?:java\.util\.)?BitSet|(?:java\.util\.)?StringJoiner|Optional|OptionalInt|OptionalLong|OptionalDouble|Stream|IntStream|LongStream|DoubleStream|Charset|IntSummaryStatistics|LongSummaryStatistics|DoubleSummaryStatistics|[a-zA-Z_$][a-zA-Z0-9_$]*)(?:\s*<[^>]*>)?(?:\s*\[\s*\])*\s+([a-zA-Z_$][a-zA-Z0-9_$]*)$`)
 	reIdentAssign          = regexp.MustCompile(`(?s)^([a-zA-Z_$][a-zA-Z0-9_$]*)\s*=\s*(.+)$`)
 	reIdentOnly            = regexp.MustCompile(`^[a-zA-Z_$][a-zA-Z0-9_$]*$`)
 	reSimpleFieldPath      = regexp.MustCompile(`^[a-zA-Z0-9_$_.@/:?\x00-\x08\x10-\x1f\x7f-]+$`)
@@ -4402,12 +4402,15 @@ func execForStatement(sourceMap map[string]any, stmt string, params map[string]a
 		if _, isDVF := iterVal.(*DenseVectorFieldVal); isDVF {
 			return &painlessExceptionError{
 				exType:  "UnsupportedOperationException",
-				message: "Cannot iterate over single valued dense_vector field",
+				message: DenseVectorIterateErrorMessage,
 			}
 		}
 		if fv, isFV := iterVal.(*FieldVal); isFV && fv != nil {
 			slice = fv.Values
 		} else if dv, isDV := iterVal.(*DenseVectorVal); isDV && dv != nil {
+			if dv.isMissingVectorRound62() {
+				return newMissingDenseVectorDocValueErrorRound62()
+			}
 			slice = make([]any, len(dv.Floats))
 			for i, f := range dv.Floats {
 				if dv.ElemType == "byte" || dv.ElemType == "bit" {
@@ -7850,10 +7853,10 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 		".utf8ToString()", ".limit()", ".position()", ".remaining()", ".hasRemaining()",
 		".getLat()", ".getLon()", ".getCentroid()", ".getBoundingBox()", ".getLabelPosition()", ".getDimensionalType()", ".getMercatorWidth()", ".getMercatorHeight()", ".topLeft()", ".bottomRight()",
 		".getCenturyOfEra()", ".getEra()", ".getMillisOfDay()", ".getMillisOfSecond()", ".getMinuteOfDay()", ".getSecondOfDay()", ".getWeekOfWeekyear()", ".getWeekyear()", ".getYearOfCentury()", ".getYearOfEra()",
-		".l1Norm()", ".l2Norm()", ".l1norm()", ".l2norm()", ".getDims()", ".dims()", ".vectorValue()", ".getMagnitude()", ".magnitude()",
+		".l1Norm()", ".l2Norm()", ".l1norm()", ".l2norm()", ".getDims()", ".dims()", ".getVector()", ".vector()", ".vectorValue()", ".getMagnitude()", ".magnitude()",
 		".isIPv4()", ".isIPv6()", ".getHostAddress()", ".toCanonicalString()", ".getAddress()", ".isLoopbackAddress()", ".isMulticastAddress()", ".isSiteLocalAddress()", ".isLinkLocalAddress()",
 		".exists()", ".remove()", ".deduplicate()", ".asDate()", ".asGeoPoint()", ".asDouble()", ".asString()", ".asStrings()", ".doc()", ".docs()", ".iterator()",
-		".getAsBoolean()", ".run()",
+		".getAsBoolean()", ".run()", ".getMonthEnum()", ".toOffsetDateTime()", ".getChronology()", ".minLength()", ".maxLength()", ".firstMonthOfQuarter()",
 	} {
 		if strings.HasSuffix(rhs, mSuffix) {
 			rawRecBeforeSuffix := strings.TrimSpace(rhs[:len(rhs)-len(mSuffix)])
@@ -8407,7 +8410,7 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 					}
 				}
 				return nil, nil
-			case ".getYear()", ".getMonthValue()", ".getMonthOfYear()", ".getMonth()", ".getDayOfMonth()", ".getDayOfYear()", ".getDate()", ".getHour()", ".getHourOfDay()", ".getMinute()", ".getMinuteOfHour()", ".getSecond()", ".getSecondOfMinute()", ".getNano()", ".getDayOfWeek()", ".getDayOfWeekEnum()", ".getMillis()", ".toEpochMilli()", ".getEpochSecond()", ".toEpochDay()", ".toLocalDate()", ".toLocalDateTime()", ".toLocalTime()", ".toSecondOfDay()", ".toNanoOfDay()", ".atStartOfDay()", ".lengthOfMonth()", ".lengthOfYear()", ".isLeapYear()", ".isLeap()", ".atEndOfMonth()":
+			case ".getYear()", ".getMonthValue()", ".getMonthOfYear()", ".getMonth()", ".getMonthEnum()", ".getDayOfMonth()", ".getDayOfYear()", ".getDate()", ".getHour()", ".getHourOfDay()", ".getMinute()", ".getMinuteOfHour()", ".getSecond()", ".getSecondOfMinute()", ".getNano()", ".getDayOfWeek()", ".getDayOfWeekEnum()", ".getMillis()", ".toEpochMilli()", ".getEpochSecond()", ".toEpochDay()", ".toLocalDate()", ".toLocalDateTime()", ".toLocalTime()", ".toSecondOfDay()", ".toNanoOfDay()", ".atStartOfDay()", ".lengthOfMonth()", ".lengthOfYear()", ".isLeapYear()", ".isLeap()", ".atEndOfMonth()":
 				if mSuffix == ".getNano()" {
 					if dur, ok := parsePainlessDuration(recVal); ok {
 						rem := int64(dur % time.Second)
@@ -8445,6 +8448,8 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 						return int64(tm.Month()), nil
 					case ".getMonth()":
 						return strings.ToUpper(tm.Month().String()), nil
+					case ".getMonthEnum()":
+						return newMonthEnumRound62(tm.Month()), nil
 					case ".getDayOfMonth()", ".getDate()":
 						return int64(tm.Day()), nil
 					case ".getDayOfYear()":
@@ -8464,7 +8469,7 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 						}
 						return dow, nil
 					case ".getDayOfWeekEnum()":
-						return strings.ToUpper(tm.Weekday().String()), nil
+						return newDayOfWeekEnumFromWeekdayRound60(tm.Weekday()), nil
 					case ".getMillis()", ".toEpochMilli()":
 						return tm.UnixMilli(), nil
 					case ".getEpochSecond()":
@@ -8959,7 +8964,7 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 		case *DenseVectorFieldVal:
 			return tv.IsEmpty(), nil
 		case *DenseVectorVal:
-			return tv == nil || len(tv.Floats) == 0, nil
+			return tv == nil || tv.isMissingVectorRound62(), nil
 		case *BytesRefVal:
 			return tv == nil || tv.Length == 0, nil
 		case *ByteBufferVal:
@@ -9001,6 +9006,7 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 		".accept(", ".combine(", ".withOffsetSameLocal(", ".withOffsetSameInstant(", ".toEpochSecond(",
 		".splitAsStream(", ".usePattern(", ".useTransparentBounds(", ".useAnchoringBounds(", ".test(",
 		".resolve(", ".relativize(", ".sameFile(",
+		".getDisplayName(", ".extract(", ".dotProduct(", ".cosineSimilarity(", ".hamming(", ".l1Norm(", ".l2Norm(", ".l1norm(", ".l2norm(",
 	} {
 		if recExpr, argExpr, isNullSafe, ok := matchTrailingMethodCallWithNullSafePainless(rhs, mName); ok {
 			if isKnownStaticClassIdentifierRound58(recExpr, params) ||
@@ -9049,6 +9055,9 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 					return false, nil
 				}
 				fieldPath := fmt.Sprintf("%v", argVal)
+				if isFieldMappedInContextRound62(sourceMap, params, fieldPath) {
+					return true, nil
+				}
 				if len(resolveDocValuesSlice(sourceMap, fieldPath)) > 0 {
 					return true, nil
 				}
@@ -12541,11 +12550,17 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 		}
 		return resolveParamPath(sourceMap, path), nil
 	}
-	for _, wProp := range []string{".lat", ".lon", ".top_left", ".bottom_right", ".topLeft", ".bottomRight", ".bytes", ".offset", ".value", ".values"} {
+	for _, wProp := range []string{".lat", ".lon", ".top_left", ".bottom_right", ".topLeft", ".bottomRight", ".bytes", ".offset", ".zone", ".vector", ".vectorValue", ".dims", ".magnitude", ".value", ".values"} {
 		if strings.HasSuffix(rhs, wProp) && ((wProp != ".value" && wProp != ".values") || (!strings.HasPrefix(rhs, "doc.") && !strings.HasPrefix(rhs, "doc?."))) {
 			recExpr := strings.TrimSpace(strings.TrimSuffix(rhs[:len(rhs)-len(wProp)], "?"))
 			if recVal, err := evalRHSExprDepth(sourceMap, recExpr, params, depth+1); err == nil && recVal != nil {
 				if _, isMap := recVal.(map[string]any); !isMap {
+					if dv, isDV := recVal.(*DenseVectorVal); isDV && dv != nil && dv.isMissingVectorRound62() {
+						switch wProp {
+						case ".vector", ".vectorValue", ".dims", ".magnitude":
+							return nil, newMissingDenseVectorDocValueErrorRound62()
+						}
+					}
 					if wVal, wOk := resolveWrapperPropertyRound60(recVal, strings.TrimPrefix(wProp, ".")); wOk {
 						return wVal, nil
 					}
@@ -12554,7 +12569,7 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 		}
 	}
 	for _, dProp := range []string{
-		".year", ".monthValue", ".monthOfYear", ".month", ".dayOfMonth", ".dayOfYear", ".date",
+		".year", ".monthValue", ".monthOfYear", ".month", ".monthEnum", ".dayOfMonth", ".dayOfYear", ".date",
 		".hour", ".hourOfDay", ".minute", ".minuteOfHour", ".second", ".secondOfMinute",
 		".nano", ".dayOfWeek", ".dayOfWeekEnum", ".millis",
 	} {
@@ -12572,8 +12587,8 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 						return int64(tm.Year()), nil
 					case ".monthValue", ".monthOfYear":
 						return int64(tm.Month()), nil
-					case ".month":
-						return strings.ToUpper(tm.Month().String()), nil
+					case ".month", ".monthEnum":
+						return newMonthEnumRound62(tm.Month()), nil
 					case ".dayOfMonth", ".date":
 						return int64(tm.Day()), nil
 					case ".dayOfYear":
@@ -12586,14 +12601,8 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 						return int64(tm.Second()), nil
 					case ".nano":
 						return int64(tm.Nanosecond()), nil
-					case ".dayOfWeek":
-						dow := int64(tm.Weekday())
-						if dow == 0 {
-							dow = 7
-						}
-						return dow, nil
-					case ".dayOfWeekEnum":
-						return strings.ToUpper(tm.Weekday().String()), nil
+					case ".dayOfWeek", ".dayOfWeekEnum":
+						return newDayOfWeekEnumFromWeekdayRound60(tm.Weekday()), nil
 					case ".millis":
 						return tm.UnixMilli(), nil
 					}
@@ -12733,6 +12742,26 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 						return tv.Size(), nil
 					}
 					return tv.IsEmpty(), nil
+				}
+			case *DenseVectorFieldVal:
+				if tv != nil {
+					if isLen {
+						if !tv.Present || tv.Vec == nil {
+							return int64(0), nil
+						}
+						return int64(len(tv.Vec.Floats)), nil
+					}
+					return tv.IsEmpty(), nil
+				}
+			case *DenseVectorVal:
+				if tv != nil {
+					if isLen {
+						if tv.isMissingVectorRound62() {
+							return nil, newMissingDenseVectorDocValueErrorRound62()
+						}
+						return int64(len(tv.Floats)), nil
+					}
+					return tv.isMissingVectorRound62(), nil
 				}
 			case map[string]any:
 				if _, hasProp := tv[strings.TrimPrefix(suf, ".")]; !hasProp {
@@ -13395,7 +13424,7 @@ func evalCollectionConstructorPainless(sourceMap map[string]any, rhs string, par
 		isStringJoiner = true
 	case "UUID":
 		isUUID = true
-	case "IntSummaryStatistics", "LongSummaryStatistics", "DoubleSummaryStatistics", "URI", "URL":
+	case "IntSummaryStatistics", "LongSummaryStatistics", "DoubleSummaryStatistics", "URI", "URL", "Locale":
 		isRound54Ctor = true
 	default:
 		if b := getOrInitEvalBudget(params); b != nil && b.userClasses != nil {
@@ -14671,12 +14700,18 @@ func resolveParamPath(params map[string]any, path []string) any {
 			}
 			return projected
 		}
-		if strVal, isStr := curr.(string); isStr && i == len(path)-1 {
-			if seg == "length" {
-				return int64(utf8.RuneCountInString(strVal))
+		if strVal, isStr := curr.(string); isStr {
+			if i == len(path)-1 {
+				if seg == "length" {
+					return int64(utf8.RuneCountInString(strVal))
+				}
+				if seg == "empty" {
+					return len(strVal) == 0
+				}
 			}
-			if seg == "empty" {
-				return len(strVal) == 0
+			if tProp, ok := resolveTemporalStringPropertyRound62(strVal, seg); ok {
+				curr = tProp
+				continue
 			}
 		}
 		if uo, isUO := curr.(*painlessUserObject); isUO {
@@ -15291,6 +15326,18 @@ func parseDayOfWeekIndexPainless(v any) int {
 	if v == nil {
 		return 0
 	}
+	switch tv := v.(type) {
+	case DayOfWeekEnum:
+		if tv.Value >= 1 && tv.Value <= 7 {
+			return int(tv.Value)
+		}
+		return 0
+	case *DayOfWeekEnum:
+		if tv != nil && tv.Value >= 1 && tv.Value <= 7 {
+			return int(tv.Value)
+		}
+		return 0
+	}
 	if s, ok := v.(string); ok {
 		switch strings.ToUpper(strings.TrimSpace(s)) {
 		case "MONDAY":
@@ -15340,6 +15387,18 @@ func dayOfWeekNamePainless(idx int) string {
 
 func parseMonthIndexPainless(v any) int {
 	if v == nil {
+		return 0
+	}
+	switch tv := v.(type) {
+	case MonthEnum:
+		if tv.Value >= 1 && tv.Value <= 12 {
+			return int(tv.Value)
+		}
+		return 0
+	case *MonthEnum:
+		if tv != nil && tv.Value >= 1 && tv.Value <= 12 {
+			return int(tv.Value)
+		}
 		return 0
 	}
 	if s, ok := v.(string); ok {
@@ -16605,6 +16664,13 @@ func evalStaticCallPainless(sourceMap map[string]any, rhs string, params map[str
 				if tv, ok := colVal.([]any); ok {
 					parts := make([]string, len(tv))
 					for i, item := range tv {
+						parts[i] = formatValueForStringPainless(item)
+					}
+					return strings.Join(parts, sepStr), true, nil
+				}
+				if fv, isFV := colVal.(*FieldVal); isFV && fv != nil {
+					parts := make([]string, len(fv.Values))
+					for i, item := range fv.Values {
 						parts[i] = formatValueForStringPainless(item)
 					}
 					return strings.Join(parts, sepStr), true, nil

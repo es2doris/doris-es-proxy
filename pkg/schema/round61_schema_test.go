@@ -51,12 +51,20 @@ func TestRound61_F10_DenseVectorAutoDimsDefaultsAndTransitions(t *testing.T) {
 	if !idx.Fields["vec"].AutoDims || idx.Fields["vec"].VectorDims != 0 {
 		t.Fatalf("expected AutoDims=true VectorDims=0, got %+v", idx.Fields["vec"])
 	}
-	// First document locks AutoDims to 3
+	// First document validates locally without mutating idx, and InspectAutoDimsAndDynamicVectors + CloneWithLockedAutoDims locks AutoDims to 3 on a new clone
 	if _, err := ShredDocument(idx, "1", 1, false, []byte(`{"vec":[0.1,0.2,0.3]}`)); err != nil {
 		t.Fatalf("shred first auto-dims doc failed: %v", err)
 	}
+	if !idx.Fields["vec"].AutoDims || idx.Fields["vec"].VectorDims != 0 {
+		t.Fatalf("expected ShredDocument not to mutate shared IndexSchema in place, got %+v", idx.Fields["vec"])
+	}
+	lockedMap, _, inspErr := InspectAutoDimsAndDynamicVectors(idx, [][]byte{[]byte(`{"vec":[0.1,0.2,0.3]}`)})
+	if inspErr != nil || lockedMap["vec"] != 3 {
+		t.Fatalf("expected InspectAutoDimsAndDynamicVectors to discover vec=3, got %+v (err=%v)", lockedMap, inspErr)
+	}
+	idx, _ = idx.CloneWithLockedAutoDims(lockedMap)
 	if idx.Fields["vec"].VectorDims != 3 || idx.Fields["vec"].AutoDims {
-		t.Fatalf("expected AutoDims locked to 3, got %+v", idx.Fields["vec"])
+		t.Fatalf("expected AutoDims locked to 3 on clone, got %+v", idx.Fields["vec"])
 	}
 	// Second document with >3 dims -> exact ES8 > dims error
 	if _, err := ShredDocument(idx, "2", 1, false, []byte(`{"vec":[0.1,0.2,0.3,0.4]}`)); err == nil || !strings.Contains(err.Error(), "more dimensions than defined in the mapping: [4] > [3]") {
@@ -199,7 +207,7 @@ func TestRound61_F12_F13_F14_DocValuesSyntheticSourceAndTSDB(t *testing.T) {
 	// F13: Synthetic _source validation (reject text with synthetic_source_keep=none, reject percolator, reject force_synthetic_source on stored text), dotted expansion, CIDR/range canonicalization, ignore_above retention
 	for _, badSynth := range []string{
 		`{"_source":{"mode":"synthetic"},"properties":{"t":{"type":"text","synthetic_source_keep":"none"}}}`,
-		`{"_source":{"mode":"synthetic"},"properties":{"q":{"type":"percolator"}}}`,
+		`{"_source":{"mode":"synthetic"},"properties":{"m":{"type":"murmur3"}}}`,
 	} {
 		var bad esast.MappingSpec
 		_ = json.Unmarshal([]byte(badSynth), &bad)
@@ -492,7 +500,7 @@ func TestRound61_CoverageSyntheticRangesTSDBScalarsAndPathHelpers(t *testing.T) 
 	advTSIdx := CompileIndexSchema("es_db", "ts_adv", &advTSSpec)
 	advTSIdx.IndexMode = "time_series"
 	advTSIdx.RoutingPath = []string{"host", "env"}
-	dims, err := extractTSDBDimensionsFromDoc(advTSIdx, map[string]any{
+	dims, err := ExtractTSDBDimensionKeyMap(advTSIdx, map[string]any{
 		"labels": map[string]any{"region": "us-east", "zone": "1a"},
 		"host":   "web-01",
 	})

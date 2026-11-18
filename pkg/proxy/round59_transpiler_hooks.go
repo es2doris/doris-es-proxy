@@ -1307,19 +1307,17 @@ func synthesizeDateHistogramBucketsRound59(rows []AggRow, spec *esast.DateHistog
 		rows = filtered
 	}
 
-	// Empty-bucket synthesis only runs when `min_doc_count` is explicitly `0`.
-	if spec.MinDocCount == nil || *spec.MinDocCount > 0 {
-		if spec.MinDocCount != nil && *spec.MinDocCount > 0 {
-			minCnt := int64(*spec.MinDocCount)
-			filtered := make([]AggRow, 0, len(rows))
-			for _, r := range rows {
-				if r.effectiveCount() >= minCnt {
-					filtered = append(filtered, r)
-				}
+	// Elasticsearch `date_histogram` defaults `min_doc_count` to `0`, synthesizing empty buckets
+	// between min and max keys unless `min_doc_count > 0` is explicitly requested.
+	if spec.MinDocCount != nil && *spec.MinDocCount > 0 {
+		minCnt := int64(*spec.MinDocCount)
+		filtered := make([]AggRow, 0, len(rows))
+		for _, r := range rows {
+			if r.effectiveCount() >= minCnt {
+				filtered = append(filtered, r)
 			}
-			return filtered
 		}
-		return rows
+		return filtered
 	}
 
 	byKey := make(map[int64]AggRow, len(rows))
@@ -1374,8 +1372,9 @@ func synthesizeDateHistogramBucketsRound59(rows []AggRow, spec *esast.DateHistog
 		return rows
 	}
 
+	const maxSynthesizedBuckets = 100001
 	var out []AggRow
-	for k := minKey; k <= maxKey && len(out) < transpiler.DefaultMaxAggBuckets; k = stepDateHistogramBucketMillisRound59(k, spec) {
+	for k := minKey; k <= maxKey && len(out) < maxSynthesizedBuckets; {
 		if existing, ok := byKey[k]; ok {
 			out = append(out, existing)
 		} else {
@@ -1385,6 +1384,11 @@ func synthesizeDateHistogramBucketsRound59(rows []AggRow, spec *esast.DateHistog
 				Value:     0,
 			})
 		}
+		nextK := stepDateHistogramBucketMillisRound59(k, spec)
+		if nextK <= k {
+			break
+		}
+		k = nextK
 	}
 	return out
 }

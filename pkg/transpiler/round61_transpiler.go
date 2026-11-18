@@ -100,6 +100,8 @@ func IsSafeJSONNumberLiteral(s string) bool {
 
 // sqlCollectRawValuesBranch emits a 3-column companion branch collecting raw finite DOUBLE values
 // for top-level exact quantiles (`percentiles`, `percentile_ranks`, `boxplot`, `median_absolute_deviation`).
+// Guards `COLLECT_LIST` with `COUNT(...) <= 50000` (`:OVERFLOW:` sentinel above 50k rows) so large tables
+// never exceed Doris `string_type_length_soft_limit_bytes` and seamlessly fall back to `PERCENTILE_APPROX`.
 func sqlCollectRawValuesBranch(fullAggName, valExpr, fromClause, whereClause string) string {
 	w := ""
 	trimmed := strings.TrimSpace(whereClause)
@@ -111,32 +113,38 @@ func sqlCollectRawValuesBranch(fullAggName, valExpr, fromClause, whereClause str
 		}
 	}
 	return fmt.Sprintf(
-		"SELECT %s AS `_agg_name`, CONCAT('_vals:', COALESCE(ARRAY_JOIN(COLLECT_LIST(CAST(%s AS DOUBLE)), ','), '')) AS `_bucket_key`, CAST(COUNT(%s) AS DOUBLE) AS `_doc_count` FROM %s%s",
-		quoteStr(RawValuesAggPrefix+fullAggName), valExpr, valExpr, fromClause, w,
+		"SELECT %s AS `_agg_name`, CONCAT('_vals:', IF(COUNT(%s) <= 50000, COALESCE(ARRAY_JOIN(COLLECT_LIST(CAST(%s AS DOUBLE)), ','), ''), ':OVERFLOW:')) AS `_bucket_key`, CAST(COUNT(%s) AS DOUBLE) AS `_doc_count` FROM %s%s",
+		quoteStr(RawValuesAggPrefix+fullAggName), valExpr, valExpr, valExpr, fromClause, w,
 	)
 }
 
 // sqlCollectGroupedRawValuesBranch emits a 3-column companion branch collecting raw finite DOUBLE values
-// per parent bucket (`<parentBucketKey>\x1f_vals:<v1,v2,...>`).
+// per parent bucket (`<parentBucketKey>\x1f_vals:<v1,v2,...>`), separating `'\x1f'` from `'_vals:'` so
+// `normalizeDorisSQL` rewrites `'\x1f'` -> `CHAR(31)` cleanly.
 func sqlCollectGroupedRawValuesBranch(subFull, parentBucketExpr, valExpr, fromClause, whereClause string) string {
 	return fmt.Sprintf(
-		"SELECT %s AS `_agg_name`, CONCAT(CAST(%s AS STRING), '\\x1f_vals:', COALESCE(ARRAY_JOIN(COLLECT_LIST(CAST(%s AS DOUBLE)), ','), '')) AS `_bucket_key`, CAST(COUNT(%s) AS DOUBLE) AS `_doc_count` "+
+		"SELECT %s AS `_agg_name`, CONCAT(CAST(%s AS STRING), '\\x1f', '_vals:', IF(COUNT(%s) <= 50000, COALESCE(ARRAY_JOIN(COLLECT_LIST(CAST(%s AS DOUBLE)), ','), ''), ':OVERFLOW:')) AS `_bucket_key`, CAST(COUNT(%s) AS DOUBLE) AS `_doc_count` "+
 			"FROM %s WHERE %s GROUP BY %s",
-		quoteStr(RawValuesAggPrefix+subFull), parentBucketExpr, valExpr, valExpr, fromClause, whereClause, parentBucketExpr,
+		quoteStr(RawValuesAggPrefix+subFull), parentBucketExpr, valExpr, valExpr, valExpr, fromClause, whereClause, parentBucketExpr,
 	)
 }
 
 // ParseCollectedFloatValues parses a `_bucket_key` produced by `sqlCollectRawValuesBranch`
 // (`_vals:1.5,2.5`) or `sqlCollectGroupedRawValuesBranch` (`<parentKey>\x1f_vals:1.5,2.5`).
+// Returns `ok = false` on `:OVERFLOW:` (`COUNT > 50000`) so callers fall back to `PERCENTILE_APPROX`,
+// while genuine empty buckets (`rawPart == ""`) return `values = nil, ok = true` (`null` quantiles).
 func ParseCollectedFloatValues(bucketKey string) (parentBucketKey string, values []float64, ok bool) {
 	rawPart := ""
-	if strings.HasPrefix(bucketKey, "_vals:") {
-		rawPart = strings.TrimPrefix(bucketKey, "_vals:")
-	} else if idx := strings.LastIndex(bucketKey, "\x1f_vals:"); idx >= 0 {
+	if idx := strings.LastIndex(bucketKey, "\x1f_vals:"); idx >= 0 {
 		parentBucketKey = bucketKey[:idx]
 		rawPart = bucketKey[idx+len("\x1f_vals:"):]
+	} else if strings.HasPrefix(bucketKey, "_vals:") {
+		rawPart = strings.TrimPrefix(bucketKey, "_vals:")
 	} else {
 		return "", nil, false
+	}
+	if rawPart == ":OVERFLOW:" {
+		return parentBucketKey, nil, false
 	}
 	if strings.TrimSpace(rawPart) == "" {
 		return parentBucketKey, nil, true
@@ -982,6 +990,7 @@ func (t *Transpiler) compileKNNRound61(kq *esast.KNNQuery, scoring bool, nctx *n
 	if kq.Boost != nil {
 		boost = *kq.Boost
 	}
+	boostStr := strconv.FormatFloat(boost, 'g', -1, 64)
 
 	buildScoreAndSimSQL := func(colExpr string) (baseCond, rawScoreExpr, simCond string) {
 		baseCond = fmt.Sprintf("(%s IS NOT NULL AND array_size(%s) = %d)", colExpr, colExpr, dim)
@@ -1018,7 +1027,9 @@ func (t *Transpiler) compileKNNRound61(kq *esast.KNNQuery, scoring bool, nctx *n
 			if kq.Similarity != nil {
 				simCond = fmt.Sprintf("(%s >= %s)", ipExpr, strconv.FormatFloat(*kq.Similarity, 'f', -1, 64))
 			}
-		default: // cosine
+		default: // cosine: guard against zero-norm dynamic/unindexed vectors
+			baseCond = fmt.Sprintf("(%s IS NOT NULL AND array_size(%s) = %d AND INNER_PRODUCT(%s, %s) > 0)", colExpr, colExpr, dim, colExpr, colExpr)
+			safeCol = fmt.Sprintf("IF(array_size(%s) = %d AND INNER_PRODUCT(%s, %s) > 0, %s, %s)", colExpr, dim, colExpr, colExpr, colExpr, vecLit)
 			cdExpr := fmt.Sprintf("COSINE_DISTANCE(%s, %s)", safeCol, vecLit)
 			rawScoreExpr = fmt.Sprintf("GREATEST((2.0 - (%s)) / 2.0, 0.0)", cdExpr)
 			if kq.Similarity != nil {
@@ -1049,7 +1060,7 @@ func (t *Transpiler) compileKNNRound61(kq *esast.KNNQuery, scoring bool, nctx *n
 			corrCol = "n__" + schema.SanitizeDorisIdentifier(b.NestedPath)
 		}
 		relPath := t.nestedRelativeJSONPath(resolvedField, false, b.NestedPath)
-		childColExpr := fmt.Sprintf("CAST(json_extract(`_nel`, %s) AS ARRAY<FLOAT>)", quoteStr(relPath))
+		childColExpr := fmt.Sprintf("CAST(json_extract_string(`_nel`, %s) AS ARRAY<FLOAT>)", quoteStr(relPath))
 		baseCond, rawScoreExpr, simCond := buildScoreAndSimSQL(childColExpr)
 
 		childElemCond := baseCond
@@ -1057,7 +1068,7 @@ func (t *Transpiler) compileKNNRound61(kq *esast.KNNQuery, scoring bool, nctx *n
 			childElemCond = fmt.Sprintf("(%s AND %s)", baseCond, simCond)
 		}
 		existsChild := fmt.Sprintf("array_exists(_nel -> %s IS NOT NULL AND %s, `%s`)",
-			fmt.Sprintf("json_extract(_nel, %s)", quoteStr(relPath)),
+			fmt.Sprintf("json_extract_string(_nel, %s)", quoteStr(relPath)),
 			strings.ReplaceAll(childElemCond, "`_nel`", "_nel"),
 			corrCol,
 		)
@@ -1065,6 +1076,7 @@ func (t *Transpiler) compileKNNRound61(kq *esast.KNNQuery, scoring bool, nctx *n
 		safeConds := []string{fmt.Sprintf("(`%s` IS NOT NULL AND %s)", corrCol, existsChild)}
 		conds = append(conds, filterConds...)
 		safeConds = append(safeConds, safeFilterConds...)
+		filterSafeWhere := strings.Join(safeConds, " AND ")
 
 		maxChildScoreExpr := fmt.Sprintf("COALESCE(ARRAY_MAX(array_map(_nel -> IF(%s, %s, NULL), `%s`)), 0.0)",
 			strings.ReplaceAll(childElemCond, "`_nel`", "_nel"),
@@ -1087,8 +1099,8 @@ func (t *Transpiler) compileKNNRound61(kq *esast.KNNQuery, scoring bool, nctx *n
 		safeWhereSQL := strings.Join(safeConds, " AND ")
 		scoreSQL := "1.0"
 		if scoring {
-			scoreSQL = fmt.Sprintf("(CASE WHEN %s THEN (%.4f * (%s)) ELSE 0.0 END)",
-				safeWhereSQL, boost, maxChildScoreExpr)
+			scoreSQL = fmt.Sprintf("(CASE WHEN %s THEN (%s * (%s)) ELSE 0.0 END)",
+				filterSafeWhere, boostStr, maxChildScoreExpr)
 		}
 		return CompiledQuery{
 			WhereSQL:          whereSQL,
@@ -1123,6 +1135,7 @@ func (t *Transpiler) compileKNNRound61(kq *esast.KNNQuery, scoring bool, nctx *n
 		conds = append(conds, simCond)
 		safeConds = append(safeConds, simCond)
 	}
+	filterSafeWhere := strings.Join(safeConds, " AND ")
 
 	preFilter := strings.Join(conds, " AND ")
 	if t.activeAliasWhere != "" && t.activeAliasWhere != "TRUE" {
@@ -1139,8 +1152,8 @@ func (t *Transpiler) compileKNNRound61(kq *esast.KNNQuery, scoring bool, nctx *n
 	safeWhereSQL := strings.Join(safeConds, " AND ")
 	scoreSQL := "1.0"
 	if scoring {
-		scoreSQL = fmt.Sprintf("(CASE WHEN %s THEN (%.4f * COALESCE(%s, 0.0)) ELSE 0.0 END)",
-			safeWhereSQL, boost, rawScoreExpr)
+		scoreSQL = fmt.Sprintf("(CASE WHEN %s THEN (%s * COALESCE(%s, 0.0)) ELSE 0.0 END)",
+			filterSafeWhere, boostStr, rawScoreExpr)
 	}
 	return CompiledQuery{
 		WhereSQL:          whereSQL,

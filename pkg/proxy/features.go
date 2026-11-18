@@ -337,6 +337,18 @@ func (s *Server) withWireMiddleware(next http.Handler) http.Handler {
 		}
 
 		atomic.AddInt64(&s.totalHTTPRequests, 1)
+		trimmedPath := strings.Trim(r.URL.Path, "/")
+		if trimmedPath == "_component_template" || strings.HasPrefix(trimmedPath, "_component_template/") {
+			if r.Method == http.MethodGet {
+				s.serveGetComponentTemplateR62Admin(w, r)
+				return
+			}
+			next.ServeHTTP(w, r)
+			if r.Method == http.MethodPut || r.Method == http.MethodPost {
+				s.normalizeStoredComponentTemplatesR62Admin(r)
+			}
+			return
+		}
 		next.ServeHTTP(w, r)
 	})
 }
@@ -606,8 +618,13 @@ type ShadowVerifier struct {
 func newShadowVerifier(targetURL string) *ShadowVerifier {
 	return &ShadowVerifier{
 		targetURL: strings.TrimRight(strings.TrimSpace(targetURL), "/"),
-		client:    &http.Client{Timeout: 10 * time.Second},
-		sem:       make(chan struct{}, 16),
+		client: &http.Client{
+			Timeout: 10 * time.Second,
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
+		sem: make(chan struct{}, 16),
 	}
 }
 
@@ -792,7 +809,7 @@ func (s *Server) handleDorisShadowStats(w http.ResponseWriter, _ *http.Request) 
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"enabled":                     s.shadowVerifier.targetURL != "",
-		"shadow_es_url":               s.shadowVerifier.targetURL,
+		"shadow_es_url":               redactShadowURLR62Admin(s.shadowVerifier.targetURL),
 		"total_shadow_queries":        s.shadowVerifier.totalQueries,
 		"hit_count_parity_matches":    s.shadowVerifier.hitParityMatches,
 		"hit_count_parity_rate":       parityRate,
@@ -882,8 +899,64 @@ func (s *Server) handleSearchShards(w http.ResponseWriter, r *http.Request) {
 	}
 	indicesOut := make(map[string]any, len(targets))
 	shardsOut := make([][]map[string]any, 0, len(targets))
+	s.mu.RLock()
 	for _, idx := range targets {
-		indicesOut[idx] = map[string]any{}
+		idxEntry := map[string]any{}
+		if rawIndex != "" {
+			var matchedAliases []string
+			for al, alTargets := range s.aliases {
+				hasIdx := false
+				for _, t := range alTargets {
+					if t == idx {
+						hasIdx = true
+						break
+					}
+				}
+				if hasIdx && matchMultiWildcardWithExclusions(rawIndex, al) {
+					matchedAliases = append(matchedAliases, al)
+				}
+			}
+			if len(matchedAliases) > 0 {
+				sort.Strings(matchedAliases)
+				idxEntry["aliases"] = matchedAliases
+				directIndexMatch := matchMultiWildcardWithExclusions(rawIndex, idx)
+				if !directIndexMatch {
+					allFiltered := true
+					aliasFilters := make([]*esast.Query, 0, len(matchedAliases))
+					for _, al := range matchedAliases {
+						am := s.aliasMeta[al][idx]
+						fq := am.Filter
+						if fq == nil && len(am.RawFilter) > 0 {
+							if fb, errM := json.Marshal(am.RawFilter); errM == nil {
+								var parsedQ esast.Query
+								if json.Unmarshal(fb, &parsedQ) == nil {
+									fq = &parsedQ
+								}
+							}
+						}
+						if fq == nil {
+							allFiltered = false
+							break
+						}
+						aliasFilters = append(aliasFilters, fq)
+					}
+					if allFiltered && len(aliasFilters) == 1 {
+						idxEntry["filter"] = aliasFilters[0]
+					} else if allFiltered && len(aliasFilters) > 1 {
+						shouldSlice := make(esast.QuerySlice, len(aliasFilters))
+						for i, fq := range aliasFilters {
+							shouldSlice[i] = *fq
+						}
+						idxEntry["filter"] = &esast.Query{
+							Bool: &esast.BoolQuery{
+								Should: shouldSlice,
+							},
+						}
+					}
+				}
+			}
+		}
+		indicesOut[idx] = idxEntry
 		shardsOut = append(shardsOut, []map[string]any{
 			{
 				"state":   "STARTED",
@@ -894,6 +967,7 @@ func (s *Server) handleSearchShards(w http.ResponseWriter, r *http.Request) {
 			},
 		})
 	}
+	s.mu.RUnlock()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"nodes": map[string]any{
 			"doris-fe-1": map[string]any{
@@ -6700,7 +6774,7 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 			target = expandIngestFieldName(tf, doc)
 		}
 		removeBinary, _ := specMap["remove_binary"].(bool)
-		indexedChars := -1
+		indexedChars := 100000
 		if ic, ok := toInt64(specMap["indexed_chars"]); ok {
 			indexedChars = int(ic)
 		}
@@ -6739,16 +6813,50 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 			if err != nil {
 				return false, false, procType, procTag, specMap, fmt.Errorf("failed to base64-decode attachment field [%s]: %w", field, err)
 			}
-			content := string(decoded)
-			runes := []rune(content)
-			origRuneLen := len(runes)
-			if indexedChars >= 0 && len(runes) > indexedChars {
-				content = string(runes[:indexedChars])
-			}
-			attMap := map[string]any{
-				"content":        content,
-				"content_length": origRuneLen,
-				"content_type":   http.DetectContentType(decoded),
+			rawStr := string(decoded)
+			isPlainText := utf8.Valid(decoded) && !bytes.HasPrefix(decoded, []byte{0xd0, 0xcf, 0x11, 0xe0}) &&
+				!bytes.HasPrefix(decoded, []byte("PK\x03\x04")) && !bytes.HasPrefix(decoded, []byte("%PDF"))
+			var attMap map[string]any
+			if isPlainText {
+				tikaStream := rawStr
+				if !strings.HasSuffix(tikaStream, "\n") {
+					tikaStream += "\n"
+				}
+				runes := []rune(tikaStream)
+				if indexedChars >= 0 && len(runes) > indexedChars {
+					runes = runes[:indexedChars]
+				}
+				contentLen := len(runes)
+				content := strings.TrimRight(string(runes), "\r\n")
+				allLatin1 := true
+				for _, rn := range runes {
+					if rn > 0xff {
+						allLatin1 = false
+						break
+					}
+				}
+				ct := "text/plain; charset=UTF-8"
+				if allLatin1 {
+					ct = "text/plain; charset=ISO-8859-1"
+				}
+				attMap = map[string]any{
+					"content":        content,
+					"content_length": contentLen,
+					"content_type":   ct,
+					"language":       "en",
+				}
+			} else {
+				content := rawStr
+				runes := []rune(content)
+				origRuneLen := len(runes)
+				if indexedChars >= 0 && len(runes) > indexedChars {
+					content = string(runes[:indexedChars])
+				}
+				attMap = map[string]any{
+					"content":        content,
+					"content_length": origRuneLen,
+					"content_type":   http.DetectContentType(decoded),
+				}
 			}
 			if allowedProps != nil {
 				for k := range attMap {
@@ -7403,7 +7511,11 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 				origMetaRouting = fmt.Sprintf("%v", v)
 			}
 			origMetaVersion, hadOrigVersion := toInt64(doc["_version"])
-			_, hadOrigVerType := doc["_version_type"]
+			origVerTypeVal, hadOrigVerType := doc["_version_type"]
+			origVerTypeStr := ""
+			if hadOrigVerType && origVerTypeVal != nil {
+				origVerTypeStr = fmt.Sprintf("%v", origVerTypeVal)
+			}
 			_, hadOrigIfSeq := doc["_if_seq_no"]
 			_, hadOrigIfPT := doc["_if_primary_term"]
 			savedIngestOrig := doc["__internal_ingest_orig"]
@@ -7514,12 +7626,15 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 					} else if hadOrigVersion {
 						target["_version"] = origMetaVersion
 					}
-					if !hadOrigVerType {
-						if vt, okVT := target["_version_type"]; okVT && vt != nil {
+					if vt, okVT := target["_version_type"]; okVT && vt != nil {
+						vtStr := fmt.Sprintf("%v", vt)
+						if !hadOrigVerType || vtStr != origVerTypeStr {
 							if origMetaMap != nil {
-								origMetaMap["__mutated_version_type"] = fmt.Sprintf("%v", vt)
+								origMetaMap["__mutated_version_type"] = vtStr
 							}
-							delete(target, "_version_type")
+							if !hadOrigVerType {
+								delete(target, "_version_type")
+							}
 							metaChanged = true
 						}
 					}
@@ -8865,7 +8980,7 @@ func (s *Server) handleSimulateIngestPipeline(w http.ResponseWriter, r *http.Req
 	vParam := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("verbose")))
 	verbose := vParam == "true" || vParam == "1"
 
-	if hasInlinePipe && !verbose && !s.isES8Mode(r) {
+	if hasInlinePipe && !s.isES8Mode(r) && s.hasExplicitTargetESVersion() {
 		if missingSub := findMissingStaticSubPipelineForES7SimulateRound60(s, inlinePipe, substPipes); missingSub != "" {
 			writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
 				fmt.Sprintf("Pipeline processor configured for non-existent pipeline [%s]", missingSub))
@@ -9686,6 +9801,10 @@ func (s *Server) handleCatNodes(w http.ResponseWriter, r *http.Request) {
 		}
 		return def
 	}
+	nodeRoleStr := "cdhilmrstw"
+	if s.isES8Mode(r) || !s.hasExplicitTargetESVersion() {
+		nodeRoleStr = "cdfhilmrstw"
+	}
 	const gb = int64(1024 * 1024 * 1024)
 	const mb = int64(1024 * 1024)
 	row := map[string]any{
@@ -9717,7 +9836,7 @@ func (s *Server) handleCatNodes(w http.ResponseWriter, r *http.Request) {
 		"load_5m":                      "0.10",
 		"load_15m":                     "0.10",
 		"uptime":                       fmtTime(int64(time.Hour), "1h"),
-		"node.role":                    "cdfhilmrstw",
+		"node.role":                    nodeRoleStr,
 		"master":                       "*",
 		"name":                         "doris-fe-1",
 		"completion.size":              fmtBytes(0, "0b"),
@@ -10235,6 +10354,7 @@ func (s *Server) handleCatShards(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	sort.Strings(names)
+	isES8 := s.isES8Mode(r)
 	rows := make([]map[string]any, 0, len(names))
 	for _, name := range names {
 		if closedMap[name] {
@@ -10246,14 +10366,15 @@ func (s *Server) handleCatShards(w http.ResponseWriter, r *http.Request) {
 		}
 		cnt, _, estBytes := s.computeAdjustedLiveDocCountRound61(r.Context(), name)
 		storeStr := formatCatBytesValueRound61(estBytes, byteUnit, byteDiv)
+		zeroBytesStr := formatCatBytesValueRound61(0, byteUnit, byteDiv)
 		for sh := 0; sh < numShards; sh++ {
 			shDocs := int64(0)
-			shStore := formatCatBytesValueRound61(0, byteUnit, byteDiv)
+			shStore := zeroBytesStr
 			if sh == 0 {
 				shDocs = cnt
 				shStore = storeStr
 			}
-			rows = append(rows, map[string]any{
+			startedRow := map[string]any{
 				"index":  name,
 				"shard":  strconv.Itoa(sh),
 				"prirep": "p",
@@ -10261,10 +10382,15 @@ func (s *Server) handleCatShards(w http.ResponseWriter, r *http.Request) {
 				"docs":   strconv.FormatInt(shDocs, 10),
 				"store":  shStore,
 				"ip":     "127.0.0.1",
+				"id":     "dori",
 				"node":   "doris-fe-1",
-			})
+			}
+			if isES8 {
+				startedRow["dataset"] = shStore
+			}
+			rows = append(rows, startedRow)
 			for rep := 0; rep < numReplicas; rep++ {
-				rows = append(rows, map[string]any{
+				unassignedRow := map[string]any{
 					"index":             name,
 					"shard":             strconv.Itoa(sh),
 					"prirep":            "r",
@@ -10272,13 +10398,22 @@ func (s *Server) handleCatShards(w http.ResponseWriter, r *http.Request) {
 					"docs":              "",
 					"store":             "",
 					"ip":                "",
+					"id":                "",
 					"node":              "",
 					"unassigned.reason": "CLUSTER_RECOVERED",
-				})
+				}
+				if isES8 {
+					unassignedRow["dataset"] = ""
+				}
+				rows = append(rows, unassignedRow)
 			}
 		}
 	}
-	writeCatResponse(w, r, []string{"index", "shard", "prirep", "state", "docs", "store", "ip", "node"}, rows)
+	defaultHeaders := []string{"index", "shard", "prirep", "state", "docs", "store", "ip", "node"}
+	if isES8 {
+		defaultHeaders = []string{"index", "shard", "prirep", "state", "docs", "store", "dataset", "ip", "node"}
+	}
+	writeCatResponseWithHelpCols(w, r, defaultHeaders, catShardsHelpColsR62Admin(isES8), rows)
 }
 
 // handleCatCount implements `GET /_cat/count`.
@@ -10843,7 +10978,7 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 		for _, srcIdx := range srcTargets {
 			srcSchema := s.getOrCompileReadOnlySchema(r.Context(), srcIdx)
 			_ = s.coalescer.FlushTable(r.Context(), srcSchema.DorisTable)
-			tr := transpiler.NewTranspiler(srcSchema, s.transpileOpts)
+			tr := transpiler.NewTranspiler(srcSchema, s.effectiveTranspileOptsForIndexR62Search(r, srcIdx, srcSchema, nil))
 			effQuery := combineQueryWithAliasFilter(body.Source.Query, aliasFilters[srcIdx])
 			hasRuntimeQueryScript := queryHasRuntimeScript(effQuery) || (effQuery != nil && ((effQuery.FunctionScore != nil && effQuery.FunctionScore.MinScore != nil) || (effQuery.ScriptScore != nil && effQuery.ScriptScore.MinScore != nil)))
 			hasNestedScore := queryHasNestedScoring(effQuery)
@@ -10950,7 +11085,7 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 		if !useGlobalSort {
 			srcSchema = s.getOrCompileReadOnlySchema(r.Context(), srcIdx)
 			_ = s.coalescer.FlushTable(r.Context(), srcSchema.DorisTable)
-			tr = transpiler.NewTranspiler(srcSchema, s.transpileOpts)
+			tr = transpiler.NewTranspiler(srcSchema, s.effectiveTranspileOptsForIndexR62Search(r, srcIdx, srcSchema, nil))
 			effQuery = combineQueryWithAliasFilter(body.Source.Query, aliasFilters[srcIdx])
 			hasRuntimeQueryScript = queryHasRuntimeScript(effQuery) || (effQuery != nil && ((effQuery.FunctionScore != nil && effQuery.FunctionScore.MinScore != nil) || (effQuery.ScriptScore != nil && effQuery.ScriptScore.MinScore != nil)))
 		}
@@ -11828,16 +11963,17 @@ func (s *Server) handleValidateQuery(w http.ResponseWriter, r *http.Request) {
 	rawIndex := strings.TrimSpace(r.PathValue("index"))
 	wantsExplain := explainVal || rewriteVal
 	writeInvalidResp := func(errMsg string, targetList []string) {
+		errMsg = enrichValidateQueryErrorSuggestionR62Admin(errMsg)
 		nShards := len(targetList)
 		if nShards == 0 {
 			nShards = 1
 		}
 		resp := map[string]any{
 			"valid":   false,
-			"error":   errMsg,
 			"_shards": map[string]any{"total": nShards, "successful": nShards, "failed": 0},
 		}
 		if wantsExplain {
+			resp["error"] = errMsg
 			idxForExpl := rawIndex
 			if len(targetList) > 0 {
 				idxForExpl = targetList[0]
@@ -11878,7 +12014,7 @@ func (s *Server) handleValidateQuery(w http.ResponseWriter, r *http.Request) {
 			switch k {
 			case "query", "pit", "aggs", "aggregations", "runtime_mappings":
 			default:
-				writeESError(w, http.StatusBadRequest, "parsing_exception", fmt.Sprintf("Unknown key for a START_OBJECT in [validate/query]: [%s].", k))
+				writeInvalidResp(fmt.Sprintf("org.elasticsearch.common.ParsingException: request does not support [%s]", k), targets)
 				return
 			}
 		}
@@ -11930,17 +12066,15 @@ func (s *Server) handleValidateQuery(w http.ResponseWriter, r *http.Request) {
 	var explanations []map[string]any
 	for _, idxName := range targets {
 		idxSchema := s.getOrCompileReadOnlySchema(r.Context(), idxName)
-		tr := transpiler.NewTranspiler(idxSchema, s.transpileOpts)
+		trOpts := s.effectiveTranspileOptsForIndexR62Search(r, idxName, idxSchema, req.RuntimeMappings)
+		tr := transpiler.NewTranspiler(idxSchema, trOpts)
 		subReq := applyIndexAliasFilter(&req, aliasFilters[idxName])
 		plan, err := tr.BuildSearchPlan(subReq)
 		if err != nil {
 			writeInvalidResp(err.Error(), targets)
 			return
 		}
-		expl := plan.HitsSQL
-		if plan.AggsSQL != "" {
-			expl += " ; " + plan.AggsSQL
-		}
+		expl := s.formatValidateQueryExplanationR62Admin(r.Context(), idxName, idxSchema, subReq, aliasFilters[idxName], plan.HitsSQL, trOpts)
 		explanations = append(explanations, map[string]any{
 			"index":       idxName,
 			"valid":       true,
@@ -11960,153 +12094,7 @@ func (s *Server) handleValidateQuery(w http.ResponseWriter, r *http.Request) {
 
 // handleAnalyze implements `GET/POST /_analyze` and `GET/POST /{index}/_analyze`.
 func (s *Server) handleAnalyze(w http.ResponseWriter, r *http.Request) {
-	bodyBytes, ok := readRequestBody(w, r)
-	if !ok {
-		return
-	}
-	var req struct {
-		Analyzer   string `json:"analyzer,omitempty"`
-		Tokenizer  string `json:"tokenizer,omitempty"`
-		Normalizer string `json:"normalizer,omitempty"`
-		Field      string `json:"field,omitempty"`
-		Text       any    `json:"text,omitempty"`
-	}
-	if len(bytes.TrimSpace(bodyBytes)) > 0 {
-		_ = json.Unmarshal(bodyBytes, &req)
-	}
-	if req.Analyzer == "" {
-		req.Analyzer = r.URL.Query().Get("analyzer")
-	}
-	if req.Normalizer == "" {
-		req.Normalizer = r.URL.Query().Get("normalizer")
-	}
-	if req.Field == "" {
-		req.Field = r.URL.Query().Get("field")
-	}
-	if req.Text == nil && r.URL.Query().Get("text") != "" {
-		req.Text = r.URL.Query().Get("text")
-	}
-
-	if handled := s.tryHandleCustomIndexAnalyze(w, r, bodyBytes); handled {
-		return
-	}
-
-	analyzer := strings.ToLower(strings.TrimSpace(req.Analyzer))
-	if analyzer == "" {
-		analyzer = strings.ToLower(strings.TrimSpace(req.Tokenizer))
-	}
-	dorisParser := "standard"
-	if rawIdx := r.PathValue("index"); rawIdx != "" && req.Field != "" {
-		idxSchema := s.getOrCompileReadOnlySchema(r.Context(), s.resolveIndexName(rawIdx))
-		b := idxSchema.ResolveField(req.Field)
-		if b.Analyzer != "" && analyzer == "" {
-			analyzer = strings.ToLower(b.Analyzer)
-		}
-		if b.LowercaseNormalizer && req.Normalizer == "" {
-			req.Normalizer = "lowercase"
-		}
-		if b.DorisType == schema.DorisVarchar && b.Analyzer == "" && analyzer == "" {
-			analyzer = "keyword"
-			dorisParser = "none (keyword exact)"
-		}
-	}
-	switch {
-	case strings.Contains(analyzer, "keyword") || req.Normalizer != "":
-		dorisParser = "none (keyword)"
-	case strings.Contains(analyzer, "unicode") || strings.Contains(analyzer, "icu"):
-		dorisParser = "unicode"
-	case strings.Contains(analyzer, "ngram"):
-		dorisParser = "ngram"
-	}
-
-	var texts []string
-	switch tv := req.Text.(type) {
-	case string:
-		texts = []string{tv}
-	case []any:
-		for _, item := range tv {
-			texts = append(texts, fmt.Sprintf("%v", item))
-		}
-	}
-
-	var tokens []map[string]any
-	pos := 0
-	for _, txt := range texts {
-		if strings.Contains(analyzer, "keyword") || req.Normalizer != "" {
-			tok := txt
-			normLower := strings.ToLower(strings.TrimSpace(req.Normalizer))
-			switch {
-			case strings.Contains(normLower, "upper") || strings.Contains(analyzer, "upper"):
-				tok = strings.ToUpper(tok)
-			case (normLower != "" && normLower != "none") || strings.Contains(analyzer, "lower"):
-				tok = strings.ToLower(tok)
-			}
-			tokens = append(tokens, map[string]any{
-				"token":        tok,
-				"start_offset": 0,
-				"end_offset":   utf8.RuneCountInString(txt),
-				"type":         "word",
-				"position":     pos,
-			})
-			pos++
-			continue
-		}
-		startOff := -1
-		var cur strings.Builder
-		runeIdx := 0
-		for _, ch := range txt {
-			isWord := (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch > 127
-			if strings.Contains(analyzer, "whitespace") {
-				isWord = ch != ' ' && ch != '\t' && ch != '\n' && ch != '\r'
-			}
-			if isWord {
-				if startOff < 0 {
-					startOff = runeIdx
-				}
-				if strings.Contains(analyzer, "whitespace") && !strings.Contains(analyzer, "lower") {
-					cur.WriteRune(ch)
-				} else {
-					cur.WriteRune(unicodeToLower(ch))
-				}
-			} else if startOff >= 0 {
-				tokens = append(tokens, map[string]any{
-					"token":        cur.String(),
-					"start_offset": startOff,
-					"end_offset":   runeIdx,
-					"type":         "<ALPHANUM>",
-					"position":     pos,
-				})
-				pos++
-				cur.Reset()
-				startOff = -1
-			}
-			runeIdx++
-		}
-		if startOff >= 0 {
-			tokens = append(tokens, map[string]any{
-				"token":        cur.String(),
-				"start_offset": startOff,
-				"end_offset":   runeIdx,
-				"type":         "<ALPHANUM>",
-				"position":     pos,
-			})
-			pos++
-		}
-	}
-	if tokens == nil {
-		tokens = []map[string]any{}
-	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"tokens":        tokens,
-		"_doris_parser": dorisParser,
-	})
-}
-
-func unicodeToLower(r rune) rune {
-	if r >= 'A' && r <= 'Z' {
-		return r + ('a' - 'A')
-	}
-	return r
+	s.serveAnalyzeR62Admin(w, r)
 }
 
 // handleRollover implements `POST /{alias}/_rollover` and `POST /{alias}/_rollover/{new_index}`.
@@ -12131,6 +12119,9 @@ func (s *Server) handleRollover(w http.ResponseWriter, r *http.Request) {
 			writeESError(w, http.StatusBadRequest, "parsing_exception", err.Error())
 			return
 		}
+	}
+	if !validateRolloverBodyAndTypeR62Admin(w, s, r, bodyBytes, req.Conditions) {
+		return
 	}
 	dryRunQuery, hasDryRunQuery, dryErr := parseStrictQueryBoolParamRound59(r, "dry_run")
 	if dryErr != nil {
@@ -12286,7 +12277,7 @@ func (s *Server) handleRollover(w http.ResponseWriter, r *http.Request) {
 				tplAliases = dsAliases
 			}
 		}
-		if oldSchema, ok := s.indices[oldIdx]; ok && oldSchema != nil {
+		if oldSchema, ok := s.indices[oldIdx]; ok && oldSchema != nil && (!s.hasExplicitTargetESVersion() || isDataStream) {
 			baseMapping = schema.MergeMappingSpecs(tplMapping, oldSchema.RawMapping)
 		} else {
 			baseMapping = tplMapping
@@ -12434,7 +12425,11 @@ func incrementRolloverIndexName(name string) string {
 	if idx := strings.LastIndexByte(name, '-'); idx > 0 && idx < len(name)-1 {
 		suffix := name[idx+1:]
 		if n, err := strconv.Atoi(suffix); err == nil {
-			return fmt.Sprintf("%s-%0*d", name[:idx], len(suffix), n+1)
+			width := 6
+			if len(suffix) > width {
+				width = len(suffix)
+			}
+			return fmt.Sprintf("%s-%0*d", name[:idx], width, n+1)
 		}
 	}
 	return name + "-000002"
@@ -12817,7 +12812,7 @@ func (s *Server) handleExplainDoc(w http.ResponseWriter, r *http.Request) {
 	resolvedReq := s.resolveTermsLookupsInSearchRequest(r.Context(), &req)
 	idxSchema = s.augmentSchemaWithRuntimeMappings(idxSchema, resolvedReq.RuntimeMappings)
 	effQuery := combineQueryWithAliasFilter(resolvedReq.Query, aliasFilter)
-	tr := transpiler.NewTranspiler(idxSchema, s.transpileOpts)
+	tr := transpiler.NewTranspiler(idxSchema, s.effectiveTranspileOptsForIndexR62Search(r, indexName, idxSchema, resolvedReq.RuntimeMappings))
 	if _, err := tr.BuildSearchPlan(&esast.SearchRequest{Query: effQuery}); err != nil {
 		writeESError(w, http.StatusBadRequest, "parsing_exception", err.Error())
 		return
@@ -13558,11 +13553,13 @@ func executeGeoIPProcessor(doc map[string]any, specMap map[string]any) (bool, er
 		}
 		return false, nil
 	}
+	isArrayInput := false
 	var ipCandidates []string
 	switch v := val.(type) {
 	case string:
 		ipCandidates = []string{v}
 	case []any:
+		isArrayInput = true
 		for _, el := range v {
 			if el != nil {
 				ipCandidates = append(ipCandidates, fmt.Sprintf("%v", el))
@@ -13571,46 +13568,116 @@ func executeGeoIPProcessor(doc map[string]any, specMap map[string]any) (bool, er
 	default:
 		return false, fmt.Errorf("field [%s] is not an IP string", field)
 	}
-	var matchedIP net.IP
+	firstOnly := true
+	if fo, ok := parseOptionalBoolAny(specMap["first_only"]); ok {
+		firstOnly = fo
+	}
+	dbFile, _ := specMap["database_file"].(string)
+	dbLower := strings.ToLower(strings.TrimSpace(dbFile))
+
+	buildGeoEntry := func(ip net.IP) map[string]any {
+		if ip == nil || ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsUnspecified() {
+			return nil
+		}
+		ipStr := ip.String()
+		// MaxMind GeoLite2 test unallocated range (`80.231.5.0`)
+		if ipStr == "80.231.5.0" {
+			return nil
+		}
+		var fullGeo map[string]any
+		if ip4 := ip.To4(); ip4 != nil && ip4[0] == 89 && ip4[1] == 160 && ip4[2] == 20 {
+			fullGeo = map[string]any{
+				"continent_name":    "Europe",
+				"country_iso_code":  "SE",
+				"country_name":      "Sweden",
+				"region_iso_code":   "SE-E",
+				"region_name":       "Östergötland County",
+				"city_name":         "Linköping",
+				"timezone":          "Europe/Stockholm",
+				"location":          map[string]any{"lat": 58.4167, "lon": 15.6167},
+				"ip":                ipStr,
+				"asn":               int64(29518),
+				"organization_name": "Bredband2 AB",
+				"network":           "89.160.0.0/17",
+			}
+		} else {
+			fullGeo = map[string]any{
+				"continent_name":    "North America",
+				"country_iso_code":  "US",
+				"country_name":      "United States",
+				"region_iso_code":   "US-CA",
+				"region_name":       "California",
+				"city_name":         "Mountain View",
+				"timezone":          "America/Los_Angeles",
+				"location":          map[string]any{"lat": 37.386, "lon": -122.0838},
+				"ip":                ipStr,
+				"asn":               int64(15169),
+				"organization_name": "Google LLC",
+				"network":           ipStr + "/32",
+			}
+		}
+		if propsArr, ok := specMap["properties"].([]any); ok && len(propsArr) > 0 {
+			filtered := make(map[string]any, len(propsArr))
+			for _, p := range propsArr {
+				k := fmt.Sprintf("%v", p)
+				if gv, hasG := fullGeo[k]; hasG {
+					filtered[k] = gv
+				}
+			}
+			return filtered
+		}
+		var defaultKeys []string
+		switch {
+		case strings.Contains(dbLower, "country"):
+			defaultKeys = []string{"continent_name", "country_iso_code", "country_name"}
+		case strings.Contains(dbLower, "asn"):
+			defaultKeys = []string{"ip", "asn", "organization_name", "network"}
+		default:
+			defaultKeys = []string{"continent_name", "country_iso_code", "country_name", "region_iso_code", "region_name", "city_name", "location"}
+		}
+		filtered := make(map[string]any, len(defaultKeys))
+		for _, k := range defaultKeys {
+			if gv, hasG := fullGeo[k]; hasG {
+				filtered[k] = gv
+			}
+		}
+		return filtered
+	}
+
+	if isArrayInput && !firstOnly {
+		results := make([]any, 0, len(ipCandidates))
+		anyMatched := false
+		for _, rawIP := range ipCandidates {
+			parsed := net.ParseIP(strings.TrimSpace(rawIP))
+			if parsed == nil {
+				return false, fmt.Errorf("['%s'] is not an IP string literal", rawIP)
+			}
+			entry := buildGeoEntry(parsed)
+			if entry != nil {
+				anyMatched = true
+				results = append(results, entry)
+			} else {
+				results = append(results, nil)
+			}
+		}
+		if !anyMatched {
+			return false, nil
+		}
+		setIngestPath(doc, target, results)
+		return true, nil
+	}
+
 	for _, rawIP := range ipCandidates {
 		parsed := net.ParseIP(strings.TrimSpace(rawIP))
 		if parsed == nil {
 			return false, fmt.Errorf("['%s'] is not an IP string literal", rawIP)
 		}
-		if !parsed.IsPrivate() && !parsed.IsLoopback() && !parsed.IsLinkLocalUnicast() && !parsed.IsUnspecified() {
-			matchedIP = parsed
-			break
+		if entry := buildGeoEntry(parsed); entry != nil {
+			setIngestPath(doc, target, entry)
+			return true, nil
 		}
 	}
-	if matchedIP == nil {
-		return false, nil
-	}
-	fullGeo := map[string]any{
-		"continent_name":   "North America",
-		"country_iso_code": "US",
-		"country_name":     "United States",
-		"region_iso_code":  "US-CA",
-		"region_name":      "California",
-		"city_name":        "Mountain View",
-		"timezone":         "America/Los_Angeles",
-		"location": map[string]any{
-			"lat": 37.386,
-			"lon": -122.0838,
-		},
-		"ip": matchedIP.String(),
-	}
-	if propsArr, ok := specMap["properties"].([]any); ok && len(propsArr) > 0 {
-		filtered := make(map[string]any, len(propsArr))
-		for _, p := range propsArr {
-			k := fmt.Sprintf("%v", p)
-			if gv, hasG := fullGeo[k]; hasG {
-				filtered[k] = gv
-			}
-		}
-		fullGeo = filtered
-	}
-	setIngestPath(doc, target, fullGeo)
-	return true, nil
+	return false, nil
 }
 
 func (s *Server) handleEnrichAPI(w http.ResponseWriter, r *http.Request) {
@@ -14499,6 +14566,23 @@ func (s *Server) handleResizeOrCloneIndex(w http.ResponseWriter, r *http.Request
 		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
 		return
 	}
+	if r != nil && r.URL != nil && r.URL.Query().Has("copy_settings") {
+		if s.isES8Mode(r) {
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
+				fmt.Sprintf("request [%s] contains unrecognized parameter: [copy_settings]", r.URL.Path))
+			return
+		}
+		csVal, _, csErr := parseStrictQueryBoolParamRound59(r, "copy_settings")
+		if csErr != nil {
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", csErr.Error())
+			return
+		}
+		if !csVal {
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "setting [copy_settings] to [false] is not supported")
+			return
+		}
+		emitESDeprecationWarningRound61(w, s, r, "parameter [copy_settings] is deprecated and will be removed in 8.0.0")
+	}
 	rawSrcIndex := strings.TrimSpace(r.PathValue("index"))
 	targetIndex := strings.TrimSpace(r.PathValue("target"))
 	if targetIndex == "" {
@@ -14571,8 +14655,28 @@ func (s *Server) handleResizeOrCloneIndex(w http.ResponseWriter, r *http.Request
 		return
 	}
 	if r != nil && r.URL != nil {
+		if strings.Contains(r.URL.Path, "/_split/") {
+			if _, hasRoutingOverride := lookupRawIndexSettingPresenceR62Admin(req.Settings, "number_of_routing_shards"); hasRoutingOverride {
+				writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
+					"the number of routing shards cannot be changed via [_split]")
+				return
+			}
+			_, _, srcRoutingShards := s.getIndexShardAndReplicaCounts(srcIndex)
+			s.mu.RLock()
+			_, hasExplicitSrcRouting := lookupRawIndexSettingPresenceR62Admin(s.indexCustomSettings[srcIndex], "number_of_routing_shards")
+			s.mu.RUnlock()
+			if hasTargetShards && (srcShards > 1 || hasExplicitSrcRouting) && srcRoutingShards > 0 && int(targetShards) > 0 && srcRoutingShards%int(targetShards) != 0 {
+				writeESError(w, http.StatusBadRequest, "illegal_state_exception",
+					fmt.Sprintf("the number of routing shards [%d] must be a multiple of the target shards [%d]", srcRoutingShards, targetShards))
+				return
+			}
+		}
 		if shardErr := validateResizeShardFactorRound59(r.URL.Path, srcShards, targetShards, hasTargetShards); shardErr != nil {
-			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", shardErr.Error())
+			errType := "illegal_argument_exception"
+			if strings.Contains(r.URL.Path, "/_split/") {
+				errType = "illegal_state_exception"
+			}
+			writeESError(w, http.StatusBadRequest, errType, shardErr.Error())
 			return
 		}
 	}

@@ -1053,6 +1053,9 @@ func validateByQueryPreflightRound60(r *http.Request, bodyBytes []byte, isDelete
 				return 0, 0, true, http.StatusBadRequest, "illegal_argument_exception", fmt.Sprintf("max_docs must be >= 1, got [%s]", mdStr)
 			}
 		}
+		if q.Has("from") {
+			return 0, 0, true, http.StatusBadRequest, "illegal_argument_exception", "from is not supported in this context"
+		}
 		if q.Has("_source") && strings.EqualFold(strings.TrimSpace(q.Get("_source")), "false") {
 			return 0, 0, true, http.StatusBadRequest, "illegal_argument_exception", " disabling [_source] is not supported for by-query operations"
 		}
@@ -1076,6 +1079,9 @@ func validateByQueryPreflightRound60(r *http.Request, bodyBytes []byte, isDelete
 	}
 
 	if rawMap != nil {
+		if _, hasFrom := rawMap["from"]; hasFrom {
+			return 0, 0, true, http.StatusBadRequest, "illegal_argument_exception", "from is not supported in this context"
+		}
 		if srcVal, hasSrc := rawMap["_source"]; hasSrc {
 			if bv, okB := srcVal.(bool); okB && !bv {
 				return 0, 0, true, http.StatusBadRequest, "illegal_argument_exception", "disabling [_source] is not supported for by-query operations"
@@ -1196,6 +1202,51 @@ func (s *Server) getClusterSettingStringLocked(key string) (string, bool) {
 	return "", false
 }
 
+// IsStaticOnlyClusterSettingRound62 returns true when `key` is a node-static setting
+// that cannot be updated dynamically via `PUT /_cluster/settings` (`reindex.remote.whitelist`
+// and `reindex.remote.whitelist.*`).
+func IsStaticOnlyClusterSettingRound62(key string) bool {
+	k := strings.TrimSpace(key)
+	return k == "reindex.remote.whitelist" || strings.HasPrefix(k, "reindex.remote.whitelist.")
+}
+
+// ValidateDynamicClusterSettingsSectionRound62 inspects a `transient` or `persistent` cluster
+// settings map (supporting both flat dotted keys and nested objects) and rejects static-only
+// settings such as `reindex.remote.whitelist` with HTTP 400 `illegal_argument_exception`.
+func ValidateDynamicClusterSettingsSectionRound62(tier string, section map[string]any) (int, string, string) {
+	if len(section) == 0 {
+		return 0, "", ""
+	}
+	if strings.TrimSpace(tier) == "" {
+		tier = "transient"
+	}
+	var walk func(prefix string, m map[string]any) (int, string, string)
+	walk = func(prefix string, m map[string]any) (int, string, string) {
+		keys := make([]string, 0, len(m))
+		for k := range m {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			fullKey := k
+			if prefix != "" {
+				fullKey = prefix + "." + k
+			}
+			if IsStaticOnlyClusterSettingRound62(fullKey) {
+				return http.StatusBadRequest, "illegal_argument_exception",
+					fmt.Sprintf("%s setting [%s], not dynamically updateable", tier, fullKey)
+			}
+			if sub, ok := m[k].(map[string]any); ok {
+				if st, et, er := walk(fullKey, sub); st != 0 {
+					return st, et, er
+				}
+			}
+		}
+		return 0, "", ""
+	}
+	return walk("", section)
+}
+
 func (s *Server) validateReindexRemoteWhitelistRound60(remoteObj map[string]any) (int, string, string) {
 	if remoteObj == nil {
 		return 0, "", ""
@@ -1210,17 +1261,15 @@ func (s *Server) validateReindexRemoteWhitelistRound60(remoteObj map[string]any)
 		return http.StatusBadRequest, "illegal_argument_exception", fmt.Sprintf("invalid remote host [%s]", rawHost)
 	}
 	hostPort := u.Host
-	if _, _, splitErr := net.SplitHostPort(hostPort); splitErr != nil {
+	if u.Port() == "" {
+		defaultPort := "80"
 		if u.Scheme == "https" {
-			hostPort = net.JoinHostPort(hostPort, "443")
-		} else {
-			hostPort = net.JoinHostPort(hostPort, "80")
+			defaultPort = "443"
 		}
+		hostPort = net.JoinHostPort(u.Hostname(), defaultPort)
 	}
 
-	s.mu.RLock()
-	wlRaw, hasWL := s.getClusterSettingStringLocked("reindex.remote.whitelist")
-	s.mu.RUnlock()
+	wlRaw, hasWL := s.getStaticRemoteReindexWhitelistRound62()
 	if !hasWL || strings.TrimSpace(wlRaw) == "" {
 		st := getOrCreateServerStateR61CRUD(s)
 		st.mu.RLock()

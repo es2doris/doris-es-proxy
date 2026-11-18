@@ -847,14 +847,20 @@ func TestRound61ServerCRUD_F20_To_F28_ReindexWhitelistByQueryRuntimeCyclesUpdate
 		t.Fatalf("expected whitelisted remote _reindex to succeed (%d): %s", code, raw)
 	}
 
-	// Runtime mappings Painless cycle rejected in PUT /{index} and PUT /{index}/_mapping
+	// Runtime mappings Painless cycle accepted at PUT /{index} and PUT /{index}/_mapping, rejected lazily on _search (ES 90_loops.yml)
 	cycBody := `{"mappings":{"runtime":{"a":{"type":"keyword","script":"emit(doc['b'].value)"},"b":{"type":"keyword","script":"emit(doc['a'].value)"}}}}`
-	if c, _, _, rw := doReqR61CRUDTest(t, h, http.MethodPut, "/rt_cyc", cycBody, nil); c != http.StatusBadRequest {
-		t.Fatalf("expected 400 on runtime mapping cycle in create_index, got %d: %s", c, rw)
+	if c, _, _, rw := doReqR61CRUDTest(t, h, http.MethodPut, "/rt_cyc", cycBody, nil); c != http.StatusOK {
+		t.Fatalf("expected 200 on runtime mapping cycle in create_index (lazy DFS), got %d: %s", c, rw)
+	}
+	if c, _, _, rw := doReqR61CRUDTest(t, h, http.MethodPost, "/rt_cyc/_search", `{"fields":["a"]}`, nil); c != http.StatusBadRequest {
+		t.Fatalf("expected 400 on _search referencing cyclic runtime mapping from create_index, got %d: %s", c, rw)
 	}
 	_, _, _, _ = doReqR61CRUDTest(t, h, http.MethodPut, "/rt_ok", `{}`, nil)
-	if c, _, _, rw := doReqR61CRUDTest(t, h, http.MethodPut, "/rt_ok/_mapping", `{"runtime":{"a":{"type":"keyword","script":"emit(doc['b'].value)"},"b":{"type":"keyword","script":"emit(doc['a'].value)"}}}`, nil); c != http.StatusBadRequest {
-		t.Fatalf("expected 400 on runtime mapping cycle in put_mapping, got %d: %s", c, rw)
+	if c, _, _, rw := doReqR61CRUDTest(t, h, http.MethodPut, "/rt_ok/_mapping", `{"runtime":{"a":{"type":"keyword","script":"emit(doc['b'].value)"},"b":{"type":"keyword","script":"emit(doc['a'].value)"}}}`, nil); c != http.StatusOK {
+		t.Fatalf("expected 200 on runtime mapping cycle in put_mapping (lazy DFS), got %d: %s", c, rw)
+	}
+	if c, _, _, rw := doReqR61CRUDTest(t, h, http.MethodPost, "/rt_ok/_search", `{"fields":["a"]}`, nil); c != http.StatusBadRequest {
+		t.Fatalf("expected 400 on _search referencing cyclic runtime mapping from put_mapping, got %d: %s", c, rw)
 	}
 
 	// _update unknown field validation + Painless field(...) API in _update & UBQ + UBQ FieldAddedAtSeqNo (30_new_fields)

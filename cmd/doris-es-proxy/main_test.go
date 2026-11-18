@@ -338,3 +338,26 @@ func TestSubcommands_Transpile_DDL_Doctor_MigrateSchema(t *testing.T) {
 		t.Fatalf("expected UNREACHABLE in doctor output, got:\n%s", docUnreachOut)
 	}
 }
+
+func TestRound62CLISecurityHardening(t *testing.T) {
+	redacted := redactURLCredentials("https://elastic:s3cr3tPass@es-legacy.internal:9200")
+	if strings.Contains(redacted, "s3cr3tPass") || !strings.Contains(redacted, "es-legacy.internal:9200") {
+		t.Fatalf("expected credentials redacted from shadow URL, got %q", redacted)
+	}
+	fallbackRedacted := redactURLCredentials("user:topsecret@bad-scheme-host:9200\r\n")
+	if strings.Contains(fallbackRedacted, "topsecret") || strings.ContainsAny(fallbackRedacted, "\r\n") {
+		t.Fatalf("expected fallback redaction and CR/LF stripping, got %q", fallbackRedacted)
+	}
+	if got := escapeDorisBacktickIdent("es`db"); strings.Contains(got, "`") && !strings.Contains(got, "``") {
+		t.Fatalf("expected unescaped backticks never present in escapeDorisBacktickIdent, got %q", got)
+	}
+
+	t.Setenv("DORIS_ES_REINDEX_REMOTE_WHITELIST", "es1.prod:9200,es2.prod:9200")
+	t.Setenv("DORIS_ES_REINDEX_REMOTE_ALLOW_PRIVATE", "true")
+	if got := envOrDefault("DORIS_ES_REINDEX_REMOTE_WHITELIST", ""); got != "es1.prod:9200,es2.prod:9200" {
+		t.Fatalf("unexpected DORIS_ES_REINDEX_REMOTE_WHITELIST: %q", got)
+	}
+	if !envBoolOrDefault("DORIS_ES_REINDEX_REMOTE_ALLOW_PRIVATE", false) {
+		t.Fatalf("expected DORIS_ES_REINDEX_REMOTE_ALLOW_PRIVATE=true")
+	}
+}

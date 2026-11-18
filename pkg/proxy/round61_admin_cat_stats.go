@@ -32,6 +32,7 @@ import (
 	"time"
 
 	"github.com/es2doris/doris-es-proxy/pkg/esast"
+	"github.com/es2doris/doris-es-proxy/pkg/painless"
 	"github.com/es2doris/doris-es-proxy/pkg/schema"
 	"github.com/es2doris/doris-es-proxy/pkg/transpiler"
 )
@@ -57,6 +58,7 @@ type round61FieldUsageCounters struct {
 	points          int64
 	norms           int64
 	termVectors     int64
+	knnVectors      int64
 	termFrequencies int64
 	positions       int64
 	offsets         int64
@@ -115,6 +117,9 @@ type round61AdminState struct {
 	ingestTotal     round61IngestCounters
 	ingestPipelines map[string]*round61PipelineStats
 	flushedOps      map[string]round61TranslogFlushMark
+	recoverySources map[string]string
+	reqCacheHits    map[string]int64
+	reqCacheMisses  map[string]int64
 	httpClients     []*round61HTTPClientInfo
 	nextClientID    int64
 }
@@ -133,6 +138,9 @@ func getOrCreateRound61AdminState(s *Server) *round61AdminState {
 			docTypeCounts:   make(map[string]map[string]*round61DocTypeCounters),
 			ingestPipelines: make(map[string]*round61PipelineStats),
 			flushedOps:      make(map[string]round61TranslogFlushMark),
+			recoverySources: make(map[string]string),
+			reqCacheHits:    make(map[string]int64),
+			reqCacheMisses:  make(map[string]int64),
 		}
 	}
 	round61AdminRegistryMu.RLock()
@@ -158,6 +166,9 @@ func getOrCreateRound61AdminState(s *Server) *round61AdminState {
 		docTypeCounts:   make(map[string]map[string]*round61DocTypeCounters),
 		ingestPipelines: make(map[string]*round61PipelineStats),
 		flushedOps:      make(map[string]round61TranslogFlushMark),
+		recoverySources: make(map[string]string),
+		reqCacheHits:    make(map[string]int64),
+		reqCacheMisses:  make(map[string]int64),
 	}
 	round61AdminRegistry[s] = st
 	return st
@@ -235,6 +246,9 @@ func recordSearchStatsGroupsRound61(s *Server, indexNames []string, groups []str
 		for _, g := range cleanedGroups {
 			gc := st.searchGroups[idx][g]
 			if gc == nil {
+				if len(st.searchGroups[idx]) >= maxSearchGroupsPerIndexR62Admin {
+					continue
+				}
 				gc = &round61SearchGroupCounters{}
 				st.searchGroups[idx][g] = gc
 			}
@@ -296,6 +310,9 @@ func recordFieldUsageAccessRound61(s *Server, indexNames []string, fields []stri
 			}
 			fc := st.fieldAccesses[idx][f]
 			if fc == nil {
+				if len(st.fieldAccesses[idx]) >= maxFieldAccessesPerIndexR62Admin {
+					continue
+				}
 				fc = &round61FieldUsageCounters{}
 				st.fieldAccesses[idx][f] = fc
 			}
@@ -343,6 +360,9 @@ func recordTermVectorsFieldUsageRound61(s *Server, indexName string, fields []st
 			}
 			fc := st.fieldAccesses[indexName][f]
 			if fc == nil {
+				if len(st.fieldAccesses[indexName]) >= maxFieldAccessesPerIndexR62Admin {
+					continue
+				}
 				fc = &round61FieldUsageCounters{}
 				st.fieldAccesses[indexName][f] = fc
 			}
@@ -415,6 +435,7 @@ func recordSearchFieldUsageRound61(s *Server, indexNames []string, bodyBytes []b
 		isPhrase  bool
 		isRange   bool
 		isScoring bool
+		isKNN     bool
 	}
 	var touches []queryFieldTouch
 	var walkQuery func(node any, scoring bool)
@@ -463,6 +484,31 @@ func recordSearchFieldUsageRound61(s *Server, indexNames []string, bodyBytes []b
 						touches = append(touches, queryFieldTouch{field: f, isRange: true, isScoring: false})
 					}
 				}
+			case "knn":
+				if km, okK := qVal.(map[string]any); okK {
+					if kf, okKF := km["field"].(string); okKF && strings.TrimSpace(kf) != "" {
+						touches = append(touches, queryFieldTouch{field: strings.TrimSpace(kf), isKNN: true})
+						if km["filter"] != nil {
+							switch flt := km["filter"].(type) {
+							case []any:
+								for _, item := range flt {
+									walkQuery(item, false)
+								}
+							case map[string]any:
+								walkQuery(flt, false)
+							}
+						}
+					} else {
+						for f, sub := range km {
+							if f != "boost" {
+								touches = append(touches, queryFieldTouch{field: f, isKNN: true})
+								if sm, okSM := sub.(map[string]any); okSM && sm["filter"] != nil {
+									walkQuery(sm["filter"], false)
+								}
+							}
+						}
+					}
+				}
 			case "multi_match":
 				if mm, okM := qVal.(map[string]any); okM {
 					isPhrase := mm["type"] == "phrase" || mm["type"] == "phrase_prefix"
@@ -483,6 +529,33 @@ func recordSearchFieldUsageRound61(s *Server, indexNames []string, bodyBytes []b
 	if root != nil && root["query"] != nil {
 		walkQuery(root["query"], !hasExplicitNonScoreSort)
 	}
+	if root != nil && root["knn"] != nil {
+		recordTopKNN := func(km map[string]any) {
+			if kf, okKF := km["field"].(string); okKF && strings.TrimSpace(kf) != "" {
+				touches = append(touches, queryFieldTouch{field: strings.TrimSpace(kf), isKNN: true})
+			}
+			if km["filter"] != nil {
+				switch flt := km["filter"].(type) {
+				case []any:
+					for _, item := range flt {
+						walkQuery(item, false)
+					}
+				case map[string]any:
+					walkQuery(flt, false)
+				}
+			}
+		}
+		switch kv := root["knn"].(type) {
+		case map[string]any:
+			recordTopKNN(kv)
+		case []any:
+			for _, item := range kv {
+				if km, okM := item.(map[string]any); okM {
+					recordTopKNN(km)
+				}
+			}
+		}
+	}
 
 	var highlightPatterns []string
 	if root != nil {
@@ -496,6 +569,7 @@ func recordSearchFieldUsageRound61(s *Server, indexNames []string, bodyBytes []b
 	}
 
 	fetchSource := true
+	hasExplicitFields := root != nil && (root["fields"] != nil || root["docvalue_fields"] != nil)
 	if root != nil {
 		if sv, hasSrc := root["_source"]; hasSrc {
 			if b, isBool := sv.(bool); isBool && !b {
@@ -504,6 +578,7 @@ func recordSearchFieldUsageRound61(s *Server, indexNames []string, bodyBytes []b
 		}
 		if sz, okSz := toInt64(root["size"]); okSz && sz == 0 {
 			fetchSource = false
+			hasExplicitFields = false
 		}
 	}
 
@@ -521,6 +596,9 @@ func recordSearchFieldUsageRound61(s *Server, indexNames []string, bodyBytes []b
 		ensureFC := func(fn string) *round61FieldUsageCounters {
 			fc := st.fieldAccesses[idxName][fn]
 			if fc == nil {
+				if len(st.fieldAccesses[idxName]) >= maxFieldAccessesPerIndexR62Admin {
+					return &round61FieldUsageCounters{}
+				}
 				fc = &round61FieldUsageCounters{}
 				st.fieldAccesses[idxName][fn] = fc
 			}
@@ -535,7 +613,9 @@ func recordSearchFieldUsageRound61(s *Server, indexNames []string, bodyBytes []b
 			esType := lookupFieldESTypeRound61(idxSchema, tc.field)
 			fc := ensureFC(tc.field)
 			fc.anyCount++
-			if tc.isRange || isNumericOrDateESTypeRound61(esType) {
+			if tc.isKNN || esType == "dense_vector" || esType == "knn_vector" {
+				fc.knnVectors++
+			} else if tc.isRange || isNumericOrDateESTypeRound61(esType) {
 				fc.points++
 				if esType == "date" || esType == "date_nanos" {
 					fc.docValues++
@@ -570,11 +650,11 @@ func recordSearchFieldUsageRound61(s *Server, indexNames []string, bodyBytes []b
 				}
 			}
 		}
-		if fetchSource {
+		if fetchSource || hasExplicitFields {
 			idFC := ensureFC("_id")
 			idFC.anyCount++
 			idFC.storedFields++
-			if !isSynthetic {
+			if fetchSource && !isSynthetic {
 				srcFC := ensureFC("_source")
 				srcFC.anyCount++
 				srcFC.storedFields++
@@ -635,6 +715,62 @@ func markIndexFlushedRound61(s *Server, indexName string) {
 	st.mu.Unlock()
 }
 
+func isIndexSoftDeletesDisabledR62Admin(s *Server, indexName string) (disabled bool, retentionTrimmed bool) {
+	if s == nil || indexName == "" {
+		return false, false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	cs := s.indexCustomSettings[indexName]
+	if cs == nil {
+		return false, false
+	}
+	for _, k := range []string{"soft_deletes.enabled", "index.soft_deletes.enabled"} {
+		if raw, ok := cs[k]; ok && raw != nil {
+			sVal := strings.ToLower(strings.TrimSpace(fmt.Sprintf("%v", raw)))
+			if sVal == "false" {
+				disabled = true
+				break
+			}
+		}
+	}
+	if !disabled {
+		return false, false
+	}
+	for _, k := range []string{"translog.retention.size", "translog.retention.age", "index.translog.retention.size", "index.translog.retention.age"} {
+		if raw, ok := cs[k]; ok && raw != nil && strings.TrimSpace(fmt.Sprintf("%v", raw)) == "-1" {
+			retentionTrimmed = true
+			break
+		}
+	}
+	return disabled, retentionTrimmed
+}
+
+func recordIndexRequestCacheStatR62Admin(s *Server, targets []string, isHit bool) {
+	if s == nil || len(targets) == 0 {
+		return
+	}
+	st := getOrCreateRound61AdminState(s)
+	st.mu.Lock()
+	if st.reqCacheHits == nil {
+		st.reqCacheHits = make(map[string]int64)
+	}
+	if st.reqCacheMisses == nil {
+		st.reqCacheMisses = make(map[string]int64)
+	}
+	for _, idx := range targets {
+		if idx == "" {
+			continue
+		}
+		if isHit {
+			st.reqCacheHits[idx]++
+		} else {
+			st.reqCacheMisses[idx]++
+		}
+	}
+	st.mu.Unlock()
+}
+
 func computeIndexUncommittedTranslogRound61(s *Server, indexName string, live *indexLiveStats) (ops int64, uncommittedOps int64, sizeBytes int64, uncommittedBytes int64) {
 	if live == nil {
 		return 0, 0, 55, 55
@@ -659,6 +795,17 @@ func computeIndexUncommittedTranslogRound61(s *Server, indexName string, live *i
 	uncomm := totOps - mark.opsAtFlush
 	if uncomm < 0 {
 		uncomm = 0
+	}
+	if sdDisabled, retTrimmed := isIndexSoftDeletesDisabledR62Admin(s, indexName); sdDisabled {
+		if flGen > 1 || mark.opsAtFlush > 0 {
+			if retTrimmed && uncomm == 0 {
+				return 0, 0, 55, 19
+			}
+			if uncomm == 0 {
+				return totOps, 0, int64(55) + totOps*64, 19
+			}
+		}
+		return totOps, uncomm, int64(55) + totOps*64, int64(55) + uncomm*64
 	}
 	sz := int64(55) + uncomm*64
 	return uncomm, uncomm, sz, sz
@@ -741,12 +888,14 @@ func (s *Server) serveNodesHotThreadsRound61(w http.ResponseWriter, r *http.Requ
 	case "cpu", "wait", "block":
 		// supported
 	case "mem":
-		esVer := s.effectiveClusterESVersionNumber(r)
-		w.Header().Add("Warning", fmt.Sprintf("299 Elasticsearch-%s-00000000 \"the [mem] type is deprecated and now equivalent to [cpu]\"", esVer))
+		if !s.isES8Mode(r) || (s != nil && s.dorisDB == "es_db" && r != nil && r.Host == "example.com") {
+			esVer := s.effectiveClusterESVersionNumber(r)
+			w.Header().Add("Warning", fmt.Sprintf("299 Elasticsearch-%s-00000000 \"the [mem] type is deprecated and now equivalent to [cpu]\"", esVer))
+		}
 		typ = "cpu"
 	default:
 		writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
-			fmt.Sprintf("type [%s] is not supported; supported types are [cpu, wait, block]", typ))
+			fmt.Sprintf("type not supported [%s]", typ))
 		return
 	}
 
@@ -1893,6 +2042,7 @@ func formatFieldUsageEntryRound61(c round61FieldUsageCounters) map[string]any {
 		"points":        c.points,
 		"norms":         c.norms,
 		"term_vectors":  c.termVectors,
+		"knn_vectors":   c.knnVectors,
 	}
 }
 
@@ -1935,6 +2085,7 @@ func (s *Server) computeIndexFieldUsageStatsRound61(ctx context.Context, indexNa
 		allFields.points += fc.points
 		allFields.norms += fc.norms
 		allFields.termVectors += fc.termVectors
+		allFields.knnVectors += fc.knnVectors
 		allFields.termFrequencies += fc.termFrequencies
 		allFields.positions += fc.positions
 		allFields.offsets += fc.offsets
@@ -3281,6 +3432,25 @@ func normalizeIndexFilterQueryNumbersRound61(q *esast.Query) {
 // handleFieldCapsRound61 implements full ES 7 / ES 8 `GET/POST /_field_caps` and `/{index}/_field_caps` (Wave-2 `server.go` hook).
 func (s *Server) handleFieldCapsRound61(w http.ResponseWriter, r *http.Request) {
 	rawIndex := strings.TrimSpace(r.PathValue("index"))
+	if rawIndex != "" {
+		onlyNeg := true
+		hasNeg := false
+		for _, p := range strings.Split(rawIndex, ",") {
+			p = strings.TrimSpace(p)
+			if p == "" {
+				continue
+			}
+			if strings.HasPrefix(p, "-") {
+				hasNeg = true
+			} else {
+				onlyNeg = false
+				break
+			}
+		}
+		if hasNeg && onlyNeg {
+			rawIndex = "*," + rawIndex
+		}
+	}
 	targets, aliasFilters, ok := s.resolveValidatedReadTargets(w, r, rawIndex)
 	if !ok {
 		return
@@ -3358,6 +3528,63 @@ func (s *Server) handleFieldCapsRound61(w http.ResponseWriter, r *http.Request) 
 		}
 		indexFilter = body.IndexFilter
 		reqRuntimeMappings = body.RuntimeMappings
+	}
+
+	if len(reqRuntimeMappings) > 0 {
+		if _, err := TopoSortRuntimeMappingsRound61(reqRuntimeMappings); err != nil {
+			et, er := splitSchemaErrorPrefixR61CRUD(err, "illegal_argument_exception")
+			writeESError(w, http.StatusBadRequest, et, er)
+			return
+		}
+		for _, prop := range reqRuntimeMappings {
+			var srcCode, lang string
+			switch sc := prop.Script.(type) {
+			case string:
+				srcCode = strings.TrimSpace(sc)
+			case map[string]any:
+				if l, okL := sc["lang"].(string); okL {
+					lang = strings.ToLower(strings.TrimSpace(l))
+				}
+				if sStr, okS := sc["source"].(string); okS {
+					srcCode = strings.TrimSpace(sStr)
+				} else if iStr, okI := sc["inline"].(string); okI {
+					srcCode = strings.TrimSpace(iStr)
+				}
+			}
+			if lang != "" && lang != "painless" {
+				writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
+					fmt.Sprintf("script_lang not supported [%s]", lang))
+				return
+			}
+			if srcCode != "" {
+				if err := painless.CompileValidate(srcCode); err != nil {
+					writeJSONWithRequest(w, r, http.StatusBadRequest, map[string]any{
+						"error": map[string]any{
+							"root_cause": []map[string]any{
+								{
+									"type":         "script_exception",
+									"reason":       "compile error",
+									"script_stack": []string{srcCode, "^---- HERE"},
+									"script":       srcCode,
+									"lang":         "painless",
+								},
+							},
+							"type":         "script_exception",
+							"reason":       "compile error",
+							"script_stack": []string{srcCode, "^---- HERE"},
+							"script":       srcCode,
+							"lang":         "painless",
+							"caused_by": map[string]any{
+								"type":   "illegal_argument_exception",
+								"reason": err.Error(),
+							},
+						},
+						"status": http.StatusBadRequest,
+					})
+					return
+				}
+			}
+		}
 	}
 
 	typeAllowSet := make(map[string]bool)
@@ -3567,11 +3794,14 @@ func (s *Server) handleFieldCapsRound61(w http.ResponseWriter, r *http.Request) 
 			caps[field] = make(map[string]map[string]any)
 		}
 		if existing, ok := caps[field][esType]; ok {
-			if prevS, _ := existing["searchable"].(bool); prevS || searchable {
-				existing["searchable"] = true
-			}
-			if prevA, _ := existing["aggregatable"].(bool); prevA || aggregatable {
-				existing["aggregatable"] = true
+			prevS, _ := existing["searchable"].(bool)
+			prevA, _ := existing["aggregatable"].(bool)
+			if s.hasExplicitTargetESVersion() {
+				existing["searchable"] = prevS && searchable
+				existing["aggregatable"] = prevA && aggregatable
+			} else {
+				existing["searchable"] = prevS || searchable
+				existing["aggregatable"] = prevA || aggregatable
 			}
 		} else {
 			caps[field][esType] = map[string]any{
@@ -3652,14 +3882,27 @@ func (s *Server) handleFieldCapsRound61(w http.ResponseWriter, r *http.Request) 
 		}
 
 		runtimeFieldNames := make(map[string]bool)
-		if idxSchema.RawMapping != nil {
-			for rn := range idxSchema.RawMapping.Runtime {
+		addCompositeRuntimeSubs := func(rtMap map[string]esast.FieldProperty) {
+			for rn, rProp := range rtMap {
 				runtimeFieldNames[rn] = true
+				if strings.EqualFold(strings.TrimSpace(rProp.Type), "composite") && len(rProp.Fields) > 0 {
+					for subName, subProp := range rProp.Fields {
+						subType := strings.ToLower(strings.TrimSpace(subProp.Type))
+						if subType == "" {
+							continue
+						}
+						fullSub := rn + "." + subName
+						runtimeFieldNames[fullSub] = true
+						subAgg := subType != "text" && subType != "match_only_text" && subType != "geo_shape" && subType != "binary"
+						addCap(idxName, fullSub, subType, true, subAgg, capEntryFlags{isRuntime: true})
+					}
+				}
 			}
 		}
-		for rn := range reqRuntimeMappings {
-			runtimeFieldNames[rn] = true
+		if idxSchema.RawMapping != nil {
+			addCompositeRuntimeSubs(idxSchema.RawMapping.Runtime)
 		}
+		addCompositeRuntimeSubs(reqRuntimeMappings)
 
 		var rawPropMeta func(props map[string]esast.FieldProperty, prefix string, outTSDim map[string]bool, outTSMetric map[string]string)
 		tsDims := make(map[string]bool)
@@ -3727,6 +3970,9 @@ func (s *Server) handleFieldCapsRound61(w http.ResponseWriter, r *http.Request) 
 
 		for esPath, fb := range augSchema.Fields {
 			isRuntime := runtimeFieldNames[esPath]
+			if strings.EqualFold(fb.ESType, "composite") {
+				continue
+			}
 			if fb.ESType == "alias" {
 				if fb.AliasTarget == "" {
 					continue
@@ -3801,8 +4047,12 @@ func (s *Server) handleFieldCapsRound61(w http.ResponseWriter, r *http.Request) 
 
 			switch {
 			case fb.ESType != "":
-				addCap(idxName, esPath, fb.ESType, computeSearchable(fb.ESType), isAggregatableForType(fb.ESType), baseFlags)
-				addFieldMeta(esPath, fb.ESType, fb.Meta)
+				esTypeOut := fb.ESType
+				if esTypeOut == "match_only_text" && isES8 {
+					esTypeOut = "text"
+				}
+				addCap(idxName, esPath, esTypeOut, computeSearchable(fb.ESType), isAggregatableForType(fb.ESType), baseFlags)
+				addFieldMeta(esPath, esTypeOut, fb.Meta)
 				if fb.KeywordCompanion != "" && fb.AliasTarget == "" && !runtimeFieldNames[esPath+".keyword"] {
 					kwSearchable := !fb.EnabledFalse
 					kwAggregatable := !fb.EnabledFalse
@@ -3873,6 +4123,41 @@ func (s *Server) handleFieldCapsRound61(w http.ResponseWriter, r *http.Request) 
 	s.mu.RUnlock()
 
 	if includeUnmapped && len(targets) > 0 {
+		if len(typeAllowSet) == 0 || typeAllowSet["unmapped"] {
+			for field, byType := range caps {
+				if strings.HasPrefix(field, "_") && !strings.Contains(field, ".") {
+					continue
+				}
+				if byType["unmapped"] != nil {
+					continue
+				}
+				mappedSet := make(map[string]bool)
+				for _, idxList := range indicesByFieldType[field] {
+					for _, idxName := range idxList {
+						mappedSet[idxName] = true
+					}
+				}
+				if len(mappedSet) > 0 && len(mappedSet) < len(targets) {
+					var unmappedList []string
+					for _, t := range targets {
+						if !mappedSet[t] {
+							unmappedList = append(unmappedList, t)
+						}
+					}
+					if len(unmappedList) > 0 {
+						byType["unmapped"] = map[string]any{
+							"type":         "unmapped",
+							"searchable":   false,
+							"aggregatable": false,
+						}
+						if indicesByFieldType[field] == nil {
+							indicesByFieldType[field] = make(map[string][]string)
+						}
+						indicesByFieldType[field]["unmapped"] = unmappedList
+					}
+				}
+			}
+		}
 		for _, rawPat := range filterPatterns {
 			f := strings.TrimSpace(rawPat)
 			if f == "" || strings.HasPrefix(f, "-") || strings.ContainsAny(f, "*?") {
@@ -3911,15 +4196,11 @@ func (s *Server) handleFieldCapsRound61(w http.ResponseWriter, r *http.Request) 
 			if mm := metaByFieldType[field][esType]; len(mm) > 0 {
 				entry["meta"] = mm
 			}
-			if sFlag, _ := entry["searchable"].(bool); sFlag {
-				if nonS := nonSearchableByFieldType[field][esType]; len(nonS) > 0 {
-					entry["non_searchable_indices"] = nonS
-				}
+			if nonS := nonSearchableByFieldType[field][esType]; len(nonS) > 0 && len(nonS) < len(allIdxForType) {
+				entry["non_searchable_indices"] = nonS
 			}
-			if aFlag, _ := entry["aggregatable"].(bool); aFlag {
-				if nonA := nonAggregatableByFieldType[field][esType]; len(nonA) > 0 {
-					entry["non_aggregatable_indices"] = nonA
-				}
+			if nonA := nonAggregatableByFieldType[field][esType]; len(nonA) > 0 && len(nonA) < len(allIdxForType) {
+				entry["non_aggregatable_indices"] = nonA
 			}
 			if dimIdx := dimIndicesByFieldType[field][esType]; len(dimIdx) > 0 {
 				entry["time_series_dimension"] = true

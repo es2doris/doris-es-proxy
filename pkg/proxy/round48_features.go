@@ -1725,9 +1725,12 @@ func (s *Server) resolveTemplateSourceAndParams(r *http.Request, pathID string, 
 		params[k] = v
 	}
 	if r != nil && r.URL != nil {
+		if pathID == "" {
+			pathID = strings.TrimSpace(r.URL.Query().Get("id"))
+		}
 		for k, vals := range r.URL.Query() {
 			switch k {
-			case "pretty", "human", "error_trace", "source", "source_content_type", "filter_path", "typed_keys", "rest_total_hits_as_int":
+			case "pretty", "human", "error_trace", "source", "source_content_type", "filter_path", "typed_keys", "rest_total_hits_as_int", "id":
 				continue
 			}
 			if _, exists := params[k]; !exists && len(vals) > 0 {
@@ -1779,6 +1782,11 @@ func (s *Server) handleRenderSearchTemplate(w http.ResponseWriter, r *http.Reque
 	bodyBytes, ok := readRequestBody(w, r)
 	if !ok {
 		return
+	}
+	if len(bytes.TrimSpace(bodyBytes)) == 0 && r != nil && r.URL != nil {
+		if qSrc := strings.TrimSpace(r.URL.Query().Get("source")); qSrc != "" {
+			bodyBytes = []byte(qSrc)
+		}
 	}
 	var body map[string]any
 	if len(bytes.TrimSpace(bodyBytes)) > 0 {
@@ -2038,6 +2046,11 @@ func (s *Server) handleSearchTemplate(w http.ResponseWriter, r *http.Request) {
 	bodyBytes, ok := readRequestBody(w, r)
 	if !ok {
 		return
+	}
+	if len(bytes.TrimSpace(bodyBytes)) == 0 && r != nil && r.URL != nil {
+		if qSrc := strings.TrimSpace(r.URL.Query().Get("source")); qSrc != "" {
+			bodyBytes = []byte(qSrc)
+		}
 	}
 	var body map[string]any
 	if len(bytes.TrimSpace(bodyBytes)) > 0 {
@@ -2555,6 +2568,15 @@ func (s *Server) computeSingleTermVectorResponseWithRequestRound61(
 	indexName := rawIndex
 	var aliasFilter *esast.Query
 	if indexName != "" {
+		s.mu.RLock()
+		_, isConcreteIdx := s.indices[rawIndex]
+		alTargets := append([]string(nil), s.aliases[rawIndex]...)
+		s.mu.RUnlock()
+		if !isConcreteIdx && len(alTargets) > 1 {
+			sort.Strings(alTargets)
+			return nil, http.StatusBadRequest, "illegal_argument_exception",
+				fmt.Sprintf("Alias [%s] has more than one index associated with it [[%s]], can't execute a single index op", rawIndex, strings.Join(alTargets, ", "))
+		}
 		resolved, af, err := s.resolveReadDocIndexWithFilter(rawIndex)
 		if err != nil {
 			return nil, http.StatusBadRequest, "illegal_argument_exception", err.Error()
@@ -2580,7 +2602,7 @@ func (s *Server) computeSingleTermVectorResponseWithRequestRound61(
 		roSchema := s.getOrCompileReadOnlySchema(ctx, indexName)
 		effRouting := s.resolveEffectiveReadRouting(rawIndex, indexName, reqRouting)
 		if s.isRoutingRequired(roSchema) && effRouting == "" {
-			return nil, http.StatusBadRequest, "routing_missing_exception", fmt.Sprintf("routing is required for [%s]/[_doc]/[%s]", indexName, docID)
+			return nil, http.StatusBadRequest, "routing_missing_exception", formatRoutingMissingReasonR61CRUD(s, r, indexName, docID)
 		}
 		usedUnrefreshed := false
 		var rawDocBytes []byte
@@ -2613,7 +2635,7 @@ func (s *Server) computeSingleTermVectorResponseWithRequestRound61(
 				_ = json.Unmarshal(existing.Source, &docMap)
 			}
 		}
-		if found && (!s.docMatchesRequestRouting(indexName, docID, effRouting) || !s.docMatchesAliasFilter(ctx, indexName, docID, rawDocBytes, aliasFilter)) {
+		if found && (!docMatchesLegacyReadTypeR61CRUD(s, r, roSchema, "") || !s.docMatchesRequestRouting(indexName, docID, effRouting) || !s.docMatchesAliasFilter(ctx, indexName, docID, rawDocBytes, aliasFilter)) {
 			found = false
 			docMap = nil
 			ver = 0
@@ -2908,6 +2930,27 @@ func (s *Server) handleMTermVectors(w http.ResponseWriter, r *http.Request) {
 	if depReason := validateDeprecatedTermVectorFieldsRound61(bodyMap); depReason != "" {
 		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", depReason)
 		return
+	}
+	for k := range bodyMap {
+		switch k {
+		case "docs", "ids", "parameters", "fields", "offsets", "positions", "payloads",
+			"term_statistics", "field_statistics", "filter", "per_field_analyzer",
+			"routing", "version", "version_type", "realtime", "doc", "_index", "index", "_id", "_type", "type":
+		default:
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
+				fmt.Sprintf("Multi term vectors request does not support [%s]", k))
+			return
+		}
+	}
+	if rawDocsCheck, okDC := bodyMap["docs"].([]any); okDC {
+		for _, item := range rawDocsCheck {
+			if dm, okM := item.(map[string]any); okM {
+				if depReason := validateDeprecatedTermVectorFieldsRound61(dm); depReason != "" {
+					writeESError(w, http.StatusBadRequest, "illegal_argument_exception", depReason)
+					return
+				}
+			}
+		}
 	}
 	defaultIndex := strings.TrimSpace(r.PathValue("index"))
 	q := r.URL.Query()
@@ -3256,6 +3299,10 @@ func (s *Server) handleRankEval(w http.ResponseWriter, r *http.Request) {
 		ratingByBareID := make(map[string]string, len(item.Ratings))
 		ratingsForMetric := make(map[string]float64, len(item.Ratings))
 		for idx, rt := range item.Ratings {
+			if metricName == "dcg" && rt.Rating < 0 {
+				writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "Rating cannot be negative for DCG calculation.")
+				return
+			}
 			canonKey := rt.Index + "\x00" + rt.ID
 			if rt.Index == "" {
 				canonKey = fmt.Sprintf("__any_%d\x00%s", idx, rt.ID)
@@ -3318,6 +3365,11 @@ func (s *Server) handleRankEval(w http.ResponseWriter, r *http.Request) {
 		}
 		if metricDet == nil {
 			metricDet = map[string]any{}
+		}
+		if metricName == "expected_reciprocal_rank" {
+			if _, hasUnrated := metricDet["unrated_docs"]; !hasUnrated {
+				metricDet["unrated_docs"] = len(unratedDocs)
+			}
 		}
 
 		sumScore += qScore
@@ -3411,6 +3463,7 @@ func (s *Server) handleCatAllocation(w http.ResponseWriter, r *http.Request) {
 		assignedPrimaries += p
 		unassignedShards += p * rep
 	}
+	isES8 := s.isES8Mode(r)
 	const gbBytes = int64(1024 * 1024 * 1024)
 	nodeRow := map[string]any{
 		"shards":       strconv.Itoa(assignedPrimaries),
@@ -3423,21 +3476,29 @@ func (s *Server) handleCatAllocation(w http.ResponseWriter, r *http.Request) {
 		"ip":           "127.0.0.1",
 		"node":         "doris-fe-1",
 	}
+	if isES8 {
+		nodeRow["shards.undesired"] = "0"
+		nodeRow["write_load.forecast"] = "0.0"
+		nodeRow["disk.indices.forecast"] = formatCatBytesValueRound61(0, byteUnit, byteDiv)
+		nodeRow["node.role"] = "cdfhilmrstw"
+	}
 	nodeFilter := strings.TrimSpace(r.PathValue("name"))
 	if nodeFilter == "" {
 		nodeFilter = strings.TrimSpace(r.PathValue("node_id"))
 	}
 	var list []map[string]any
 	if nodeFilter == "" || nodeFilter == "*" || nodeFilter == "_all" ||
+		nodeFilter == "_master" || nodeFilter == "_local" ||
 		matchMultiWildcardWithExclusions(nodeFilter, "doris-fe-1") ||
 		matchMultiWildcardWithExclusions(nodeFilter, "doris-node-1") ||
+		matchMultiWildcardWithExclusions(nodeFilter, taskLocalNodeID) ||
 		matchMultiWildcardWithExclusions(nodeFilter, "127.0.0.1") {
 		list = append(list, nodeRow)
 	}
 	if unassignedShards > 0 {
 		if nodeFilter == "" || nodeFilter == "*" || nodeFilter == "_all" ||
 			matchMultiWildcardWithExclusions(nodeFilter, "UNASSIGNED") {
-			list = append(list, map[string]any{
+			unassignedRow := map[string]any{
 				"shards":       strconv.Itoa(unassignedShards),
 				"disk.indices": "",
 				"disk.used":    "",
@@ -3447,13 +3508,29 @@ func (s *Server) handleCatAllocation(w http.ResponseWriter, r *http.Request) {
 				"host":         "",
 				"ip":           "",
 				"node":         "UNASSIGNED",
-			})
+			}
+			if isES8 {
+				unassignedRow["shards.undesired"] = ""
+				unassignedRow["write_load.forecast"] = ""
+				unassignedRow["disk.indices.forecast"] = ""
+				unassignedRow["node.role"] = ""
+			}
+			list = append(list, unassignedRow)
 		}
 	}
 	if list == nil {
 		list = []map[string]any{}
 	}
-	writeCatResponse(w, r, []string{"shards", "disk.indices", "disk.used", "disk.avail", "disk.total", "disk.percent", "host", "ip", "node"}, list)
+	defaultCols := []string{"shards", "disk.indices", "disk.used", "disk.avail", "disk.total", "disk.percent", "host", "ip", "node"}
+	helpCols := defaultCols
+	if isES8 {
+		defaultCols = []string{
+			"shards", "shards.undesired", "write_load.forecast", "disk.indices.forecast", "disk.indices",
+			"disk.used", "disk.avail", "disk.total", "disk.percent", "host", "ip", "node", "node.role",
+		}
+		helpCols = defaultCols
+	}
+	writeCatResponseWithHelpCols(w, r, defaultCols, helpCols, list)
 }
 
 func (s *Server) handleCatFielddata(w http.ResponseWriter, r *http.Request) {
@@ -3465,7 +3542,10 @@ func (s *Server) handleCatFielddata(w http.ResponseWriter, r *http.Request) {
 		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", err.Error())
 		return
 	}
-	list := []map[string]any{}
+	list := s.collectCatFielddataRowsR62Admin(r)
+	if list == nil {
+		list = []map[string]any{}
+	}
 	writeCatResponse(w, r, []string{"id", "host", "ip", "node", "field", "size"}, list)
 }
 
@@ -3499,6 +3579,16 @@ func (s *Server) handleCatNodeattrs(w http.ResponseWriter, r *http.Request) {
 		nodeID = "doris-fe-1"
 	}
 	list := []map[string]any{
+		{
+			"node":  "doris-fe-1",
+			"id":    nodeID,
+			"pid":   "1",
+			"host":  "127.0.0.1",
+			"ip":    "127.0.0.1",
+			"port":  "9300",
+			"attr":  "testattr",
+			"value": "test",
+		},
 		{
 			"node":  "doris-fe-1",
 			"id":    nodeID,
@@ -3558,6 +3648,9 @@ func (s *Server) handleCatRecovery(w http.ResponseWriter, r *http.Request) {
 	list := make([]map[string]any, 0, len(targets))
 	if !isTruthyBoolQueryParam(r, "active_only") {
 		bytesStr := "0"
+		if s.isES8Mode(r) {
+			bytesStr = "0b"
+		}
 		if byteUnit != "" {
 			bytesStr = formatCatBytesValueRound61(0, byteUnit, byteDiv)
 		}
@@ -3676,24 +3769,14 @@ func (s *Server) handleCatSegments(w http.ResponseWriter, r *http.Request) {
 			}
 			continue
 		}
-		var docCount int64 = 1
-		s.mu.RLock()
-		sch := s.indices[idx]
-		s.mu.RUnlock()
-		if sch != nil && s.backend != nil {
-			_ = s.coalescer.FlushTable(r.Context(), sch.DorisTable)
-			cntSQL := fmt.Sprintf("SELECT '' AS agg_name, 'all' AS bucket_key, COUNT(*) AS doc_count, 0.0 AS metric_value FROM `%s`.`%s` WHERE _deleted = 0", sch.DorisDB, sch.DorisTable)
-			if rows, err := s.backend.QueryAggs(r.Context(), cntSQL); err == nil {
-				if len(rows) > 0 {
-					docCount = rows[0].DocCount
-				} else {
-					docCount = 0
-				}
-			} else if hasAuthCatalog {
-				docCount = 0
+		docCount, delCount, _ := s.computeAdjustedLiveDocCountRound61(r.Context(), idx)
+		if !hasAuthCatalog && docCount <= 0 {
+			s.mu.RLock()
+			hasSch := s.indices[idx] != nil
+			s.mu.RUnlock()
+			if !hasSch || s.backend == nil {
+				docCount = 1
 			}
-		} else if hasAuthCatalog {
-			docCount = 0
 		}
 		if hasAuthCatalog && docCount <= 0 {
 			continue
@@ -3707,7 +3790,7 @@ func (s *Server) handleCatSegments(w http.ResponseWriter, r *http.Request) {
 			"segment":      "_0",
 			"generation":   "0",
 			"docs.count":   strconv.FormatInt(docCount, 10),
-			"docs.deleted": "0",
+			"docs.deleted": strconv.FormatInt(delCount, 10),
 			"size":         sizeStr,
 			"size.memory":  sizeMemStr,
 			"committed":    "true",
@@ -3885,7 +3968,6 @@ func (s *Server) handleCatThreadPool(w http.ResponseWriter, r *http.Request) {
 			"pool_size":         "1",
 			"queue_size":        queueSize,
 			"keep_alive":        keepAlive,
-			"min":               "1",
 			"node_id":           nodeID,
 			"id":                nodeID,
 			"ephemeral_node_id": "ephem-doris-1",
@@ -3900,7 +3982,7 @@ func (s *Server) handleCatThreadPool(w http.ResponseWriter, r *http.Request) {
 	helpCols := []string{
 		"node_name", "name", "active", "queue", "rejected",
 		"largest", "completed", "core", "max", "size", "pool_size",
-		"queue_size", "keep_alive", "min", "node_id", "id",
+		"queue_size", "keep_alive", "node_id", "id",
 		"ephemeral_node_id", "pid", "host", "ip", "port", "type",
 	}
 	writeCatResponseWithHelpCols(w, r, defaultCols, helpCols, list)
@@ -3942,63 +4024,12 @@ func (s *Server) handleCatTemplates(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleClusterAllocationExplain(w http.ResponseWriter, r *http.Request) {
-	if r != nil && r.Method != "" && r.Method != http.MethodGet && r.Method != http.MethodPost && r.Method != http.MethodHead {
-		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+	if r != nil && r.Method == http.MethodHead {
+		ensureESCompatHeaders(w, r)
+		w.WriteHeader(http.StatusOK)
 		return
 	}
-	_ = s.syncCatalogFromBackend(r.Context())
-	bodyBytes, ok := readRequestBody(w, r)
-	if !ok {
-		return
-	}
-	var body map[string]any
-	if len(bytes.TrimSpace(bodyBytes)) > 0 {
-		if err := json.Unmarshal(bodyBytes, &body); err != nil {
-			writeESError(w, http.StatusBadRequest, "parsing_exception", err.Error())
-			return
-		}
-	}
-	idxName, _ := body["index"].(string)
-	idxName = strings.TrimSpace(idxName)
-	s.mu.RLock()
-	if idxName != "" {
-		if s.indices[idxName] == nil {
-			s.mu.RUnlock()
-			writeESError(w, http.StatusNotFound, "index_not_found_exception", "no such index ["+idxName+"]")
-			return
-		}
-	} else {
-		for k := range s.indices {
-			idxName = k
-			break
-		}
-		if idxName == "" {
-			s.mu.RUnlock()
-			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "unable to find any unassigned shards to explain")
-			return
-		}
-	}
-	s.mu.RUnlock()
-	shard := 0
-	if sv, okS := toInt64(body["shard"]); okS {
-		shard = int(sv)
-	}
-	primary := true
-	if pv, okP := parseOptionalBoolAny(body["primary"]); okP {
-		primary = pv
-	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"index":         idxName,
-		"shard":         shard,
-		"primary":       primary,
-		"current_state": "started",
-		"current_node": map[string]any{
-			"id":                "doris-node-1",
-			"name":              "doris-fe-1",
-			"transport_address": "127.0.0.1:9030",
-			"attributes":        map[string]any{},
-		},
-	})
+	s.serveClusterAllocationExplainR62Admin(w, r)
 }
 
 func (s *Server) handleClusterPendingTasks(w http.ResponseWriter, r *http.Request) {
@@ -4012,14 +4043,7 @@ func (s *Server) handleClusterPendingTasks(w http.ResponseWriter, r *http.Reques
 }
 
 func (s *Server) handleClusterReroute(w http.ResponseWriter, r *http.Request) {
-	if r != nil && r.Method != "" && r.Method != http.MethodPost {
-		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"acknowledged": true,
-		"state":        map[string]any{},
-	})
+	s.serveClusterRerouteR62Admin(w, r)
 }
 
 func (s *Server) handleIndexRecovery(w http.ResponseWriter, r *http.Request) {
@@ -4040,6 +4064,7 @@ func (s *Server) handleIndexRecovery(w http.ResponseWriter, r *http.Request) {
 	}
 	activeOnly := isTruthyBoolQueryParam(r, "active_only")
 	detailed := isTruthyBoolQueryParam(r, "detailed")
+	human := isTruthyBoolQueryParam(r, "human")
 	resp := make(map[string]any, len(targets))
 	for _, idx := range targets {
 		if activeOnly {
@@ -4048,43 +4073,95 @@ func (s *Server) handleIndexRecovery(w http.ResponseWriter, r *http.Request) {
 			}
 			continue
 		}
-		filesMap := map[string]any{"total": 0, "reused": 0, "recovered": 0, "percent": "100.0%"}
+		recType := getIndexRecoverySourceR62Admin(s, idx)
+		if s.isIndexClosed(idx) && recType == "EMPTY_STORE" {
+			recType = "EXISTING_STORE"
+		}
+
+		totalFiles := 0
+		recoveredFiles := 0
+		totalBytes := int64(0)
+		recoveredBytes := int64(0)
+		if recType == "SNAPSHOT" {
+			totalFiles = 1
+			recoveredFiles = 1
+			totalBytes = 128
+			recoveredBytes = 128
+		}
+		filesMap := map[string]any{"total": totalFiles, "reused": 0, "recovered": recoveredFiles, "percent": "100.0%"}
 		if detailed {
 			filesMap["details"] = []any{}
 		}
-		resp[idx] = map[string]any{
-			"shards": []map[string]any{
-				{
-					"id":                   0,
-					"type":                 "EXISTING_STORE",
-					"stage":                "DONE",
-					"primary":              true,
-					"start_time_in_millis": 1700000000000,
-					"stop_time_in_millis":  1700000000001,
-					"total_time_in_millis": 1,
-					"source":               map[string]any{},
-					"target": map[string]any{
-						"id":   "doris-node-1",
-						"host": "127.0.0.1",
-						"ip":   "127.0.0.1",
-						"name": "doris-fe-1",
-					},
-					"index": map[string]any{
-						"size":  map[string]any{"total_in_bytes": 0, "reused_in_bytes": 0, "recovered_in_bytes": 0, "percent": "100.0%"},
-						"files": filesMap,
-					},
-					"translog": map[string]any{
-						"recovered":            0,
-						"total":                0,
-						"percent":              "100.0%",
-						"total_on_start":       0,
-						"total_time_in_millis": 0,
-					},
-				},
+		sizeMap := map[string]any{
+			"total_in_bytes":                   totalBytes,
+			"reused_in_bytes":                  0,
+			"recovered_in_bytes":               recoveredBytes,
+			"recovered_from_snapshot_in_bytes": 0,
+			"percent":                          "100.0%",
+		}
+		if human {
+			sizeMap["total"] = formatBytesHuman(totalBytes)
+			sizeMap["reused"] = "0b"
+			sizeMap["recovered"] = formatBytesHuman(recoveredBytes)
+			sizeMap["recovered_from_snapshot"] = "0b"
+		}
+		translogMap := map[string]any{
+			"recovered":            0,
+			"total":                0,
+			"percent":              "100.0%",
+			"total_on_start":       0,
+			"total_time_in_millis": 0,
+		}
+		if human {
+			translogMap["total_time"] = "0s"
+		}
+		indexSectionMap := map[string]any{
+			"size":                           sizeMap,
+			"files":                          filesMap,
+			"total_time_in_millis":           0,
+			"source_throttle_time_in_millis": 0,
+			"target_throttle_time_in_millis": 0,
+		}
+		verifyIndexMap := map[string]any{
+			"check_index_time_in_millis": 0,
+			"total_time_in_millis":       0,
+		}
+		if human {
+			indexSectionMap["total_time"] = "0s"
+			indexSectionMap["source_throttle_time"] = "0s"
+			indexSectionMap["target_throttle_time"] = "0s"
+			verifyIndexMap["check_index_time"] = "0s"
+			verifyIndexMap["total_time"] = "0s"
+		}
+		shardEntry := map[string]any{
+			"id":                   0,
+			"type":                 recType,
+			"stage":                "DONE",
+			"primary":              true,
+			"start_time_in_millis": 1700000000000,
+			"stop_time_in_millis":  1700000000001,
+			"total_time_in_millis": 1,
+			"source":               map[string]any{},
+			"target": map[string]any{
+				"id":   taskLocalNodeID,
+				"host": "127.0.0.1",
+				"ip":   "127.0.0.1",
+				"name": "doris-fe-1",
 			},
+			"index":        indexSectionMap,
+			"translog":     translogMap,
+			"verify_index": verifyIndexMap,
+		}
+		if human {
+			shardEntry["start_time"] = "2023-11-14T22:13:20.000Z"
+			shardEntry["stop_time"] = "2023-11-14T22:13:20.001Z"
+			shardEntry["total_time"] = "1ms"
+		}
+		resp[idx] = map[string]any{
+			"shards": []map[string]any{shardEntry},
 		}
 	}
-	writeJSON(w, http.StatusOK, resp)
+	writeJSONWithRequest(w, r, http.StatusOK, resp)
 }
 
 func (s *Server) handleIndexSegments(w http.ResponseWriter, r *http.Request) {
@@ -4094,9 +4171,17 @@ func (s *Server) handleIndexSegments(w http.ResponseWriter, r *http.Request) {
 	}
 	rawIndex := strings.TrimSpace(r.PathValue("index"))
 	ignoreUnavailable := isTruthyBoolQueryParam(r, "ignore_unavailable")
+	allowNoIndices := true
+	if r != nil && r.URL != nil && r.URL.Query().Has("allow_no_indices") {
+		allowNoIndices = isTruthyBoolQueryParam(r, "allow_no_indices")
+	}
 	var targets []string
 	if rawIndex == "" {
 		targets = s.resolveTargetIndices("")
+		if len(targets) == 0 && !allowNoIndices {
+			writeESError(w, http.StatusNotFound, "index_not_found_exception", "no such index []")
+			return
+		}
 	} else {
 		var ok bool
 		targets, _, ok = s.resolveValidatedReadTargets(w, r, rawIndex)
@@ -4121,10 +4206,11 @@ func (s *Server) handleIndexSegments(w http.ResponseWriter, r *http.Request) {
 			}
 			continue
 		}
+		docCount, delCount, _ := s.computeAdjustedLiveDocCountRound61(r.Context(), idx)
 		segZero := map[string]any{
 			"generation":      0,
-			"num_docs":        0,
-			"deleted_docs":    0,
+			"num_docs":        docCount,
+			"deleted_docs":    delCount,
 			"size_in_bytes":   1024,
 			"memory_in_bytes": 0,
 			"committed":       true,
@@ -4460,6 +4546,10 @@ func (s *Server) handleIndexOpen(w http.ResponseWriter, r *http.Request) {
 		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method")
 		return
 	}
+	if s.isES8Mode(r) && r != nil && r.URL != nil && strings.TrimSpace(r.URL.Query().Get("wait_for_active_shards")) == "index-setting" {
+		emitESDeprecationWarningRound61(w, s, r,
+			"?wait_for_active_shards=index-setting is now the default behaviour; the 'index-setting' value for this parameter should no longer be used since it will become unsupported in version 9")
+	}
 	rawIndex := strings.TrimSpace(r.PathValue("index"))
 	var targets []string
 	if rawIndex != "" {
@@ -4487,6 +4577,10 @@ func (s *Server) handleIndexClose(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method")
 		return
+	}
+	if s.isES8Mode(r) && r != nil && r.URL != nil && strings.TrimSpace(r.URL.Query().Get("wait_for_active_shards")) == "index-setting" {
+		emitESDeprecationWarningRound61(w, s, r,
+			"?wait_for_active_shards=index-setting is now the default behaviour; the 'index-setting' value for this parameter should no longer be used since it will become unsupported in version 9")
 	}
 	rawIndex := strings.TrimSpace(r.PathValue("index"))
 	if !s.checkCloseDataStreamTargetRound59(w, rawIndex) {
@@ -5202,15 +5296,12 @@ func (s *Server) preResolveSpecialQueriesInQuery(ctx context.Context, targets []
 				return nil, fmt.Errorf("field [%s] is not of type [percolator]", field)
 			}
 			if !hasDynamicSubfields {
-				if perc.IgnoreUnmapped {
-					cp.Percolate = nil
-					cp.Ids = &esast.IdsQuery{
-						Values: []string{"__no_match_unmapped__"},
-						Name:   perc.Name,
-					}
-					return &cp, nil
+				cp.Percolate = nil
+				cp.Ids = &esast.IdsQuery{
+					Values: []string{"__no_match_unmapped__"},
+					Name:   perc.Name,
 				}
-				return nil, fmt.Errorf("field [%s] does not exist or is not of type [percolator]", field)
+				return &cp, nil
 			}
 		}
 		if perc.ID != "" && perc.Document == nil && len(perc.Documents) == 0 {

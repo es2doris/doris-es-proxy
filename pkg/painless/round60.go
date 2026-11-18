@@ -26,6 +26,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"math/big"
 	"net/netip"
 	"net/url"
 	"reflect"
@@ -341,6 +342,23 @@ func formatValueCycleWalkRound60(v any, seen map[cycleNodeKeyRound60]bool, javaM
 			return "null"
 		}
 		return tv.String()
+	case MonthEnum:
+		return tv.String()
+	case *MonthEnum:
+		if tv == nil {
+			return "null"
+		}
+		return tv.String()
+	case *GrokExtractor:
+		if tv == nil {
+			return "null"
+		}
+		return tv.String()
+	case *DissectExtractor:
+		if tv == nil {
+			return "null"
+		}
+		return tv.String()
 	case *GeoPointVal:
 		if tv == nil {
 			return "null"
@@ -628,6 +646,13 @@ func computeJavaHashCodeScalarRound60(v any) int64 {
 	case DayOfWeekEnum:
 		return tv.Value
 	case *DayOfWeekEnum:
+		if tv == nil {
+			return 0
+		}
+		return tv.Value
+	case MonthEnum:
+		return tv.Value
+	case *MonthEnum:
 		if tv == nil {
 			return 0
 		}
@@ -964,6 +989,11 @@ func CompileValidate(src string) error {
 
 	// Token-level structural & adjacencies validation
 	if err := validateTokenSequenceRound60(src, toks, userClasses); err != nil {
+		return err
+	}
+
+	// Validate built-in grok(...) / dissect(...) constant literal arguments and pattern syntax
+	if err := validateGrokAndDissectCallsRound62(src, toks, userFuncs); err != nil {
 		return err
 	}
 
@@ -1316,7 +1346,7 @@ func isKnownCompileTypeNameRound60(name string, userClasses map[string]bool) boo
 		"Function", "BiFunction", "IntFunction", "LongFunction", "DoubleFunction",
 		"UnaryOperator", "BinaryOperator", "Predicate", "BiPredicate",
 		"Consumer", "BiConsumer", "Runnable",
-		"Metadata", "UpdateMetadata", "GeoPoint", "GeoBoundingBox", "IPAddress", "DenseVector", "DenseVectorField", "BytesRef", "ByteBuffer", "DayOfWeekEnum",
+		"Metadata", "UpdateMetadata", "GeoPoint", "GeoBoundingBox", "IPAddress", "DenseVector", "DenseVectorField", "DenseVectorDocValue", "BytesRef", "ByteBuffer", "DayOfWeekEnum", "MonthEnum", "Grok", "Dissect",
 		"ZonedDateTime", "OffsetDateTime", "Instant", "LocalDate", "LocalTime", "LocalDateTime",
 		"OffsetTime", "Clock", "Duration", "Period", "Year", "YearMonth", "MonthDay",
 		"DayOfWeek", "Month", "DateTimeFormatter", "ChronoUnit", "ChronoField", "IsoFields", "TextStyle", "Locale",
@@ -1726,23 +1756,8 @@ func (d DayOfWeekEnum) MarshalJSON() ([]byte, error) {
 }
 
 // GetDisplayName models `java.time.DayOfWeek.getDisplayName(TextStyle, Locale)`.
-func (d DayOfWeekEnum) GetDisplayName(style, _ string) string {
-	idx := d.Value
-	if idx < 1 || idx > 7 {
-		idx = 1
-	}
-	st := strings.ToUpper(strings.TrimPrefix(strings.TrimSpace(style), "TextStyle."))
-	switch st {
-	case "SHORT", "SHORT_STANDALONE":
-		shortNames := [8]string{"", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"}
-		return shortNames[idx]
-	case "NARROW", "NARROW_STANDALONE":
-		narrowNames := [8]string{"", "M", "T", "W", "T", "F", "S", "S"}
-		return narrowNames[idx]
-	default:
-		fullNames := [8]string{"", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"}
-		return fullNames[idx]
-	}
+func (d DayOfWeekEnum) GetDisplayName(style, locale string) string {
+	return DayOfWeekDisplayName(d.Value, style, locale)
 }
 
 // InstantVal models `java.time.Instant` returned by `ZonedDateTimeVal.toInstant()`.
@@ -1933,6 +1948,18 @@ func (z *ZonedDateTimeVal) ToEpochMilli() int64 {
 func (z *ZonedDateTimeVal) String() string {
 	if z == nil {
 		return "null"
+	}
+	loc := z.Time.Location()
+	if loc != nil && loc != time.UTC {
+		_, off := z.Time.Zone()
+		zName := loc.String()
+		if off != 0 || (zName != "" && zName != "UTC" && zName != "Z") {
+			base := z.Time.Format(time.RFC3339Nano)
+			if zName != "" && zName != "UTC" && zName != "Z" && !strings.HasPrefix(zName, "+") && !strings.HasPrefix(zName, "-") && !strings.HasPrefix(zName, "FixedZone") {
+				return base + "[" + zName + "]"
+			}
+			return base
+		}
 	}
 	t := z.Time.UTC()
 	if z.IsNano && t.Nanosecond()%1_000_000 != 0 {
@@ -2516,7 +2543,58 @@ func normalizeSingleFieldDocValuesWithOptsRound61(raw any, fieldType string, kee
 	}
 
 	switch ft {
-	case "long", "integer", "int", "short", "byte", "unsigned_long":
+	case "unsigned_long":
+		uVals := make([]uint64, 0, len(items))
+		for _, it := range items {
+			switch uv := it.(type) {
+			case *painlessBigInteger:
+				if uv != nil && uv.val != nil && uv.val.Sign() >= 0 && uv.val.IsUint64() {
+					uVals = append(uVals, uv.val.Uint64())
+				}
+			case uint64:
+				uVals = append(uVals, uv)
+			case uint:
+				uVals = append(uVals, uint64(uv))
+			case uint32:
+				uVals = append(uVals, uint64(uv))
+			case int64:
+				if uv >= 0 {
+					uVals = append(uVals, uint64(uv)) // #nosec G115 -- guarded uv >= 0
+				}
+			case int:
+				if uv >= 0 {
+					uVals = append(uVals, uint64(uv)) // #nosec G115 -- guarded uv >= 0
+				}
+			case json.Number:
+				s := strings.TrimSpace(uv.String())
+				if parsedU, err := strconv.ParseUint(s, 10, 64); err == nil {
+					uVals = append(uVals, parsedU)
+				} else if fv, errF := strconv.ParseFloat(s, 64); errF == nil && fv >= 0 && fv <= float64(math.MaxUint64) {
+					uVals = append(uVals, uint64(fv))
+				}
+			case string:
+				s := strings.TrimSpace(uv)
+				if parsedU, err := strconv.ParseUint(s, 10, 64); err == nil {
+					uVals = append(uVals, parsedU)
+				} else if fv, errF := strconv.ParseFloat(s, 64); errF == nil && fv >= 0 && fv <= float64(math.MaxUint64) {
+					uVals = append(uVals, uint64(fv))
+				}
+			default:
+				if iv, ok := isIntegerValuePainless(it); ok && iv >= 0 {
+					uVals = append(uVals, uint64(iv)) // #nosec G115 -- guarded iv >= 0
+				} else if fv, ok := toFloat64(it); ok && fv >= 0 {
+					uVals = append(uVals, uint64(fv))
+				}
+			}
+		}
+		sort.Slice(uVals, func(i, j int) bool { return uVals[i] < uVals[j] })
+		out := make([]any, len(uVals))
+		for i, u := range uVals {
+			out[i] = newPainlessBigInteger(new(big.Int).SetUint64(u))
+		}
+		return out
+
+	case "long", "integer", "int", "short", "byte":
 		vals := make([]int64, 0, len(items))
 		for _, it := range items {
 			if iv, ok := isIntegerValuePainless(it); ok {
@@ -2727,7 +2805,7 @@ func inferImplicitDocValueWrapperRound60(fieldPath string, items []any) []any {
 	}
 	// If already wrapped, preserve as-is
 	switch items[0].(type) {
-	case *ZonedDateTimeVal, *GeoPointVal, *BytesRefVal, *ByteBufferVal:
+	case *ZonedDateTimeVal, *GeoPointVal, *BytesRefVal, *ByteBufferVal, *painlessBigInteger:
 		return items
 	}
 	cleanName := strings.ToLower(strings.ReplaceAll(fieldPath, "\x00", "."))
@@ -2949,6 +3027,9 @@ func resolveDocValuesSliceWithParamsRound60(sourceMap, params map[string]any, fi
 	if _, already := rawSlice[0].(*BytesRefVal); already {
 		return rawSlice, nil
 	}
+	if _, already := rawSlice[0].(*painlessBigInteger); already {
+		return rawSlice, nil
+	}
 	ftMap := extractFieldTypesFromMapsRound60(sourceMap, params)
 	if ft := lookupFieldTypeRound60(ftMap, fieldPath); ft != "" {
 		keepBoolDups := isKeepBooleanDupsEnabledRound61(sourceMap, params)
@@ -3110,14 +3191,14 @@ func (fv *FieldVal) IsEmpty() bool {
 
 func (fv *FieldVal) GetDefault(defaultVal any) any {
 	if fv == nil || len(fv.Values) == 0 {
-		return defaultVal
+		return coerceFieldValDefaultRound62(fv, defaultVal)
 	}
 	return fv.Values[0]
 }
 
 func (fv *FieldVal) GetAt(idx int, defaultVal any) any {
 	if fv == nil || idx < 0 || idx >= len(fv.Values) {
-		return defaultVal
+		return coerceFieldValDefaultRound62(fv, defaultVal)
 	}
 	return fv.Values[idx]
 }
@@ -3891,6 +3972,20 @@ func normalizeEmitContextNameRound60(ctxType string) string {
 }
 
 func coerceAndRecordEmitRound60(budget *evalBudget, rawArgs []any) (any, error) {
+	ctxKind := ""
+	if budget != nil {
+		ctxKind = normalizeEmitContextNameRound60(budget.emitContext)
+	}
+	if ctxKind == "composite" {
+		return handleCompositeEmitRound62(budget, rawArgs)
+	}
+	if ctxKind == "" && len(rawArgs) == 2 {
+		if _, isStr := rawArgs[0].(string); isStr {
+			if _, okNum := toFloat64WithRawPainless(rawArgs[0]); !okNum {
+				return handleCompositeEmitRound62(budget, rawArgs)
+			}
+		}
+	}
 	for _, a := range rawArgs {
 		if isEmptyOptionalOrNilPainless(a) {
 			return nil, &painlessExceptionError{
@@ -3898,10 +3993,6 @@ func coerceAndRecordEmitRound60(budget *evalBudget, rawArgs []any) (any, error) 
 				message: "Cannot emit null value",
 			}
 		}
-	}
-	ctxKind := ""
-	if budget != nil {
-		ctxKind = normalizeEmitContextNameRound60(budget.emitContext)
 	}
 	if len(rawArgs) == 2 {
 		lat, ok1 := toFloat64WithRawPainless(rawArgs[0])
@@ -4020,7 +4111,7 @@ func EvalEmitContext(src string, contextType string, doc map[string]any, source 
 	}
 	ctxKind := normalizeEmitContextNameRound60(contextType)
 	switch ctxKind {
-	case "boolean", "long", "double", "keyword", "date", "ip", "geo_point":
+	case "boolean", "long", "double", "keyword", "date", "ip", "geo_point", "composite":
 	default:
 		return nil, fmt.Errorf("illegal_argument_exception: unsupported emit field context [%s]", contextType)
 	}
@@ -5296,6 +5387,53 @@ func evalRound60StaticOrBuiltinCall(fnName string, args []string, argStr string,
 	case "metadata":
 		return getOrInitMetadataMapRound60(sourceMap, params), true, nil
 
+	case "grok", "dissect":
+		if len(args) != 1 || argStr == "" {
+			arity := len(args)
+			if argStr == "" {
+				arity = 0
+			}
+			return nil, true, &painlessExceptionError{
+				exType:  "IllegalArgumentException",
+				message: fmt.Sprintf("Unable to find dynamic method [%s] with [%d] arguments", fnName, arity),
+			}
+		}
+		toks, lErr := lexPainlessCompileRound60(args[0])
+		if lErr != nil {
+			return nil, true, lErr
+		}
+		constPat, isConst := evalCompileConstantStringTokensRound62(toks)
+		if !isConst {
+			return nil, true, &painlessExceptionError{
+				exType:  "IllegalArgumentException",
+				message: fmt.Sprintf("all arguments to [%s] must be constant but the [1] argument isn't", fnName),
+			}
+		}
+		if fnName == "grok" {
+			ext, err := CompileGrokPattern(constPat)
+			return ext, true, err
+		}
+		ext, err := CompileDissectPattern(constPat)
+		return ext, true, err
+
+	case "parse":
+		ev, err := evalAllArgs()
+		if err != nil {
+			return nil, true, err
+		}
+		res, pErr := evalBuiltinDateParseRound62(ev, sourceMap, params)
+		return res, true, pErr
+
+	case "Locale.forLanguageTag":
+		ev, err := evalAllArgs()
+		if err != nil {
+			return nil, true, err
+		}
+		if len(ev) != 1 || ev[0] == nil {
+			return nil, true, &painlessExceptionError{exType: "NullPointerException", message: "languageTag"}
+		}
+		return fmt.Sprintf("%v", ev[0]), true, nil
+
 	case "field":
 		ev, err := evalAllArgs()
 		if err != nil {
@@ -5521,51 +5659,7 @@ func evalRound60ZeroArgMethod(mSuffix string, recVal any, sourceMap, params map[
 	mBare := strings.TrimSuffix(strings.TrimPrefix(mSuffix, "."), "()")
 	switch tv := recVal.(type) {
 	case *ZonedDateTimeVal:
-		if tv == nil {
-			return nil, false, nil
-		}
-		switch mSuffix {
-		case ".getYear()":
-			return tv.GetYear(), true, nil
-		case ".getMonthValue()":
-			return tv.GetMonthValue(), true, nil
-		case ".getMonth()":
-			return strings.ToUpper(tv.Time.Month().String()), true, nil
-		case ".getDayOfMonth()":
-			return tv.GetDayOfMonth(), true, nil
-		case ".getDayOfYear()":
-			return tv.GetDayOfYear(), true, nil
-		case ".getDayOfWeek()":
-			return tv.GetDayOfWeek(), true, nil
-		case ".getDayOfWeekEnum()":
-			return tv.GetDayOfWeekEnum(), true, nil
-		case ".getHour()":
-			return tv.GetHour(), true, nil
-		case ".getMinute()":
-			return tv.GetMinute(), true, nil
-		case ".getSecond()":
-			return tv.GetSecond(), true, nil
-		case ".getNano()":
-			return tv.GetNano(), true, nil
-		case ".toInstant()":
-			return tv.ToInstant(), true, nil
-		case ".toEpochMilli()", ".getMillis()":
-			return tv.ToEpochMilli(), true, nil
-		case ".getEpochSecond()", ".toEpochSecond()":
-			return tv.Time.UTC().Unix(), true, nil
-		case ".toString()":
-			return tv.String(), true, nil
-		case ".toLocalDate()", ".toLocalDateTime()", ".toLocalTime()", ".toOffsetDateTime()", ".getZone()", ".getOffset()", ".hashCode()", ".getChronology()":
-			return nil, false, nil
-		default:
-			if err := checkDeprecatedJodaMethodRound61(mBare); err != nil {
-				return nil, true, err
-			}
-			return nil, true, &painlessExceptionError{
-				exType:  "IllegalArgumentException",
-				message: fmt.Sprintf("Unable to find dynamic method [%s] with [0] arguments for class [org.elasticsearch.script.JodaCompatibleZonedDateTime].", mBare),
-			}
-		}
+		return evalZonedDateTimeZeroArgRound62(tv, mSuffix)
 
 	case *InstantVal:
 		if tv == nil {
@@ -5597,6 +5691,70 @@ func evalRound60ZeroArgMethod(mSuffix string, recVal any, sourceMap, params map[
 				return tv.Value, true, nil
 			case ".name()", ".toString()":
 				return tv.String(), true, nil
+			}
+		}
+
+	case MonthEnum:
+		switch mSuffix {
+		case ".getValue()":
+			return tv.Value, true, nil
+		case ".name()", ".toString()":
+			return tv.String(), true, nil
+		case ".minLength()":
+			return tv.MinLength(), true, nil
+		case ".maxLength()":
+			return tv.MaxLength(), true, nil
+		case ".firstMonthOfQuarter()":
+			return tv.FirstMonthOfQuarter(), true, nil
+		}
+
+	case *MonthEnum:
+		if tv != nil {
+			switch mSuffix {
+			case ".getValue()":
+				return tv.Value, true, nil
+			case ".name()", ".toString()":
+				return tv.String(), true, nil
+			case ".minLength()":
+				return tv.MinLength(), true, nil
+			case ".maxLength()":
+				return tv.MaxLength(), true, nil
+			case ".firstMonthOfQuarter()":
+				return tv.FirstMonthOfQuarter(), true, nil
+			}
+		}
+
+	case *GrokExtractor:
+		if tv != nil && mSuffix == ".toString()" {
+			return tv.String(), true, nil
+		}
+
+	case *DissectExtractor:
+		if tv != nil && mSuffix == ".toString()" {
+			return tv.String(), true, nil
+		}
+
+	case string:
+		if dow, _, ok := parseDayOfWeekEnumReceiverRound62(tv); ok {
+			switch mSuffix {
+			case ".getValue()":
+				return dow.Value, true, nil
+			case ".name()":
+				return dow.String(), true, nil
+			}
+		}
+		if mon, _, ok := parseMonthEnumReceiverRound62(tv); ok {
+			switch mSuffix {
+			case ".getValue()":
+				return mon.Value, true, nil
+			case ".name()":
+				return mon.String(), true, nil
+			case ".minLength()":
+				return mon.MinLength(), true, nil
+			case ".maxLength()":
+				return mon.MaxLength(), true, nil
+			case ".firstMonthOfQuarter()":
+				return mon.FirstMonthOfQuarter(), true, nil
 			}
 		}
 
@@ -5883,67 +6041,18 @@ func evalRound60ReceiverMethod(recVal any, mBare, argStr string, sourceMap, para
 
 	switch tv := recVal.(type) {
 	case *ZonedDateTimeVal:
-		if tv == nil {
-			return nil, false, nil
-		}
-		if len(rawArgExprs) == 0 {
-			return evalRound60ZeroArgMethod("."+mBare+"()", tv, sourceMap, params, depth)
-		}
-		switch mBare {
-		case "get", "getLong", "isSupported", "isAfter", "isBefore", "isEqual", "equals", "compareTo",
-			"plus", "plusYears", "plusMonths", "plusWeeks", "plusDays", "plusHours", "plusMinutes", "plusSeconds", "plusNanos",
-			"minus", "minusYears", "minusMonths", "minusWeeks", "minusDays", "minusHours", "minusMinutes", "minusSeconds", "minusNanos",
-			"with", "withYear", "withMonth", "withDayOfMonth", "withDayOfYear", "withHour", "withMinute", "withSecond", "withNano",
-			"withZoneSameInstant", "withZoneSameLocal", "truncatedTo", "until", "format":
-			return nil, false, nil
-		default:
-			if err := checkDeprecatedJodaMethodRound61(mBare); err != nil {
-				return nil, true, err
-			}
-			return nil, true, &painlessExceptionError{
-				exType:  "IllegalArgumentException",
-				message: fmt.Sprintf("Unable to find dynamic method [%s] with [%d] arguments for class [org.elasticsearch.script.JodaCompatibleZonedDateTime].", mBare, len(rawArgExprs)),
-			}
-		}
+		return evalZonedDateTimeMethodRound62(tv, mBare, rawArgExprs, evalCallArgs, sourceMap, params, depth)
 
 	case *GeoBoundingBoxVal:
 		if len(rawArgExprs) == 0 {
 			return evalGeoBoundingBoxMethodRound61(tv, mBare)
 		}
 
-	case DayOfWeekEnum:
-		if mBare == "getDisplayName" {
-			args, err := evalCallArgs()
-			if err != nil {
-				return nil, true, err
-			}
-			style := "FULL"
-			loc := "ENGLISH"
-			if len(args) >= 1 && args[0] != nil {
-				style = fmt.Sprintf("%v", args[0])
-			}
-			if len(args) >= 2 && args[1] != nil {
-				loc = fmt.Sprintf("%v", args[1])
-			}
-			return tv.GetDisplayName(style, loc), true, nil
-		}
+	case *GrokExtractor, *DissectExtractor:
+		return evalGrokOrDissectMethodRound62(recVal, mBare, evalCallArgs)
 
-	case *DayOfWeekEnum:
-		if tv != nil && mBare == "getDisplayName" {
-			args, err := evalCallArgs()
-			if err != nil {
-				return nil, true, err
-			}
-			style := "FULL"
-			loc := "ENGLISH"
-			if len(args) >= 1 && args[0] != nil {
-				style = fmt.Sprintf("%v", args[0])
-			}
-			if len(args) >= 2 && args[1] != nil {
-				loc = fmt.Sprintf("%v", args[1])
-			}
-			return tv.GetDisplayName(style, loc), true, nil
-		}
+	case DayOfWeekEnum, *DayOfWeekEnum, MonthEnum, *MonthEnum:
+		return evalEnumReceiverMethodRound62(recVal, mBare, evalCallArgs)
 
 	case *IPAddressVal:
 		return evalIPAddressMethodRound61(tv, mBare, rawArgExprs, sourceMap, params, depth)
@@ -6119,6 +6228,9 @@ func evalRound60ReceiverMethod(recVal any, mBare, argStr string, sourceMap, para
 			}
 		}
 	}
+	if res, handled, err := evalEnumReceiverMethodRound62(recVal, mBare, evalCallArgs); handled {
+		return res, true, err
+	}
 	return nil, false, nil
 }
 
@@ -6188,6 +6300,46 @@ func evalFieldValMethodRound60(fv *FieldVal, mBare, argStr string, evalCallArgs 
 		}
 		idx, _ := toInt64Painless(args[0])
 		return fv.GetAt(int(idx), args[1]), true, nil
+
+	case "getValue":
+		args, err := evalCallArgs()
+		if err != nil {
+			return nil, true, err
+		}
+		unwrapLongVal := func(v any) any {
+			if bi, ok := v.(*painlessBigInteger); ok && bi != nil {
+				return bi.longValue()
+			}
+			return v
+		}
+		if len(args) == 2 {
+			idx, _ := toInt64Painless(args[0])
+			if idx < 0 || int(idx) >= len(fv.Values) {
+				return args[1], true, nil
+			}
+			return unwrapLongVal(fv.Values[int(idx)]), true, nil
+		}
+		if len(fv.Values) == 0 {
+			if len(args) >= 1 {
+				return args[0], true, nil
+			}
+			return nil, true, nil
+		}
+		return unwrapLongVal(fv.Values[0]), true, nil
+
+	case "getValues":
+		if _, err := evalCallArgs(); err != nil {
+			return nil, true, err
+		}
+		outVals := make([]any, len(fv.Values))
+		for i, v := range fv.Values {
+			if bi, ok := v.(*painlessBigInteger); ok && bi != nil {
+				outVals[i] = bi.longValue()
+			} else {
+				outVals[i] = v
+			}
+		}
+		return outVals, true, nil
 
 	case "asDouble":
 		args, err := evalCallArgs()
@@ -6542,10 +6694,24 @@ func resolveWrapperPropertyRound60(curr any, seg string) (any, bool) {
 		if tv == nil {
 			return nil, false
 		}
+		if tv.isMissingVectorRound62() {
+			switch seg {
+			case "empty":
+				return true, true
+			case "dims", "length", "magnitude", "vector", "vectorValue":
+				panic(newMissingDenseVectorDocValueErrorRound62())
+			}
+			return nil, false
+		}
 		if idx, ok := parseSliceIndex(seg, len(tv.Floats)); ok {
+			if (tv.ElemType == "byte" || tv.ElemType == "bit") && len(tv.Bytes) == len(tv.Floats) {
+				return int64(tv.Bytes[idx]), true
+			}
 			return tv.Floats[idx], true
 		}
 		switch seg {
+		case "vector", "vectorValue":
+			return tv.vectorElementsSliceRound62(nil), true
 		case "dims", "length":
 			return int64(len(tv.Floats)), true
 		case "empty":
@@ -6568,8 +6734,8 @@ func resolveWrapperPropertyRound60(curr any, seg string) (any, bool) {
 			return tv.GetYear(), true
 		case "monthValue", "monthOfYear":
 			return tv.GetMonthValue(), true
-		case "month":
-			return strings.ToUpper(tv.Time.Month().String()), true
+		case "month", "monthEnum":
+			return newMonthEnumRound62(tv.Time.Month()), true
 		case "dayOfMonth", "date":
 			return tv.GetDayOfMonth(), true
 		case "dayOfYear":
@@ -6588,12 +6754,24 @@ func resolveWrapperPropertyRound60(curr any, seg string) (any, bool) {
 			return tv.GetNano(), true
 		case "millis":
 			return tv.ToEpochMilli(), true
+		case "zone":
+			return formatZonedDateTimeZoneIDRound62(tv.Time), true
+		case "offset":
+			return formatZonedDateTimeOffsetRound62(tv.Time), true
 		}
 	case DayOfWeekEnum:
 		if seg == "value" {
 			return tv.Value, true
 		}
 	case *DayOfWeekEnum:
+		if tv != nil && seg == "value" {
+			return tv.Value, true
+		}
+	case MonthEnum:
+		if seg == "value" {
+			return tv.Value, true
+		}
+	case *MonthEnum:
 		if tv != nil && seg == "value" {
 			return tv.Value, true
 		}
@@ -6780,6 +6958,21 @@ func round60WrapperEquals(a, b any) (bool, bool) {
 			return b == nil, true
 		}
 		return round60WrapperEquals(*ta, b)
+	case MonthEnum:
+		switch tb := b.(type) {
+		case MonthEnum:
+			return ta.Value == tb.Value, true
+		case *MonthEnum:
+			return tb != nil && ta.Value == tb.Value, true
+		case string:
+			return ta.String() == strings.ToUpper(strings.TrimSpace(tb)), true
+		}
+		return false, true
+	case *MonthEnum:
+		if ta == nil {
+			return b == nil, true
+		}
+		return round60WrapperEquals(*ta, b)
 	case *ZonedDateTimeVal:
 		if ta == nil {
 			return b == nil, true
@@ -6866,7 +7059,7 @@ func round60WrapperEquals(a, b any) (bool, bool) {
 
 	// Symmetric cases where `b` is the Round-60/61 wrapper and `a` is string/time.Time/[]any
 	switch b.(type) {
-	case *IPAddressVal, *GeoBoundingBoxVal, *DenseVectorVal, DayOfWeekEnum, *DayOfWeekEnum, *ZonedDateTimeVal, *InstantVal, *GeoPointVal, *BytesRefVal, *ByteBufferVal, []float64:
+	case *IPAddressVal, *GeoBoundingBoxVal, *DenseVectorVal, DayOfWeekEnum, *DayOfWeekEnum, MonthEnum, *MonthEnum, *ZonedDateTimeVal, *InstantVal, *GeoPointVal, *BytesRefVal, *ByteBufferVal, []float64:
 		return round60WrapperEquals(b, a)
 	}
 	return false, false

@@ -46,8 +46,9 @@ type StreamLoadConfig struct {
 // StreamLoadClient streams NDJSON document batches into Apache Doris Unique Key Merge-on-Write
 // tables while preserving Basic Auth headers across FE :8030 -> BE :8040 HTTP 307 redirects.
 type StreamLoadClient struct {
-	cfg        StreamLoadConfig
-	httpClient *http.Client
+	cfg          StreamLoadConfig
+	httpClient   *http.Client
+	cachedBEBase atomic.Value // string base URL (e.g. "http://127.0.0.1:8040") discovered from FE 307 redirect
 }
 
 func NewStreamLoadClient(cfg StreamLoadConfig) *StreamLoadClient {
@@ -64,7 +65,7 @@ func NewStreamLoadClient(cfg StreamLoadConfig) *StreamLoadClient {
 		MaxIdleConnsPerHost:   64,
 		MaxConnsPerHost:       128,
 		IdleConnTimeout:       90 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
+		ExpectContinueTimeout: 50 * time.Millisecond,
 	}
 	client := &http.Client{
 		Timeout:   cfg.Timeout,
@@ -157,12 +158,7 @@ func (c *StreamLoadClient) loadSingleNDJSONBatch(
 	}
 	safeDB := url.PathEscape(schema.SanitizeDorisIdentifier(c.cfg.Database))
 	safeTable := url.PathEscape(schema.SanitizeDorisIdentifier(table))
-	endpoint := fmt.Sprintf(
-		"%s/api/%s/%s/_stream_load",
-		strings.TrimRight(c.cfg.FEHTTPEndpoint, "/"),
-		safeDB,
-		safeTable,
-	)
+	feBase := strings.TrimRight(c.cfg.FEHTTPEndpoint, "/")
 
 	const maxAttempts = 3
 	backoff := 25 * time.Millisecond
@@ -178,6 +174,16 @@ func (c *StreamLoadClient) loadSingleNDJSONBatch(
 				backoff *= 2
 			}
 		}
+
+		targetBase := feBase
+		usedCachedBE := false
+		if attempt == 1 {
+			if cached, ok := c.cachedBEBase.Load().(string); ok && cached != "" {
+				targetBase = cached
+				usedCachedBE = true
+			}
+		}
+		endpoint := fmt.Sprintf("%s/api/%s/%s/_stream_load", targetBase, safeDB, safeTable)
 
 		// #nosec G704 -- endpoint is constructed from operator-configured FEHTTPEndpoint and sanitized Doris identifiers
 		req, err := http.NewRequestWithContext(ctx, http.MethodPut, endpoint, bytes.NewReader(ndjsonPayload))
@@ -196,6 +202,9 @@ func (c *StreamLoadClient) loadSingleNDJSONBatch(
 		// #nosec G704 -- operator-configured Doris FE/BE Stream Load HTTP request
 		resp, err := c.httpClient.Do(req)
 		if err != nil {
+			if usedCachedBE {
+				c.cachedBEBase.Store("")
+			}
 			lastErr = fmt.Errorf("doris stream load HTTP error: %w", err)
 			if ctx.Err() != nil {
 				return lastErr
@@ -206,6 +215,9 @@ func (c *StreamLoadClient) loadSingleNDJSONBatch(
 		bodyBytes, readErr := io.ReadAll(io.LimitReader(resp.Body, 16*1024*1024))
 		_ = resp.Body.Close()
 		if readErr != nil {
+			if usedCachedBE {
+				c.cachedBEBase.Store("")
+			}
 			lastErr = fmt.Errorf("reading stream load response: %w", readErr)
 			continue
 		}
@@ -214,6 +226,9 @@ func (c *StreamLoadClient) loadSingleNDJSONBatch(
 			resp.StatusCode == http.StatusBadGateway ||
 			resp.StatusCode == http.StatusServiceUnavailable ||
 			resp.StatusCode == http.StatusGatewayTimeout {
+			if usedCachedBE {
+				c.cachedBEBase.Store("")
+			}
 			lastErr = fmt.Errorf("transient stream load HTTP %d: %s", resp.StatusCode, string(bodyBytes))
 			continue
 		}
@@ -241,6 +256,15 @@ func (c *StreamLoadClient) loadSingleNDJSONBatch(
 			detail := c.fetchErrorURLDetail(ctx, slResp.ErrorURL)
 			return fmt.Errorf("doris stream load filtered %d/%d rows: %s (error_url=%s detail=%s)",
 				slResp.NumberFilteredRows, slResp.NumberTotalRows, slResp.Message, slResp.ErrorURL, detail)
+		}
+		if resp.Request != nil && resp.Request.URL != nil &&
+			(resp.Request.URL.Scheme == "http" || resp.Request.URL.Scheme == "https") &&
+			resp.Request.URL.Host != "" &&
+			strings.HasSuffix(resp.Request.URL.Path, "/_stream_load") {
+			resolvedBase := resp.Request.URL.Scheme + "://" + resp.Request.URL.Host
+			if resolvedBase != feBase {
+				c.cachedBEBase.Store(resolvedBase)
+			}
 		}
 		return nil
 	}

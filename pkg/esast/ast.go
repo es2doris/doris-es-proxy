@@ -875,9 +875,6 @@ func (r *SearchRequest) UnmarshalJSON(data []byte) error {
 			return fmt.Errorf("parsing_exception: [sub_searches] must contain at least 1 sub-search")
 		}
 	}
-	if r.Rank != nil && r.Rank.RRF != nil && r.Rank.RRF.WindowSize != nil && r.Size != nil && *r.Rank.RRF.WindowSize < *r.Size {
-		return fmt.Errorf("illegal_argument_exception: [window_size] [%d] must be greater than or equal to [size] [%d]", *r.Rank.RRF.WindowSize, *r.Size)
-	}
 	if hasRetriever {
 		retTrim := bytes.TrimSpace(rawRetriever)
 		if len(retTrim) == 0 || bytes.Equal(retTrim, []byte("null")) {
@@ -889,6 +886,15 @@ func (r *SearchRequest) UnmarshalJSON(data []byte) error {
 		}
 		r.Retriever = &ret
 		LowerRetrieverToSearchRequest(r)
+	}
+	if r.Rank != nil && r.Rank.RRF != nil && r.Rank.RRF.WindowSize != nil {
+		effSize := 10
+		if r.Size != nil {
+			effSize = *r.Size
+		}
+		if *r.Rank.RRF.WindowSize < effSize {
+			return fmt.Errorf("illegal_argument_exception: [rank] requires [rank_window_size: %d] be greater than or equal to [size: %d]", *r.Rank.RRF.WindowSize, effSize)
+		}
 	}
 	if hasPointInTime {
 		ptTrim := bytes.TrimSpace(rawPointInTime)
@@ -1245,10 +1251,15 @@ func (ts *TermSuggestSpec) UnmarshalJSON(data []byte) error {
 
 // PhraseSuggestSpec models a `phrase` suggester configuration.
 type PhraseSuggestSpec struct {
-	Field     string               `json:"field"`
-	Size      int                  `json:"size,omitempty"`
-	MaxErrors float64              `json:"max_errors,omitempty"`
-	Highlight *PhraseHighlightSpec `json:"highlight,omitempty"`
+	Field           string               `json:"field"`
+	Analyzer        string               `json:"analyzer,omitempty"`
+	Size            int                  `json:"size,omitempty"`
+	GramSize        *int                 `json:"gram_size,omitempty"`
+	MaxErrors       float64              `json:"max_errors,omitempty"`
+	Confidence      *float64             `json:"confidence,omitempty"`
+	ForceUnigrams   *bool                `json:"force_unigrams,omitempty"`
+	DirectGenerator []map[string]any     `json:"direct_generator,omitempty"`
+	Highlight       *PhraseHighlightSpec `json:"highlight,omitempty"`
 }
 
 func (ps *PhraseSuggestSpec) UnmarshalJSON(data []byte) error {
@@ -1264,7 +1275,7 @@ func (ps *PhraseSuggestSpec) UnmarshalJSON(data []byte) error {
 		switch k {
 		case "field", "size", "real_word_error_likelihood", "confidence", "max_errors",
 			"separator", "gram_size", "analyzer", "shard_size", "text", "prefix",
-			"highlight", "direct_generator", "collate", "smoothing", "token_limit":
+			"highlight", "direct_generator", "collate", "smoothing", "token_limit", "force_unigrams":
 		default:
 			return fmt.Errorf("parsing_exception: [phrase] unknown field [%s]", k)
 		}
@@ -1290,8 +1301,11 @@ func (ps *PhraseSuggestSpec) UnmarshalJSON(data []byte) error {
 		}
 		p.Size = *raw.Size
 	}
-	if raw.GramSize != nil && *raw.GramSize <= 0 {
-		return fmt.Errorf("illegal_argument_exception: [phrase] [gram_size] must be > 0")
+	if raw.GramSize != nil {
+		if *raw.GramSize <= 0 {
+			return fmt.Errorf("illegal_argument_exception: [phrase] [gram_size] must be > 0")
+		}
+		p.GramSize = raw.GramSize
 	}
 	if raw.MaxErrors != nil {
 		if *raw.MaxErrors < 0 {
@@ -1299,8 +1313,11 @@ func (ps *PhraseSuggestSpec) UnmarshalJSON(data []byte) error {
 		}
 		p.MaxErrors = *raw.MaxErrors
 	}
-	if raw.Confidence != nil && *raw.Confidence < 0 {
-		return fmt.Errorf("illegal_argument_exception: [phrase] [confidence] must be >= 0")
+	if raw.Confidence != nil {
+		if *raw.Confidence < 0 {
+			return fmt.Errorf("illegal_argument_exception: [phrase] [confidence] must be >= 0")
+		}
+		p.Confidence = raw.Confidence
 	}
 	*ps = PhraseSuggestSpec(p)
 	return nil
@@ -2112,18 +2129,22 @@ func (s *SliceSpec) UnmarshalJSON(data []byte) error {
 }
 
 type InnerHitsSpec struct {
-	Name           string             `json:"name,omitempty"`
-	From           int                `json:"from,omitempty"`
-	Size           *int               `json:"size,omitempty"`
-	Sort           SortSlice          `json:"sort,omitempty"`
-	TrackScores    *bool              `json:"track_scores,omitempty"`
-	Source         *SourceFilter      `json:"_source,omitempty"`
-	StoredFields   any                `json:"stored_fields,omitempty"`
-	Fields         []FieldRequestSpec `json:"fields,omitempty"`
-	DocvalueFields []FieldRequestSpec `json:"docvalue_fields,omitempty"`
-	ScriptFields   map[string]any     `json:"script_fields,omitempty"`
-	Highlight      *HighlightSpec     `json:"highlight,omitempty"`
-	Collapse       *CollapseSpec      `json:"collapse,omitempty"`
+	Name             string             `json:"name,omitempty"`
+	From             int                `json:"from,omitempty"`
+	Size             *int               `json:"size,omitempty"`
+	Sort             SortSlice          `json:"sort,omitempty"`
+	TrackScores      *bool              `json:"track_scores,omitempty"`
+	Version          bool               `json:"version,omitempty"`
+	SeqNoPrimaryTerm bool               `json:"seq_no_primary_term,omitempty"`
+	Explain          bool               `json:"explain,omitempty"`
+	IgnoreUnmapped   bool               `json:"ignore_unmapped,omitempty"`
+	Source           *SourceFilter      `json:"_source,omitempty"`
+	StoredFields     any                `json:"stored_fields,omitempty"`
+	Fields           []FieldRequestSpec `json:"fields,omitempty"`
+	DocvalueFields   []FieldRequestSpec `json:"docvalue_fields,omitempty"`
+	ScriptFields     map[string]any     `json:"script_fields,omitempty"`
+	Highlight        *HighlightSpec     `json:"highlight,omitempty"`
+	Collapse         *CollapseSpec      `json:"collapse,omitempty"`
 }
 
 func (ih *InnerHitsSpec) UnmarshalJSON(data []byte) error {
@@ -2145,9 +2166,44 @@ func (ih *InnerHitsSpec) UnmarshalJSON(data []byte) error {
 		}
 	}
 	type plain InnerHitsSpec
-	var p plain
-	if err := json.Unmarshal(trimmed, &p); err != nil {
+	var raw struct {
+		plain
+		Version          any `json:"version"`
+		SeqNoPrimaryTerm any `json:"seq_no_primary_term"`
+		Explain          any `json:"explain"`
+		IgnoreUnmapped   any `json:"ignore_unmapped"`
+	}
+	if err := json.Unmarshal(trimmed, &raw); err != nil {
 		return err
+	}
+	p := raw.plain
+	if raw.Version != nil {
+		v, err := parseFlexibleBool(raw.Version)
+		if err != nil {
+			return fmt.Errorf("parsing_exception: [inner_hits.version] %w", err)
+		}
+		p.Version = v
+	}
+	if raw.SeqNoPrimaryTerm != nil {
+		sn, err := parseFlexibleBool(raw.SeqNoPrimaryTerm)
+		if err != nil {
+			return fmt.Errorf("parsing_exception: [inner_hits.seq_no_primary_term] %w", err)
+		}
+		p.SeqNoPrimaryTerm = sn
+	}
+	if raw.Explain != nil {
+		ex, err := parseFlexibleBool(raw.Explain)
+		if err != nil {
+			return fmt.Errorf("parsing_exception: [inner_hits.explain] %w", err)
+		}
+		p.Explain = ex
+	}
+	if raw.IgnoreUnmapped != nil {
+		iu, err := parseFlexibleBool(raw.IgnoreUnmapped)
+		if err != nil {
+			return fmt.Errorf("parsing_exception: [inner_hits.ignore_unmapped] %w", err)
+		}
+		p.IgnoreUnmapped = iu
 	}
 	if p.From < 0 {
 		return fmt.Errorf("parsing_exception: [inner_hits] [from] must be >= 0")
@@ -6676,6 +6732,7 @@ type TermsLookupSpec struct {
 	Index   string `json:"index"`
 	ID      string `json:"id"`
 	Path    string `json:"path"`
+	Type    string `json:"type,omitempty"`
 	Routing string `json:"routing,omitempty"`
 	Store   *bool  `json:"store,omitempty"`
 }
@@ -6691,7 +6748,7 @@ func (tls *TermsLookupSpec) UnmarshalJSON(data []byte) error {
 	}
 	for k := range rawMap {
 		switch k {
-		case "index", "id", "path", "routing", "store":
+		case "index", "id", "path", "type", "routing", "store":
 		default:
 			return fmt.Errorf("parsing_exception: [terms] lookup unknown field [%s]", k)
 		}
@@ -6700,6 +6757,7 @@ func (tls *TermsLookupSpec) UnmarshalJSON(data []byte) error {
 		Index   string `json:"index"`
 		ID      any    `json:"id"`
 		Path    string `json:"path"`
+		Type    string `json:"type"`
 		Routing string `json:"routing"`
 		Store   any    `json:"store"`
 	}
@@ -6726,6 +6784,7 @@ func (tls *TermsLookupSpec) UnmarshalJSON(data []byte) error {
 	tls.Index = raw.Index
 	tls.ID = idStr
 	tls.Path = raw.Path
+	tls.Type = raw.Type
 	tls.Routing = raw.Routing
 	if raw.Store != nil {
 		b, err := parseFlexibleBool(raw.Store)
@@ -9605,6 +9664,10 @@ var knownAggTypeKeys = map[string]bool{
 	"cartesian_centroid":        true,
 	"geo_line":                  true,
 	"random_sampler":            true,
+	"ip_prefix":                 true,
+	"time_series":               true,
+	"children":                  true,
+	"parent":                    true,
 }
 
 // AggSpec represents an Elasticsearch aggregation definition.
@@ -9680,6 +9743,10 @@ type AggSpec struct {
 	BucketSelector          *BucketSelectorAggSpec         `json:"bucket_selector,omitempty"`
 	BucketScript            *BucketSelectorAggSpec         `json:"bucket_script,omitempty"`
 	ScriptedMetric          *ScriptedMetricAggSpec         `json:"scripted_metric,omitempty"`
+	IPPrefix                *IPPrefixAggSpec               `json:"ip_prefix,omitempty"`
+	TimeSeries              *TimeSeriesAggSpec             `json:"time_series,omitempty"`
+	Children                *ChildrenAggSpec               `json:"children,omitempty"`
+	Parent                  *ParentAggSpec                 `json:"parent,omitempty"`
 	Meta                    map[string]any                 `json:"meta,omitempty"`
 	Aggs                    map[string]AggSpec             `json:"aggs,omitempty"`
 	Aggregations            map[string]AggSpec             `json:"aggregations,omitempty"`
@@ -9939,7 +10006,10 @@ func (rs *RandomSamplerAggSpec) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(trimmed, &p); err != nil {
 		return err
 	}
-	if p.Probability == nil || *p.Probability <= 0 || *p.Probability >= 1 || math.IsNaN(*p.Probability) || math.IsInf(*p.Probability, 0) {
+	if _, hasProb := rawMap["probability"]; !hasProb {
+		defProb := 0.1
+		p.Probability = &defProb
+	} else if p.Probability == nil || *p.Probability <= 0 || *p.Probability >= 1 || math.IsNaN(*p.Probability) || math.IsInf(*p.Probability, 0) {
 		return fmt.Errorf("illegal_argument_exception: [random_sampler] [probability] must be in (0, 1)")
 	}
 	*rs = RandomSamplerAggSpec(p)
@@ -10804,11 +10874,8 @@ func (a *AggSpec) UnmarshalJSON(data []byte) error {
 	if typeCount > 1 {
 		return fmt.Errorf("parsing_exception: aggregation definition cannot specify multiple aggregation types")
 	}
-	if rawMeta, hasMeta := rawMap["meta"]; hasMeta {
-		mTrim := bytes.TrimSpace(rawMeta)
-		if len(mTrim) > 0 && !bytes.Equal(mTrim, []byte("null")) && mTrim[0] != '{' {
-			return fmt.Errorf("parsing_exception: [meta] must be an object")
-		}
+	if err := validateInnerAggMeta(rawMap); err != nil {
+		return err
 	}
 	if rawFilter, hasFilter := rawMap["filter"]; hasFilter {
 		if isEmptyOrNullJSONQueryObject(rawFilter) {
@@ -10893,6 +10960,17 @@ func (a *AggSpec) UnmarshalJSON(data []byte) error {
 		if *p.ExtendedStatsBucket.Sigma < 0 || math.IsNaN(*p.ExtendedStatsBucket.Sigma) || math.IsInf(*p.ExtendedStatsBucket.Sigma, 0) {
 			return fmt.Errorf("parsing_exception: [extended_stats_bucket] [sigma] must be >= 0")
 		}
+	}
+	if p.Cardinality != nil && strings.TrimSpace(p.Cardinality.ExecutionHint) != "" {
+		switch strings.ToLower(strings.TrimSpace(p.Cardinality.ExecutionHint)) {
+		case "direct", "global_ordinals", "segment_ordinals", "save_memory_heuristic", "save_time_heuristic",
+			"global_ordinals_hash", "global_ordinals_low_cardinality", "ordinals", "bytes_hash", "map", "default", "high_accuracy":
+		default:
+			return fmt.Errorf("illegal_argument_exception: Invalid execution mode for cardinality aggregation: [%s]", p.Cardinality.ExecutionHint)
+		}
+	}
+	if _, hasMeta := rawMap["meta"]; hasMeta && p.Meta == nil {
+		p.Meta = map[string]any{}
 	}
 	*a = AggSpec(p)
 	return nil
@@ -11660,22 +11738,23 @@ func (p *PercentilesBucketAggSpec) UnmarshalJSON(data []byte) error {
 		}
 	}
 	type plain PercentilesBucketAggSpec
-	var pl plain
-	if err := json.Unmarshal(trimmed, &pl); err != nil {
+	var raw struct {
+		plain
+		Percents json.RawMessage `json:"percents"`
+	}
+	if err := json.Unmarshal(trimmed, &raw); err != nil {
 		return err
 	}
+	pl := raw.plain
 	if err := validateSingleOrMultiBucketsPath(pl.BucketsPath, "percentiles_bucket"); err != nil {
 		return err
 	}
-	if _, hasPercents := rawMap["percents"]; hasPercents {
-		if len(pl.Percents) == 0 {
-			return fmt.Errorf("parsing_exception: [percentiles_bucket] [percents] cannot be empty")
+	if rawPct, hasPercents := rawMap["percents"]; hasPercents {
+		pcts, err := parseFlexiblePercentsSlice(rawPct, "percentiles_bucket")
+		if err != nil {
+			return err
 		}
-		for _, pct := range pl.Percents {
-			if pct < 0 || pct > 100 || math.IsNaN(pct) || math.IsInf(pct, 0) {
-				return fmt.Errorf("illegal_argument_exception: [percentiles_bucket] [percents] values must be between 0.0 and 100.0")
-			}
-		}
+		pl.Percents = pcts
 	}
 	if err := validateGapPolicy(pl.GapPolicy, "percentiles_bucket"); err != nil {
 		return err
@@ -12220,10 +12299,14 @@ func (p *PercentilesAggSpec) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	type plain PercentilesAggSpec
-	var pl plain
-	if err := json.Unmarshal(trimmed, &pl); err != nil {
+	var raw struct {
+		plain
+		Percents json.RawMessage `json:"percents"`
+	}
+	if err := json.Unmarshal(trimmed, &raw); err != nil {
 		return err
 	}
+	pl := raw.plain
 	if strings.TrimSpace(pl.Field) == "" && pl.Script == nil {
 		return fmt.Errorf("parsing_exception: [percentiles] requires either [field] or [script]")
 	}
@@ -12232,15 +12315,12 @@ func (p *PercentilesAggSpec) UnmarshalJSON(data []byte) error {
 			return err
 		}
 	}
-	if _, hasPercents := rawMap["percents"]; hasPercents {
-		if len(pl.Percents) == 0 {
-			return fmt.Errorf("parsing_exception: [percentiles] [percents] cannot be empty")
+	if rawPct, hasPercents := rawMap["percents"]; hasPercents {
+		pcts, err := parseFlexiblePercentsSlice(rawPct, "percentiles")
+		if err != nil {
+			return err
 		}
-		for _, pct := range pl.Percents {
-			if pct < 0 || pct > 100 || math.IsNaN(pct) || math.IsInf(pct, 0) {
-				return fmt.Errorf("illegal_argument_exception: [percentiles] [percents] values must be between 0.0 and 100.0")
-			}
-		}
+		pl.Percents = pcts
 	}
 	*p = PercentilesAggSpec(pl)
 	return nil
@@ -12254,16 +12334,19 @@ func (p *PercentilesAggSpec) EffectivePercents() []float64 {
 }
 
 type TopHitsAggSpec struct {
-	From           int                `json:"from,omitempty"`
-	Size           *int               `json:"size,omitempty"`
-	Sort           SortSlice          `json:"sort,omitempty"`
-	TrackScores    *bool              `json:"track_scores,omitempty"`
-	Source         *SourceFilter      `json:"_source,omitempty"`
-	StoredFields   any                `json:"stored_fields,omitempty"`
-	Fields         []FieldRequestSpec `json:"fields,omitempty"`
-	DocvalueFields []FieldRequestSpec `json:"docvalue_fields,omitempty"`
-	ScriptFields   map[string]any     `json:"script_fields,omitempty"`
-	Highlight      *HighlightSpec     `json:"highlight,omitempty"`
+	From             int                `json:"from,omitempty"`
+	Size             *int               `json:"size,omitempty"`
+	Sort             SortSlice          `json:"sort,omitempty"`
+	TrackScores      *bool              `json:"track_scores,omitempty"`
+	Version          bool               `json:"version,omitempty"`
+	SeqNoPrimaryTerm bool               `json:"seq_no_primary_term,omitempty"`
+	Explain          bool               `json:"explain,omitempty"`
+	Source           *SourceFilter      `json:"_source,omitempty"`
+	StoredFields     any                `json:"stored_fields,omitempty"`
+	Fields           []FieldRequestSpec `json:"fields,omitempty"`
+	DocvalueFields   []FieldRequestSpec `json:"docvalue_fields,omitempty"`
+	ScriptFields     map[string]any     `json:"script_fields,omitempty"`
+	Highlight        *HighlightSpec     `json:"highlight,omitempty"`
 }
 
 func (th *TopHitsAggSpec) UnmarshalJSON(data []byte) error {
@@ -12287,12 +12370,36 @@ func (th *TopHitsAggSpec) UnmarshalJSON(data []byte) error {
 	type plain TopHitsAggSpec
 	var raw struct {
 		plain
-		From *int `json:"from"`
+		From             *int `json:"from"`
+		Version          any  `json:"version"`
+		SeqNoPrimaryTerm any  `json:"seq_no_primary_term"`
+		Explain          any  `json:"explain"`
 	}
 	if err := json.Unmarshal(trimmed, &raw); err != nil {
 		return err
 	}
 	p := raw.plain
+	if raw.Version != nil {
+		v, err := parseFlexibleBool(raw.Version)
+		if err != nil {
+			return fmt.Errorf("parsing_exception: [top_hits.version] %w", err)
+		}
+		p.Version = v
+	}
+	if raw.SeqNoPrimaryTerm != nil {
+		sn, err := parseFlexibleBool(raw.SeqNoPrimaryTerm)
+		if err != nil {
+			return fmt.Errorf("parsing_exception: [top_hits.seq_no_primary_term] %w", err)
+		}
+		p.SeqNoPrimaryTerm = sn
+	}
+	if raw.Explain != nil {
+		ex, err := parseFlexibleBool(raw.Explain)
+		if err != nil {
+			return fmt.Errorf("parsing_exception: [top_hits.explain] %w", err)
+		}
+		p.Explain = ex
+	}
 	if raw.From != nil {
 		if *raw.From < 0 {
 			return fmt.Errorf("parsing_exception: [top_hits] [from] must be >= 0")
@@ -12799,9 +12906,20 @@ func (d *DateHistogramAggSpec) UnmarshalJSON(data []byte) error {
 		}
 	}
 	type plain DateHistogramAggSpec
-	var p plain
-	if err := json.Unmarshal(trimmed, &p); err != nil {
+	var raw struct {
+		plain
+		Offset json.RawMessage `json:"offset"`
+	}
+	if err := json.Unmarshal(trimmed, &raw); err != nil {
 		return err
+	}
+	p := raw.plain
+	if rawOff, hasOff := rawMap["offset"]; hasOff {
+		offStr, err := parseFlexibleDateHistogramOffset(rawOff)
+		if err != nil {
+			return err
+		}
+		p.Offset = offStr
 	}
 	if strings.TrimSpace(p.Field) == "" && p.Script == nil {
 		return fmt.Errorf("parsing_exception: [date_histogram] requires either [field] or [script]")
@@ -13403,8 +13521,13 @@ func (m *MetricAggSpec) UnmarshalJSON(data []byte) error {
 	if p.Sigma != nil && (*p.Sigma < 0 || math.IsNaN(*p.Sigma) || math.IsInf(*p.Sigma, 0)) {
 		return fmt.Errorf("illegal_argument_exception: [sigma] must be >= 0")
 	}
-	if raw.PrecisionThreshold != nil && (*raw.PrecisionThreshold < 0 || *raw.PrecisionThreshold > 40000) {
-		return fmt.Errorf("illegal_argument_exception: [precision_threshold] must be in [0, 40000]")
+	if raw.PrecisionThreshold != nil {
+		if *raw.PrecisionThreshold < 0 {
+			return fmt.Errorf("illegal_argument_exception: [precisionThreshold] must be greater than or equal to 0. Found [%d]", *raw.PrecisionThreshold)
+		}
+		if *raw.PrecisionThreshold > 40000 {
+			return fmt.Errorf("illegal_argument_exception: [precisionThreshold] must be less than or equal to 40000. Found [%d]", *raw.PrecisionThreshold)
+		}
 	}
 	if raw.Compression != nil {
 		if math.IsNaN(*raw.Compression) || math.IsInf(*raw.Compression, 0) {
@@ -13425,9 +13548,12 @@ func (m *MetricAggSpec) UnmarshalJSON(data []byte) error {
 		}
 	}
 	switch strings.ToLower(strings.TrimSpace(raw.ExecutionHint)) {
-	case "", "default", "high_accuracy", "map", "global_ordinals", "bytes_hash", "ordinals", "direct", "save_memory_heuristic", "save_time_heuristic":
+	case "", "default", "high_accuracy", "map", "global_ordinals", "bytes_hash", "ordinals", "direct", "segment_ordinals", "global_ordinals_hash", "global_ordinals_low_cardinality", "save_memory_heuristic", "save_time_heuristic":
 	default:
-		return fmt.Errorf("illegal_argument_exception: Invalid execution_hint [%s], valid values are [default, high_accuracy]", raw.ExecutionHint)
+		if raw.Compression != nil {
+			return fmt.Errorf("illegal_argument_exception: Invalid execution_hint [%s], valid values are [default, high_accuracy]", raw.ExecutionHint)
+		}
+		return fmt.Errorf("illegal_argument_exception: Invalid execution mode for cardinality aggregation: [%s], valid values are [default, high_accuracy]", raw.ExecutionHint)
 	}
 	*m = MetricAggSpec(p)
 	return nil
@@ -13847,10 +13973,10 @@ func (s *SortSpec) UnmarshalJSON(data []byte) error {
 			}
 		}
 		switch strings.ToLower(strings.TrimSpace(scriptType)) {
-		case "number", "string":
+		case "number", "string", "version":
 			scriptType = strings.ToLower(strings.TrimSpace(scriptType))
 		default:
-			return fmt.Errorf("parsing_exception: [_script] sort requires [type] in [number, string], got [%s]", scriptType)
+			return fmt.Errorf("parsing_exception: [_script] sort requires [type] in [number, string, version], got [%s]", scriptType)
 		}
 		mode := obj.Mode
 		if mode == "" {
@@ -14528,6 +14654,7 @@ type RoutingMetaSpec struct {
 // MappingSpec models an Elasticsearch `_mapping` payload.
 type MappingSpec struct {
 	Dynamic             any                      `json:"dynamic,omitempty"`
+	Enabled             *bool                    `json:"enabled,omitempty"`
 	Subobjects          *bool                    `json:"subobjects,omitempty"`
 	Routing             *RoutingMetaSpec         `json:"_routing,omitempty"`
 	Meta                map[string]any           `json:"_meta,omitempty"`
@@ -14550,6 +14677,8 @@ type FieldProperty struct {
 	DocValues                *bool                    `json:"doc_values,omitempty"`
 	Store                    *bool                    `json:"store,omitempty"`
 	StoreArraySource         *bool                    `json:"store_array_source,omitempty"`
+	IncludeInParent          *bool                    `json:"include_in_parent,omitempty"`
+	IncludeInRoot            *bool                    `json:"include_in_root,omitempty"`
 	SyntheticSourceKeep      string                   `json:"synthetic_source_keep,omitempty"`
 	TimeSeriesDimension      *bool                    `json:"time_series_dimension,omitempty"`
 	TimeSeriesDimensions     []string                 `json:"time_series_dimensions,omitempty"`
@@ -14557,8 +14686,10 @@ type FieldProperty struct {
 	Path                     string                   `json:"path,omitempty"`
 	Value                    any                      `json:"value,omitempty"`
 	Script                   any                      `json:"script,omitempty"`
+	OnScriptError            string                   `json:"on_script_error,omitempty"`
 	Analyzer                 string                   `json:"analyzer,omitempty"`
 	SearchAnalyzer           string                   `json:"search_analyzer,omitempty"`
+	SearchQuoteAnalyzer      string                   `json:"search_quote_analyzer,omitempty"`
 	Normalizer               string                   `json:"normalizer,omitempty"`
 	Format                   string                   `json:"format,omitempty"`
 	TimeZone                 string                   `json:"time_zone,omitempty"`

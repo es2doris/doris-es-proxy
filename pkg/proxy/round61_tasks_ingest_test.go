@@ -546,6 +546,7 @@ func TestRound61TasksIngest_ReindexPreflightOCCSlicesRemote(t *testing.T) {
 	}
 
 	// Whitelist remote.test:9200 and configure custom RoundTripper
+	srv.SetStaticRemoteReindexWhitelist("remote.test:9200")
 	_, _ = doRound61Req(t, h, http.MethodPut, "/_cluster/settings", `{"transient":{"reindex.remote.whitelist":"remote.test:9200"}}`, nil)
 	// Pre-create destination index with `join` mapping to verify legacy `_parent` -> `join` conversion
 	_, _ = doRound61Req(t, h, http.MethodPut, "/rem_join_dst", `{"mappings":{"properties":{"my_join":{"type":"join","relations":{"question":"answer"}}}}}`, nil)

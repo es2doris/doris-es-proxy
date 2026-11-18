@@ -4794,7 +4794,7 @@ func (s *Server) handleEQLSearchAPIRound57(w http.ResponseWriter, r *http.Reques
 	if s.eqlSearches == nil {
 		s.eqlSearches = make(map[string]map[string]any)
 	}
-	eqlID := fmt.Sprintf("eql_%d", len(s.eqlSearches)+1)
+	eqlID := nextEQLSearchIDR62Admin()
 	resp := map[string]any{
 		"id":         eqlID,
 		"is_partial": false,
@@ -4811,6 +4811,7 @@ func (s *Server) handleEQLSearchAPIRound57(w http.ResponseWriter, r *http.Reques
 		},
 	}
 	if keepOnCompletion || hasWaitTimeout {
+		evictBoundedAsyncRegistryLockedR62Admin(s.eqlSearches)
 		stored := deepCloneDocMap(resp)
 		if hasExplicitKeepFalse {
 			stored["__delete_on_get"] = true
@@ -5980,260 +5981,6 @@ func applySynonymFilterToTokens(tokens []analyzedToken, rules []parsedSynonymRul
 		}
 	}
 	return out
-}
-
-// tryHandleCustomIndexAnalyze evaluates custom index analyzers & synonym/synonym_graph filters in /{index}/_analyze (F6.1).
-func (s *Server) tryHandleCustomIndexAnalyze(w http.ResponseWriter, r *http.Request, bodyBytes []byte) bool {
-	rawIndex := strings.TrimSpace(r.PathValue("index"))
-	var req map[string]any
-	if len(bytes.TrimSpace(bodyBytes)) > 0 {
-		if err := json.Unmarshal(bodyBytes, &req); err != nil {
-			return false // let standard handler emit parse_exception
-		}
-	}
-
-	// Check inline filter objects for synonym / synonym_graph even without an index
-	hasInlineSynFilter := false
-	if rawFilters, okF := req["filter"].([]any); okF {
-		for _, rf := range rawFilters {
-			if fm, okM := rf.(map[string]any); okM {
-				ft := strings.ToLower(fmt.Sprintf("%v", fm["type"]))
-				if ft == "synonym" || ft == "synonym_graph" {
-					hasInlineSynFilter = true
-					break
-				}
-			}
-		}
-	}
-
-	if rawIndex == "" && !hasInlineSynFilter {
-		return false
-	}
-
-	var analyzers, filters map[string]map[string]any
-	var idxSchema *schema.IndexSchema
-	s.mu.RLock()
-	if rawIndex != "" {
-		resolvedIdx := rawIndex
-		if s.indices[resolvedIdx] == nil {
-			if tgts := s.aliases[resolvedIdx]; len(tgts) > 0 {
-				resolvedIdx = tgts[0]
-			}
-		}
-		idxSchema = s.indices[resolvedIdx]
-		if idxSchema == nil {
-			s.mu.RUnlock()
-			return false // let standard handleAnalyze return 404 index_not_found_exception
-		}
-		analyzers, filters = extractIndexAnalysisMaps(s.indexCustomSettings[resolvedIdx])
-	}
-
-	analyzerName, _ := req["analyzer"].(string)
-	if analyzerName == "" {
-		analyzerName = strings.TrimSpace(r.URL.Query().Get("analyzer"))
-	}
-	fieldName, _ := req["field"].(string)
-	if fieldName == "" && analyzerName == "" && idxSchema != nil && idxSchema.RawMapping != nil {
-		fieldName = strings.TrimSpace(r.URL.Query().Get("field"))
-	}
-	if analyzerName == "" && fieldName != "" && idxSchema != nil && idxSchema.RawMapping != nil {
-		analyzerName = lookupFieldSearchAnalyzerFromMappingSpec(idxSchema.RawMapping, fieldName)
-	}
-
-	customAnDef := analyzers[analyzerName]
-	var reqFilterList []any
-	if rf, okF := req["filter"].([]any); okF {
-		reqFilterList = rf
-	}
-	usesCustomFilter := hasInlineSynFilter
-	if !usesCustomFilter {
-		for _, rf := range reqFilterList {
-			if fn, okS := rf.(string); okS && filters[fn] != nil {
-				usesCustomFilter = true
-				break
-			}
-		}
-	}
-	if customAnDef == nil && !usesCustomFilter {
-		s.mu.RUnlock()
-		return false
-	}
-
-	// Extract input text(s)
-	var texts []string
-	switch tv := req["text"].(type) {
-	case string:
-		texts = []string{tv}
-	case []any:
-		for _, item := range tv {
-			if str, ok := item.(string); ok {
-				texts = append(texts, str)
-			}
-		}
-	}
-	if len(texts) == 0 {
-		if qt := r.URL.Query().Get("text"); qt != "" {
-			texts = []string{qt}
-		}
-	}
-	if len(texts) == 0 {
-		s.mu.RUnlock()
-		return false
-	}
-
-	tokName := "standard"
-	var filterSteps []any
-	if customAnDef != nil {
-		if tn, okT := customAnDef["tokenizer"].(string); okT && tn != "" {
-			tokName = tn
-		}
-		for _, fn := range extractStringSliceAny(customAnDef["filter"]) {
-			filterSteps = append(filterSteps, fn)
-		}
-	} else {
-		if tn, okT := req["tokenizer"].(string); okT && tn != "" {
-			tokName = tn
-		}
-		filterSteps = reqFilterList
-	}
-
-	// Tokenize input texts
-	var toks []analyzedToken
-	pos := 0
-	baseOffset := 0
-	for tIdx, text := range texts {
-		if tIdx > 0 {
-			baseOffset++
-		}
-		switch strings.ToLower(tokName) {
-		case "keyword", "noop":
-			toks = append(toks, analyzedToken{
-				token:       text,
-				startOffset: baseOffset,
-				endOffset:   baseOffset + len(text),
-				tokenType:   "word",
-				position:    pos,
-			})
-			pos++
-		case "whitespace":
-			idx := 0
-			for idx < len(text) {
-				for idx < len(text) && unicode.IsSpace(rune(text[idx])) {
-					idx++
-				}
-				if idx >= len(text) {
-					break
-				}
-				start := idx
-				for idx < len(text) && !unicode.IsSpace(rune(text[idx])) {
-					idx++
-				}
-				toks = append(toks, analyzedToken{
-					token:       text[start:idx],
-					startOffset: baseOffset + start,
-					endOffset:   baseOffset + idx,
-					tokenType:   "word",
-					position:    pos,
-				})
-				pos++
-			}
-		default: // standard / letter
-			idx := 0
-			for idx < len(text) {
-				rn, sz := utf8.DecodeRuneInString(text[idx:])
-				if !unicode.IsLetter(rn) && !unicode.IsDigit(rn) {
-					idx += sz
-					continue
-				}
-				start := idx
-				for idx < len(text) {
-					r2, s2 := utf8.DecodeRuneInString(text[idx:])
-					if !unicode.IsLetter(r2) && !unicode.IsDigit(r2) {
-						break
-					}
-					idx += s2
-				}
-				toks = append(toks, analyzedToken{
-					token:       text[start:idx],
-					startOffset: baseOffset + start,
-					endOffset:   baseOffset + idx,
-					tokenType:   "<ALPHANUM>",
-					position:    pos,
-				})
-				pos++
-			}
-		}
-		baseOffset += len(text)
-	}
-
-	// Apply filters sequentially while holding RLock so synonymSets read is consistent
-	for _, step := range filterSteps {
-		var fType string
-		var fDef map[string]any
-		switch sv := step.(type) {
-		case string:
-			if def, okD := filters[sv]; okD {
-				fDef = def
-				fType = strings.ToLower(fmt.Sprintf("%v", def["type"]))
-			} else {
-				fType = strings.ToLower(sv)
-			}
-		case map[string]any:
-			fDef = sv
-			fType = strings.ToLower(fmt.Sprintf("%v", sv["type"]))
-		}
-		switch fType {
-		case "lowercase":
-			for i := range toks {
-				toks[i].token = strings.ToLower(toks[i].token)
-			}
-		case "uppercase":
-			for i := range toks {
-				toks[i].token = strings.ToUpper(toks[i].token)
-			}
-		case "trim":
-			for i := range toks {
-				toks[i].token = strings.TrimSpace(toks[i].token)
-			}
-		case "stop":
-			stopSet := map[string]bool{"a": true, "an": true, "and": true, "are": true, "as": true, "at": true, "be": true, "but": true, "by": true, "for": true, "if": true, "in": true, "into": true, "is": true, "it": true, "no": true, "not": true, "of": true, "on": true, "or": true, "such": true, "that": true, "the": true, "their": true, "then": true, "there": true, "these": true, "they": true, "this": true, "to": true, "was": true, "will": true, "with": true}
-			if fDef != nil {
-				customStops := extractStringSliceAny(fDef["stopwords"])
-				if len(customStops) > 0 {
-					stopSet = make(map[string]bool, len(customStops))
-					for _, sw := range customStops {
-						stopSet[strings.ToLower(sw)] = true
-					}
-				}
-			}
-			filtered := make([]analyzedToken, 0, len(toks))
-			for _, tk := range toks {
-				if !stopSet[strings.ToLower(tk.token)] {
-					filtered = append(filtered, tk)
-				}
-			}
-			toks = filtered
-		case "synonym", "synonym_graph":
-			if fDef != nil {
-				rules := s.collectSynonymRulesFromFilterDefLocked(fDef)
-				toks = applySynonymFilterToTokens(toks, rules)
-			}
-		}
-	}
-	s.mu.RUnlock()
-
-	respTokens := make([]any, 0, len(toks))
-	for _, tk := range toks {
-		respTokens = append(respTokens, map[string]any{
-			"token":        tk.token,
-			"start_offset": tk.startOffset,
-			"end_offset":   tk.endOffset,
-			"type":         tk.tokenType,
-			"position":     tk.position,
-		})
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"tokens": respTokens})
-	return true
 }
 
 func lookupFieldSearchAnalyzerFromMappingSpec(ms *esast.MappingSpec, fieldPath string) string {
@@ -8664,6 +8411,25 @@ func (s *Server) handleFlushSyncedRound57(w http.ResponseWriter, r *http.Request
 	}
 	if !s.ensureNoExplicitClosedTargetRound59(w, r, rawIndex) {
 		return
+	}
+	if !s.isES8Mode(r) {
+		if existing := w.Header()["Warning"]; len(existing) > 0 {
+			filtered := existing[:0]
+			for _, ew := range existing {
+				if !strings.Contains(ew, "Synced flush is deprecated") {
+					filtered = append(filtered, ew)
+				}
+			}
+			if len(filtered) == 0 {
+				w.Header().Del("Warning")
+			} else {
+				w.Header()["Warning"] = filtered
+			}
+		}
+		if s.hasExplicitTargetESVersion() {
+			emitESDeprecationWarningRound61(w, s, r,
+				"Synced flush is deprecated and will be removed in 8.0. Use flush at _/flush or /{index}/_flush instead.")
+		}
 	}
 	var targets []string
 	if rawIndex != "" && rawIndex != "*" && rawIndex != "_all" {

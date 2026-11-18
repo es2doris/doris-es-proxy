@@ -489,6 +489,10 @@ func validateAggsScriptsCompileRound60(aggs map[string]esast.AggSpec) error {
 // validateSearchRequestScriptsRound60 runs upfront static Painless CompileValidate
 // across all script bearing clauses in a SearchRequest before SQL execution.
 func validateSearchRequestScriptsRound60(req *esast.SearchRequest) error {
+	return validateSearchRequestScriptsLazyR62(req, false)
+}
+
+func validateSearchRequestScriptsLazyR62(req *esast.SearchRequest, deferRuntimeCycles bool) error {
 	if req == nil {
 		return nil
 	}
@@ -498,17 +502,16 @@ func validateSearchRequestScriptsRound60(req *esast.SearchRequest) error {
 	if err := validateQueryScriptsCompileRound60(req.PostFilter); err != nil {
 		return err
 	}
-	for _, rm := range req.RuntimeMappings {
-		if src, ok := extractPainlessSourceIfApplicableRound60(rm.Script); ok {
-			if err := painless.CompileValidate(src); err != nil {
-				return fmt.Errorf("%s", formatSearchShardScriptFailureReasonRound60(err))
-			}
-		}
-	}
-	if len(req.RuntimeMappings) > 0 {
+	if !deferRuntimeCycles && len(req.RuntimeMappings) > 0 {
 		if _, err := TopoSortRuntimeMappingsRound61(req.RuntimeMappings); err != nil {
-			clean := strings.TrimPrefix(err.Error(), "illegal_argument_exception: ")
-			return fmt.Errorf("all_shards_failed|illegal_argument_exception|%s", clean)
+			return err
+		}
+		for _, rm := range req.RuntimeMappings {
+			if src, ok := extractPainlessSourceIfApplicableRound60(rm.Script); ok {
+				if err := painless.CompileValidate(src); err != nil {
+					return fmt.Errorf("%s", formatSearchShardScriptFailureReasonRound60(err))
+				}
+			}
 		}
 	}
 	for _, s := range req.Sort {
@@ -876,7 +879,7 @@ func validateRuntimeSearchScriptsOnHitsRound60(idxSchema *schema.IndexSchema, re
 		}
 		doc := decodeHitDocMapRound60(h)
 		isES8 := resolveDocES8ModeRound61(doc)
-		rtEvalDoc, _, rtErr := EvalRuntimeMappingsOnDocTopologicalRound61(effSch, req.RuntimeMappings, doc, isES8)
+		rtEvalDoc, _, rtErr := evalRuntimeMappingsOnDocLazyForReqR62Search(effSch, req.RuntimeMappings, req, doc, isES8)
 		if rtErr != nil {
 			if strings.HasPrefix(rtErr.Error(), "illegal_argument_exception: ") {
 				return fmt.Errorf("all_shards_failed|illegal_argument_exception|%s", strings.TrimPrefix(rtErr.Error(), "illegal_argument_exception: "))
@@ -977,6 +980,8 @@ func runtimeFieldTypeToEmitContextRound60(esType string) (string, bool) {
 		return "ip_field", true
 	case "geo_point":
 		return "geo_point_field", true
+	case "composite":
+		return "composite", true
 	}
 	return "", false
 }

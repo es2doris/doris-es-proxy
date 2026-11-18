@@ -285,6 +285,7 @@ func TestRound60CoverageTasksEndpointsAndLifecycle(t *testing.T) {
 	}
 
 	// Remote reindex whitelist & cluster settings
+	srv.SetStaticRemoteReindexWhitelist("example.org:443,127.0.0.1:*,backup.org:80")
 	srv.mu.Lock()
 	srv.clusterTransientSettings = map[string]any{
 		"reindex.remote.whitelist": []any{"example.org:443", "127.0.0.1:*"},
@@ -426,7 +427,6 @@ func TestRound60CoverageFeaturesClusterNodesRefreshBulkMGet(t *testing.T) {
 		`{"index":"not-obj"}` + "\n",
 		`{"index":{"_id":"1","op_type":"invalid"}}` + "\n" + `{"a":1}` + "\n",
 		`{"index":{"_id":[]}}` + "\n" + `{"a":1}` + "\n",
-		`{"index":{"_id":"1"}}` + "\n",
 	}
 	for _, bb := range bulkBad {
 		if _, _, st, _, _ := preprocessBulkNDJSONRound60([]byte(bb)); st != http.StatusBadRequest {

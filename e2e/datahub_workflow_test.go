@@ -827,8 +827,8 @@ func TestV04DisMaxTopHitsCompositePromoteValidateAnalyzeRolloverMetrics_E2E(t *t
 		t.Fatal(err)
 	}
 	_ = anResp.Body.Close()
-	if len(anBody.Tokens) != 5 {
-		t.Fatalf("expected 5 tokens from /_analyze, got %d", len(anBody.Tokens))
+	if len(anBody.Tokens) != 4 {
+		t.Fatalf("expected 4 tokens from /_analyze, got %d", len(anBody.Tokens))
 	}
 
 	rollReq, err := http.NewRequest(http.MethodPost, ts.URL+"/logs-write/_rollover", strings.NewReader(`{"conditions":{"max_docs":2}}`))

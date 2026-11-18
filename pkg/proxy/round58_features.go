@@ -572,18 +572,44 @@ func (s *Server) isPITActive(pitID string) bool {
 	return ok && entry != nil && !now.After(entry.ExpiresAt)
 }
 
+func (s *Server) sweepScrollStoreLockedR62Admin(now time.Time) {
+	for tok, entry := range s.scrollContexts {
+		if entry == nil || s.invalidatedScrollSessions[entry.SessionID] || now.After(entry.ExpiresAt) {
+			delete(s.scrollContexts, tok)
+		}
+	}
+	if len(s.invalidatedScrollSessions) > 512 {
+		activeSess := make(map[string]bool, len(s.scrollContexts))
+		for _, entry := range s.scrollContexts {
+			if entry != nil {
+				activeSess[entry.SessionID] = true
+			}
+		}
+		for sid := range s.invalidatedScrollSessions {
+			if !activeSess[sid] {
+				delete(s.invalidatedScrollSessions, sid)
+			}
+		}
+		if len(s.invalidatedScrollSessions) > 512 {
+			s.invalidatedScrollSessions = make(map[string]bool)
+		}
+	}
+}
+
 func (s *Server) registerInitialScrollContext(token string, ttl time.Duration) {
 	if token == "" {
 		return
 	}
+	now := time.Now()
 	s.mu.Lock()
 	s.ensureScrollStoreLocked()
+	s.sweepScrollStoreLockedR62Admin(now)
 	s.scrollSeq++
 	sessionID := fmt.Sprintf("scroll-sess-%d", s.scrollSeq)
 	s.scrollContexts[token] = &scrollContextEntry{
 		Token:     token,
 		SessionID: sessionID,
-		ExpiresAt: time.Now().Add(ttl),
+		ExpiresAt: now.Add(ttl),
 	}
 	s.mu.Unlock()
 }
@@ -595,10 +621,12 @@ func (s *Server) validateAndAdvanceScrollToken(token, nextToken string, extendTT
 	s.ensureScrollStoreLocked()
 	entry, ok := s.scrollContexts[token]
 	if !ok || entry == nil {
+		s.sweepScrollStoreLockedR62Admin(now)
 		return false
 	}
 	if s.invalidatedScrollSessions[entry.SessionID] || now.After(entry.ExpiresAt) {
 		delete(s.scrollContexts, token)
+		s.sweepScrollStoreLockedR62Admin(now)
 		return false
 	}
 	newExp := entry.ExpiresAt
@@ -607,6 +635,19 @@ func (s *Server) validateAndAdvanceScrollToken(token, nextToken string, extendTT
 		entry.ExpiresAt = newExp
 	}
 	if nextToken != "" {
+		// Bound per-session tokens in s.scrollContexts to 64 while preserving recent tokens for multi-ID DELETE /_search/scroll.
+		var sessionTokens []string
+		for tok, existing := range s.scrollContexts {
+			if existing != nil && existing.SessionID == entry.SessionID && tok != token && tok != nextToken {
+				sessionTokens = append(sessionTokens, tok)
+			}
+		}
+		if len(sessionTokens) >= 62 {
+			sort.Strings(sessionTokens)
+			for _, evictTok := range sessionTokens[:len(sessionTokens)-61] {
+				delete(s.scrollContexts, evictTok)
+			}
+		}
 		s.scrollContexts[nextToken] = &scrollContextEntry{
 			Token:     nextToken,
 			SessionID: entry.SessionID,
@@ -1108,7 +1149,7 @@ func (s *Server) handleComposableOrLegacyTemplateRound58(w http.ResponseWriter, 
 				return
 			}
 		}
-		if !isLegacyEndpoint && len(tpl.ComposedOf) > 0 {
+		if !isLegacyEndpoint && len(tpl.ComposedOf) > 0 && !isTruthyBoolQueryParam(r, "ignore_missing_component_template") {
 			_ = s.syncCatalogFromBackend(r.Context())
 			s.mu.RLock()
 			var missingComp string
@@ -1225,7 +1266,11 @@ func (s *Server) handleComposableOrLegacyTemplateRound58(w http.ResponseWriter, 
 				}
 				if _, ok := store[part]; !ok {
 					s.mu.RUnlock()
-					writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("index_template [%s] missing", part))
+					missingMsg := fmt.Sprintf("index template matching [%s] not found", part)
+					if isLegacyEndpoint {
+						missingMsg = fmt.Sprintf("index_template [%s] missing", part)
+					}
+					writeESError(w, http.StatusNotFound, "resource_not_found_exception", missingMsg)
 					return
 				}
 			}
@@ -1237,7 +1282,11 @@ func (s *Server) handleComposableOrLegacyTemplateRound58(w http.ResponseWriter, 
 		} else {
 			if _, ok := store[name]; !ok {
 				s.mu.RUnlock()
-				writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("index_template [%s] missing", name))
+				missingMsg := fmt.Sprintf("index template matching [%s] not found", name)
+				if isLegacyEndpoint {
+					missingMsg = fmt.Sprintf("index_template [%s] missing", name)
+				}
+				writeESError(w, http.StatusNotFound, "resource_not_found_exception", missingMsg)
 				return
 			}
 			names = []string{name}
@@ -2183,7 +2232,7 @@ func advanceArrayFilterPatterns(patterns [][]string, idx int) (elemPatterns [][]
 }
 
 var catColumnShortAliases = map[string][]string{
-	"i":               {"index", "id"},
+	"i":               {"index", "ip", "id"},
 	"idx":             {"index"},
 	"s":               {"status", "state", "shard"},
 	"st":              {"store", "stage", "state", "status"},
@@ -2272,6 +2321,9 @@ func catWildcardColumnRank(col string) int {
 }
 
 func resolveCatColumnToken(tok string, headers []string, knownCols map[string]bool) ([]string, bool) {
+	if tok == "min" && knownCols["pool_size"] && !knownCols["min"] {
+		return []string{}, true
+	}
 	if knownCols[tok] {
 		return []string{tok}, true
 	}
@@ -2497,10 +2549,15 @@ func writeCatResponseWithHelpCols(w http.ResponseWriter, r *http.Request, header
 		maxColW := 0
 		maxShortW := 0
 		shortByCol := make(map[string]string, len(allHelpCols))
-		for shortTok, cands := range catColumnShortAliases {
-			if len(shortTok) > 4 {
-				continue // skip camelCase aliases like diskAvail in short column list
+		aliasKeys := make([]string, 0, len(catColumnShortAliases))
+		for shortTok := range catColumnShortAliases {
+			if len(shortTok) <= 4 {
+				aliasKeys = append(aliasKeys, shortTok)
 			}
+		}
+		sort.Strings(aliasKeys)
+		for _, shortTok := range aliasKeys {
+			cands := catColumnShortAliases[shortTok]
 			for _, c := range cands {
 				if knownCols[c] {
 					if existing := shortByCol[c]; existing == "" {
@@ -2550,6 +2607,9 @@ func writeCatResponseWithHelpCols(w http.ResponseWriter, r *http.Request, header
 				if !ok {
 					writeESError(w, http.StatusBadRequest, "illegal_argument_exception", fmt.Sprintf("unable to parse header [%s]; valid headers: %v", part, allHelpCols))
 					return
+				}
+				if len(resolvedCols) == 0 {
+					continue
 				}
 				filtered = append(filtered, resolvedCols...)
 				if len(resolvedCols) == 1 && !strings.ContainsAny(part, "*?") {
@@ -2689,7 +2749,10 @@ func writeCatResponseWithHelpCols(w http.ResponseWriter, r *http.Request, header
 				if ci > 0 {
 					line.WriteByte(' ')
 				}
-				if ci == len(cells)-1 {
+				rightAlign := ci < len(selectedHeaders) && isRightAlignedCatColumnR62Admin(selectedHeaders[ci])
+				if rightAlign {
+					fmt.Fprintf(&line, "%*s", widths[ci], cell)
+				} else if ci == len(cells)-1 {
 					line.WriteString(cell)
 				} else {
 					fmt.Fprintf(&line, "%-*s", widths[ci], cell)

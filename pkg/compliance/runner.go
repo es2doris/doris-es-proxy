@@ -1070,6 +1070,12 @@ func parseIgnoreStatuses(v any) map[int]bool {
 		out[int(val)] = true
 	case float64:
 		out[int(val)] = true
+	case json.Number:
+		if iv, err := val.Int64(); err == nil {
+			out[int(iv)] = true
+		} else if fv, err := val.Float64(); err == nil {
+			out[int(fv)] = true
+		}
 	case string:
 		for _, part := range strings.Split(val, ",") {
 			if code, err := strconv.Atoi(strings.TrimSpace(part)); err == nil {
@@ -1195,6 +1201,41 @@ func (c *runnerContext) verifyCatch(catchSpec, actionName string, status int, bo
 	return fmt.Errorf("unsupported catch specification %q", catchSpec)
 }
 
+func collectStructuredErrorStrings(errMap map[string]any, parts *[]string) {
+	if errMap == nil {
+		return
+	}
+	t, _ := errMap["type"].(string)
+	r, _ := errMap["reason"].(string)
+	switch {
+	case t != "" && r != "":
+		*parts = append(*parts, t+": "+r, fmt.Sprintf("type=%s, reason=%s", t, r))
+	case t != "":
+		*parts = append(*parts, t, "type="+t)
+	case r != "":
+		*parts = append(*parts, r, "reason="+r)
+	}
+	if rcSlice, ok := errMap["root_cause"].([]any); ok {
+		for _, item := range rcSlice {
+			if rcMap, ok := item.(map[string]any); ok {
+				collectStructuredErrorStrings(rcMap, parts)
+			}
+		}
+	}
+	if cbMap, ok := errMap["caused_by"].(map[string]any); ok {
+		collectStructuredErrorStrings(cbMap, parts)
+	}
+	if fsSlice, ok := errMap["failed_shards"].([]any); ok {
+		for _, item := range fsSlice {
+			if fsMap, ok := item.(map[string]any); ok {
+				if reasonMap, ok := fsMap["reason"].(map[string]any); ok {
+					collectStructuredErrorStrings(reasonMap, parts)
+				}
+			}
+		}
+	}
+}
+
 func extractErrorText(parsed any, raw string) string {
 	if m, ok := parsed.(map[string]any); ok {
 		switch errVal := m["error"].(type) {
@@ -1202,14 +1243,9 @@ func extractErrorText(parsed any, raw string) string {
 			return errVal
 		case map[string]any:
 			var parts []string
-			if t, ok := errVal["type"].(string); ok {
-				parts = append(parts, t)
-			}
-			if r, ok := errVal["reason"].(string); ok {
-				parts = append(parts, r)
-			}
+			collectStructuredErrorStrings(errVal, &parts)
 			if len(parts) > 0 {
-				return strings.Join(parts, ": ")
+				return strings.Join(parts, "; ")
 			}
 		}
 	}
@@ -6271,6 +6307,9 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 func serializeNDJSON(rawBody any) ([]byte, error) {
 	switch b := rawBody.(type) {
 	case string:
+		if b == "" {
+			return []byte{}, nil
+		}
 		if !strings.HasSuffix(b, "\n") {
 			b += "\n"
 		}
@@ -7016,11 +7055,7 @@ func hasUnescapedArbitraryKeySuffix(fieldPath string) bool {
 		return false
 	}
 	dotIdx := len(fieldPath) - len("._arbitrary_key_")
-	backslashes := 0
-	for i := dotIdx - 1; i >= 0 && fieldPath[i] == '\\'; i-- {
-		backslashes++
-	}
-	return backslashes%2 == 0
+	return dotIdx == 0 || fieldPath[dotIdx-1] != '\\'
 }
 
 func (c *runnerContext) execSet(rawVal any) error {
@@ -7383,6 +7418,31 @@ func decodeBase64String(s string) (string, error) {
 	return "", fmt.Errorf("invalid base64 input %q", s)
 }
 
+func (c *runnerContext) lookupStashPathValue(rawKey string) (any, bool) {
+	trimmed := strings.TrimSpace(rawKey)
+	if !strings.HasPrefix(trimmed, "$") ||
+		trimmed == "$body" || strings.HasPrefix(trimmed, "$body.") ||
+		trimmed == "$headers" || strings.HasPrefix(trimmed, "$headers.") {
+		return nil, false
+	}
+	segs := splitEscapedPath(trimmed)
+	if len(segs) == 0 || !strings.HasPrefix(segs[0], "$") {
+		return nil, false
+	}
+	sv, ok := c.lookupStashVar(normalizeStashKey(segs[0]))
+	if !ok {
+		return nil, false
+	}
+	if len(segs) == 1 {
+		return sv, true
+	}
+	rest := make([]string, len(segs)-1)
+	for i := 1; i < len(segs); i++ {
+		rest[i] = c.expandStashString(segs[i])
+	}
+	return lookupSegments(sv, rest)
+}
+
 func checkSingleContains(fieldPath string, actual, expected any) error {
 	switch actVal := actual.(type) {
 	case []any:
@@ -7400,6 +7460,20 @@ func checkSingleContains(fieldPath string, actual, expected any) error {
 		}
 		return nil
 	case map[string]any:
+		if expStr, isStr := expected.(string); isStr {
+			if _, exists := actVal[expStr]; exists {
+				return nil
+			}
+			if re, isRegex, err := compileMatchRegex(expStr); isRegex && err == nil {
+				for k := range actVal {
+					if re.MatchString(k) {
+						return nil
+					}
+				}
+			}
+			actJSON, _ := json.Marshal(actual)
+			return fmt.Errorf("contains %q failed: map %s does not contain key %q", fieldPath, string(actJSON), expStr)
+		}
 		if !containsElementMatch(actVal, expected) {
 			actJSON, _ := json.Marshal(actual)
 			expJSON, _ := json.Marshal(expected)
@@ -7441,6 +7515,12 @@ func (c *runnerContext) execContains(rawVal any) error {
 		}
 		actual, found := c.lookupResponsePath(fieldPath)
 		if !found {
+			if sv, sOk := c.lookupStashPathValue(p.Key); sOk {
+				actual = sv
+				found = true
+			}
+		}
+		if !found {
 			return fmt.Errorf("contains: path %q not found in response: %s", fieldPath, c.lastBodyRaw)
 		}
 		if err := checkSingleContains(fieldPath, actual, expected); err != nil {
@@ -7467,6 +7547,21 @@ func checkSingleNotContains(fieldPath string, actual, expected any) error {
 		}
 		return nil
 	case map[string]any:
+		if expStr, isStr := expected.(string); isStr {
+			if _, exists := actVal[expStr]; exists {
+				actJSON, _ := json.Marshal(actual)
+				return fmt.Errorf("not_contains %q failed: map %s contains key %q", fieldPath, string(actJSON), expStr)
+			}
+			if re, isRegex, err := compileMatchRegex(expStr); isRegex && err == nil {
+				for k := range actVal {
+					if re.MatchString(k) {
+						actJSON, _ := json.Marshal(actual)
+						return fmt.Errorf("not_contains %q failed: map %s key %q matched %s", fieldPath, string(actJSON), k, expStr)
+					}
+				}
+			}
+			return nil
+		}
 		if containsElementMatch(actVal, expected) {
 			actJSON, _ := json.Marshal(actual)
 			expJSON, _ := json.Marshal(expected)
@@ -7499,6 +7594,12 @@ func (c *runnerContext) execNotContains(rawVal any) error {
 			continue
 		}
 		actual, found := c.lookupResponsePath(fieldPath)
+		if !found {
+			if sv, sOk := c.lookupStashPathValue(p.Key); sOk {
+				actual = sv
+				found = true
+			}
+		}
 		if !found {
 			return fmt.Errorf("not_contains: path %q not found in response: %s", fieldPath, c.lastBodyRaw)
 		}
@@ -7571,6 +7672,16 @@ func (c *runnerContext) execMatch(rawVal any) error {
 		fieldPath := c.expandStashPath(p.Key)
 		expected := ToNative(c.expandStash(p.Value))
 		actual, found := c.lookupResponsePath(fieldPath)
+		if !found && expected != nil {
+			if sv, sOk := c.lookupStashPathValue(p.Key); sOk {
+				actual = sv
+				found = true
+			}
+		}
+		if !found && expected == nil && c.lastResponse != nil {
+			actual = nil
+			found = true
+		}
 		if !found {
 			return fmt.Errorf("match: path %q not found in response: %s", fieldPath, c.lastBodyRaw)
 		}
@@ -7783,6 +7894,148 @@ func extractInlineCommentsFlag(pattern string) (string, bool) {
 	return sb.String(), enabledX
 }
 
+func applyInlineMultilineFlags(cur bool, rawFlags string) bool {
+	neg := false
+	for i := 0; i < len(rawFlags); i++ {
+		switch rawFlags[i] {
+		case '-':
+			neg = true
+		case 'm':
+			cur = !neg
+		}
+	}
+	return cur
+}
+
+// rewriteJavaEndAnchorForRE2 rewrites unescaped '$' anchors outside [...] character classes
+// and \Q...\E literal quotes when multiline mode is inactive so RE2 matches Java Pattern's
+// end-of-input behavior (matching before an optional trailing \r?\n at \z).
+func rewriteJavaEndAnchorForRE2(pattern string, initialMultiline bool) string {
+	if !strings.ContainsRune(pattern, '$') {
+		return pattern
+	}
+	var sb strings.Builder
+	sb.Grow(len(pattern) + 16)
+	inCharClass := false
+	charClassStart := -1
+	multilineStack := []bool{initialMultiline}
+
+	for i := 0; i < len(pattern); i++ {
+		ch := pattern[i]
+		if inCharClass {
+			if ch == '\\' && i+1 < len(pattern) {
+				sb.WriteByte(ch)
+				i++
+				sb.WriteByte(pattern[i])
+				continue
+			}
+			if ch == '[' && i+1 < len(pattern) && (pattern[i+1] == ':' || pattern[i+1] == '=' || pattern[i+1] == '.') {
+				delim := pattern[i+1]
+				sb.WriteByte('[')
+				sb.WriteByte(delim)
+				i += 2
+				for i < len(pattern) {
+					if pattern[i] == delim && i+1 < len(pattern) && pattern[i+1] == ']' {
+						sb.WriteByte(delim)
+						sb.WriteByte(']')
+						i++
+						break
+					}
+					sb.WriteByte(pattern[i])
+					i++
+				}
+				continue
+			}
+			if ch == ']' {
+				isInitialLiteral := (i == charClassStart+1) || (i == charClassStart+2 && pattern[charClassStart+1] == '^')
+				if !isInitialLiteral {
+					inCharClass = false
+				}
+				sb.WriteByte(']')
+				continue
+			}
+			sb.WriteByte(ch)
+			continue
+		}
+
+		if ch == '\\' {
+			if i+1 >= len(pattern) {
+				sb.WriteByte('\\')
+				break
+			}
+			if pattern[i+1] == 'Q' {
+				sb.WriteString(`\Q`)
+				i += 2
+				for i < len(pattern) {
+					if pattern[i] == '\\' && i+1 < len(pattern) && pattern[i+1] == 'E' {
+						sb.WriteString(`\E`)
+						i++
+						break
+					}
+					sb.WriteByte(pattern[i])
+					i++
+				}
+				continue
+			}
+			sb.WriteByte('\\')
+			i++
+			sb.WriteByte(pattern[i])
+			continue
+		}
+
+		if ch == '[' {
+			inCharClass = true
+			charClassStart = i
+			sb.WriteByte('[')
+			continue
+		}
+
+		if ch == '(' {
+			if i+2 < len(pattern) && pattern[i+1] == '?' {
+				j := i + 2
+				for j < len(pattern) && isInlineRegexFlagByte(pattern[j]) {
+					j++
+				}
+				if j > i+2 && j < len(pattern) && (pattern[j] == ')' || pattern[j] == ':') {
+					curM := multilineStack[len(multilineStack)-1]
+					nextM := applyInlineMultilineFlags(curM, pattern[i+2:j])
+					if pattern[j] == ')' {
+						multilineStack[len(multilineStack)-1] = nextM
+					} else {
+						multilineStack = append(multilineStack, nextM)
+					}
+					sb.WriteString(pattern[i : j+1])
+					i = j
+					continue
+				}
+			}
+			multilineStack = append(multilineStack, multilineStack[len(multilineStack)-1])
+			sb.WriteByte('(')
+			continue
+		}
+
+		if ch == ')' {
+			if len(multilineStack) > 1 {
+				multilineStack = multilineStack[:len(multilineStack)-1]
+			}
+			sb.WriteByte(')')
+			continue
+		}
+
+		if ch == '$' {
+			if !multilineStack[len(multilineStack)-1] {
+				sb.WriteString(`(?:(?:\r?\n)?\z)`)
+			} else {
+				sb.WriteByte('$')
+			}
+			continue
+		}
+
+		sb.WriteByte(ch)
+	}
+	return sb.String()
+}
+
 func compileRegexWithMode(spec string, defaultComments bool) (*regexp.Regexp, bool, error) {
 	trimmed := strings.TrimSpace(spec)
 	if len(trimmed) < 2 || trimmed[0] != '/' {
@@ -7829,6 +8082,7 @@ func compileRegexWithMode(spec string, defaultComments bool) (*regexp.Regexp, bo
 	if defaultComments || hasX || hadInlineX {
 		pattern = stripESCommentsMode(pattern)
 	}
+	pattern = rewriteJavaEndAnchorForRE2(pattern, hasM)
 	var flagBuf strings.Builder
 	flagBuf.WriteString("(?s")
 	if hasI {
@@ -8518,6 +8772,12 @@ func (c *runnerContext) execLength(rawVal any) error {
 
 		val, found := c.lookupResponsePath(fieldPath)
 		if !found {
+			if sv, sOk := c.lookupStashPathValue(p.Key); sOk {
+				val = sv
+				found = true
+			}
+		}
+		if !found {
 			return fmt.Errorf("length: path %q not found in response: %s", fieldPath, c.lastBodyRaw)
 		}
 		if err := checkSingleLength(fieldPath, val, expLen); err != nil {
@@ -8854,6 +9114,15 @@ func (c *runnerContext) resolveResponseRootAndSegments(rawPath string) (any, []s
 	}
 	segments := splitEscapedPath(rawPath)
 	cur := c.lastResponse
+	if len(segments) > 1 && segments[0] == "" {
+		hasEmptyLiteralKey := false
+		if bodyMap, ok := c.lastResponse.(map[string]any); ok {
+			_, hasEmptyLiteralKey = bodyMap[""]
+		}
+		if !hasEmptyLiteralKey {
+			segments = segments[1:]
+		}
+	}
 	if len(segments) > 0 && strings.HasPrefix(segments[0], "$") {
 		hasLiteralKey := false
 		if bodyMap, ok := c.lastResponse.(map[string]any); ok {
@@ -9033,9 +9302,18 @@ func splitEscapedPath(rawPath string) []string {
 	var sb strings.Builder
 	braceDepth := 0
 	for i := 0; i < len(rawPath); i++ {
-		if rawPath[i] == '\\' && i+1 < len(rawPath) && rawPath[i+1] == '.' {
-			sb.WriteByte('.')
-			i++
+		if rawPath[i] == '\\' {
+			j := i
+			for j < len(rawPath) && rawPath[j] == '\\' {
+				j++
+			}
+			if j < len(rawPath) && rawPath[j] == '.' {
+				sb.WriteByte('.')
+				i = j
+				continue
+			}
+			sb.WriteString(rawPath[i:j])
+			i = j - 1
 			continue
 		}
 		if rawPath[i] == '$' && i+1 < len(rawPath) && rawPath[i+1] == '{' {

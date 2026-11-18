@@ -89,7 +89,8 @@ func ShredDocumentWithNow(
 		return nil, fmt.Errorf("invalid document JSON for _id=%q: %w", id, err)
 	}
 	var origDocForSynthetic map[string]any
-	if (s.SyntheticSource || strings.EqualFold(s.IndexMode, "time_series")) && !s.SourceDisabled() && !strings.EqualFold(s.SourceMode, "stored") {
+	isImplicitSynthMode := strings.EqualFold(s.IndexMode, "time_series") || strings.EqualFold(s.IndexMode, "logsdb")
+	if (s.SyntheticSource || isImplicitSynthMode) && !s.SourceDisabled() && !strings.EqualFold(s.SourceMode, "stored") {
 		decOrig := json.NewDecoder(bytes.NewReader(trimmed))
 		decOrig.UseNumber()
 		_ = decOrig.Decode(&origDocForSynthetic)
@@ -115,12 +116,12 @@ func ShredDocumentWithNow(
 			totalNestedObjs += len(extractNestedElementMapsWithIDs(parsedDoc, parts, ""))
 		}
 		if totalNestedObjs > s.MaxNestedObjects {
-			return nil, fmt.Errorf("illegal_argument_exception: The number of nested documents has exceeded the allowed limit of [%d]", s.MaxNestedObjects)
+			return nil, esWireError(fmt.Sprintf("illegal_argument_exception: The number of nested documents has exceeded the allowed limit of [%d]. This limit can be set by changing the [index.mapping.nested_objects.limit] index level setting.", s.MaxNestedObjects))
 		}
 	}
-	if s.RawMapping != nil {
+	if s.RawMapping != nil && !s.IsRuntimeEvalSchema {
 		var err error
-		prunedDynamic, err = validateStrictDynamicObject(parsedDoc, s.RawMapping.Properties, s.RawMapping.Dynamic, s.RawMapping.Subobjects, "")
+		prunedDynamic, err = validateStrictDynamicObjectWithRuntime(parsedDoc, s.RawMapping.Properties, s.RawMapping.Runtime, s.RawMapping.Dynamic, s.RawMapping.Subobjects, "")
 		if err != nil {
 			return nil, err
 		}
@@ -143,6 +144,15 @@ func ShredDocumentWithNow(
 			now = time.Now().UTC()
 		}
 		return now
+	}
+
+	if scriptMod, scriptErr := evaluateIndexTimeMappedScripts(s, trimmed, parsedDoc); scriptErr != nil {
+		return nil, scriptErr
+	} else if scriptMod {
+		prunedDynamic = true
+		if origDocForSynthetic != nil {
+			_, _ = evaluateIndexTimeMappedScripts(s, trimmed, origDocForSynthetic)
+		}
 	}
 
 	// Populate promoted scalar, multi-valued array, and nested pre-filter columns
@@ -532,6 +542,9 @@ func ShredDocumentWithNow(
 							hadMalformed = true
 							continue
 						}
+						if dnErr := diagnoseDateNanosOutOfRangeError(rv, b); dnErr != nil {
+							return nil, dnErr
+						}
 						return nil, fmt.Errorf("mapper_parsing_exception: failed to parse field [%s] of type [%s]", b.ESFieldPath, b.ESType)
 					}
 					validLeafs = append(validLeafs, rv)
@@ -591,6 +604,9 @@ func ShredDocumentWithNow(
 								deferDeletePath(b.SourceJSONPath)
 							}
 						} else {
+							if dnErr := diagnoseDateNanosOutOfRangeError(val, b); dnErr != nil {
+								return nil, dnErr
+							}
 							return nil, fmt.Errorf("mapper_parsing_exception: failed to parse field [%s] of type [%s]", b.ESFieldPath, b.ESType)
 						}
 					}
@@ -607,9 +623,15 @@ func ShredDocumentWithNow(
 					rootParts = strings.Split(b.NestedPath, ".")
 				}
 				rawElems := extractNestedElementMapsWithIDs(parsedDoc, rootParts, "")
+				curB := s.Fields[b.ESFieldPath]
+				docLockedDims := curB.VectorDims
 				for _, elem := range rawElems {
-					curB := s.Fields[b.ESFieldPath]
-					vec, present, vecErr := extractAndValidateTypedVectorValues(elem.m, b.RelativeJSONPath, curB)
+					checkB := curB
+					if docLockedDims > 0 {
+						checkB.VectorDims = docLockedDims
+						checkB.AutoDims = false
+					}
+					vec, present, vecErr := extractAndValidateTypedVectorValues(elem.m, b.RelativeJSONPath, checkB)
 					if present {
 						if vecErr != nil {
 							if b.IgnoreMalformed != nil && *b.IgnoreMalformed {
@@ -618,11 +640,45 @@ func ShredDocumentWithNow(
 							}
 							return nil, vecErr
 						}
-						if curB.AutoDims && curB.VectorDims == 0 && len(vec) > 0 {
-							if lockErr := s.LockAutoDims(b.ESFieldPath, len(vec)); lockErr != nil {
+						if curB.AutoDims && docLockedDims == 0 && len(vec) > 0 {
+							if lockErr := validateAutoDimsVectorBinding(curB, len(vec)); lockErr != nil {
 								return nil, lockErr
 							}
+							docLockedDims = len(vec)
 						}
+						if len(vec) > 0 {
+							writeNormalizedVectorIntoNestedMap(elem.m, b.RelativeJSONPath, vec)
+							prunedDynamic = true
+						}
+					}
+				}
+				continue
+			}
+			if b.IsVirtualSAYTSubfield {
+				var rawStrs []string
+				if b.Kind == StorageNestedSubfield && b.NestedPath != "" {
+					rawElems := extractNestedElementMapsWithIDs(parsedDoc, strings.Split(b.NestedPath, "."), "")
+					for _, elem := range rawElems {
+						rawStrs = append(rawStrs, extractStringSliceValuesWithNull(elem.m, b.RelativeJSONPath, false, nil)...)
+					}
+				} else {
+					rawStrs = extractStringSliceValuesWithNull(parsedDoc, b.SourceJSONPath, false, nil)
+				}
+				if len(rawStrs) > 0 {
+					g2, g3, g4, pfx := TokenizeSearchAsYouTypeSubfields(rawStrs, b.Analyzer, b.MaxShingleSize)
+					var picked []string
+					switch {
+					case strings.HasSuffix(b.ESFieldPath, "._2gram"):
+						picked = g2
+					case strings.HasSuffix(b.ESFieldPath, "._3gram"):
+						picked = g3
+					case strings.HasSuffix(b.ESFieldPath, "._4gram"):
+						picked = g4
+					case strings.HasSuffix(b.ESFieldPath, "._index_prefix"):
+						picked = pfx
+					}
+					if len(picked) > 0 {
+						row[b.ColumnName] = picked
 					}
 				}
 				continue
@@ -653,6 +709,9 @@ func ShredDocumentWithNow(
 							recordIgnored(b.ESFieldPath)
 							hadMalformed = true
 							continue
+						}
+						if dnErr := diagnoseDateNanosOutOfRangeError(rv, b); dnErr != nil {
+							return nil, dnErr
 						}
 						return nil, fmt.Errorf("mapper_parsing_exception: failed to parse field [%s] of type [%s]", b.ESFieldPath, b.ESType)
 					}
@@ -743,7 +802,7 @@ func ShredDocumentWithNow(
 					return nil, vecErr
 				}
 				if curVecB.AutoDims && curVecB.VectorDims == 0 && len(vec) > 0 {
-					if lockErr := s.LockAutoDims(curVecB.ESFieldPath, len(vec)); lockErr != nil {
+					if lockErr := validateAutoDimsVectorBinding(curVecB, len(vec)); lockErr != nil {
 						return nil, lockErr
 					}
 				}
@@ -1096,6 +1155,8 @@ func ShredDocumentWithNow(
 		}
 	}
 
+	PopulateTSDBColumnsForShred(s, parsedDoc, row)
+
 	if len(ignoredFields) > 0 {
 		sort.Strings(ignoredFields)
 		row["_ignored"] = ignoredFields
@@ -1120,7 +1181,7 @@ func ShredDocumentWithNow(
 	collectAllTextWithSchema(parsedDoc, s, nil, &allTextBuilder)
 	row["_all_text"] = allTextBuilder.String()
 	row["_doc"] = buildVariantDocPayload(trimmed, parsedDoc, prunedDynamic, s)
-	if (s.SyntheticSource || strings.EqualFold(s.IndexMode, "time_series")) && !s.SourceDisabled() && !strings.EqualFold(s.SourceMode, "stored") {
+	if (s.SyntheticSource || isImplicitSynthMode) && !s.SourceDisabled() && !strings.EqualFold(s.SourceMode, "stored") {
 		srcInput := origDocForSynthetic
 		if srcInput == nil {
 			srcInput = parsedDoc
@@ -1925,10 +1986,16 @@ func coerceScalarBindingForDoris(val any, b FieldBinding, now time.Time) any {
 				return ms
 			}
 		case int64:
+			if b.FromScript || b.FromRuntime {
+				return v
+			}
 			if ms, ok := ParseESDateWithFormatToEpochMillis(strconv.FormatInt(v, 10), b.Format, now); ok {
 				return ms
 			}
 		case int:
+			if b.FromScript || b.FromRuntime {
+				return int64(v)
+			}
 			if ms, ok := ParseESDateWithFormatToEpochMillis(strconv.Itoa(v), b.Format, now); ok {
 				return ms
 			}
@@ -1939,6 +2006,11 @@ func coerceScalarBindingForDoris(val any, b FieldBinding, now time.Time) any {
 				}
 			}
 		case json.Number:
+			if b.FromScript || b.FromRuntime {
+				if iv, err := v.Int64(); err == nil {
+					return iv
+				}
+			}
 			if ms, ok := ParseESDateWithFormatToEpochMillis(v.String(), b.Format, now); ok {
 				return ms
 			}
@@ -2254,7 +2326,23 @@ func isObjectAcceptingLeafProperty(prop esast.FieldProperty) bool {
 	}
 }
 
-func validateStrictDynamicObject(obj map[string]any, props map[string]esast.FieldProperty, parentDynamic any, parentSubobjects *bool, pathPrefix string) (bool, error) {
+func isRuntimeFieldOrPrefix(runtimeProps map[string]esast.FieldProperty, fullKey string) bool {
+	if len(runtimeProps) == 0 || fullKey == "" {
+		return false
+	}
+	if _, ok := runtimeProps[fullKey]; ok {
+		return true
+	}
+	pfx := fullKey + "."
+	for rk := range runtimeProps {
+		if strings.HasPrefix(rk, pfx) || strings.HasPrefix(fullKey, rk+".") {
+			return true
+		}
+	}
+	return false
+}
+
+func validateStrictDynamicObjectWithRuntime(obj map[string]any, props map[string]esast.FieldProperty, runtimeProps map[string]esast.FieldProperty, parentDynamic any, parentSubobjects *bool, pathPrefix string) (bool, error) {
 	mode := normalizeDynamicMode(parentDynamic)
 	currentSubobjects := parentSubobjects == nil || *parentSubobjects
 	pruned := false
@@ -2327,7 +2415,7 @@ func validateStrictDynamicObject(obj map[string]any, props map[string]esast.Fiel
 					}
 					continue
 				}
-				subPruned, err := validateStrictDynamicObject(subObj, p0.Properties, childMode, childSubobjects, fullPath)
+				subPruned, err := validateStrictDynamicObjectWithRuntime(subObj, p0.Properties, runtimeProps, childMode, childSubobjects, fullPath)
 				if err != nil {
 					return false, err
 				}
@@ -2341,7 +2429,11 @@ func validateStrictDynamicObject(obj map[string]any, props map[string]esast.Fiel
 			}
 		}
 		if !exists {
-			if mode == "strict" {
+			candFull := k
+			if pathPrefix != "" {
+				candFull = pathPrefix + "." + k
+			}
+			if mode == "strict" && !isRuntimeFieldOrPrefix(runtimeProps, candFull) {
 				return false, fmt.Errorf("strict_dynamic_mapping_exception: mapping set to strict, dynamic introduction of [%s] within [%s] is not allowed", k, scope)
 			}
 			if mode == "false" {
@@ -2380,7 +2472,7 @@ func validateStrictDynamicObject(obj map[string]any, props map[string]esast.Fiel
 			childSubobjects = prop.Subobjects
 		}
 		if subMap, ok := v.(map[string]any); ok {
-			subPruned, err := validateStrictDynamicObject(subMap, prop.Properties, childMode, childSubobjects, fullPath)
+			subPruned, err := validateStrictDynamicObjectWithRuntime(subMap, prop.Properties, runtimeProps, childMode, childSubobjects, fullPath)
 			if err != nil {
 				return false, err
 			}
@@ -2388,7 +2480,7 @@ func validateStrictDynamicObject(obj map[string]any, props map[string]esast.Fiel
 				pruned = true
 			}
 		} else if slice, ok := v.([]any); ok {
-			subPruned, err := validateStrictDynamicSlice(slice, prop.Properties, childMode, childSubobjects, fullPath)
+			subPruned, err := validateStrictDynamicSliceWithRuntime(slice, prop.Properties, runtimeProps, childMode, childSubobjects, fullPath)
 			if err != nil {
 				return false, err
 			}
@@ -2400,11 +2492,11 @@ func validateStrictDynamicObject(obj map[string]any, props map[string]esast.Fiel
 	return pruned, nil
 }
 
-func validateStrictDynamicSlice(slice []any, props map[string]esast.FieldProperty, childMode string, childSubobjects *bool, fullPath string) (bool, error) {
+func validateStrictDynamicSliceWithRuntime(slice []any, props map[string]esast.FieldProperty, runtimeProps map[string]esast.FieldProperty, childMode string, childSubobjects *bool, fullPath string) (bool, error) {
 	pruned := false
 	for _, elem := range slice {
 		if elemMap, ok := elem.(map[string]any); ok {
-			subPruned, err := validateStrictDynamicObject(elemMap, props, childMode, childSubobjects, fullPath)
+			subPruned, err := validateStrictDynamicObjectWithRuntime(elemMap, props, runtimeProps, childMode, childSubobjects, fullPath)
 			if err != nil {
 				return false, err
 			}
@@ -2412,7 +2504,7 @@ func validateStrictDynamicSlice(slice []any, props map[string]esast.FieldPropert
 				pruned = true
 			}
 		} else if subSlice, ok := elem.([]any); ok {
-			subPruned, err := validateStrictDynamicSlice(subSlice, props, childMode, childSubobjects, fullPath)
+			subPruned, err := validateStrictDynamicSliceWithRuntime(subSlice, props, runtimeProps, childMode, childSubobjects, fullPath)
 			if err != nil {
 				return false, err
 			}
@@ -2705,6 +2797,9 @@ func ParseESDateBoundWithFormatToEpochNanos(input, format string, now time.Time,
 			switch fmtPart {
 			case "epoch_nanos":
 				if iv, err := strconv.ParseInt(prefix, 10, 64); err == nil {
+					if iv < 0 {
+						return 0, false
+					}
 					if !hasMath || mathExpr == "" {
 						return iv, true
 					}
@@ -2712,6 +2807,9 @@ func ParseESDateBoundWithFormatToEpochNanos(input, format string, now time.Time,
 				}
 			case "epoch_millis":
 				if ns, ok := parseScaledDecimalEpochToNanos(prefix, 6, true); ok {
+					if ns < 0 {
+						return 0, false
+					}
 					if !hasMath || mathExpr == "" {
 						return ns, true
 					}
@@ -2719,6 +2817,9 @@ func ParseESDateBoundWithFormatToEpochNanos(input, format string, now time.Time,
 				}
 			case "epoch_second":
 				if ns, ok := parseScaledDecimalEpochToNanos(prefix, 9, false); ok {
+					if ns < 0 {
+						return 0, false
+					}
 					if !hasMath || mathExpr == "" {
 						return ns, true
 					}
@@ -2783,7 +2884,10 @@ func ParseESDateBoundToEpochNanos(input string, now time.Time, roundUp bool) (in
 		}
 	}
 	if iv, err := strconv.ParseInt(s, 10, 64); err == nil {
-		if iv <= math.MaxInt64/1_000_000 && iv >= math.MinInt64/1_000_000 {
+		if iv < 0 {
+			return 0, false
+		}
+		if iv <= math.MaxInt64/1_000_000 {
 			return iv * 1_000_000, true
 		}
 		return iv, true
@@ -2846,17 +2950,11 @@ func safeTimeToEpochNanos(t time.Time) (int64, bool) {
 	t = t.UTC()
 	sec := t.Unix()
 	nsec := int64(t.Nanosecond())
-	if sec < -9223372037 || sec > 9223372036 {
+	if sec < 0 || sec > 9223372036 {
 		return 0, false
 	}
 	if sec == 9223372036 && nsec > 854775807 {
 		return 0, false
-	}
-	if sec == -9223372037 {
-		if nsec < 145224192 {
-			return 0, false
-		}
-		return (sec+1)*1_000_000_000 + (nsec - 1_000_000_000), true
 	}
 	return sec*1_000_000_000 + nsec, true
 }
@@ -4789,6 +4887,12 @@ func normalizeNestedLeafValue(val any, b FieldBinding, getNow func() time.Time) 
 		}
 		return nil
 	}
+	if b.ESType == "dense_vector" || b.ESType == "knn_vector" {
+		if vec, present, err := extractAndValidateTypedVectorValues(val, nil, b); present && err == nil && len(vec) > 0 {
+			return vec
+		}
+		return val
+	}
 	if b.ESType == "flattened" {
 		norm, _, err := validateAndNormalizeFlattenedValue(val, b, nil)
 		if err != nil {
@@ -5065,10 +5169,79 @@ func traverseFieldInDocMap(curr map[string]any, path []string, leafFn func(m map
 }
 
 func validateAndNormalizeSparseVectorFieldInDoc(curr map[string]any, path []string, b FieldBinding) (bool, error) {
+	parseTokenWeight := func(tk string, tv any) (float64, bool, error) {
+		if strings.TrimSpace(tk) == "" {
+			return 0, false, fmt.Errorf("mapper_parsing_exception: [%s] token key in [%s] cannot be empty", b.ESType, b.ESFieldPath)
+		}
+		if b.ESType == "rank_features" && strings.Contains(tk, ".") {
+			return 0, false, esWireError(fmt.Sprintf("mapper_parsing_exception: [rank_features] fields do not support dots in feature names but found [%s]", tk))
+		}
+		var fv float64
+		var validNum bool
+		coercedFromStr := false
+		switch val := tv.(type) {
+		case float64:
+			fv, validNum = val, !math.IsNaN(val) && !math.IsInf(val, 0)
+		case json.Number:
+			if f, err := val.Float64(); err == nil && !math.IsNaN(f) && !math.IsInf(f, 0) {
+				fv, validNum = f, true
+			}
+		case int:
+			fv, validNum = float64(val), true
+		case int64:
+			fv, validNum = float64(val), true
+		case string:
+			if f, err := strconv.ParseFloat(strings.TrimSpace(val), 64); err == nil && !math.IsNaN(f) && !math.IsInf(f, 0) {
+				fv, validNum = f, true
+				coercedFromStr = true
+			}
+		}
+		if !validNum {
+			return 0, false, fmt.Errorf("mapper_parsing_exception: [%s] token [%s.%s] weight must be a finite number", b.ESType, b.ESFieldPath, tk)
+		}
+		if b.ESType == "rank_features" && fv <= 0 {
+			return 0, false, fmt.Errorf("mapper_parsing_exception: [rank_features] feature [%s.%s] weight must be > 0, got [%v]", b.ESFieldPath, tk, fv)
+		}
+		return fv, coercedFromStr, nil
+	}
+
 	return traverseFieldInDocMap(curr, path, func(m map[string]any, key string) (bool, error) {
 		raw, exists := m[key]
 		if !exists || raw == nil {
 			return false, nil
+		}
+		if b.ESType == "sparse_vector" {
+			if rawSlice, isSlice := raw.([]any); isSlice {
+				merged := make(map[string]any)
+				for _, elem := range rawSlice {
+					if elem == nil {
+						continue
+					}
+					elemMap, okM := elem.(map[string]any)
+					if !okM {
+						return false, fmt.Errorf("mapper_parsing_exception: failed to parse field [%s] of type [sparse_vector]: expected object mapping tokens to numeric weights", b.ESFieldPath)
+					}
+					for tk, tv := range elemMap {
+						fv, _, err := parseTokenWeight(tk, tv)
+						if err != nil {
+							return false, err
+						}
+						f32 := float64(float32(fv))
+						if f32 <= 0 {
+							continue
+						}
+						if prev, had := merged[tk].(float64); !had || f32 > prev {
+							merged[tk] = f32
+						}
+					}
+				}
+				if len(merged) == 0 {
+					delete(m, key)
+				} else {
+					m[key] = merged
+				}
+				return true, nil
+			}
 		}
 		tokMap, ok := raw.(map[string]any)
 		if !ok {
@@ -5076,34 +5249,13 @@ func validateAndNormalizeSparseVectorFieldInDoc(curr map[string]any, path []stri
 		}
 		modified := false
 		for tk, tv := range tokMap {
-			if strings.TrimSpace(tk) == "" {
-				return false, fmt.Errorf("mapper_parsing_exception: [%s] token key in [%s] cannot be empty", b.ESType, b.ESFieldPath)
+			fv, coercedFromStr, err := parseTokenWeight(tk, tv)
+			if err != nil {
+				return false, err
 			}
-			var fv float64
-			var validNum bool
-			switch val := tv.(type) {
-			case float64:
-				fv, validNum = val, !math.IsNaN(val) && !math.IsInf(val, 0)
-			case json.Number:
-				if f, err := val.Float64(); err == nil && !math.IsNaN(f) && !math.IsInf(f, 0) {
-					fv, validNum = f, true
-				}
-			case int:
-				fv, validNum = float64(val), true
-			case int64:
-				fv, validNum = float64(val), true
-			case string:
-				if f, err := strconv.ParseFloat(strings.TrimSpace(val), 64); err == nil && !math.IsNaN(f) && !math.IsInf(f, 0) {
-					fv, validNum = f, true
-					tokMap[tk] = fv
-					modified = true
-				}
-			}
-			if !validNum {
-				return false, fmt.Errorf("mapper_parsing_exception: [%s] token [%s.%s] weight must be a finite number", b.ESType, b.ESFieldPath, tk)
-			}
-			if b.ESType == "rank_features" && fv <= 0 {
-				return false, fmt.Errorf("mapper_parsing_exception: [rank_features] feature [%s.%s] weight must be > 0, got [%v]", b.ESFieldPath, tk, fv)
+			if coercedFromStr {
+				tokMap[tk] = fv
+				modified = true
 			}
 		}
 		return modified, nil

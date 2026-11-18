@@ -987,6 +987,13 @@ func unmarshalFieldPropertyRound60Internal(fp *FieldProperty, data []byte, stric
 			return err
 		}
 	}
+	if p.OnScriptError != "" {
+		normErrMode, err := ValidateOnScriptError(p.OnScriptError)
+		if err != nil {
+			return err
+		}
+		p.OnScriptError = normErrMode
+	}
 	p.Meta = parsedMeta
 	p.Contexts = parsedContexts
 	p.ExplicitDims = hasDims || hasDim

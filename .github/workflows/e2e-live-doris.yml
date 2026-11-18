@@ -31,7 +31,7 @@ jobs:
   live-doris-e2e:
     name: E2E against Live Apache Doris Container
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 35
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -72,9 +72,10 @@ jobs:
         run: |
           ./bin/doris-es-proxy \
             --listen 127.0.0.1:9200 \
-            --doris-dsn "root:@tcp(127.0.0.1:9030)/?interpolateParams=true&multiStatements=true&timeout=5s&readTimeout=30s&writeTimeout=30s" \
+            --doris-dsn "root:@tcp(127.0.0.1:9030)/?interpolateParams=true&timeout=5s&readTimeout=30s&writeTimeout=30s" \
             --doris-http "http://127.0.0.1:8030" \
             --doris-db "es_sdk_e2e" \
+            --es-version "8.15.5" \
             --log-sql >/tmp/doris-es-proxy.log 2>&1 &
           PROXY_PID=$!
           trap 'kill "$PROXY_PID" 2>/dev/null || true; wait "$PROXY_PID" 2>/dev/null || true' EXIT
@@ -94,6 +95,13 @@ jobs:
           fi
           bash scripts/fetch-conformance-specs.sh
           DORIS_ES_PROXY_URL=http://127.0.0.1:9200 go -C e2e/sdkconformance test -race -count=1 -v ./...
+
+      - name: Run Curated Upstream Elastic YAML Conformance against Live Apache Doris
+        env:
+          DORIS_E2E_DSN: "root:@tcp(127.0.0.1:9030)/?interpolateParams=true&timeout=5s&readTimeout=30s&writeTimeout=30s"
+          DORIS_E2E_HTTP: "http://127.0.0.1:8030"
+          DORIS_E2E_DB: "es_yaml_e2e"
+        run: go test -v -race -count=1 -timeout 20m ./e2e/... -run TestLiveDorisUpstreamYAMLConformance_E2E
 
       - name: Dump Doris logs on failure
         if: failure()

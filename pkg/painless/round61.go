@@ -474,7 +474,7 @@ func CountStandardAnalyzerTokens(val any) (int64, bool) {
 			}
 			return
 		}
-		if n, ok := toInt64Painless(v); ok {
+		if n, ok := isIntegerValuePainless(v); ok {
 			// Already pre-counted numeric token_count
 			hasAny = true
 			total += n
@@ -1303,7 +1303,7 @@ func parseVectorValueRound61(val any, elemType string) ([]float32, []int8, error
 		i8 = make([]int8, len(elems))
 	}
 	for i, elem := range elems {
-		f, ok := toFloat64(elem)
+		f, ok := toFloat64WithRawPainless(elem)
 		if !ok {
 			return nil, nil, &painlessExceptionError{
 				exType:  "IllegalArgumentException",
@@ -1531,10 +1531,12 @@ func docVectorValueAndMagnitudeRound61(sourceMap, params map[string]any, fieldPa
 
 // DenseVectorVal represents the value returned by field('vec').get(...) / $('vec', default).
 type DenseVectorVal struct {
-	Name     string
-	ElemType string
-	Floats   []float32
-	Bytes    []int8
+	Name       string
+	ElemType   string
+	Floats     []float32
+	Bytes      []int8
+	Present    bool
+	IsDocValue bool
 }
 
 func (v *DenseVectorVal) MarshalJSON() ([]byte, error) {
@@ -1659,6 +1661,7 @@ func resolveDenseVectorFieldValRound61(name string, sourceMap, params map[string
 			ElemType: elemType,
 			Floats:   f32,
 			Bytes:    i8,
+			Present:  true,
 		},
 	}, true, nil
 }
@@ -1666,6 +1669,7 @@ func resolveDenseVectorFieldValRound61(name string, sourceMap, params map[string
 func evalDenseVectorMethodRound61(rec any, method string, cArgs []string, sourceMap, params map[string]any, depth int) (any, bool, error) {
 	var vec *DenseVectorVal
 	var fieldName string
+	var elemType string
 	isFieldWrapper := false
 	switch tv := rec.(type) {
 	case *DenseVectorFieldVal:
@@ -1674,6 +1678,7 @@ func evalDenseVectorMethodRound61(rec any, method string, cArgs []string, source
 		}
 		isFieldWrapper = true
 		fieldName = tv.Name
+		elemType = tv.ElemType
 		if tv.Present {
 			vec = tv.Vec
 		}
@@ -1683,11 +1688,15 @@ func evalDenseVectorMethodRound61(rec any, method string, cArgs []string, source
 		}
 		vec = tv
 		fieldName = tv.Name
+		elemType = tv.ElemType
 	default:
 		return nil, false, nil
 	}
 
 	requireVec := func() (*DenseVectorVal, error) {
+		if !isFieldWrapper && vec != nil && vec.IsDocValue && vec.isMissingVectorRound62() {
+			return nil, newMissingDenseVectorDocValueErrorRound62()
+		}
 		if vec == nil || len(vec.Floats) == 0 {
 			return nil, &painlessExceptionError{
 				exType:  "IllegalArgumentException",
@@ -1699,18 +1708,29 @@ func evalDenseVectorMethodRound61(rec any, method string, cArgs []string, source
 
 	switch method {
 	case "isEmpty":
-		return vec == nil || len(vec.Floats) == 0, true, nil
+		if isFieldWrapper {
+			return vec == nil || len(vec.Floats) == 0, true, nil
+		}
+		return vec == nil || vec.isMissingVectorRound62(), true, nil
 	case "size":
+		if !isFieldWrapper && vec != nil && vec.IsDocValue {
+			if vec.isMissingVectorRound62() {
+				return int64(0), true, nil
+			}
+			return int64(1), true, nil
+		}
 		if vec == nil {
 			return int64(0), true, nil
 		}
-		if isFieldWrapper {
-			// Support dims length so loops `for (int i = 0; i < field('vec').size(); i++) field('vec').get(i)`
-			// and emptiness checks `field('vec').size() == 0` both work naturally.
-			return int64(len(vec.Floats)), true, nil
-		}
 		return int64(len(vec.Floats)), true, nil
 	case "getDims", "dims":
+		if !isFieldWrapper && vec != nil && vec.IsDocValue {
+			v, err := requireVec()
+			if err != nil {
+				return nil, true, err
+			}
+			return int64(len(v.Floats)), true, nil
+		}
 		if vec == nil {
 			return int64(0), true, nil
 		}
@@ -1719,19 +1739,15 @@ func evalDenseVectorMethodRound61(rec any, method string, cArgs []string, source
 		if isFieldWrapper {
 			return nil, true, &painlessExceptionError{
 				exType:  "UnsupportedOperationException",
-				message: "Cannot iterate over single valued dense_vector field",
+				message: DenseVectorIterateErrorMessage,
 			}
 		}
-	case "getValue", "vectorValue":
+	case "getVector", "vector", "getValue", "vectorValue":
 		v, err := requireVec()
 		if err != nil {
 			return nil, true, err
 		}
-		out := make([]any, len(v.Floats))
-		for i, f := range v.Floats {
-			out[i] = f
-		}
-		return out, true, nil
+		return v.vectorElementsSliceRound62(getOrInitEvalBudget(params)), true, nil
 	case "getMagnitude", "magnitude":
 		v, err := requireVec()
 		if err != nil {
@@ -1740,6 +1756,24 @@ func evalDenseVectorMethodRound61(rec any, method string, cArgs []string, source
 		return computeVectorMagnitudeF32Round61(v.Floats, v.Bytes, v.ElemType), true, nil
 	case "get":
 		if len(cArgs) == 0 {
+			if isFieldWrapper {
+				if vec == nil || len(vec.Floats) == 0 {
+					return &DenseVectorVal{
+						Name:       fieldName,
+						ElemType:   elemType,
+						Present:    false,
+						IsDocValue: true,
+					}, true, nil
+				}
+				return &DenseVectorVal{
+					Name:       vec.Name,
+					ElemType:   vec.ElemType,
+					Floats:     vec.Floats,
+					Bytes:      vec.Bytes,
+					Present:    true,
+					IsDocValue: true,
+				}, true, nil
+			}
 			v, err := requireVec()
 			if err != nil {
 				return nil, true, err
@@ -1827,11 +1861,7 @@ func evalDenseVectorMethodRound61(rec any, method string, cArgs []string, source
 		if qErr != nil {
 			return nil, true, qErr
 		}
-		qElem := v.ElemType
-		if _, isStr := qVal.(string); isStr && qElem == "float" {
-			qElem = "byte"
-		}
-		qF32, qI8, pErr := parseVectorValueRound61(qVal, qElem)
+		qF32, qI8, pErr := parseDenseVectorQueryArgRound62(qVal, v.ElemType, isFieldWrapper)
 		if pErr != nil {
 			return nil, true, pErr
 		}
@@ -1849,11 +1879,7 @@ func evalDenseVectorMethodRound61(rec any, method string, cArgs []string, source
 		if qErr != nil {
 			return nil, true, qErr
 		}
-		qElem := v.ElemType
-		if _, isStr := qVal.(string); isStr && qElem == "float" {
-			qElem = "byte"
-		}
-		qF32, qI8, pErr := parseVectorValueRound61(qVal, qElem)
+		qF32, qI8, pErr := parseDenseVectorQueryArgRound62(qVal, v.ElemType, isFieldWrapper)
 		if pErr != nil {
 			return nil, true, pErr
 		}
@@ -1874,11 +1900,7 @@ func evalDenseVectorMethodRound61(rec any, method string, cArgs []string, source
 		if qErr != nil {
 			return nil, true, qErr
 		}
-		qElem := v.ElemType
-		if _, isStr := qVal.(string); isStr && qElem == "float" {
-			qElem = "byte"
-		}
-		qF32, qI8, pErr := parseVectorValueRound61(qVal, qElem)
+		qF32, qI8, pErr := parseDenseVectorQueryArgRound62(qVal, v.ElemType, isFieldWrapper)
 		if pErr != nil {
 			return nil, true, pErr
 		}

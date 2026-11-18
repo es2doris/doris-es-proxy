@@ -3560,6 +3560,31 @@ func evalRound54ConstructorPainless(clsName, argStr string, sourceMap, params ma
 			uObj, uErr := newPainlessURLFromString(fmt.Sprintf("%v://%v%s", pVal, hVal, fileStr))
 			return uObj, true, uErr
 		}
+	case "Locale":
+		if len(cArgs) >= 1 {
+			v0, err0 := evalArg(0)
+			if err0 != nil {
+				return nil, true, err0
+			}
+			if v0 == nil {
+				return nil, true, &painlessExceptionError{exType: "NullPointerException", message: "language"}
+			}
+			lang := fmt.Sprintf("%v", v0)
+			if len(cArgs) >= 2 {
+				v1, err1 := evalArg(1)
+				if err1 != nil {
+					return nil, true, err1
+				}
+				if v1 == nil {
+					return nil, true, &painlessExceptionError{exType: "NullPointerException", message: "country"}
+				}
+				ctry := fmt.Sprintf("%v", v1)
+				if ctry != "" {
+					return lang + "_" + ctry, true, nil
+				}
+			}
+			return lang, true, nil
+		}
 	}
 	return nil, false, nil
 }

@@ -413,7 +413,7 @@ func InferMappingFromSampleDocsWithES8(docs []json.RawMessage, es8Mode bool, exi
 
 	props := make(map[string]esast.FieldProperty)
 	if baseSpec != nil && len(baseSpec.Properties) > 0 {
-		props = DeepMergeMappingProperties(nil, baseSpec.Properties)
+		props = deepMergeMappingPropertiesWithSubobjects(nil, baseSpec.Properties, !opts.subobjects)
 	}
 	totalFields := 0
 	limit := len(docs)
@@ -450,7 +450,7 @@ func InferMappingFromSampleDocsWithES8(docs []json.RawMessage, es8Mode bool, exi
 		if addedRT {
 			mergedRuntime = rtMap
 		} else if len(baseSpec.Runtime) > 0 {
-			mergedRuntime = DeepMergeMappingProperties(nil, baseSpec.Runtime)
+			mergedRuntime = CloneFlatRuntimeMap(nil, baseSpec.Runtime)
 		}
 	}
 	if len(props) == 0 {
@@ -471,7 +471,7 @@ func InferMappingFromSampleDocsWithES8(docs []json.RawMessage, es8Mode bool, exi
 		if len(mergedRuntime) > 0 {
 			out.Runtime = mergedRuntime
 		}
-		out.Properties = mergeInferredIntoExistingProps(baseSpec.Properties, inferredSpec.Properties)
+		out.Properties = mergeInferredIntoExistingPropsWithSubobjects(baseSpec.Properties, inferredSpec.Properties, !opts.subobjects)
 		return &out
 	}
 	return inferredSpec
@@ -658,7 +658,7 @@ func validateSingleSyntheticSourceProp(fullPath string, prop esast.FieldProperty
 		return fmt.Errorf("mapper_parsing_exception: [synthetic_source_keep] is not supported for [%s] field [%s]", fType, fullPath)
 	}
 	switch fType {
-	case "percolator", "token_count", "murmur3", "rank_feature", "annotated-text", "annotated_text":
+	case "murmur3", "annotated-text", "annotated_text":
 		if prop.Store != nil && *prop.Store {
 			return nil
 		}
@@ -666,6 +666,8 @@ func validateSingleSyntheticSourceProp(fullPath string, prop esast.FieldProperty
 			return nil
 		}
 		return fmt.Errorf("illegal_argument_exception: Field [%s] of type [%s] doesn't support synthetic source", fullPath, prop.Type)
+	case "percolator", "token_count", "rank_feature", "rank_features", "search_as_you_type", "sparse_vector", "completion":
+		return nil
 	case "flattened":
 		if prop.DocValues != nil && !*prop.DocValues && (prop.Store == nil || !*prop.Store) {
 			return fmt.Errorf("illegal_argument_exception: field [%s] of type [flattened] doesn't support synthetic source because it doesn't have doc values", fullPath)
@@ -1410,8 +1412,7 @@ func ValidateTSDBFieldParams(fullPath, fType string, prop esast.FieldProperty) e
 	return nil
 }
 
-// ExtractTSDBSettings extracts and validates `index.mode`, `index.routing_path`, `index.time_series.start_time`, and `index.time_series.end_time`.
-func ExtractTSDBSettings(settings map[string]any) (mode string, routingPath []string, startTime string, endTime string, err error) {
+func extractRawTSDBSettingsValues(settings map[string]any) (mode string, routingPath []string, startTime string, endTime string, err error) {
 	if len(settings) == 0 {
 		return "", nil, "", "", nil
 	}
@@ -1481,6 +1482,20 @@ func ExtractTSDBSettings(settings map[string]any) (mode string, routingPath []st
 	}
 	if rawEnd, ok := lookup("index.time_series.end_time", "time_series.end_time"); ok {
 		endTime = strings.TrimSpace(fmt.Sprintf("%v", rawEnd))
+	}
+	return mode, routingPath, startTime, endTime, nil
+}
+
+// ExtractTSDBSettings extracts and validates `index.mode`, `index.routing_path`, `index.time_series.start_time`, and `index.time_series.end_time`.
+func ExtractTSDBSettings(settings map[string]any) (mode string, routingPath []string, startTime string, endTime string, err error) {
+	mode, routingPath, startTime, endTime, err = extractRawTSDBSettingsValues(settings)
+	if err != nil {
+		return mode, routingPath, startTime, endTime, err
+	}
+	if mode != "" {
+		if mErr := ValidateIndexModeSettings(mode, settings); mErr != nil {
+			return mode, routingPath, startTime, endTime, mErr
+		}
 	}
 	if mode == "time_series" {
 		if startTime != "" && endTime != "" {
@@ -1625,11 +1640,6 @@ func ValidateTSDBDocID(id, indexName string) error {
 	return nil
 }
 
-type tsdbDimensionEntry struct {
-	name  string
-	canon string
-}
-
 // ComputeTSDBIdentity validates `@timestamp` bounds, extracts TSDB dimensions & routing fields,
 // and computes deterministic `(_tsid, _id, routingKey)` for a TSDB document.
 func ComputeTSDBIdentity(idx *IndexSchema, doc map[string]any, settings map[string]any) (tsid string, docID string, routingKey string, err error) {
@@ -1705,8 +1715,8 @@ func ComputeTSDBIdentityWithRoutingHash(idx *IndexSchema, doc map[string]any, se
 		}
 	}
 
-	// 2. Collect dimensions from schema (`FieldBinding` + `RawMapping`).
-	dims, dimErr := extractTSDBDimensionsFromDoc(idx, doc)
+	// 2. Collect typed dimensions from schema (`FieldBinding` + `RawMapping`).
+	dims, dimErr := extractTSDBTypedDimensionsFromDoc(idx, doc)
 	if dimErr != nil {
 		return "", "", "", "", dimErr
 	}
@@ -1717,30 +1727,44 @@ func ComputeTSDBIdentityWithRoutingHash(idx *IndexSchema, doc map[string]any, se
 		return dims[i].name < dims[j].name
 	})
 
-	// 3. Extract routing key from `routing_path` (or default to all dimension fields if `routing_path` is empty).
-	var routingPairs []string
+	// 3. Extract routing pairs from `routing_path` (or default to all dimension fields if `routing_path` is empty).
+	var rPairs []tsdbRoutingPair
 	if len(routingPath) > 0 {
-		if err := extractTSDBRoutingPairs(idx, doc, routingPath, &routingPairs); err != nil {
+		var rawPairs []string
+		if err := extractTSDBRoutingPairs(idx, doc, routingPath, &rawPairs); err != nil {
 			return "", "", "", "", err
 		}
-		if len(routingPairs) == 0 {
+		if len(rawPairs) == 0 {
 			return "", "", "", "", fmt.Errorf("illegal_argument_exception: Error extracting routing: source didn't contain any routing fields")
+		}
+		for _, rpStr := range rawPairs {
+			if eq := strings.IndexByte(rpStr, '='); eq > 0 {
+				rPairs = append(rPairs, tsdbRoutingPair{name: rpStr[:eq], canon: rpStr[eq+1:]})
+			}
 		}
 	} else {
 		for _, d := range dims {
-			routingPairs = append(routingPairs, d.name+"="+d.canon)
+			rPairs = append(rPairs, tsdbRoutingPair{name: d.name, canon: d.canon})
 		}
 	}
-	sort.Strings(routingPairs)
+	sort.Slice(rPairs, func(i, j int) bool {
+		if rPairs[i].name != rPairs[j].name {
+			return rPairs[i].name < rPairs[j].name
+		}
+		return rPairs[i].canon < rPairs[j].canon
+	})
+	routingPairs := make([]string, len(rPairs))
+	for i, rp := range rPairs {
+		routingPairs[i] = rp.name + "=" + rp.canon
+	}
 	routingKey = strings.Join(routingPairs, ",")
 
-	// 4. Encode `_tsid` (`1 + 16 + 4*N + 16` bytes -> RawURLEncoding) and 20-byte `_id` (`4B routing_hash + 8B tsid_hash + 8B big-endian timestamp`).
-	tsidBytes := buildTSIDBytes(dims)
+	// 4. Encode exact upstream ES `_tsid` (`VInt + 16B namesHash + 4*N valHashes + 16B valsHash` -> RawURLEncoding)
+	// and 20-byte `_id` (`4B LE routing_hash + 8B LE tsid_hash + 8B BE timestamp`).
+	tsidBytes := buildExactESTSIDBytes(dims)
 	tsid = base64.RawURLEncoding.EncodeToString(tsidBytes)
 
-	rHash32 := murmur3X86_32Bytes([]byte(routingKey), 0)
-	var rHashBytes [4]byte
-	binary.BigEndian.PutUint32(rHashBytes[:], rHash32)
+	rHashBytes := computeExactESTSDBRoutingHashBytes(rPairs)
 	routingHash = base64.RawURLEncoding.EncodeToString(rHashBytes[:])
 
 	tsidH1, _ := murmur3X64_128Bytes(tsidBytes, 0)
@@ -1819,84 +1843,6 @@ func extractSingleDocPathValue(node any, parts []string) (any, bool) {
 		}
 	}
 	return nil, false
-}
-
-func extractTSDBDimensionsFromDoc(idx *IndexSchema, doc map[string]any) ([]tsdbDimensionEntry, error) {
-	var out []tsdbDimensionEntry
-	seen := make(map[string]bool)
-	if idx == nil {
-		return nil, nil
-	}
-
-	// Check compiled FieldBindings first
-	fieldKeys := make([]string, 0, len(idx.Fields))
-	for k := range idx.Fields {
-		fieldKeys = append(fieldKeys, k)
-	}
-	sort.Strings(fieldKeys)
-	for _, k := range fieldKeys {
-		b := idx.Fields[k]
-		if b.AliasTarget != "" || strings.HasSuffix(k, ".keyword") {
-			continue
-		}
-		if b.TimeSeriesDimension != nil && *b.TimeSeriesDimension {
-			if strings.EqualFold(b.ESType, "constant_keyword") && b.HasConstantValue && b.ConstantValue != nil {
-				rawVal, present := extractSingleDocPathValue(doc, strings.Split(k, "."))
-				if present && rawVal != nil {
-					canon, err := canonicalizeTSDBDimensionScalar(k, b, rawVal)
-					if err != nil {
-						return nil, err
-					}
-					if !seen[k] {
-						seen[k] = true
-						out = append(out, tsdbDimensionEntry{name: k, canon: canon})
-					}
-				} else if !seen[k] {
-					seen[k] = true
-					out = append(out, tsdbDimensionEntry{name: k, canon: fmt.Sprintf("%v", b.ConstantValue)})
-				}
-				continue
-			}
-			rawVal, present := extractSingleDocPathValue(doc, strings.Split(k, "."))
-			if !present || rawVal == nil {
-				continue
-			}
-			canon, err := canonicalizeTSDBDimensionScalar(k, b, rawVal)
-			if err != nil {
-				return nil, err
-			}
-			if !seen[k] {
-				seen[k] = true
-				out = append(out, tsdbDimensionEntry{name: k, canon: canon})
-			}
-		}
-		if strings.EqualFold(b.ESType, "flattened") && len(b.TimeSeriesDimensions) > 0 {
-			rawFlat, present := extractSingleDocPathValue(doc, strings.Split(k, "."))
-			if !present || rawFlat == nil {
-				continue
-			}
-			flatMap, okM := rawFlat.(map[string]any)
-			if !okM {
-				continue
-			}
-			for _, subDim := range b.TimeSeriesDimensions {
-				subVal, hasSub := extractSingleDocPathValue(flatMap, strings.Split(subDim, "."))
-				if !hasSub || subVal == nil {
-					continue
-				}
-				fullName := k + "." + subDim
-				canon, err := canonicalizeTSDBDimensionScalar(fullName, FieldBinding{ESFieldPath: fullName, ESType: "keyword"}, subVal)
-				if err != nil {
-					return nil, err
-				}
-				if !seen[fullName] {
-					seen[fullName] = true
-					out = append(out, tsdbDimensionEntry{name: fullName, canon: canon})
-				}
-			}
-		}
-	}
-	return out, nil
 }
 
 func canonicalizeTSDBDimensionScalar(fieldName string, b FieldBinding, raw any) (string, error) {
@@ -2022,46 +1968,6 @@ func extractTSDBRoutingPairs(idx *IndexSchema, doc map[string]any, routingPath [
 	}
 	expanded := expandDottedKeysForSyntheticObject(idx, doc, "")
 	return walk(expanded, "")
-}
-
-func buildTSIDBytes(dims []tsdbDimensionEntry) []byte {
-	n := len(dims)
-	bodyLen := 16 + 4*n + 16
-	var out []byte
-	// VInt prefix for bodyLen
-	v := bodyLen
-	for v >= 0x80 {
-		out = append(out, byte((v&0x7f)|0x80)) // #nosec G115 -- masked to 8-bit VInt continuation byte
-		v >>= 7
-	}
-	out = append(out, byte(v))
-
-	var namesBuf bytes.Buffer
-	var valsBuf bytes.Buffer
-	valHashes := make([]byte, 0, 4*n)
-	for _, d := range dims {
-		namesBuf.WriteString(d.name)
-		namesBuf.WriteByte(0)
-		valsBuf.WriteString(d.canon)
-		valsBuf.WriteByte(0)
-		vh := murmur3X86_32Bytes([]byte(d.canon), 0)
-		var b4 [4]byte
-		binary.LittleEndian.PutUint32(b4[:], vh)
-		valHashes = append(valHashes, b4[:]...)
-	}
-	nh1, nh2 := murmur3X64_128Bytes(namesBuf.Bytes(), 0)
-	var name16 [16]byte
-	binary.LittleEndian.PutUint64(name16[0:8], nh1)
-	binary.LittleEndian.PutUint64(name16[8:16], nh2)
-	out = append(out, name16[:]...)
-	out = append(out, valHashes...)
-
-	vh1, vh2 := murmur3X64_128Bytes(valsBuf.Bytes(), 0)
-	var val16 [16]byte
-	binary.LittleEndian.PutUint64(val16[0:8], vh1)
-	binary.LittleEndian.PutUint64(val16[8:16], vh2)
-	out = append(out, val16[:]...)
-	return out
 }
 
 func murmur3X86_32Bytes(data []byte, seed uint32) uint32 {

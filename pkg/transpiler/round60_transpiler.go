@@ -122,7 +122,7 @@ func (t *Transpiler) checkRegexLengthLimit(pattern string) bool {
 	maxLen := t.effectiveMaxRegexLength()
 	if utf8.RuneCountInString(pattern) > maxLen {
 		if !t.inLenientQuery && t.searchErr == nil {
-			t.searchErr = fmt.Errorf("illegal_argument_exception: Regular expression [%s] exceeds max_regex_length [%d]", pattern, maxLen)
+			t.searchErr = esTranspilerError(fmt.Sprintf("illegal_argument_exception: Regular expression [%s] exceeds max_regex_length [%d]. This maximum can be set by changing the [index.max_regex_length] index level setting.", pattern, maxLen))
 		}
 		return false
 	}
@@ -335,6 +335,14 @@ func TypedAggKeyPrefix(agg *esast.AggSpec, idxSchema *schema.IndexSchema) string
 		return "diversified_sampler"
 	case agg.RandomSampler != nil:
 		return "random_sampler"
+	case agg.IPPrefix != nil:
+		return "ip_prefix"
+	case agg.TimeSeries != nil:
+		return "time_series"
+	case agg.Children != nil:
+		return "children"
+	case agg.Parent != nil:
+		return "parent"
 	case agg.CategorizeText != nil:
 		return "categorize_text"
 	case agg.FrequentItemSets != nil:
@@ -1458,7 +1466,7 @@ func (t *Transpiler) compileMetadataExistsPredicate(field string) (string, bool)
 	switch field {
 	case "_source":
 		if !t.inLenientQuery && t.searchErr == nil {
-			t.searchErr = fmt.Errorf("illegal_argument_exception: Field [_source] is defined as an object in mapping [_source] but this name is already used for a meta field and cannot be searched with [exists]")
+			t.searchErr = esTranspilerError("query_shard_exception: failed to create query: Field [_source] is not supported in [exists] queries")
 		}
 		return "FALSE", true
 	case "_id", "_index", "_type", "_seq_no", "_primary_term", "_version":
