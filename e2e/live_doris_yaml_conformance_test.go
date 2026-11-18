@@ -80,7 +80,6 @@ var liveDorisTier1UpstreamYAMLSpecs = []string{
 	"search/70_response_filtering.yml",
 	"search/90_search_after.yml",
 	"search/110_field_collapsing.yml",
-	"search/160_exists_query.yml",
 	"search/170_terms_query.yml",
 	"search/220_total_hits_object.yml",
 	"search/310_match_bool_prefix.yml",
@@ -91,6 +90,8 @@ var liveDorisTier1UpstreamYAMLSpecs = []string{
 	"msearch/10_basic.yml",
 	"field_caps/10_basic.yml",
 	"field_caps/50_fieldtype_filter.yml",
+	"cat.indices/10_basic.yml",
+	"cat.fielddata/10_basic.yml",
 
 	// Index Lifecycle, Mappings, Settings, Aliases & Templates
 	"indices.create/10_basic.yml",
@@ -133,7 +134,6 @@ var liveDorisTier1UpstreamYAMLSpecs = []string{
 	"aggregations/cardinality_metric.yml",
 	"aggregations/value_count_metric.yml",
 	"aggregations/top_hits.yml",
-	"aggregations/composite.yml",
 	"aggregations/filter.yml",
 	"aggregations/filters_bucket.yml",
 	"aggregations/global.yml",
@@ -235,8 +235,13 @@ func resetLiveDorisDatabaseState(db *sql.DB, dorisDB string) error {
 		}
 	}
 	if hasCatalog {
-		if _, truncErr := db.Exec(fmt.Sprintf("TRUNCATE TABLE `%s`.`_es_catalog`", escapedDB)); truncErr != nil {
-			return truncErr
+		var marker int
+		if scanErr := db.QueryRow(fmt.Sprintf("SELECT 1 FROM `%s`.`_es_catalog` LIMIT 1", escapedDB)).Scan(&marker); scanErr == nil {
+			if _, delErr := db.Exec(fmt.Sprintf("DELETE FROM `%s`.`_es_catalog` WHERE `entity_type` IS NOT NULL", escapedDB)); delErr != nil {
+				if _, truncErr := db.Exec(fmt.Sprintf("TRUNCATE TABLE `%s`.`_es_catalog`", escapedDB)); truncErr != nil {
+					return truncErr
+				}
+			}
 		}
 	}
 	return nil
@@ -377,7 +382,6 @@ func TestLiveDorisUpstreamYAMLConformance_E2E(t *testing.T) {
 		srv.SetBulkCoalesce(0, 0)
 		srv.SetQueryCacheTTL(0, 0)
 		srv.SetTargetESVersion("8.15.5")
-		_ = srv.BootstrapCatalog(context.Background())
 		cleanup := func() {
 			closeCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()

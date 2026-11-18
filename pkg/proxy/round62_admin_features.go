@@ -982,6 +982,24 @@ func isRightAlignedCatColumnR62Admin(col string) bool {
 	return rightAlignedCatColumnsR62Admin[strings.ToLower(strings.TrimSpace(col))]
 }
 
+func collectFielddataEnabledPathsR62Admin(prefix string, props map[string]esast.FieldProperty, dst map[string]bool) {
+	for name, prop := range props {
+		full := name
+		if prefix != "" {
+			full = prefix + "." + name
+		}
+		if isFielddataEnabledRound61(prop.Fielddata) {
+			dst[full] = true
+		}
+		if len(prop.Fields) > 0 {
+			collectFielddataEnabledPathsR62Admin(full, prop.Fields, dst)
+		}
+		if len(prop.Properties) > 0 {
+			collectFielddataEnabledPathsR62Admin(full, prop.Properties, dst)
+		}
+	}
+}
+
 func (s *Server) collectCatFielddataRowsR62Admin(r *http.Request) []map[string]any {
 	nodeFilter := ""
 	var rawFields []string
@@ -1001,15 +1019,33 @@ func (s *Server) collectCatFielddataRowsR62Admin(r *http.Request) []map[string]a
 		return nil
 	}
 
+	fdEnabledByIndex := make(map[string]map[string]bool)
+	s.mu.RLock()
+	for idxName, sch := range s.indices {
+		if sch == nil || s.closedIndices[idxName] || sch.RawMapping == nil || len(sch.RawMapping.Properties) == 0 {
+			continue
+		}
+		enabled := make(map[string]bool)
+		collectFielddataEnabledPathsR62Admin("", sch.RawMapping.Properties, enabled)
+		if len(enabled) > 0 {
+			fdEnabledByIndex[idxName] = enabled
+		}
+	}
+	s.mu.RUnlock()
+
 	fieldBytes := make(map[string]int64)
 	round61AdminRegistryMu.Lock()
 	st := round61AdminRegistry[s]
 	round61AdminRegistryMu.Unlock()
-	if st != nil {
-		st.mu.Lock()
-		for _, byField := range st.fieldAccesses {
+	if st != nil && len(fdEnabledByIndex) > 0 {
+		st.mu.RLock()
+		for idxName, byField := range st.fieldAccesses {
+			enabled := fdEnabledByIndex[idxName]
+			if len(enabled) == 0 {
+				continue
+			}
 			for fn, fa := range byField {
-				if fa == nil || strings.HasPrefix(fn, "_") {
+				if fa == nil || strings.HasPrefix(fn, "_") || !enabled[fn] {
 					continue
 				}
 				cnt := fa.anyCount
@@ -1019,22 +1055,7 @@ func (s *Server) collectCatFielddataRowsR62Admin(r *http.Request) []map[string]a
 				fieldBytes[fn] += cnt * 64
 			}
 		}
-		st.mu.Unlock()
-	}
-
-	if len(fieldBytes) == 0 && len(rawFields) > 0 {
-		s.mu.RLock()
-		for _, sch := range s.indices {
-			if sch == nil {
-				continue
-			}
-			for fn := range sch.Fields {
-				if !strings.HasPrefix(fn, "_") {
-					fieldBytes[fn] = 0
-				}
-			}
-		}
-		s.mu.RUnlock()
+		st.mu.RUnlock()
 	}
 
 	fieldPat := strings.Join(rawFields, ",")

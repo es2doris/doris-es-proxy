@@ -235,17 +235,17 @@ func TestRound62Admin_F2_F3_CatClusterNodesAndSnapshots(t *testing.T) {
 
 	_, _, _, _ = doR62AdminReq(t, h8, http.MethodPut, "/cat_idx", `{
 		"settings": {"number_of_shards": 1, "number_of_replicas": 1},
-		"mappings": {"properties": {"tag": {"type": "keyword"}, "vec": {"type": "dense_vector", "dims": 3}}}
+		"mappings": {"properties": {"tag": {"type": "keyword"}, "txt_fd": {"type": "text", "fielddata": true}, "vec": {"type": "dense_vector", "dims": 3}}}
 	}`, nil)
-	_, _, _, _ = doR62AdminReq(t, h8, http.MethodPost, "/cat_idx/_doc/1?refresh=true", `{"tag":"a","vec":[1.0,2.0,3.0]}`, nil)
-	recordFieldUsageAccessRound61(srv8, []string{"cat_idx"}, []string{"tag"})
+	_, _, _, _ = doR62AdminReq(t, h8, http.MethodPost, "/cat_idx/_doc/1?refresh=true", `{"tag":"a","txt_fd":"hello","vec":[1.0,2.0,3.0]}`, nil)
+	recordFieldUsageAccessRound61(srv8, []string{"cat_idx"}, []string{"tag", "txt_fd"})
 
 	// F2: _cat endpoints
 	for _, catPath := range []string{
 		"/_cat/segments?v=true",
 		"/_cat/allocation/_master?v=true&bytes=b",
 		"/_cat/allocation/_local?v=true",
-		"/_cat/fielddata?v=true&fields=tag",
+		"/_cat/fielddata?v=true&fields=txt_fd",
 		"/_cat/nodeattrs?v=true",
 		"/_cat/recovery?v=true",
 		"/_cat/shards?v=true",
