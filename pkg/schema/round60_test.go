@@ -110,8 +110,8 @@ func TestRound60_F11_SyntheticSource_SerializeMappings_DottedProperties(t *testi
 	if _, hasSecret := gotSyn["secret"]; hasSecret {
 		t.Fatalf("expected doc_values:false field 'secret' omitted from synthetic _source: %#v", gotSyn)
 	}
-	if _, hasDis := gotSyn["disabled_obj"]; hasDis {
-		t.Fatalf("expected enabled:false object 'disabled_obj' omitted from synthetic _source: %#v", gotSyn)
+	if disMap, ok := gotSyn["disabled_obj"].(map[string]any); !ok || disMap["foo"] != "bar" {
+		t.Fatalf("expected enabled:false object 'disabled_obj' retained in ES 8.4+ synthetic _source, got %#v", gotSyn["disabled_obj"])
 	}
 	wantTags := []any{"alpha", "beta", "zeta"}
 	if !reflect.DeepEqual(gotSyn["tags"], wantTags) {

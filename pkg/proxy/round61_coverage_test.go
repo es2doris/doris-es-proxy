@@ -521,8 +521,8 @@ func TestRound61Coverage_DiskUsageSuggestHighlightRuntimeTasksAndParsers(t *test
 	if cDUS != http.StatusOK || !strings.Contains(rawDUS, `"_recovery_source"`) {
 		t.Fatalf("POST /du_synth/_disk_usage failed (%d): %s", cDUS, rawDUS)
 	}
-	if cNoExp, _, _, _ := doReqR61CRUDTest(t, h, http.MethodGet, "/du_cov/_field_usage_stats", "", nil); cNoExp != http.StatusBadRequest {
-		t.Fatalf("expected 400 without run_expensive_tasks, got %d", cNoExp)
+	if cNoExp, _, _, _ := doReqR61CRUDTest(t, h, http.MethodGet, "/du_cov/_field_usage_stats?run_expensive_tasks=false", "", nil); cNoExp != http.StatusBadRequest {
+		t.Fatalf("expected 400 with run_expensive_tasks=false, got %d", cNoExp)
 	}
 	cFUS, _, _, rawFUS := doReqR61CRUDTest(t, h, http.MethodGet, "/du_cov/_field_usage_stats?run_expensive_tasks=true", "", nil)
 	if cFUS != http.StatusOK || !strings.Contains(rawFUS, `"shards"`) {
@@ -872,6 +872,8 @@ func TestRound61Coverage_IntervalsCompoundScriptScoreRuntimeRowsResolveAndIngest
 	}`)
 	remRec := httptest.NewRecorder()
 	remReq := httptest.NewRequest(http.MethodPost, "/_reindex?wait_for_completion=true&refresh=true", strings.NewReader(string(remBody)))
+	srv.SetRemoteReindexAllowPrivateIPs(true)
+	srv.SetStaticRemoteReindexWhitelist(strings.TrimPrefix(remoteSrv.URL, "http://"))
 	srv.executeRemoteReindexRound61(remRec, remReq, time.Now(), remBody, map[string]any{
 		"host":            remoteSrv.URL,
 		"username":        "u",

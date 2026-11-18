@@ -242,15 +242,22 @@ func withLegacyDocType(r *http.Request, docType string) *http.Request {
 	return r.WithContext(context.WithValue(r.Context(), legacyDocTypeCtxKey{}, docType))
 }
 
-func legacyDocTypeFromRequest(r *http.Request) string {
+func explicitLegacyDocTypeFromRequest(r *http.Request) string {
 	if r == nil {
-		return "_doc"
+		return ""
 	}
 	if v, ok := r.Context().Value(legacyDocTypeCtxKey{}).(string); ok && v != "" {
 		return v
 	}
 	if pv := strings.TrimSpace(r.PathValue("type")); pv != "" {
 		return pv
+	}
+	return ""
+}
+
+func legacyDocTypeFromRequest(r *http.Request) string {
+	if t := explicitLegacyDocTypeFromRequest(r); t != "" {
+		return t
 	}
 	return "_doc"
 }
@@ -259,13 +266,23 @@ func (s *Server) applyDocTypeFieldRound60(m map[string]any, r *http.Request, exp
 	if m == nil {
 		return
 	}
+	if foundVal, okF := m["found"].(bool); okF && foundVal && r != nil && isTruthyBoolQueryParam(r, "force_synthetic_source") {
+		m[forceSynSourceMarkerKeyR62Admin] = true
+	}
 	if s.isES8Mode(r) {
 		delete(m, "_type")
 		return
 	}
 	reqType := explicitType
 	if reqType == "" {
-		reqType = legacyDocTypeFromRequest(r)
+		reqType = explicitLegacyDocTypeFromRequest(r)
+	}
+	if reqType == "" && r != nil && r.URL != nil {
+		up := r.URL.Path
+		if strings.Contains(up, "/_doc") || strings.Contains(up, "/_create") || strings.Contains(up, "/_update") {
+			m["_type"] = "_doc"
+			return
+		}
 	}
 	if reqType == "" || reqType == "_all" {
 		if idxName, _ := m["_index"].(string); idxName != "" && s != nil {
@@ -330,6 +347,7 @@ func (s *Server) recordDocWriteMetaRound60(indexName, docID string, ver, seqNo i
 		s.docVersions[indexName] = make(map[string]int64)
 	}
 	s.docVersions[indexName][docID] = ver
+	boundInt64DocMapLockedR62Admin(s.docVersions[indexName], docID)
 
 	if s.docSeqNos == nil {
 		s.docSeqNos = make(map[string]map[string]int64)
@@ -338,7 +356,11 @@ func (s *Server) recordDocWriteMetaRound60(indexName, docID string, ver, seqNo i
 		s.docSeqNos[indexName] = make(map[string]int64)
 	}
 	s.docSeqNos[indexName][docID] = seqNo
+	boundInt64DocMapLockedR62Admin(s.docSeqNos[indexName], docID)
 
+	if s.docRouting != nil && s.docRouting[indexName] != nil {
+		boundStringDocMapLockedR62Admin(s.docRouting[indexName], docID)
+	}
 	if s.docDeleted != nil && s.docDeleted[indexName] != nil {
 		delete(s.docDeleted[indexName], docID)
 	}
@@ -363,6 +385,7 @@ func (s *Server) recordDocDeleteMetaRound60(indexName, docID string, delVer, seq
 		s.docSeqNos[indexName] = make(map[string]int64)
 	}
 	s.docSeqNos[indexName][docID] = seqNo
+	boundInt64DocMapLockedR62Admin(s.docSeqNos[indexName], docID)
 
 	if s.docDeleted == nil {
 		s.docDeleted = make(map[string]map[string]bool)
@@ -371,6 +394,7 @@ func (s *Server) recordDocDeleteMetaRound60(indexName, docID string, delVer, seq
 		s.docDeleted[indexName] = make(map[string]bool)
 	}
 	s.docDeleted[indexName][docID] = true
+	boundBoolDocMapLockedR62Admin(s.docDeleted[indexName], docID)
 
 	if isExternal {
 		if s.docExtTombstones == nil {
@@ -380,6 +404,7 @@ func (s *Server) recordDocDeleteMetaRound60(indexName, docID string, delVer, seq
 			s.docExtTombstones[indexName] = make(map[string]int64)
 		}
 		s.docExtTombstones[indexName][docID] = delVer
+		boundInt64DocMapLockedR62Admin(s.docExtTombstones[indexName], docID)
 	} else if s.docExtTombstones != nil && s.docExtTombstones[indexName] != nil {
 		delete(s.docExtTombstones[indexName], docID)
 	}
@@ -609,6 +634,9 @@ func (s *Server) recordPreMutationUnrefreshedState(indexName string, shard int, 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.unrefreshedDocs == nil {
+		s.unrefreshedDocs = make(map[string]map[int]map[string]unrefreshedDocState)
+	}
+	if countTotalUnrefreshedDocsLockedR62Admin(s.unrefreshedDocs) >= maxUnrefreshedDocsTotalR62Admin {
 		s.unrefreshedDocs = make(map[string]map[int]map[string]unrefreshedDocState)
 	}
 	if s.unrefreshedDocs[indexName] == nil {
@@ -1003,20 +1031,26 @@ func preprocessBulkNDJSONRound60(raw []byte) ([]byte, []bulkActionMetaInfoRound6
 		if err != nil {
 			return nil, nil, http.StatusBadRequest, "illegal_argument_exception", err.Error()
 		}
-		outBuf.Write(rewrittenMeta)
-		outBuf.WriteByte('\n')
-		metaInfos = append(metaInfos, info)
 
 		lineIdx++
 		if actName != "delete" {
-			if lineIdx >= len(lines) {
-				return nil, nil, http.StatusBadRequest, "illegal_argument_exception",
-					fmt.Sprintf("Unexpected end of bulk request after [%s] action on line [%d]", actName, lineNum)
+			for lineIdx < len(lines) && len(bytes.TrimSpace(lines[lineIdx])) == 0 {
+				lineIdx++
 			}
+			if lineIdx >= len(lines) {
+				break
+			}
+			outBuf.Write(rewrittenMeta)
+			outBuf.WriteByte('\n')
+			metaInfos = append(metaInfos, info)
 			srcLine := bytes.TrimRight(lines[lineIdx], "\r")
 			outBuf.Write(srcLine)
 			outBuf.WriteByte('\n')
 			lineIdx++
+		} else {
+			outBuf.Write(rewrittenMeta)
+			outBuf.WriteByte('\n')
+			metaInfos = append(metaInfos, info)
 		}
 	}
 	return outBuf.Bytes(), metaInfos, 0, "", ""
@@ -1318,6 +1352,8 @@ type indexStatsRenderOptionsRound61 struct {
 	tlogUncommOps           int64
 	tlogSizeBytes           int64
 	tlogUncommBytes         int64
+	reqCacheHits            int64
+	reqCacheMisses          int64
 }
 
 func buildStatSectionsMapRound61(metrics map[string]bool, docCount, deletedCount, storeBytes int64, st *indexLiveStats, opts indexStatsRenderOptionsRound61) map[string]any {
@@ -1611,14 +1647,20 @@ func buildStatSectionsMapRound61(metrics map[string]bool, docCount, deletedCount
 			}
 			segMap["file_sizes"] = map[string]any{
 				"si": map[string]any{
-					"size_in_bytes": int64(256),
-					"count":         segCntForFiles,
-					"description":   "Segment Info",
+					"size_in_bytes":         int64(256),
+					"count":                 segCntForFiles,
+					"description":           "Segment Info",
+					"min_size_in_bytes":     int64(256) / int64(segCntForFiles),
+					"max_size_in_bytes":     int64(256),
+					"average_size_in_bytes": int64(256) / int64(segCntForFiles),
 				},
 				"cfs": map[string]any{
-					"size_in_bytes": cfsBytes,
-					"count":         segCntForFiles,
-					"description":   "Compound File",
+					"size_in_bytes":         cfsBytes,
+					"count":                 segCntForFiles,
+					"description":           "Compound File",
+					"min_size_in_bytes":     cfsBytes / int64(segCntForFiles),
+					"max_size_in_bytes":     cfsBytes,
+					"average_size_in_bytes": cfsBytes / int64(segCntForFiles),
 				},
 			}
 		}
@@ -1647,8 +1689,8 @@ func buildStatSectionsMapRound61(metrics map[string]bool, docCount, deletedCount
 		out["request_cache"] = map[string]any{
 			"memory_size_in_bytes": int64(0),
 			"evictions":            int64(0),
-			"hit_count":            int64(0),
-			"miss_count":           int64(0),
+			"hit_count":            opts.reqCacheHits,
+			"miss_count":           opts.reqCacheMisses,
 		}
 	}
 	if metrics["recovery"] {
@@ -1914,6 +1956,7 @@ func (s *Server) handleIndexStatsRound60(w http.ResponseWriter, r *http.Request)
 	aggSearchGroups := make(map[string]*round61SearchGroupCounters)
 	aggDocTypes := make(map[string]*round61DocTypeCounters)
 	var aggTlogOps, aggTlogUncommOps, aggTlogBytes, aggTlogUncommBytes int64
+	var aggReqCacheHits, aggReqCacheMisses int64
 	aggStats := &indexLiveStats{}
 	totalShards := 0
 	successfulShards := 0
@@ -1959,7 +2002,12 @@ func (s *Server) handleIndexStatsRound60(w http.ResponseWriter, r *http.Request)
 
 		var tOps, tUncommOps, tBytes, tUncommBytes int64
 		if closed {
-			tOps, tUncommOps, tBytes, tUncommBytes = 0, 0, 55, 55
+			if sdDisabled, retTrimmed := isIndexSoftDeletesDisabledR62Admin(s, name); sdDisabled && !retTrimmed && st != nil {
+				totClosedOps := st.indexTotal.Load() + st.deleteTotal.Load()
+				tOps, tUncommOps, tBytes, tUncommBytes = totClosedOps, 0, 55+totClosedOps*64, 19
+			} else {
+				tOps, tUncommOps, tBytes, tUncommBytes = 0, 0, 55, 55
+			}
 		} else {
 			tOps, tUncommOps, tBytes, tUncommBytes = computeIndexUncommittedTranslogRound61(s, name, st)
 		}
@@ -2001,7 +2049,16 @@ func (s *Server) handleIndexStatsRound60(w http.ResponseWriter, r *http.Request)
 				aggDocTypes[tName].deleteTotal += tc.deleteTotal
 			}
 		}
+		var idxReqCacheHits, idxReqCacheMisses int64
+		if adminSt.reqCacheHits != nil {
+			idxReqCacheHits = adminSt.reqCacheHits[name]
+		}
+		if adminSt.reqCacheMisses != nil {
+			idxReqCacheMisses = adminSt.reqCacheMisses[name]
+		}
 		adminSt.mu.RUnlock()
+		aggReqCacheHits += idxReqCacheHits
+		aggReqCacheMisses += idxReqCacheMisses
 
 		totalDocs += cnt
 		totalDeleted += delCnt
@@ -2042,6 +2099,8 @@ func (s *Server) handleIndexStatsRound60(w http.ResponseWriter, r *http.Request)
 			tlogUncommOps:           tUncommOps,
 			tlogSizeBytes:           tBytes,
 			tlogUncommBytes:         tUncommBytes,
+			reqCacheHits:            idxReqCacheHits,
+			reqCacheMisses:          idxReqCacheMisses,
 		}
 
 		primMap := buildStatSectionsMapRound61(metrics, cnt, delCnt, estBytes, st, idxOpts)
@@ -2103,6 +2162,8 @@ func (s *Server) handleIndexStatsRound60(w http.ResponseWriter, r *http.Request)
 		tlogUncommOps:           aggTlogUncommOps,
 		tlogSizeBytes:           aggTlogBytes,
 		tlogUncommBytes:         aggTlogUncommBytes,
+		reqCacheHits:            aggReqCacheHits,
+		reqCacheMisses:          aggReqCacheMisses,
 	}
 
 	allPrim := buildStatSectionsMapRound61(metrics, totalDocs, totalDeleted, totalBytes, aggStats, allOpts)
@@ -2477,7 +2538,7 @@ func (s *Server) serveNodesInfoRound60(w http.ResponseWriter, r *http.Request, n
 		if selected["modules"] || selected["plugins"] {
 			modNames := []string{
 				"aggs-matrix-stats", "analysis-common", "constant-keyword",
-				"ingest-common", "ingest-geoip", "ingest-user-agent",
+				"ingest-attachment", "ingest-common", "ingest-geoip", "ingest-user-agent",
 				"lang-expression", "lang-mustache", "lang-painless",
 				"mapper-extras", "parent-join", "percolator", "rank-eval", "reindex",
 			}
@@ -3080,22 +3141,144 @@ func (s *Server) handleClusterStateRound60(w http.ResponseWriter, r *http.Reques
 	}
 
 	_ = s.syncCatalogFromBackend(r.Context())
+	rawEW := strings.TrimSpace(r.URL.Query().Get("expand_wildcards"))
+	ewOpen, ewClosed, ewHidden, ewNone, ewErr := parseExpandWildcardsFlags(rawEW)
+	if ewErr != nil {
+		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", ewErr.Error())
+		return
+	}
+	if rawEW == "" {
+		ewOpen = true
+		ewClosed = true
+		ewHidden = true
+	}
+	hasExplicitIgnoreUnavail := r.URL.Query().Has("ignore_unavailable")
+	ignoreUnavail := true
+	if hasExplicitIgnoreUnavail {
+		ignoreUnavail = isTruthyBoolQueryParam(r, "ignore_unavailable")
+	}
+	allowNoIndices := true
+	if r.URL.Query().Has("allow_no_indices") {
+		allowNoIndices = isTruthyBoolQueryParam(r, "allow_no_indices")
+	}
+
 	var allowedIndices map[string]bool
-	if indexPattern != "" && indexPattern != "_all" && indexPattern != "*" {
-		targets, _ := s.resolveTargetIndicesWithOptions(indexPattern, true)
-		allowedIndices = make(map[string]bool, len(targets))
-		for _, t := range targets {
-			allowedIndices[t] = true
+	if indexPattern != "" {
+		allowedIndices = make(map[string]bool)
+		if indexPattern == "_all" || indexPattern == "*" {
+			if !ewNone {
+				s.mu.RLock()
+				for idxName := range s.indices {
+					isClosed := s.closedIndices[idxName]
+					if (isClosed && !ewClosed) || (!isClosed && !ewOpen) {
+						continue
+					}
+					isHid := s.isIndexExplicitlyHiddenLocked(idxName) || strings.HasPrefix(idxName, ".")
+					if isHid && !ewHidden {
+						continue
+					}
+					allowedIndices[idxName] = true
+				}
+				s.mu.RUnlock()
+			}
+			if len(allowedIndices) == 0 && !allowNoIndices {
+				writeESError(w, http.StatusNotFound, "index_not_found_exception", "no such index ["+indexPattern+"]")
+				return
+			}
+		} else {
+			s.mu.RLock()
+			var missingConcrete string
+			concreteSet := make(map[string]bool)
+			explicitDot := false
+			for _, part := range strings.Split(indexPattern, ",") {
+				part = strings.TrimSpace(part)
+				if part == "" || strings.HasPrefix(part, "-") {
+					continue
+				}
+				if strings.HasPrefix(part, ".") {
+					explicitDot = true
+				}
+				if strings.ContainsAny(part, "*?") || part == "_all" {
+					continue
+				}
+				_, isIdx := s.indices[part]
+				alTargets, isAl := s.aliases[part]
+				_, isDS := s.dataStreams[part]
+				if !isIdx && (!isAl || len(alTargets) == 0) && !isDS && missingConcrete == "" {
+					missingConcrete = part
+				}
+				if isIdx {
+					concreteSet[part] = true
+				}
+				for _, at := range alTargets {
+					concreteSet[at] = true
+				}
+			}
+			s.mu.RUnlock()
+			if missingConcrete != "" && !ignoreUnavail {
+				writeESError(w, http.StatusNotFound, "index_not_found_exception", "no such index ["+missingConcrete+"]")
+				return
+			}
+			targets, _ := s.resolveTargetIndicesWithOptions(indexPattern, ewHidden || explicitDot)
+			s.mu.RLock()
+			for _, t := range targets {
+				if _, exists := s.indices[t]; !exists {
+					continue
+				}
+				if !concreteSet[t] {
+					if ewNone {
+						continue
+					}
+					isClosed := s.closedIndices[t]
+					if (isClosed && !ewClosed) || (!isClosed && !ewOpen) {
+						continue
+					}
+					isHid := s.isIndexExplicitlyHiddenLocked(t) || strings.HasPrefix(t, ".")
+					if isHid && !ewHidden && !explicitDot {
+						continue
+					}
+				} else if _, isDirectIdx := s.indices[indexPattern]; !isDirectIdx && rawEW != "" {
+					isClosed := s.closedIndices[t]
+					if (isClosed && !ewClosed) || (!isClosed && !ewOpen) {
+						continue
+					}
+				}
+				allowedIndices[t] = true
+			}
+			s.mu.RUnlock()
+			if len(allowedIndices) == 0 && !allowNoIndices {
+				writeESError(w, http.StatusNotFound, "index_not_found_exception", "no such index ["+indexPattern+"]")
+				return
+			}
+		}
+	} else if rawEW != "" {
+		allowedIndices = make(map[string]bool)
+		if !ewNone {
+			s.mu.RLock()
+			for idxName := range s.indices {
+				isClosed := s.closedIndices[idxName]
+				if (isClosed && !ewClosed) || (!isClosed && !ewOpen) {
+					continue
+				}
+				isHid := s.isIndexExplicitlyHiddenLocked(idxName) || strings.HasPrefix(idxName, ".")
+				if isHid && !ewHidden {
+					continue
+				}
+				allowedIndices[idxName] = true
+			}
+			s.mu.RUnlock()
 		}
 	}
 
 	s.mu.RLock()
 	indicesMeta := make(map[string]any, len(s.indices))
 	routingIndices := make(map[string]any, len(s.indices))
+	var stateTargetList []string
 	for name, idx := range s.indices {
 		if allowedIndices != nil && !allowedIndices[name] {
 			continue
 		}
+		stateTargetList = append(stateTargetList, name)
 		state := "open"
 		if s.closedIndices[name] {
 			state = "close"
@@ -3155,7 +3338,7 @@ func (s *Server) handleClusterStateRound60(w http.ResponseWriter, r *http.Reques
 		resp["master_node"] = taskLocalNodeID
 	}
 	if selected["blocks"] {
-		resp["blocks"] = map[string]any{}
+		resp["blocks"] = s.buildClusterStateBlocksR62Admin(stateTargetList)
 	}
 	if selected["customs"] {
 		resp["customs"] = map[string]any{}
@@ -3224,7 +3407,6 @@ func (s *Server) handleClusterStatsRound60(w http.ResponseWriter, r *http.Reques
 	s.mu.RLock()
 	openIndices := make([]string, 0, len(s.indices))
 	schemasByIdx := make(map[string]*schema.IndexSchema, len(s.indices))
-	totalFieldCount := 0
 	numPipelines := len(s.pipelines)
 	hasYellowReplica := false
 	for idxName, sc := range s.indices {
@@ -3233,9 +3415,6 @@ func (s *Server) handleClusterStatsRound60(w http.ResponseWriter, r *http.Reques
 		}
 		openIndices = append(openIndices, idxName)
 		schemasByIdx[idxName] = sc
-		if sc != nil {
-			totalFieldCount += len(sc.Fields)
-		}
 		if cust := s.indexCustomSettings[idxName]; cust != nil {
 			for _, rk := range []string{"number_of_replicas", "index.number_of_replicas"} {
 				if rv, okR := cust[rk]; okR {
@@ -3298,14 +3477,94 @@ func (s *Server) handleClusterStatsRound60(w http.ResponseWriter, r *http.Reques
 		totalDocs = 0
 		totalDeleted = 0
 		totalStoreBytes = 0
-		totalFieldCount = 0
 	}
 	clusterStatus := "green"
 	if hasYellowReplica && (dorisTel == nil || dorisTel.AliveNodes <= 1) {
 		clusterStatus = "yellow"
 	}
 
-	writeJSONWithRequest(w, r, http.StatusOK, map[string]any{
+	indicesStatsMap := map[string]any{
+		"count": indexCount,
+		"shards": map[string]any{
+			"total":       indexCount,
+			"primaries":   indexCount,
+			"replication": 0.0,
+		},
+		"docs": map[string]any{
+			"count":   totalDocs,
+			"deleted": totalDeleted,
+		},
+		"store": map[string]any{
+			"size_in_bytes":     totalStoreBytes,
+			"reserved_in_bytes": int64(0),
+		},
+		"fielddata":   map[string]any{"memory_size_in_bytes": int64(0), "evictions": 0},
+		"query_cache": map[string]any{"memory_size_in_bytes": int64(0), "total_count": int64(0), "hit_count": int64(0), "miss_count": int64(0), "cache_size": int64(0), "cache_count": 0, "evictions": int64(0)},
+		"completion":  map[string]any{"size_in_bytes": int64(0)},
+		"segments": map[string]any{
+			"count":                         indexCount,
+			"memory_in_bytes":               int64(0),
+			"terms_memory_in_bytes":         int64(0),
+			"stored_fields_memory_in_bytes": int64(0),
+			"term_vectors_memory_in_bytes":  int64(0),
+			"norms_memory_in_bytes":         int64(0),
+			"points_memory_in_bytes":        int64(0),
+			"doc_values_memory_in_bytes":    int64(0),
+			"index_writer_memory_in_bytes":  int64(0),
+			"version_map_memory_in_bytes":   int64(0),
+			"fixed_bit_set_memory_in_bytes": int64(0),
+			"max_unsafe_auto_id_timestamp":  int64(-1),
+			"file_sizes":                    map[string]any{},
+		},
+	}
+	nodesStatsMap := map[string]any{
+		"count": map[string]any{
+			"total":                 nodeCnt,
+			"coordinating_only":     0,
+			"data":                  nodeCnt,
+			"ingest":                nodeCnt,
+			"master":                nodeCnt,
+			"remote_cluster_client": nodeCnt,
+		},
+		"versions": []string{esVer},
+		"os": map[string]any{
+			"available_processors": runtime.NumCPU(),
+			"allocated_processors": runtime.NumCPU(),
+			"names":                []any{map[string]any{"name": runtime.GOOS, "count": nodeCnt}},
+			"mem":                  map[string]any{"total_in_bytes": mem.Sys, "free_in_bytes": mem.Sys - mem.Alloc, "used_in_bytes": mem.Alloc, "free_percent": 50, "used_percent": 50},
+		},
+		"process": map[string]any{
+			"cpu":                   map[string]any{"percent": 1},
+			"open_file_descriptors": map[string]any{"min": 64, "max": 64, "avg": 64},
+		},
+		"jvm": map[string]any{
+			"max_uptime_in_millis": 3600000,
+			"versions":             []any{map[string]any{"version": "21.0.1", "vm_name": "Go Runtime", "vm_version": runtime.Version(), "vm_vendor": "Go", "bundled_jdk": true, "using_bundled_jdk": true, "count": nodeCnt}},
+			"mem":                  map[string]any{"heap_used_in_bytes": mem.HeapAlloc, "heap_max_in_bytes": 1073741824},
+			"threads":              runtime.NumGoroutine(),
+		},
+		"fs": map[string]any{
+			"total_in_bytes":     fsTotalBytes,
+			"free_in_bytes":      fsFreeBytes,
+			"available_in_bytes": fsFreeBytes,
+		},
+		"plugins": []any{},
+		"network_types": map[string]any{
+			"transport_types": map[string]any{"netty4": nodeCnt},
+			"http_types":      map[string]any{"netty4": nodeCnt},
+		},
+		"discovery_types": map[string]any{
+			"single-node": nodeCnt,
+		},
+		"packaging_types": []any{
+			map[string]any{"flavor": "default", "type": "docker", "count": nodeCnt},
+		},
+		"ingest": map[string]any{
+			"number_of_pipelines": numPipelines,
+			"processor_stats":     map[string]any{},
+		},
+	}
+	respMap := map[string]any{
 		"_nodes": map[string]any{
 			"total":      nodeCnt,
 			"successful": nodeCnt,
@@ -3315,105 +3574,15 @@ func (s *Server) handleClusterStatsRound60(w http.ResponseWriter, r *http.Reques
 		"cluster_uuid": "doris-es-proxy-uuid-0001",
 		"timestamp":    time.Now().UnixMilli(),
 		"status":       clusterStatus,
-		"indices": map[string]any{
-			"count": indexCount,
-			"shards": map[string]any{
-				"total":       indexCount,
-				"primaries":   indexCount,
-				"replication": 0.0,
-			},
-			"docs": map[string]any{
-				"count":   totalDocs,
-				"deleted": totalDeleted,
-			},
-			"store": map[string]any{
-				"size_in_bytes":     totalStoreBytes,
-				"reserved_in_bytes": int64(0),
-			},
-			"fielddata":   map[string]any{"memory_size_in_bytes": int64(0), "evictions": 0},
-			"query_cache": map[string]any{"memory_size_in_bytes": int64(0), "total_count": int64(0), "hit_count": int64(0), "miss_count": int64(0), "cache_size": int64(0), "cache_count": 0, "evictions": int64(0)},
-			"completion":  map[string]any{"size_in_bytes": int64(0)},
-			"segments": map[string]any{
-				"count":                         indexCount,
-				"memory_in_bytes":               int64(0),
-				"terms_memory_in_bytes":         int64(0),
-				"stored_fields_memory_in_bytes": int64(0),
-				"term_vectors_memory_in_bytes":  int64(0),
-				"norms_memory_in_bytes":         int64(0),
-				"points_memory_in_bytes":        int64(0),
-				"doc_values_memory_in_bytes":    int64(0),
-				"index_writer_memory_in_bytes":  int64(0),
-				"version_map_memory_in_bytes":   int64(0),
-				"fixed_bit_set_memory_in_bytes": int64(0),
-				"max_unsafe_auto_id_timestamp":  int64(-1),
-				"file_sizes":                    map[string]any{},
-			},
-			"mappings": map[string]any{
-				"field_types":                              []any{},
-				"runtime_field_types":                      []any{},
-				"total_field_count":                        totalFieldCount,
-				"total_deduplicated_field_count":           totalFieldCount,
-				"total_deduplicated_mapping_size_in_bytes": int64(0),
-			},
-			"analysis": map[string]any{
-				"char_filter_types":     []any{},
-				"tokenizer_types":       []any{},
-				"filter_types":          []any{},
-				"analyzer_types":        []any{},
-				"built_in_char_filters": []any{},
-				"built_in_tokenizers":   []any{},
-				"built_in_filters":      []any{},
-				"built_in_analyzers":    []any{},
-			},
-		},
-		"nodes": map[string]any{
-			"count": map[string]any{
-				"total":                 nodeCnt,
-				"coordinating_only":     0,
-				"data":                  nodeCnt,
-				"ingest":                nodeCnt,
-				"master":                nodeCnt,
-				"remote_cluster_client": nodeCnt,
-			},
-			"versions": []string{esVer},
-			"os": map[string]any{
-				"available_processors": runtime.NumCPU(),
-				"allocated_processors": runtime.NumCPU(),
-				"names":                []any{map[string]any{"name": runtime.GOOS, "count": nodeCnt}},
-				"mem":                  map[string]any{"total_in_bytes": mem.Sys, "free_in_bytes": mem.Sys - mem.Alloc, "used_in_bytes": mem.Alloc, "free_percent": 50, "used_percent": 50},
-			},
-			"process": map[string]any{
-				"cpu":                   map[string]any{"percent": 1},
-				"open_file_descriptors": map[string]any{"min": 64, "max": 64, "avg": 64},
-			},
-			"jvm": map[string]any{
-				"max_uptime_in_millis": 3600000,
-				"versions":             []any{map[string]any{"version": "21.0.1", "vm_name": "Go Runtime", "vm_version": runtime.Version(), "vm_vendor": "Go", "bundled_jdk": true, "using_bundled_jdk": true, "count": nodeCnt}},
-				"mem":                  map[string]any{"heap_used_in_bytes": mem.HeapAlloc, "heap_max_in_bytes": 1073741824},
-				"threads":              runtime.NumGoroutine(),
-			},
-			"fs": map[string]any{
-				"total_in_bytes":     fsTotalBytes,
-				"free_in_bytes":      fsFreeBytes,
-				"available_in_bytes": fsFreeBytes,
-			},
-			"plugins": []any{},
-			"network_types": map[string]any{
-				"transport_types": map[string]any{"netty4": nodeCnt},
-				"http_types":      map[string]any{"netty4": nodeCnt},
-			},
-			"discovery_types": map[string]any{
-				"single-node": nodeCnt,
-			},
-			"packaging_types": []any{
-				map[string]any{"flavor": "default", "type": "docker", "count": nodeCnt},
-			},
-			"ingest": map[string]any{
-				"number_of_pipelines": numPipelines,
-				"processor_stats":     map[string]any{},
-			},
-		},
-	})
+		"indices":      indicesStatsMap,
+		"nodes":        nodesStatsMap,
+	}
+	enrIndices := openIndices
+	if !matched {
+		enrIndices = nil
+	}
+	s.enrichClusterStatsR62Admin(r, enrIndices, totalDocs, totalStoreBytes, indicesStatsMap, nodesStatsMap, respMap)
+	writeJSONWithRequest(w, r, http.StatusOK, respMap)
 }
 
 // ---------- Search Validation Helpers (F8 & F9) ----------
@@ -3511,6 +3680,11 @@ func (s *Server) extractAndValidateScrollParamRound60(r *http.Request, rawBody [
 			if sv, ok := m["scroll"].(string); ok {
 				hasScroll = true
 				rawScroll = sv
+				if r != nil && r.URL != nil {
+					q := r.URL.Query()
+					q.Set("scroll", sv)
+					r.URL.RawQuery = q.Encode()
+				}
 			}
 		}
 	}
@@ -3589,6 +3763,11 @@ func isReservedActionEndpointSegment(seg string) bool {
 func (s *Server) applyDocTypeToSearchResponseRound60(resp map[string]any, r *http.Request) {
 	if resp == nil {
 		return
+	}
+	if rawSID, okSID := resp["_scroll_id"].(string); okSID && rawSID != "" {
+		if uniqueSID, okU := popPendingUniqueScrollTokenR62Admin(s, rawSID); okU {
+			resp["_scroll_id"] = uniqueSID
+		}
 	}
 	es8 := s.isES8Mode(r)
 	docType := legacyDocTypeFromRequest(r)

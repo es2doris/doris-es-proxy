@@ -71,10 +71,12 @@ type sdkOrderDoc struct {
 var targetValidatedEndpoints = []string{
 	"info",
 	"cluster.health",
+	"cluster.stats",
 	"cluster.put_settings",
 	"cluster.get_settings",
 	"cluster.put_component_template",
 	"cluster.delete_component_template",
+	"nodes.stats",
 	"indices.create",
 	"indices.delete",
 	"indices.refresh",
@@ -89,6 +91,18 @@ var targetValidatedEndpoints = []string{
 	"indices.put_index_template",
 	"indices.get_index_template",
 	"indices.delete_index_template",
+	"indices.simulate_index_template",
+	"indices.simulate_template",
+	"indices.create_data_stream",
+	"indices.get_data_stream",
+	"indices.data_streams_stats",
+	"indices.delete_data_stream",
+	"indices.rollover",
+	"indices.close",
+	"indices.open",
+	"indices.segments",
+	"indices.forcemerge",
+	"indices.clear_cache",
 	"indices.analyze",
 	"indices.validate_query",
 	"indices.resolve_index",
@@ -104,6 +118,24 @@ var targetValidatedEndpoints = []string{
 	"update_by_query",
 	"delete_by_query",
 	"field_caps",
+	"termvectors",
+	"mtermvectors",
+	"rank_eval",
+	"scripts_painless_execute",
+	"render_search_template",
+	"search_template",
+	"msearch_template",
+	"synonyms.put_synonym",
+	"synonyms.get_synonym",
+	"synonyms.get_synonyms_sets",
+	"synonyms.put_synonym_rule",
+	"synonyms.delete_synonym",
+	"async_search.submit",
+	"async_search.get",
+	"async_search.delete",
+	"sql.query",
+	"esql.query",
+	"eql.search",
 	"open_point_in_time",
 	"close_point_in_time",
 	"scroll",
@@ -119,6 +151,7 @@ var targetValidatedEndpoints = []string{
 	"cat.indices",
 	"cat.aliases",
 	"cat.count",
+	"cat.segments",
 }
 
 // --- Wire-Conformance Recording Transport ---
@@ -1288,6 +1321,658 @@ func TestOfficialElasticGoSDKv8_Conformance(t *testing.T) {
 			_ = remAliasRes.Body.Close()
 		}
 		wireTransport.assertNoViolations(t, "Round61_12_UpdateAliases_ResolveIndex_And_CatSuite")
+	})
+
+	// 9. Round 62: Tier-2 Official Go SDK v8 & schema.json 80+ Endpoint Expansion (Round62_01 .. Round62_08)
+	t.Run("Round62_01_DataStreams_Stats_And_Rollover", func(t *testing.T) {
+		dsTmpl := fmt.Sprintf("sdk_v8_ds_tmpl_%d", time.Now().UnixNano())
+		dsName := fmt.Sprintf("sdk_v8_ds_%d", time.Now().UnixNano())
+		t.Cleanup(func() {
+			if r, e := esClient.Indices.DeleteDataStream([]string{dsName}); e == nil && r != nil {
+				_ = r.Body.Close()
+			}
+			if r, e := esClient.Indices.DeleteIndexTemplate(dsTmpl); e == nil && r != nil {
+				_ = r.Body.Close()
+			}
+		})
+
+		dsTmplBody := fmt.Sprintf(`{"index_patterns":[%q],"data_stream":{},"priority":400,"template":{"mappings":{"properties":{"@timestamp":{"type":"date"},"msg":{"type":"keyword"}}}}}`, dsName+"*")
+		putTmplRes, err := esClient.Indices.PutIndexTemplate(
+			dsTmpl,
+			strings.NewReader(dsTmplBody),
+			esClient.Indices.PutIndexTemplate.WithContext(ctx),
+		)
+		if err != nil {
+			t.Fatalf("PutIndexTemplate(ds) failed: %v", err)
+		}
+		_ = putTmplRes.Body.Close()
+		if putTmplRes.IsError() {
+			t.Fatalf("PutIndexTemplate(ds) error: %s", putTmplRes.Status())
+		}
+
+		createDSRes, err := esClient.Indices.CreateDataStream(
+			dsName,
+			esClient.Indices.CreateDataStream.WithContext(ctx),
+		)
+		if err != nil {
+			t.Fatalf("CreateDataStream failed: %v", err)
+		}
+		createDSRaw, _ := io.ReadAll(createDSRes.Body)
+		_ = createDSRes.Body.Close()
+		if createDSRes.IsError() {
+			t.Fatalf("CreateDataStream error (%s): %s", createDSRes.Status(), string(createDSRaw))
+		}
+
+		getDSRes, err := esClient.Indices.GetDataStream(
+			esClient.Indices.GetDataStream.WithName(dsName),
+			esClient.Indices.GetDataStream.WithContext(ctx),
+		)
+		if err != nil {
+			t.Fatalf("GetDataStream failed: %v", err)
+		}
+		getDSRaw, _ := io.ReadAll(getDSRes.Body)
+		_ = getDSRes.Body.Close()
+		if getDSRes.IsError() || !strings.Contains(string(getDSRaw), dsName) {
+			t.Fatalf("unexpected GetDataStream (%s): %s", getDSRes.Status(), string(getDSRaw))
+		}
+
+		dsStatsRes, err := esClient.Indices.DataStreamsStats(
+			esClient.Indices.DataStreamsStats.WithName(dsName),
+			esClient.Indices.DataStreamsStats.WithContext(ctx),
+		)
+		if err != nil {
+			t.Fatalf("DataStreamsStats failed: %v", err)
+		}
+		dsStatsRaw, _ := io.ReadAll(dsStatsRes.Body)
+		_ = dsStatsRes.Body.Close()
+		if dsStatsRes.IsError() || !strings.Contains(string(dsStatsRaw), dsName) {
+			t.Fatalf("unexpected DataStreamsStats (%s): %s", dsStatsRes.Status(), string(dsStatsRaw))
+		}
+
+		rollRes, err := esClient.Indices.Rollover(
+			dsName,
+			esClient.Indices.Rollover.WithContext(ctx),
+		)
+		if err != nil {
+			t.Fatalf("Indices.Rollover failed: %v", err)
+		}
+		rollRaw, _ := io.ReadAll(rollRes.Body)
+		_ = rollRes.Body.Close()
+		if rollRes.IsError() || !strings.Contains(string(rollRaw), `"rolled_over"`) {
+			t.Fatalf("unexpected Indices.Rollover (%s): %s", rollRes.Status(), string(rollRaw))
+		}
+
+		delDSRes, err := esClient.Indices.DeleteDataStream(
+			[]string{dsName},
+			esClient.Indices.DeleteDataStream.WithContext(ctx),
+		)
+		if err != nil {
+			t.Fatalf("DeleteDataStream failed: %v", err)
+		}
+		delDSRaw, _ := io.ReadAll(delDSRes.Body)
+		_ = delDSRes.Body.Close()
+		if delDSRes.IsError() {
+			t.Fatalf("DeleteDataStream error (%s): %s", delDSRes.Status(), string(delDSRaw))
+		}
+		wireTransport.assertNoViolations(t, "Round62_01_DataStreams_Stats_And_Rollover")
+	})
+
+	t.Run("Round62_02_TemplateSim_CloseOpen_Segments_Forcemerge_ClearCache", func(t *testing.T) {
+		simTmpl := fmt.Sprintf("sdk_v8_sim_%d", time.Now().UnixNano())
+		maintIdx := fmt.Sprintf("sdk_v8_maint_%d", time.Now().UnixNano())
+		t.Cleanup(func() {
+			_, _ = typedClient.Indices.Delete(maintIdx).Do(context.Background())
+			if r, e := esClient.Indices.DeleteIndexTemplate(simTmpl); e == nil && r != nil {
+				_ = r.Body.Close()
+			}
+		})
+
+		putSimTmpl, err := esClient.Indices.PutIndexTemplate(
+			simTmpl,
+			strings.NewReader(fmt.Sprintf(`{"index_patterns":[%q],"priority":250,"template":{"mappings":{"properties":{"tag":{"type":"keyword"}}}}}`, maintIdx+"*")),
+			esClient.Indices.PutIndexTemplate.WithContext(ctx),
+		)
+		if err != nil {
+			t.Fatalf("PutIndexTemplate(sim) failed: %v", err)
+		}
+		_ = putSimTmpl.Body.Close()
+
+		simIdxRes, err := esClient.Indices.SimulateIndexTemplate(
+			maintIdx+"_probe",
+			esClient.Indices.SimulateIndexTemplate.WithContext(ctx),
+		)
+		if err != nil {
+			t.Fatalf("SimulateIndexTemplate failed: %v", err)
+		}
+		simIdxRaw, _ := io.ReadAll(simIdxRes.Body)
+		_ = simIdxRes.Body.Close()
+		if simIdxRes.IsError() {
+			t.Fatalf("SimulateIndexTemplate error (%s): %s", simIdxRes.Status(), string(simIdxRaw))
+		}
+
+		simTmplRes, err := esClient.Indices.SimulateTemplate(
+			esClient.Indices.SimulateTemplate.WithName(simTmpl),
+			esClient.Indices.SimulateTemplate.WithContext(ctx),
+		)
+		if err != nil {
+			t.Fatalf("SimulateTemplate failed: %v", err)
+		}
+		simTmplRaw, _ := io.ReadAll(simTmplRes.Body)
+		_ = simTmplRes.Body.Close()
+		if simTmplRes.IsError() {
+			t.Fatalf("SimulateTemplate error (%s): %s", simTmplRes.Status(), string(simTmplRaw))
+		}
+
+		if _, err := typedClient.Indices.Create(maintIdx).Do(ctx); err != nil {
+			t.Fatalf("Create(%s) failed: %v", maintIdx, err)
+		}
+
+		closeRes, err := esClient.Indices.Close(
+			[]string{maintIdx},
+			esClient.Indices.Close.WithContext(ctx),
+		)
+		if err != nil {
+			t.Fatalf("Indices.Close failed: %v", err)
+		}
+		closeRaw, _ := io.ReadAll(closeRes.Body)
+		_ = closeRes.Body.Close()
+		if closeRes.IsError() {
+			t.Fatalf("Indices.Close error (%s): %s", closeRes.Status(), string(closeRaw))
+		}
+
+		openRes, err := esClient.Indices.Open(
+			[]string{maintIdx},
+			esClient.Indices.Open.WithContext(ctx),
+		)
+		if err != nil {
+			t.Fatalf("Indices.Open failed: %v", err)
+		}
+		openRaw, _ := io.ReadAll(openRes.Body)
+		_ = openRes.Body.Close()
+		if openRes.IsError() {
+			t.Fatalf("Indices.Open error (%s): %s", openRes.Status(), string(openRaw))
+		}
+
+		segRes, err := esClient.Indices.Segments(
+			esClient.Indices.Segments.WithIndex(idx),
+			esClient.Indices.Segments.WithContext(ctx),
+		)
+		if err != nil {
+			t.Fatalf("Indices.Segments failed: %v", err)
+		}
+		segRaw, _ := io.ReadAll(segRes.Body)
+		_ = segRes.Body.Close()
+		if segRes.IsError() {
+			t.Fatalf("Indices.Segments error (%s): %s", segRes.Status(), string(segRaw))
+		}
+
+		fmRes, err := esClient.Indices.Forcemerge(
+			esClient.Indices.Forcemerge.WithIndex(idx),
+			esClient.Indices.Forcemerge.WithMaxNumSegments(1),
+			esClient.Indices.Forcemerge.WithContext(ctx),
+		)
+		if err != nil {
+			t.Fatalf("Indices.Forcemerge failed: %v", err)
+		}
+		fmRaw, _ := io.ReadAll(fmRes.Body)
+		_ = fmRes.Body.Close()
+		if fmRes.IsError() {
+			t.Fatalf("Indices.Forcemerge error (%s): %s", fmRes.Status(), string(fmRaw))
+		}
+
+		ccRes, err := esClient.Indices.ClearCache(
+			esClient.Indices.ClearCache.WithIndex(idx),
+			esClient.Indices.ClearCache.WithContext(ctx),
+		)
+		if err != nil {
+			t.Fatalf("Indices.ClearCache failed: %v", err)
+		}
+		ccRaw, _ := io.ReadAll(ccRes.Body)
+		_ = ccRes.Body.Close()
+		if ccRes.IsError() {
+			t.Fatalf("Indices.ClearCache error (%s): %s", ccRes.Status(), string(ccRaw))
+		}
+
+		catSegRes, err := esClient.Cat.Segments(
+			esClient.Cat.Segments.WithIndex(idx),
+			esClient.Cat.Segments.WithFormat("json"),
+			esClient.Cat.Segments.WithContext(ctx),
+		)
+		if err != nil {
+			t.Fatalf("Cat.Segments failed: %v", err)
+		}
+		catSegRaw, _ := io.ReadAll(catSegRes.Body)
+		_ = catSegRes.Body.Close()
+		if catSegRes.IsError() {
+			t.Fatalf("Cat.Segments error (%s): %s", catSegRes.Status(), string(catSegRaw))
+		}
+		wireTransport.assertNoViolations(t, "Round62_02_TemplateSim_CloseOpen_Segments_Forcemerge_ClearCache")
+	})
+
+	t.Run("Round62_03_Termvectors_Mtermvectors_And_RankEval", func(t *testing.T) {
+		tvRes, err := esClient.Termvectors(
+			idx,
+			esClient.Termvectors.WithDocumentID("order-1"),
+			esClient.Termvectors.WithFields("title"),
+			esClient.Termvectors.WithContext(ctx),
+		)
+		if err != nil {
+			t.Fatalf("Termvectors failed: %v", err)
+		}
+		tvRaw, _ := io.ReadAll(tvRes.Body)
+		_ = tvRes.Body.Close()
+		if tvRes.IsError() {
+			t.Fatalf("Termvectors error (%s): %s", tvRes.Status(), string(tvRaw))
+		}
+
+		mtvRes, err := esClient.Mtermvectors(
+			esClient.Mtermvectors.WithIndex(idx),
+			esClient.Mtermvectors.WithBody(strings.NewReader(`{"ids":["order-1","order-2"]}`)),
+			esClient.Mtermvectors.WithContext(ctx),
+		)
+		if err != nil {
+			t.Fatalf("Mtermvectors failed: %v", err)
+		}
+		mtvRaw, _ := io.ReadAll(mtvRes.Body)
+		_ = mtvRes.Body.Close()
+		if mtvRes.IsError() {
+			t.Fatalf("Mtermvectors error (%s): %s", mtvRes.Status(), string(mtvRaw))
+		}
+
+		rankEvalBody := fmt.Sprintf(`{
+			"requests": [
+				{
+					"id": "analytics_q1",
+					"request": {"query": {"match": {"title": "Analytics"}}},
+					"ratings": [{"_index": %q, "_id": "order-1", "rating": 3}]
+				}
+			],
+			"metric": {"precision": {"k": 5}}
+		}`, idx)
+		reRes, err := esClient.RankEval(
+			strings.NewReader(rankEvalBody),
+			esClient.RankEval.WithIndex(idx),
+			esClient.RankEval.WithContext(ctx),
+		)
+		if err != nil {
+			t.Fatalf("RankEval failed: %v", err)
+		}
+		reRaw, _ := io.ReadAll(reRes.Body)
+		_ = reRes.Body.Close()
+		if reRes.IsError() {
+			t.Fatalf("RankEval error (%s): %s", reRes.Status(), string(reRaw))
+		}
+		wireTransport.assertNoViolations(t, "Round62_03_Termvectors_Mtermvectors_And_RankEval")
+	})
+
+	t.Run("Round62_04_PainlessExecute_And_SearchTemplates", func(t *testing.T) {
+		painlessRes, err := esClient.ScriptsPainlessExecute(
+			esClient.ScriptsPainlessExecute.WithBody(strings.NewReader(`{"script":{"source":"params.count / params.total","params":{"count":100.0,"total":1000.0}}}`)),
+			esClient.ScriptsPainlessExecute.WithContext(ctx),
+		)
+		if err != nil {
+			t.Fatalf("ScriptsPainlessExecute failed: %v", err)
+		}
+		painlessRaw, _ := io.ReadAll(painlessRes.Body)
+		_ = painlessRes.Body.Close()
+		if painlessRes.IsError() || !strings.Contains(string(painlessRaw), `"0.1"`) {
+			t.Fatalf("unexpected ScriptsPainlessExecute (%s): %s", painlessRes.Status(), string(painlessRaw))
+		}
+
+		renderRes, err := esClient.RenderSearchTemplate(
+			esClient.RenderSearchTemplate.WithBody(strings.NewReader(`{"source":{"query":{"term":{"category":"{{cat}}"}}},"params":{"cat":"analytics"}}`)),
+			esClient.RenderSearchTemplate.WithContext(ctx),
+		)
+		if err != nil {
+			t.Fatalf("RenderSearchTemplate failed: %v", err)
+		}
+		renderRaw, _ := io.ReadAll(renderRes.Body)
+		_ = renderRes.Body.Close()
+		if renderRes.IsError() || !strings.Contains(string(renderRaw), `"analytics"`) {
+			t.Fatalf("unexpected RenderSearchTemplate (%s): %s", renderRes.Status(), string(renderRaw))
+		}
+
+		stRes, err := esClient.SearchTemplate(
+			strings.NewReader(`{"source":{"query":{"term":{"category":"{{cat}}"}}},"params":{"cat":"analytics"}}`),
+			esClient.SearchTemplate.WithIndex(idx),
+			esClient.SearchTemplate.WithContext(ctx),
+		)
+		if err != nil {
+			t.Fatalf("SearchTemplate failed: %v", err)
+		}
+		stRaw, _ := io.ReadAll(stRes.Body)
+		_ = stRes.Body.Close()
+		if stRes.IsError() {
+			t.Fatalf("SearchTemplate error (%s): %s", stRes.Status(), string(stRaw))
+		}
+
+		mstNDJSON := "{}\n" + `{"source":{"query":{"term":{"category":"{{cat}}"}}},"params":{"cat":"analytics"}}` + "\n"
+		mstRes, err := esClient.MsearchTemplate(
+			strings.NewReader(mstNDJSON),
+			esClient.MsearchTemplate.WithIndex(idx),
+			esClient.MsearchTemplate.WithContext(ctx),
+		)
+		if err != nil {
+			t.Fatalf("MsearchTemplate failed: %v", err)
+		}
+		mstRaw, _ := io.ReadAll(mstRes.Body)
+		_ = mstRes.Body.Close()
+		if mstRes.IsError() {
+			t.Fatalf("MsearchTemplate error (%s): %s", mstRes.Status(), string(mstRaw))
+		}
+		wireTransport.assertNoViolations(t, "Round62_04_PainlessExecute_And_SearchTemplates")
+	})
+
+	t.Run("Round62_05_SynonymsManagement_Lifecycle", func(t *testing.T) {
+		synID := fmt.Sprintf("sdk_v8_syn_%d", time.Now().UnixNano())
+		t.Cleanup(func() {
+			if r, e := esClient.SynonymsDeleteSynonym(synID); e == nil && r != nil {
+				_ = r.Body.Close()
+			}
+		})
+
+		putSynRes, err := esClient.SynonymsPutSynonym(
+			synID,
+			strings.NewReader(`{"synonyms_set":[{"id":"rule1","synonyms":"analytics, telemetry"}]}`),
+			esClient.SynonymsPutSynonym.WithContext(ctx),
+		)
+		if err != nil {
+			t.Fatalf("SynonymsPutSynonym failed: %v", err)
+		}
+		putSynRaw, _ := io.ReadAll(putSynRes.Body)
+		_ = putSynRes.Body.Close()
+		if putSynRes.IsError() {
+			t.Fatalf("SynonymsPutSynonym error (%s): %s", putSynRes.Status(), string(putSynRaw))
+		}
+
+		getSynRes, err := esClient.SynonymsGetSynonym(
+			synID,
+			esClient.SynonymsGetSynonym.WithContext(ctx),
+		)
+		if err != nil {
+			t.Fatalf("SynonymsGetSynonym failed: %v", err)
+		}
+		getSynRaw, _ := io.ReadAll(getSynRes.Body)
+		_ = getSynRes.Body.Close()
+		if getSynRes.IsError() || !strings.Contains(string(getSynRaw), "telemetry") {
+			t.Fatalf("unexpected SynonymsGetSynonym (%s): %s", getSynRes.Status(), string(getSynRaw))
+		}
+
+		listSynRes, err := esClient.SynonymsGetSynonymsSets(
+			esClient.SynonymsGetSynonymsSets.WithContext(ctx),
+		)
+		if err != nil {
+			t.Fatalf("SynonymsGetSynonymsSets failed: %v", err)
+		}
+		listSynRaw, _ := io.ReadAll(listSynRes.Body)
+		_ = listSynRes.Body.Close()
+		if listSynRes.IsError() {
+			t.Fatalf("SynonymsGetSynonymsSets error (%s): %s", listSynRes.Status(), string(listSynRaw))
+		}
+
+		putRuleRes, err := esClient.SynonymsPutSynonymRule(
+			strings.NewReader(`{"synonyms":"storage, warehouse"}`),
+			"rule2",
+			synID,
+			esClient.SynonymsPutSynonymRule.WithContext(ctx),
+		)
+		if err != nil {
+			t.Fatalf("SynonymsPutSynonymRule failed: %v", err)
+		}
+		putRuleRaw, _ := io.ReadAll(putRuleRes.Body)
+		_ = putRuleRes.Body.Close()
+		if putRuleRes.IsError() {
+			t.Fatalf("SynonymsPutSynonymRule error (%s): %s", putRuleRes.Status(), string(putRuleRaw))
+		}
+
+		delSynRes, err := esClient.SynonymsDeleteSynonym(
+			synID,
+			esClient.SynonymsDeleteSynonym.WithContext(ctx),
+		)
+		if err != nil {
+			t.Fatalf("SynonymsDeleteSynonym failed: %v", err)
+		}
+		delSynRaw, _ := io.ReadAll(delSynRes.Body)
+		_ = delSynRes.Body.Close()
+		if delSynRes.IsError() {
+			t.Fatalf("SynonymsDeleteSynonym error (%s): %s", delSynRes.Status(), string(delSynRaw))
+		}
+		wireTransport.assertNoViolations(t, "Round62_05_SynonymsManagement_Lifecycle")
+	})
+
+	t.Run("Round62_06_AsyncSearch_Lifecycle", func(t *testing.T) {
+		subRes, err := esClient.AsyncSearch.Submit(
+			esClient.AsyncSearch.Submit.WithIndex(idx),
+			esClient.AsyncSearch.Submit.WithWaitForCompletionTimeout(0),
+			esClient.AsyncSearch.Submit.WithKeepOnCompletion(true),
+			esClient.AsyncSearch.Submit.WithBody(strings.NewReader(`{"query":{"term":{"category":"analytics"}}}`)),
+			esClient.AsyncSearch.Submit.WithContext(ctx),
+		)
+		if err != nil {
+			t.Fatalf("AsyncSearch.Submit failed: %v", err)
+		}
+		subRaw, _ := io.ReadAll(subRes.Body)
+		_ = subRes.Body.Close()
+		if subRes.IsError() {
+			t.Fatalf("AsyncSearch.Submit error (%s): %s", subRes.Status(), string(subRaw))
+		}
+		var subParsed struct {
+			ID string `json:"id"`
+		}
+		if err := json.Unmarshal(subRaw, &subParsed); err != nil || subParsed.ID == "" {
+			t.Fatalf("expected non-empty async_search id, got err=%v raw=%s", err, string(subRaw))
+		}
+
+		getAsyncRes, err := esClient.AsyncSearch.Get(
+			subParsed.ID,
+			esClient.AsyncSearch.Get.WithContext(ctx),
+		)
+		if err != nil {
+			t.Fatalf("AsyncSearch.Get failed: %v", err)
+		}
+		getAsyncRaw, _ := io.ReadAll(getAsyncRes.Body)
+		_ = getAsyncRes.Body.Close()
+		if getAsyncRes.IsError() {
+			t.Fatalf("AsyncSearch.Get error (%s): %s", getAsyncRes.Status(), string(getAsyncRaw))
+		}
+
+		delAsyncRes, err := esClient.AsyncSearch.Delete(
+			subParsed.ID,
+			esClient.AsyncSearch.Delete.WithContext(ctx),
+		)
+		if err != nil {
+			t.Fatalf("AsyncSearch.Delete failed: %v", err)
+		}
+		delAsyncRaw, _ := io.ReadAll(delAsyncRes.Body)
+		_ = delAsyncRes.Body.Close()
+		if delAsyncRes.IsError() {
+			t.Fatalf("AsyncSearch.Delete error (%s): %s", delAsyncRes.Status(), string(delAsyncRaw))
+		}
+		wireTransport.assertNoViolations(t, "Round62_06_AsyncSearch_Lifecycle")
+	})
+
+	t.Run("Round62_07_SQL_ESQL_And_EQL_Queries", func(t *testing.T) {
+		sqlRes, err := esClient.SQL.Query(
+			strings.NewReader(fmt.Sprintf(`{"query":"SELECT category, quantity FROM \"%s\" WHERE active = true"}`, idx)),
+			esClient.SQL.Query.WithFormat("json"),
+			esClient.SQL.Query.WithContext(ctx),
+		)
+		if err != nil {
+			t.Fatalf("SQL.Query failed: %v", err)
+		}
+		sqlRaw, _ := io.ReadAll(sqlRes.Body)
+		_ = sqlRes.Body.Close()
+		if sqlRes.IsError() {
+			t.Fatalf("SQL.Query error (%s): %s", sqlRes.Status(), string(sqlRaw))
+		}
+
+		esqlRes, err := esClient.EsqlQuery(
+			strings.NewReader(fmt.Sprintf(`{"query":"FROM %s | LIMIT 3"}`, idx)),
+			esClient.EsqlQuery.WithFormat("json"),
+			esClient.EsqlQuery.WithContext(ctx),
+		)
+		if err != nil {
+			t.Fatalf("EsqlQuery failed: %v", err)
+		}
+		esqlRaw, _ := io.ReadAll(esqlRes.Body)
+		_ = esqlRes.Body.Close()
+		if esqlRes.IsError() {
+			t.Fatalf("EsqlQuery error (%s): %s", esqlRes.Status(), string(esqlRaw))
+		}
+
+		eqlIdx := fmt.Sprintf("sdk_v8_eql_%d", time.Now().UnixNano())
+		t.Cleanup(func() {
+			_, _ = typedClient.Indices.Delete(eqlIdx).Do(context.Background())
+		})
+		if _, err := typedClient.Indices.Create(eqlIdx).Mappings(&types.TypeMapping{
+			Properties: map[string]types.Property{
+				"@timestamp":     types.NewDateProperty(),
+				"event.category": types.NewKeywordProperty(),
+			},
+		}).Do(ctx); err != nil {
+			t.Fatalf("Create(%s) failed: %v", eqlIdx, err)
+		}
+		_, _ = typedClient.Index(eqlIdx).Id("ev-1").Refresh(refresh.True).
+			Document(map[string]any{"@timestamp": "2026-11-01T10:00:00Z", "event": map[string]any{"category": "process"}}).
+			Do(ctx)
+
+		eqlRes, err := esClient.EqlSearch(
+			eqlIdx,
+			strings.NewReader(`{"query":"process where true"}`),
+			esClient.EqlSearch.WithContext(ctx),
+		)
+		if err != nil {
+			t.Fatalf("EqlSearch failed: %v", err)
+		}
+		eqlRaw, _ := io.ReadAll(eqlRes.Body)
+		_ = eqlRes.Body.Close()
+		if eqlRes.IsError() {
+			t.Fatalf("EqlSearch error (%s): %s", eqlRes.Status(), string(eqlRaw))
+		}
+		wireTransport.assertNoViolations(t, "Round62_07_SQL_ESQL_And_EQL_Queries")
+	})
+
+	t.Run("Round62_08_TypedKnn_IfSeqNo409_ErrorSchemas_And_BulkIndexerOnFailure", func(t *testing.T) {
+		knnIdx := fmt.Sprintf("sdk_v8_knn_%d", time.Now().UnixNano())
+		t.Cleanup(func() {
+			_, _ = typedClient.Indices.Delete(knnIdx).Do(context.Background())
+		})
+
+		dims := 3
+		knnCreateRes, err := esClient.Indices.Create(
+			knnIdx,
+			esClient.Indices.Create.WithBody(strings.NewReader(fmt.Sprintf(`{"mappings":{"properties":{"label":{"type":"keyword"},"vec":{"type":"dense_vector","dims":%d,"index":true,"similarity":"cosine"}}}}`, dims))),
+			esClient.Indices.Create.WithContext(ctx),
+		)
+		if err != nil {
+			t.Fatalf("Create(%s) failed: %v", knnIdx, err)
+		}
+		_ = knnCreateRes.Body.Close()
+		if knnCreateRes.IsError() {
+			t.Fatalf("Create(%s) status: %s", knnIdx, knnCreateRes.Status())
+		}
+
+		_, err = typedClient.Index(knnIdx).Id("v1").Refresh(refresh.True).
+			Document(map[string]any{"label": "near", "vec": []float32{0.95, 0.05, 0.0}}).Do(ctx)
+		if err != nil {
+			t.Fatalf("index v1 failed: %v", err)
+		}
+		_, err = typedClient.Index(knnIdx).Id("v2").Refresh(refresh.True).
+			Document(map[string]any{"label": "far", "vec": []float32{0.0, 0.95, 0.05}}).Do(ctx)
+		if err != nil {
+			t.Fatalf("index v2 failed: %v", err)
+		}
+
+		knnRes, err := typedClient.Search().
+			Index(knnIdx).
+			Knn(types.KnnSearch{
+				Field:         "vec",
+				QueryVector:   []float32{1.0, 0.0, 0.0},
+				K:             intPtr(1),
+				NumCandidates: intPtr(5),
+			}).
+			Do(ctx)
+		if err != nil {
+			t.Fatalf("typedClient.Search().Knn() failed: %v", err)
+		}
+		if len(knnRes.Hits.Hits) != 1 || knnRes.Hits.Hits[0].Id_ == nil || *knnRes.Hits.Hits[0].Id_ != "v1" {
+			t.Fatalf("expected top-1 Knn hit v1, got %+v", knnRes.Hits.Hits)
+		}
+
+		// Exercise 404, 400, and 409 error envelopes through wireTransport schema.json validation
+		missRes, err := esClient.Get(idx, "missing-order-404", esClient.Get.WithContext(ctx))
+		if err != nil {
+			t.Fatalf("Get(404) transport error: %v", err)
+		}
+		_ = missRes.Body.Close()
+		if missRes.StatusCode != http.StatusNotFound {
+			t.Fatalf("expected HTTP 404 on missing doc, got %d", missRes.StatusCode)
+		}
+
+		badSearchRes, err := esClient.Search(
+			esClient.Search.WithIndex(idx),
+			esClient.Search.WithBody(strings.NewReader(`{"query":{"unknown_query_clause_r62":{}}}`)),
+			esClient.Search.WithContext(ctx),
+		)
+		if err != nil {
+			t.Fatalf("Search(400) transport error: %v", err)
+		}
+		_ = badSearchRes.Body.Close()
+		if badSearchRes.StatusCode != http.StatusBadRequest {
+			t.Fatalf("expected HTTP 400 on invalid query clause, got %d", badSearchRes.StatusCode)
+		}
+
+		conflictRes, err := esClient.Index(
+			idx,
+			strings.NewReader(`{"title":"stale-seq-write","category":"analytics","quantity":99,"amount":1.0,"active":true,"created_at":"2026-11-01T10:00:00Z"}`),
+			esClient.Index.WithDocumentID("order-1"),
+			esClient.Index.WithIfSeqNo(999999),
+			esClient.Index.WithIfPrimaryTerm(999),
+			esClient.Index.WithContext(ctx),
+		)
+		if err != nil {
+			t.Fatalf("Index(if_seq_no conflict) transport error: %v", err)
+		}
+		_ = conflictRes.Body.Close()
+		if conflictRes.StatusCode != http.StatusConflict {
+			t.Fatalf("expected HTTP 409 on stale if_seq_no, got %d", conflictRes.StatusCode)
+		}
+
+		// BulkIndexer OnFailure callback on duplicate "create" action
+		var failedDocIDs []string
+		var failMu sync.Mutex
+		failIndexer, err := esutil.NewBulkIndexer(esutil.BulkIndexerConfig{
+			Client:  esClient,
+			Index:   idx,
+			Refresh: "true",
+		})
+		if err != nil {
+			t.Fatalf("NewBulkIndexer(OnFailure) failed: %v", err)
+		}
+		if err := failIndexer.Add(ctx, esutil.BulkIndexerItem{
+			Action:     "create",
+			DocumentID: "order-1",
+			Body:       strings.NewReader(`{"title":"dup","category":"analytics","quantity":1,"amount":10.0,"active":true,"created_at":"2026-11-01T10:00:00Z"}`),
+			OnFailure: func(_ context.Context, item esutil.BulkIndexerItem, resp esutil.BulkIndexerResponseItem, _ error) {
+				failMu.Lock()
+				defer failMu.Unlock()
+				if resp.Status == http.StatusConflict {
+					failedDocIDs = append(failedDocIDs, item.DocumentID)
+				}
+			},
+		}); err != nil {
+			t.Fatalf("failIndexer.Add failed: %v", err)
+		}
+		if err := failIndexer.Close(ctx); err != nil {
+			t.Fatalf("failIndexer.Close failed: %v", err)
+		}
+		failStats := failIndexer.Stats()
+		if failStats.NumFailed != 1 || len(failedDocIDs) != 1 || failedDocIDs[0] != "order-1" {
+			t.Fatalf("expected BulkIndexer OnFailure for duplicate create order-1 (409), stats=%+v failedDocIDs=%v",
+				failStats, failedDocIDs)
+		}
+
+		wireTransport.assertNoViolations(t, "Round62_08_TypedKnn_IfSeqNo409_ErrorSchemas_And_BulkIndexerOnFailure")
 	})
 
 	ubqBody := `{"query":{"term":{"category":"storage"}},"script":{"source":"ctx._source.quantity = ctx._source.quantity + params.bump","lang":"painless","params":{"bump":6}}}`

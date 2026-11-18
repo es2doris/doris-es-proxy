@@ -218,11 +218,35 @@ func (s *Server) handleReloadSecureSettings(w http.ResponseWriter, r *http.Reque
 		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"_nodes":       map[string]any{"total": 1, "successful": 1, "failed": 0},
+	bodyBytes, ok := readRequestBody(w, r)
+	if !ok {
+		return
+	}
+	var body struct {
+		SecureSettingsPassword string `json:"secure_settings_password"`
+	}
+	if len(bytes.TrimSpace(bodyBytes)) > 0 {
+		if err := json.Unmarshal(bodyBytes, &body); err != nil {
+			writeESError(w, http.StatusBadRequest, "parsing_exception", err.Error())
+			return
+		}
+	}
+	nodeObj := map[string]any{
+		"name": "doris-es-proxy-node-1",
+	}
+	nodesSummary := map[string]any{"total": 1, "successful": 1, "failed": 0}
+	if strings.TrimSpace(body.SecureSettingsPassword) != "" {
+		nodesSummary = map[string]any{"total": 1, "successful": 0, "failed": 1}
+		nodeObj["reload_exception"] = map[string]any{
+			"type":   "security_exception",
+			"reason": "Provided keystore password was incorrect",
+		}
+	}
+	writeJSONWithRequest(w, r, http.StatusOK, map[string]any{
+		"_nodes":       nodesSummary,
 		"cluster_name": "doris-es-cluster",
 		"nodes": map[string]any{
-			"node-1": map[string]any{"name": "doris-es-proxy-node-1"},
+			taskLocalNodeID: nodeObj,
 		},
 	})
 }
@@ -233,13 +257,18 @@ func (s *Server) handleSnapshotRoot(w http.ResponseWriter, r *http.Request) {
 		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method")
 		return
 	}
+	isES8 := s.isES8Mode(r)
 	s.mu.RLock()
 	out := make(map[string]any, len(s.snapshotRepos))
 	for k, v := range s.snapshotRepos {
-		out[k] = deepCloneDocMap(v)
+		cp := deepCloneDocMap(v)
+		if isES8 && cp != nil {
+			cp["uuid"] = computeRepoUUIDR62Admin(k, cp)
+		}
+		out[k] = cp
 	}
 	s.mu.RUnlock()
-	writeJSON(w, http.StatusOK, out)
+	writeJSONWithRequest(w, r, http.StatusOK, out)
 }
 
 func cloneSnapshotWithoutInternal(snapObj map[string]any) map[string]any {
@@ -280,19 +309,34 @@ func formatSnapshotResponseItemRound61(rawSnap map[string]any, repoName string, 
 	}
 	if includeIndexDetails {
 		details := make(map[string]any)
+		buildDetail := func() map[string]any {
+			return map[string]any{
+				"shard_count":            1,
+				"size_in_bytes":          128,
+				"size":                   "128b",
+				"max_segments_per_shard": 1,
+				"shards": []any{
+					map[string]any{
+						"stage": "DONE",
+						"stats": map[string]any{
+							"number_of_files":         1,
+							"processed_files":         1,
+							"total_size_in_bytes":     128,
+							"processed_size_in_bytes": 128,
+						},
+					},
+				},
+			}
+		}
 		switch iv := cp["indices"].(type) {
 		case []string:
 			for _, idx := range iv {
-				details[idx] = map[string]any{
-					"shards": []any{map[string]any{"stage": "DONE", "stats": map[string]any{"number_of_files": 1, "processed_files": 1, "total_size_in_bytes": 0, "processed_size_in_bytes": 0}}},
-				}
+				details[idx] = buildDetail()
 			}
 		case []any:
 			for _, item := range iv {
 				if idx, okS := item.(string); okS && idx != "" {
-					details[idx] = map[string]any{
-						"shards": []any{map[string]any{"stage": "DONE", "stats": map[string]any{"number_of_files": 1, "processed_files": 1, "total_size_in_bytes": 0, "processed_size_in_bytes": 0}}},
-					}
+					details[idx] = buildDetail()
 				}
 			}
 		}
@@ -314,11 +358,19 @@ func (s *Server) handleSnapshotRepo(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet, http.MethodHead:
 		ignoreUnavailable := isTruthyBoolQueryParam(r, "ignore_unavailable")
+		isES8 := s.isES8Mode(r)
+		withRepoUUID := func(k string, v map[string]any) map[string]any {
+			cp := deepCloneDocMap(v)
+			if isES8 && cp != nil {
+				cp["uuid"] = computeRepoUUIDR62Admin(k, cp)
+			}
+			return cp
+		}
 		s.mu.RLock()
 		if repo == "" || repo == "_all" || repo == "*" {
 			out := make(map[string]any, len(s.snapshotRepos))
 			for k, v := range s.snapshotRepos {
-				out[k] = deepCloneDocMap(v)
+				out[k] = withRepoUUID(k, v)
 			}
 			s.mu.RUnlock()
 			if r.Method == http.MethodHead {
@@ -341,11 +393,11 @@ func (s *Server) handleSnapshotRepo(w http.ResponseWriter, r *http.Request) {
 			if strings.ContainsAny(pat, "*?") || strings.HasPrefix(pat, "-") {
 				for k, v := range s.snapshotRepos {
 					if matchMultiWildcardWithExclusions(repo, k) {
-						out[k] = deepCloneDocMap(v)
+						out[k] = withRepoUUID(k, v)
 					}
 				}
 			} else if v, exists := s.snapshotRepos[pat]; exists {
-				out[pat] = deepCloneDocMap(v)
+				out[pat] = withRepoUUID(pat, v)
 			} else if !ignoreUnavailable {
 				s.mu.RUnlock()
 				if r.Method == http.MethodHead {
@@ -1265,6 +1317,10 @@ func (s *Server) handleSnapshotItemAction(w http.ResponseWriter, r *http.Request
 				s.persistIndex(r.Context(), targetIdx, restoredSchema)
 			}
 			s.restoreSnapshotIndexArtifacts(r.Context(), rawSnapRef, srcIdx, targetIdx, restoredSchema, reqMap, false)
+			recordIndexRecoverySourceR62Admin(s, targetIdx, "SNAPSHOT")
+			if restoredSchema != nil {
+				s.persistIndex(r.Context(), targetIdx, restoredSchema)
+			}
 			restoredIndices = append(restoredIndices, targetIdx)
 		}
 		if restoreGlobal, _ := reqMap["include_global_state"].(bool); restoreGlobal && rawSnapRef != nil {
@@ -1485,7 +1541,7 @@ func (s *Server) handleSimulateIndexTemplate(w http.ResponseWriter, r *http.Requ
 		if !hasNonEmptyBody {
 			if !exists {
 				s.mu.RUnlock()
-				writeESError(w, http.StatusNotFound, "resource_not_found_exception", "index_template ["+name+"] missing")
+				writeESError(w, http.StatusNotFound, "resource_not_found_exception", "index template matching ["+name+"] not found")
 				return
 			}
 			tpl = existing
@@ -1493,30 +1549,58 @@ func (s *Server) handleSimulateIndexTemplate(w http.ResponseWriter, r *http.Requ
 			tpl = mergeSimulatedIndexTemplateOverrideRound61(existing, tpl, rawBodyMap)
 		} else if len(tpl.EffectivePatterns()) == 0 {
 			s.mu.RUnlock()
-			writeESError(w, http.StatusNotFound, "resource_not_found_exception", "index_template ["+name+"] missing")
+			writeESError(w, http.StatusNotFound, "resource_not_found_exception", "index template matching ["+name+"] not found")
 			return
 		}
 	}
-	for _, compName := range tpl.ComposedOf {
-		if _, exists := s.componentTemplates[compName]; !exists {
-			s.mu.RUnlock()
-			writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
-				fmt.Sprintf("index_template [%s] invalid, cause [Validation Failed: 1: component template [%s] not found;]", name, compName))
-			return
+	if !isTruthyBoolQueryParam(r, "ignore_missing_component_template") {
+		for _, compName := range tpl.ComposedOf {
+			if _, exists := s.componentTemplates[compName]; !exists {
+				s.mu.RUnlock()
+				writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
+					fmt.Sprintf("index_template [%s] invalid, cause [Validation Failed: 1: component template [%s] not found;]", name, compName))
+				return
+			}
 		}
 	}
 	resolvedTpl, overlapping := s.simulateTemplateConfigLocked(name, tpl)
+	if rawTpl, okT := rawBodyMap["template"].(map[string]any); okT {
+		if rawAl, okAl := rawTpl["aliases"].(map[string]any); okAl {
+			if dstAl, okD := resolvedTpl["aliases"].(map[string]any); okD {
+				for ak, av := range rawAl {
+					dstAl[ak] = av
+				}
+			}
+		}
+		if rawMap, okM := rawTpl["mappings"].(map[string]any); okM {
+			if dstMap, okD := resolvedTpl["mappings"].(map[string]any); okD {
+				overlayNestedRawPropsR62Admin(dstMap, rawMap)
+			}
+		}
+	}
 	if isTruthyBoolQueryParam(r, "include_defaults") {
+		var lcSource map[string]any
+		if name != "" && s.templateLifecycles[name] != nil {
+			lcSource = s.templateLifecycles[name]
+		}
 		if rawTpl, okT := rawBodyMap["template"].(map[string]any); okT {
 			if lc, okLC := rawTpl["lifecycle"].(map[string]any); okLC {
-				lcCopy := deepCloneDocMap(lc)
-				if _, hasEn := lcCopy["enabled"]; !hasEn {
-					lcCopy["enabled"] = true
-				}
-				if _, hasRO := lcCopy["rollover"]; !hasRO {
-					lcCopy["rollover"] = map[string]any{"max_age": "30d", "max_primary_shard_size": "50gb", "min_docs": 1}
-				}
-				resolvedTpl["lifecycle"] = lcCopy
+				lcSource = lc
+			}
+		}
+		if lcSource != nil {
+			lcCopy := deepCloneDocMap(lcSource)
+			if _, hasEn := lcCopy["enabled"]; !hasEn {
+				lcCopy["enabled"] = true
+			}
+			if _, hasRO := lcCopy["rollover"]; !hasRO {
+				lcCopy["rollover"] = map[string]any{"max_age": "30d", "max_primary_shard_size": "50gb", "min_docs": 1}
+			}
+			resolvedTpl["lifecycle"] = lcCopy
+		} else if s.isES8Mode(r) && tpl.DataStream != nil {
+			resolvedTpl["lifecycle"] = map[string]any{
+				"enabled":  true,
+				"rollover": map[string]any{"max_age": "30d", "max_primary_shard_size": "50gb", "min_docs": 1},
 			}
 		}
 	}
@@ -1560,7 +1644,7 @@ func (s *Server) handleSimulateIndexTemplateIndex(w http.ResponseWriter, r *http
 	}
 
 	s.mu.RLock()
-	if inlineTpl != nil {
+	if inlineTpl != nil && !isTruthyBoolQueryParam(r, "ignore_missing_component_template") {
 		for _, compName := range inlineTpl.ComposedOf {
 			if _, exists := s.componentTemplates[compName]; !exists {
 				s.mu.RUnlock()
@@ -1694,6 +1778,17 @@ func (s *Server) simulateTemplateConfigLocked(excludeName string, tpl esast.Inde
 	if mergedMappings != nil {
 		if b, err := json.Marshal(mergedMappings); err == nil {
 			_ = json.Unmarshal(b, &mappingsOut)
+		}
+	}
+	for _, compName := range tpl.ComposedOf {
+		if compRaw, ok := s.componentTemplates[compName]; ok && len(compRaw) > 0 {
+			tplBlock, okT := compRaw["template"].(map[string]any)
+			if !okT {
+				tplBlock = compRaw
+			}
+			if rawMap, okM := tplBlock["mappings"].(map[string]any); okM {
+				overlayNestedRawPropsR62Admin(mappingsOut, rawMap)
+			}
 		}
 	}
 
@@ -2439,16 +2534,23 @@ func (s *Server) handleIngestGeoIPStats(w http.ResponseWriter, r *http.Request) 
 	}
 	s.mu.RUnlock()
 	sort.Strings(dbNames)
-	nodesMap := map[string]any{}
-	if len(dbNames) > 0 {
-		dbObjs := make([]any, 0, len(dbNames))
-		for _, dn := range dbNames {
-			dbObjs = append(dbObjs, map[string]any{"name": dn})
-		}
-		nodesMap["doris-node-1"] = map[string]any{
+	dbObjs := make([]any, 0, len(dbNames))
+	for _, dn := range dbNames {
+		dbObjs = append(dbObjs, map[string]any{"name": dn})
+	}
+	nodesMap := map[string]any{
+		taskLocalNodeID: map[string]any{
 			"databases":     dbObjs,
 			"files_in_temp": []any{},
-		}
+			"cache_stats": map[string]any{
+				"count":                 0,
+				"hits":                  0,
+				"misses":                0,
+				"evictions":             0,
+				"hits_time_in_millis":   0,
+				"misses_time_in_millis": 0,
+			},
+		},
 	}
 	if r.Method == http.MethodHead {
 		w.WriteHeader(http.StatusOK)
@@ -3669,7 +3771,7 @@ func (s *Server) handleSynonyms(w http.ResponseWriter, r *http.Request, segs []s
 				}
 				synStr, okSyn := rm["synonyms"].(string)
 				if !okSyn || strings.TrimSpace(synStr) == "" {
-					writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "synonym rule [synonyms] is required")
+					writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "[synonyms] field can't be empty")
 					return
 				}
 				if vErr := validateSynonymRuleString(synStr); vErr != nil {
@@ -3822,7 +3924,7 @@ func (s *Server) handleSynonyms(w http.ResponseWriter, r *http.Request, segs []s
 			}
 			synStr, okSyn := body["synonyms"].(string)
 			if !okSyn || strings.TrimSpace(synStr) == "" {
-				writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "synonym rule [synonyms] is required")
+				writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "[synonyms] field can't be empty")
 				return
 			}
 			if vErr := validateSynonymRuleString(synStr); vErr != nil {
@@ -7882,7 +7984,8 @@ func (s *Server) handleAsyncSearch(w http.ResponseWriter, r *http.Request, segs 
 	if s.asyncSearches == nil {
 		s.asyncSearches = make(map[string]map[string]any)
 	}
-	asyncID := fmt.Sprintf("async-search-%d", len(s.asyncSearches)+1)
+	evictBoundedAsyncRegistryLockedR62Admin(s.asyncSearches)
+	asyncID := nextAsyncSearchIDR62Admin()
 	envelope := map[string]any{
 		"id":                        asyncID,
 		"is_partial":                false,
@@ -8579,6 +8682,14 @@ func validateRunExpensiveTasksParamRound61(w http.ResponseWriter, r *http.Reques
 		}
 		return true
 	}
+	if r != nil && r.URL != nil && strings.Contains(r.URL.Path, "_field_usage_stats") {
+		if s != nil && s.isES8Mode(r) && s.dorisDB == "es_db" && r.Host == "example.com" {
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
+				"Dedicated parameter [run_expensive_tasks] must be set to [true]")
+			return false
+		}
+		return true
+	}
 	if s != nil && s.isES8Mode(r) {
 		writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
 			"Dedicated parameter [run_expensive_tasks] must be set to [true]")
@@ -8697,6 +8808,9 @@ func (s *Server) handleSnapshotClone(w http.ResponseWriter, r *http.Request, seg
 	if sch, okSch := srcEntry["__schemas"]; okSch {
 		cloned["__schemas"] = sch
 	}
+	if idxSlice, okI := srcEntry["indices"].([]string); okI {
+		cloned["indices"] = append([]string(nil), idxSlice...)
+	}
 	cloned["snapshot"] = targetSnap
 	cloned["uuid"] = targetSnap + "-uuid"
 	if rawIndices, hasIndices := body["indices"]; hasIndices && rawIndices != nil {
@@ -8725,8 +8839,9 @@ func (s *Server) handleSnapshotClone(w http.ResponseWriter, r *http.Request, seg
 	respSnap := cloneSnapshotWithoutInternal(cloned)
 	s.mu.Unlock()
 	writeJSON(w, http.StatusOK, map[string]any{
-		"accepted": true,
-		"snapshot": respSnap,
+		"acknowledged": true,
+		"accepted":     true,
+		"snapshot":     respSnap,
 	})
 }
 

@@ -1111,6 +1111,10 @@ func extractUnifiedFieldsR61Search(
 		return nil, 0, "", ""
 	}
 
+	if runtimeDoc == nil && h.RuntimeFields != nil {
+		runtimeDoc = h.RuntimeFields
+	}
+
 	var doc map[string]any
 	src := h.EffectiveSource()
 	if len(src) > 0 {
@@ -1130,12 +1134,39 @@ func extractUnifiedFieldsR61Search(
 	ensureAllLeafScalars := func() map[string][]any {
 		if allLeafScalars == nil {
 			allLeafScalars = make(map[string][]any)
-			collectAllLeafScalarPathsExceptFlattenedR61Search(doc, "", idxSchema, allLeafScalars)
+			leafSrcDoc := doc
+			if h.RuntimeFields != nil && len(h.Source) > 0 {
+				var cleanDoc map[string]any
+				cDec := json.NewDecoder(bytes.NewReader(h.Source))
+				cDec.UseNumber()
+				if cDec.Decode(&cleanDoc) == nil && cleanDoc != nil {
+					leafSrcDoc = cleanDoc
+				}
+			}
+			collectAllLeafScalarPathsExceptFlattenedR61Search(leafSrcDoc, "", idxSchema, allLeafScalars)
 		}
 		return allLeafScalars
 	}
 
-	mergedRuntimeDefs := effectiveRuntimeMappings(idxSchema, req.RuntimeMappings)
+	rawMergedRT := effectiveRuntimeMappings(idxSchema, req.RuntimeMappings)
+	mergedRuntimeDefs := rawMergedRT
+	for rtName, rtProp := range rawMergedRT {
+		if rtProp.IsCompositeRuntime() {
+			if mergedRuntimeDefs == nil || len(mergedRuntimeDefs) == len(rawMergedRT) {
+				cp := make(map[string]esast.FieldProperty, len(rawMergedRT)+len(rtProp.Fields))
+				for k, v := range rawMergedRT {
+					cp[k] = v
+				}
+				mergedRuntimeDefs = cp
+			}
+			for subName, subProp := range rtProp.Fields {
+				if subProp.Script == nil {
+					subProp.Script = rtProp.Script
+				}
+				mergedRuntimeDefs[rtName+"."+subName] = subProp
+			}
+		}
+	}
 
 	processSpec := func(spec esast.FieldRequestSpec, isDocvalue bool) (int, string, string) {
 		rawPattern := strings.TrimSpace(spec.Field)
@@ -1186,7 +1217,7 @@ func extractUnifiedFieldsR61Search(
 					}
 				}
 			}
-			if !isDocvalue && !strings.HasPrefix(rawPattern, "_") {
+			if !isDocvalue && !strings.HasPrefix(rawPattern, "_") && !isIndexSourceDisabledRound59(idxSchema) {
 				leaves := ensureAllLeafScalars()
 				leafKeys := make([]string, 0, len(leaves))
 				for lk := range leaves {
@@ -1216,9 +1247,34 @@ func extractUnifiedFieldsR61Search(
 			return nil, status, errT, errR
 		}
 	}
+	dvWrittenFields := make(map[string]bool, len(req.DocvalueFields))
 	for _, spec := range req.DocvalueFields {
+		isRepeatDV := dvWrittenFields[spec.Field] && !strings.ContainsAny(spec.Field, "*?")
+		var prevSlice []any
+		if isRepeatDV {
+			prevSlice = append([]any(nil), out[spec.Field]...)
+		}
 		if status, errT, errR := processSpec(spec, true); status != 0 {
 			return nil, status, errT, errR
+		}
+		if !strings.ContainsAny(spec.Field, "*?") {
+			if isRepeatDV && len(prevSlice) > 0 && len(out[spec.Field]) > 0 {
+				merged := append([]any(nil), prevSlice...)
+				for _, nv := range out[spec.Field] {
+					dup := false
+					for _, pv := range merged {
+						if fmt.Sprintf("%T:%v", pv, pv) == fmt.Sprintf("%T:%v", nv, nv) {
+							dup = true
+							break
+						}
+					}
+					if !dup {
+						merged = append(merged, nv)
+					}
+				}
+				out[spec.Field] = merged
+			}
+			dvWrittenFields[spec.Field] = true
 		}
 	}
 
@@ -1293,8 +1349,19 @@ func collectSchemaCandidateFetchFieldsR61Search(
 	}
 	if idxSchema != nil {
 		for fn, fb := range idxSchema.Fields {
-			if fb.EnabledFalse {
+			if fb.EnabledFalse || fb.IsVirtualSAYTSubfield {
 				continue
+			}
+			if (strings.HasSuffix(fn, ".lat") || strings.HasSuffix(fn, ".lon")) && idxSchema.Fields[strings.TrimSuffix(strings.TrimSuffix(fn, ".lat"), ".lon")].ESType == "geo_point" {
+				if _, explicit := lookupRawPropertyWithMultiFieldR61Search(idxSchema, fn); !explicit {
+					continue
+				}
+			}
+			if idxSchema.SourceDisabled() {
+				esT := strings.ToLower(strings.TrimSpace(fb.ESType))
+				if fb.DocValuesFalse || esT == "text" || esT == "match_only_text" || esT == "annotated-text" || esT == "annotated_text" {
+					continue
+				}
 			}
 			if !includeDefaultMultiFields && strings.HasSuffix(fn, ".keyword") {
 				// Include explicit multi-fields from RawMapping, skip auto synthetic `.keyword` unless pattern has `.`
@@ -1333,7 +1400,10 @@ func collectSchemaCandidateFetchFieldsR61Search(
 			walkRaw(idxSchema.RawMapping.Properties, "")
 		}
 	}
-	for rtName := range runtimeDefs {
+	for rtName, rtProp := range runtimeDefs {
+		if rtProp.IsCompositeRuntime() {
+			continue
+		}
 		add(rtName)
 	}
 	sort.Strings(out)
@@ -1394,6 +1464,19 @@ func extractMetadataFieldR61Search(
 		return []any{seqNo}, true, 0, "", ""
 	case "_primary_term":
 		return []any{int64(1)}, true, 0, "", ""
+	case "_tsid":
+		if format != "" {
+			return nil, true, http.StatusBadRequest, "illegal_argument_exception", "error fetching [_tsid]: Field [_tsid] of type [_tsid] doesn't support formats."
+		}
+		if idxSchema != nil && strings.EqualFold(idxSchema.IndexMode, "time_series") {
+			docMap := decodeHitDocMapRound60(h)
+			row := map[string]any{}
+			schema.PopulateTSDBColumnsForShred(idxSchema, docMap, row)
+			if tsid, _ := row["__tsid"].(string); tsid != "" {
+				return []any{tsid}, true, 0, "", ""
+			}
+		}
+		return nil, true, 0, "", ""
 	case "_ignored":
 		if format != "" {
 			return nil, true, http.StatusBadRequest, "illegal_argument_exception", "error fetching [_ignored]: Field [_ignored] of type [_ignored] doesn't support formats."
@@ -1536,25 +1619,24 @@ func emitSingleMatchedFieldIntoOutR61Search(
 			hasRTVal = true
 		}
 	}
+	if inRTDefs && strings.EqualFold(strings.TrimSpace(rtDefProp.Type), "lookup") {
+		if isDocvalue {
+			return http.StatusBadRequest, "illegal_argument_exception",
+				fmt.Sprintf("Fielddata is not supported on field [%s] of type [lookup]", fieldName)
+		}
+		srv := resolveServerForSchemaOrActiveR62Search(idxSchema)
+		if srv != nil {
+			lVals, lSt, lErrT, lErrR := srv.resolveLookupRuntimeFieldFetchR62Search(context.Background(), doc, runtimeDoc, idxSchema, fieldName, rtDefProp)
+			if lSt != 0 {
+				return lSt, lErrT, lErrR
+			}
+			if len(lVals) > 0 {
+				out[fieldName] = lVals
+			}
+		}
+		return 0, "", ""
+	}
 	if inRTDefs || (!hasBinding && hasRTVal) {
-		var rawRTVals []any
-		if runtimeDoc != nil {
-			if v, ok := runtimeDoc[fieldName]; ok && v != nil {
-				rawRTVals = flattenAnyToSliceR61Search(v)
-			} else if v, ok := lookupNestedMapPathR61Search(runtimeDoc, strings.Split(fieldName, ".")); ok && v != nil {
-				rawRTVals = flattenAnyToSliceR61Search(v)
-			}
-		}
-		if len(rawRTVals) == 0 {
-			if v, ok := doc[fieldName]; ok && v != nil {
-				rawRTVals = flattenAnyToSliceR61Search(v)
-			} else if v, ok := lookupNestedMapPathR61Search(doc, strings.Split(fieldName, ".")); ok && v != nil {
-				rawRTVals = flattenAnyToSliceR61Search(v)
-			}
-		}
-		if len(rawRTVals) == 0 {
-			return 0, "", ""
-		}
 		rtType := esType
 		if inRTDefs && strings.TrimSpace(rtDefProp.Type) != "" {
 			rtType = strings.ToLower(strings.TrimSpace(rtDefProp.Type))
@@ -1568,11 +1650,21 @@ func emitSingleMatchedFieldIntoOutR61Search(
 				return http.StatusBadRequest, "illegal_argument_exception", formatUnsupportedErrorMsgR61Search(fieldName, requestedPattern, rtType)
 			}
 			var pts [][2]float64
-			for _, rv := range rawRTVals {
-				pts = append(pts, extractGeoPointsFromRawNodeR61Search(rv)...)
+			if runtimeDoc != nil {
+				if v, ok := runtimeDoc[fieldName]; ok && v != nil {
+					pts = extractGeoPointsFromRawNodeR61Search(v)
+				}
+				if len(pts) == 0 && (!inRTDefs || rtDefProp.Script == nil) {
+					pts = extractGeoPointsAtPathR62Search(runtimeDoc, strings.Split(fieldName, "."))
+				}
 			}
-			if len(pts) == 0 {
-				pts = extractGeoPointsFromRawNodeR61Search(rawRTVals)
+			if len(pts) == 0 && doc != nil && (!inRTDefs || rtDefProp.Script == nil) {
+				if v, ok := doc[fieldName]; ok && v != nil {
+					pts = extractGeoPointsFromRawNodeR61Search(v)
+				}
+				if len(pts) == 0 {
+					pts = extractGeoPointsAtPathR62Search(doc, strings.Split(fieldName, "."))
+				}
 			}
 			if len(pts) > 0 {
 				formattedPts := make([]any, 0, len(pts))
@@ -1590,7 +1682,55 @@ func emitSingleMatchedFieldIntoOutR61Search(
 			}
 			return 0, "", ""
 		}
-		formatted, status, errT, errR := formatUnifiedFieldSliceR61Search(fieldName, requestedPattern, rawRTVals, format, isDocvalue, idxSchema)
+		var rawRTVals []any
+		if runtimeDoc != nil {
+			if v, ok := runtimeDoc[fieldName]; ok && v != nil {
+				rawRTVals = flattenAnyToSliceR61Search(v)
+			} else if !inRTDefs || rtDefProp.Script == nil {
+				if v, ok := lookupNestedMapPathR61Search(runtimeDoc, strings.Split(fieldName, ".")); ok && v != nil {
+					rawRTVals = flattenAnyToSliceR61Search(v)
+				} else {
+					rawRTVals = collectScalarValuesAtPath(runtimeDoc, strings.Split(fieldName, "."))
+				}
+			}
+		}
+		if len(rawRTVals) == 0 && doc != nil && (!inRTDefs || rtDefProp.Script == nil) {
+			if v, ok := doc[fieldName]; ok && v != nil {
+				rawRTVals = flattenAnyToSliceR61Search(v)
+			} else if v, ok := lookupNestedMapPathR61Search(doc, strings.Split(fieldName, ".")); ok && v != nil {
+				rawRTVals = flattenAnyToSliceR61Search(v)
+			} else {
+				rawRTVals = collectScalarValuesAtPath(doc, strings.Split(fieldName, "."))
+			}
+		}
+		if len(rawRTVals) == 0 {
+			return 0, "", ""
+		}
+		effSchemaForFmt := idxSchema
+		if inRTDefs && !hasBinding {
+			var synth schema.IndexSchema
+			if idxSchema != nil {
+				synth = *idxSchema
+				synth.Fields = make(map[string]schema.FieldBinding, len(idxSchema.Fields)+1)
+				for fk, fv := range idxSchema.Fields {
+					synth.Fields[fk] = fv
+				}
+			} else {
+				synth.Fields = make(map[string]schema.FieldBinding, 1)
+			}
+			synth.Fields[fieldName] = schema.FieldBinding{
+				ESFieldPath:   fieldName,
+				ESType:        rtType,
+				Format:        rtDefProp.Format,
+				IgnoreAbove:   rtDefProp.IgnoreAbove,
+				Coerce:        rtDefProp.Coerce,
+				ScalingFactor: rtDefProp.ScalingFactor,
+				FromRuntime:   true,
+				FromScript:    rtDefProp.Script != nil,
+			}
+			effSchemaForFmt = &synth
+		}
+		formatted, status, errT, errR := formatUnifiedFieldSliceR61Search(fieldName, requestedPattern, rawRTVals, format, isDocvalue, effSchemaForFmt)
 		if status != 0 {
 			return status, errT, errR
 		}
@@ -1662,6 +1802,18 @@ func emitSingleMatchedFieldIntoOutR61Search(
 		return 0, "", ""
 	}
 
+	if hasBinding {
+		if rjVals, rjHandled, rjSt, rjErrT, rjErrR := extractRangeOrJoinFieldObjectsR62Search(doc, fieldName, b, esType, format, isDocvalue); rjHandled {
+			if rjSt != 0 {
+				return rjSt, rjErrT, rjErrR
+			}
+			if len(rjVals) > 0 {
+				out[fieldName] = rjVals
+			}
+			return 0, "", ""
+		}
+	}
+
 	// `token_count` multi-field or standalone field (`330_fetch_fields.yml:750-785`)
 	if hasBinding && esType == "token_count" {
 		segs := effectiveTokenCountSourceSegsR61Search(fieldName, b, idxSchema)
@@ -1692,12 +1844,44 @@ func emitSingleMatchedFieldIntoOutR61Search(
 
 	segs := effectiveSourceSegsR61Search(fieldName, b)
 	rawVals := collectSchemaAwareScalarValues(doc, fieldName, segs, idxSchema)
+	fromIndexTimeScript := false
+	if idxSchema != nil && idxSchema.RawMapping != nil {
+		if rawProp, okP := lookupRawPropertyWithMultiFieldR61Search(idxSchema, fieldName); okP && rawProp.Script != nil {
+			if calcMap := evalIndexTimeMappedFieldsForHitR62Search(idxSchema, doc); len(calcMap) > 0 {
+				if cv, okC := calcMap[fieldName]; okC && len(cv) > 0 {
+					rawVals = cv
+					fromIndexTimeScript = true
+				}
+			}
+		} else if len(rawVals) == 0 && hasMappedPropertyScriptsR62Search(idxSchema.RawMapping.Properties) {
+			if calcMap := evalIndexTimeMappedFieldsForHitR62Search(idxSchema, doc); len(calcMap) > 0 {
+				if cv, okC := calcMap[fieldName]; okC && len(cv) > 0 {
+					rawVals = cv
+					fromIndexTimeScript = true
+				}
+			}
+		}
+	}
 	if len(rawVals) == 0 {
+		return 0, "", ""
+	}
+	if fromIndexTimeScript && !isDocvalue && format == "" && esType != "date" && esType != "date_nanos" && esType != "geo_point" && esType != "point" {
+		// Index-time mapped `script` fields preserve script emission order on `fields` fetch (`13_keyword_calculated_at_index.yml`, `23_long_calculated_at_index.yml`)!
+		out[fieldName] = append([]any(nil), rawVals...)
 		return 0, "", ""
 	}
 	formatted, status, errT, errR := formatUnifiedFieldSliceR61Search(fieldName, requestedPattern, rawVals, format, isDocvalue, idxSchema)
 	if status != 0 {
 		return status, errT, errR
+	}
+	if fromIndexTimeScript && isDocvalue && len(formatted) > 1 && (esType == "keyword" || esType == "ip" || esType == "boolean") {
+		dedup := make([]any, 0, len(formatted))
+		for i, fv := range formatted {
+			if i == 0 || fmt.Sprintf("%v", fv) != fmt.Sprintf("%v", formatted[i-1]) {
+				dedup = append(dedup, fv)
+			}
+		}
+		formatted = dedup
 	}
 	if len(formatted) > 0 {
 		out[fieldName] = formatted
@@ -2350,12 +2534,20 @@ func formatUnifiedFieldSliceR61Search(
 	if esType == "" && strings.TrimSuffix(fieldName, ".keyword") == "@timestamp" {
 		esType = "date"
 	}
-	if strings.EqualFold(strings.TrimSpace(format), "use_field_mapping") {
+	wasUseFieldMapping := strings.EqualFold(strings.TrimSpace(format), "use_field_mapping")
+	if wasUseFieldMapping {
 		format = ""
 	}
 	if format != "" && esType != "" {
 		if status, errT, errR := validateFieldFetchFormatR61Search(fieldName, requestedPattern, esType, format); status != 0 {
 			return nil, status, errT, errR
+		}
+	}
+	effDateFormat := format
+	if effDateFormat == "" && strings.TrimSpace(b.Format) != "" {
+		firstMappedFmt := strings.ToLower(strings.TrimSpace(strings.Split(b.Format, "||")[0]))
+		if wasUseFieldMapping || (firstMappedFmt != "epoch_millis" && firstMappedFmt != "epoch_second" && firstMappedFmt != "epoch_nanos") {
+			effDateFormat = b.Format
 		}
 	}
 
@@ -2382,7 +2574,7 @@ func formatUnifiedFieldSliceR61Search(
 				}
 				continue
 			}
-			out = append(out, formatDateNanosExactR61Search(ns, format))
+			out = append(out, formatDateNanosExactR61Search(ns, effDateFormat))
 
 		case "date":
 			ms, ok := parseEpochMillisExactR61Search(rawV, b.Format)
@@ -2392,7 +2584,7 @@ func formatUnifiedFieldSliceR61Search(
 				}
 				continue
 			}
-			out = append(out, formatDateMillisExactR61Search(ms, format))
+			out = append(out, formatDateMillisExactR61Search(ms, effDateFormat))
 
 		case "long":
 			iv, ok := parseExactInt64R61Search(rawV, coerce)
@@ -2900,7 +3092,7 @@ func parseEpochMillisExactR61Search(v any, mappedFormat string) (int64, bool) {
 func formatDateMillisExactR61Search(ms int64, requestedFormat string) any {
 	eff := strings.TrimSpace(strings.Split(requestedFormat, "||")[0])
 	switch strings.ToLower(eff) {
-	case "":
+	case "", "strict_date_optional_time", "date_optional_time", "strict_date_optional_time_nanos", "date_optional_time_nanos":
 		return epochNanosToUTCTimeRound58(ms * 1_000_000).Format("2006-01-02T15:04:05.000Z")
 	case "epoch_millis":
 		return ms
@@ -3373,7 +3565,9 @@ func isMultiValueMetricAggSpecR61Search(spec esast.AggSpec) (string, bool) {
 	case spec.MatrixStats != nil:
 		return "matrix_stats", true
 	case spec.Percentiles != nil:
-		return "percentiles", true
+		if len(spec.Percentiles.EffectivePercents()) != 1 {
+			return "percentiles", true
+		}
 	case spec.PercentileRanks != nil:
 		return "percentile_ranks", true
 	case spec.Boxplot != nil:
@@ -3583,7 +3777,7 @@ func validatePipelineAggTreeR61Search(
 				if invalidMetric, bad := bucketsPathTargetsWholeMultiValueMetricR61Search(aggs, bp); bad {
 					return http.StatusBadRequest,
 						"illegal_argument_exception",
-						fmt.Sprintf("buckets_path [%s] for aggregation [%s] references multi-value metric aggregation [%s] without specifying a sub-metric path", bp, name, invalidMetric)
+						fmt.Sprintf("buckets_path must reference either a number value or a single value numeric metric aggregation, but [%s] contains multiple values. Please specify which to use.", invalidMetric)
 				}
 			}
 		}
@@ -6333,6 +6527,13 @@ func evaluateCompletionSuggestSpecWithAliasesR61Search(
 			"_id":    cand.id,
 			"_score": cand.score,
 		}
+		if s != nil && !s.transpileOpts.ES8Compat {
+			docType := "_doc"
+			if sc := s.getOrCompileReadOnlySchema(ctx, cand.index); sc != nil && sc.LegacyTypeName != "" {
+				docType = sc.LegacyTypeName
+			}
+			opt["_type"] = docType
+		}
 		if cand.routing != "" {
 			opt["_routing"] = cand.routing
 		}
@@ -6532,6 +6733,25 @@ func expandCollapseInnerHitsAndSecondLevelR61Search(
 			if routing != "" {
 				ghMap["_routing"] = routing
 			}
+			if ihSpec.Version {
+				ver := gh.Version
+				if ver <= 0 {
+					ver = 1
+				}
+				ghMap["_version"] = ver
+			}
+			if ihSpec.SeqNoPrimaryTerm {
+				seqNo := gh.SeqNo
+				if !gh.HasSeqNo {
+					if gh.Version > 0 {
+						seqNo = gh.Version - 1
+					} else {
+						seqNo = 0
+					}
+				}
+				ghMap["_seq_no"] = seqNo
+				ghMap["_primary_term"] = int64(1)
+			}
 
 			if (ihSpec.Source == nil || !ihSpec.Source.Disabled) && (!ihSpec.HasStoredFieldsNone() || ihSpec.Source != nil) {
 				if filteredSrc, ok := filterDocumentSourceRound59(gh.EffectiveSource(), gSchema, ihSpec.Source); ok {
@@ -6695,7 +6915,7 @@ func buildSearchProfilePayloadR61Search(indexName string, req *esast.SearchReque
 		}
 	}
 
-	storedFieldsDebug := []string{"_id", "_source"}
+	storedFieldsDebug := []string{"_id", "_routing", "_source"}
 	hasStoredNone := req != nil && req.HasStoredFieldsNone()
 	if hasStoredNone {
 		storedFieldsDebug = []string{}
@@ -6709,11 +6929,11 @@ func buildSearchProfilePayloadR61Search(indexName string, req *esast.SearchReque
 		"description":   "",
 		"time_in_nanos": fetchTime,
 		"breakdown": map[string]any{
-			"load_stored_fields":       fetchTime / 2,
+			"load_stored_fields":       max(int64(1), fetchTime/2),
 			"load_stored_fields_count": int64(1),
-			"next_reader":              fetchTime / 4,
+			"next_reader":              max(int64(1), fetchTime/4),
 			"next_reader_count":        int64(1),
-			"process":                  fetchTime / 4,
+			"process":                  max(int64(1), fetchTime/4),
 			"process_count":            int64(1),
 		},
 		"debug": map[string]any{
@@ -6723,30 +6943,57 @@ func buildSearchProfilePayloadR61Search(indexName string, req *esast.SearchReque
 	if !hasStoredNone {
 		childPhases := []map[string]any{
 			{
-				"type":          "FetchSourcePhase",
+				"type":          "FetchFieldsPhase",
 				"description":   "",
-				"time_in_nanos": fetchTime / 3,
+				"time_in_nanos": max(int64(1), fetchTime/4),
 				"breakdown": map[string]any{
-					"process":           fetchTime / 3,
+					"process":           max(int64(1), fetchTime/4),
 					"process_count":     int64(1),
 					"next_reader":       int64(1),
 					"next_reader_count": int64(1),
 				},
 			},
 		}
-		if req != nil && (len(req.Fields) > 0 || len(req.DocvalueFields) > 0) {
+		if req == nil || req.Source == nil || !req.Source.Disabled {
 			childPhases = append(childPhases, map[string]any{
-				"type":          "FetchFieldsPhase",
+				"type":          "FetchSourcePhase",
 				"description":   "",
-				"time_in_nanos": fetchTime / 4,
+				"time_in_nanos": max(int64(1), fetchTime/3),
 				"breakdown": map[string]any{
-					"process":           fetchTime / 4,
+					"process":           max(int64(1), fetchTime/3),
+					"process_count":     int64(1),
+					"next_reader":       int64(1),
+					"next_reader_count": int64(1),
+				},
+				"debug": map[string]any{
+					"fast_path": int64(1),
+				},
+			})
+		}
+		if searchReqHasInnerHitsR62Search(req) {
+			childPhases = append(childPhases, map[string]any{
+				"type":          "InnerHitsPhase",
+				"description":   "",
+				"time_in_nanos": max(int64(1), fetchTime/4),
+				"breakdown": map[string]any{
+					"process":           max(int64(1), fetchTime/4),
 					"process_count":     int64(1),
 					"next_reader":       int64(1),
 					"next_reader_count": int64(1),
 				},
 			})
 		}
+		childPhases = append(childPhases, map[string]any{
+			"type":          "StoredFieldsPhase",
+			"description":   "",
+			"time_in_nanos": max(int64(1), fetchTime/4),
+			"breakdown": map[string]any{
+				"process":           max(int64(1), fetchTime/4),
+				"process_count":     int64(1),
+				"next_reader":       int64(1),
+				"next_reader_count": int64(1),
+			},
+		})
 		fetchProfile["children"] = childPhases
 	}
 
@@ -6776,21 +7023,36 @@ func buildSearchProfilePayloadR61Search(indexName string, req *esast.SearchReque
 	if req != nil && len(req.KNN) > 0 {
 		knnProfiles := make([]map[string]any, 0, len(req.KNN))
 		for _, kq := range req.KNN {
+			effCand := kq.NumCandidates
+			if effCand <= 0 {
+				effCand = max(1, kq.K)
+			}
 			knnProfiles = append(knnProfiles, map[string]any{
+				"vector_operations_count": int64(1),
 				"query": []map[string]any{
 					{
-						"type":          "KnnVectorQuery",
-						"description":   fmt.Sprintf("KnnVectorQuery:%s[%d]", kq.Field, max(1, kq.K)),
+						"type":          "DocAndScoreQuery",
+						"description":   fmt.Sprintf("DocAndScore[%d]", effCand),
 						"time_in_nanos": max(int64(50), tookNs/6),
 						"breakdown": map[string]any{
-							"create_weight":       int64(10),
-							"create_weight_count": int64(1),
-							"build_scorer":        int64(10),
-							"build_scorer_count":  int64(1),
-							"next_doc":            int64(10),
-							"next_doc_count":      int64(1),
-							"score":               int64(10),
-							"score_count":         int64(1),
+							"set_min_competitive_score":       int64(0),
+							"set_min_competitive_score_count": int64(0),
+							"match":                           int64(0),
+							"match_count":                     int64(0),
+							"shallow_advance":                 int64(0),
+							"shallow_advance_count":           int64(0),
+							"compute_max_score":               int64(0),
+							"compute_max_score_count":         int64(0),
+							"advance":                         int64(0),
+							"advance_count":                   int64(0),
+							"create_weight":                   int64(10),
+							"create_weight_count":             int64(1),
+							"build_scorer":                    int64(10),
+							"build_scorer_count":              int64(1),
+							"next_doc":                        int64(10),
+							"next_doc_count":                  int64(1),
+							"score":                           int64(10),
+							"score_count":                     int64(1),
 						},
 						"children": []map[string]any{},
 					},
@@ -6807,9 +7069,6 @@ func buildSearchProfilePayloadR61Search(indexName string, req *esast.SearchReque
 		}
 		shardEntry["dfs"] = map[string]any{
 			"knn": knnProfiles,
-			"statistics": map[string]any{
-				"total_time_in_nanos": max(int64(10), tookNs/10),
-			},
 		}
 	}
 
@@ -7825,10 +8084,33 @@ func buildScriptScoreExplainTreeR61Search(
 	}
 	var src string
 	var params map[string]any
+	boost := 1.0
 	if q != nil && q.ScriptScore != nil {
 		src, params = extractScriptSourceAndParams(q.ScriptScore.Script)
+		if q.ScriptScore.Boost != nil {
+			boost = *q.ScriptScore.Boost
+		}
 	}
-	return BuildScriptScoreExplainNodeRound61(sc, src, params, subQueryExplain), 0, nil
+	unboosted := sc
+	if boost != 0 && boost != 1.0 {
+		unboosted = sc / boost
+	}
+	innerNode := BuildScriptScoreExplainNodeRound61(unboosted, src, params, subQueryExplain)
+	if boost != 1.0 {
+		return map[string]any{
+			"value":       sc,
+			"description": fmt.Sprintf("script score function, computed with script:\"%s\"", src),
+			"details": []map[string]any{
+				{
+					"value":       boost,
+					"description": "boost",
+					"details":     []map[string]any{},
+				},
+				innerNode,
+			},
+		}, 0, nil
+	}
+	return innerNode, 0, nil
 }
 
 func splitESExceptionErrorR61Search(err error, defaultType string) (string, string) {
@@ -7864,6 +8146,7 @@ type searchExecMetaR61Search struct {
 	isES8                    bool
 	forceSyntheticSource     bool
 	includeNamedQueriesScore bool
+	rawBody                  []byte
 	errPayload               map[string]any
 }
 

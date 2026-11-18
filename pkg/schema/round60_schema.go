@@ -342,6 +342,9 @@ func SerializeMappingSpec(m *esast.MappingSpec) map[string]any {
 		return map[string]any{}
 	}
 	out := make(map[string]any)
+	if m.Enabled != nil {
+		out["enabled"] = *m.Enabled
+	}
 	if m.Dynamic != nil {
 		out["dynamic"] = m.Dynamic
 	}
@@ -466,6 +469,12 @@ func SerializeFieldProperty(fp esast.FieldProperty) map[string]any {
 	if fp.Enabled != nil {
 		out["enabled"] = *fp.Enabled
 	}
+	if fp.IncludeInParent != nil {
+		out["include_in_parent"] = *fp.IncludeInParent
+	}
+	if fp.IncludeInRoot != nil {
+		out["include_in_root"] = *fp.IncludeInRoot
+	}
 	if fp.Index != nil {
 		out["index"] = *fp.Index
 	}
@@ -482,20 +491,14 @@ func SerializeFieldProperty(fp esast.FieldProperty) map[string]any {
 		out["value"] = fp.Value
 	}
 	if fp.Script != nil {
-		if sm, ok := fp.Script.(map[string]any); ok {
-			if _, hasLang := sm["lang"]; !hasLang {
-				cp := make(map[string]any, len(sm)+1)
-				for k, v := range sm {
-					cp[k] = v
-				}
-				cp["lang"] = "painless"
-				out["script"] = cp
-			} else {
-				out["script"] = fp.Script
-			}
+		if normScript, err := esast.NormalizeFieldScriptObject(fp.Script); err == nil && normScript != nil {
+			out["script"] = normScript
 		} else {
 			out["script"] = fp.Script
 		}
+	}
+	if fp.OnScriptError != "" {
+		out["on_script_error"] = fp.OnScriptError
 	}
 	if fp.TermVector != "" {
 		out["term_vector"] = fp.TermVector
@@ -505,6 +508,9 @@ func SerializeFieldProperty(fp esast.FieldProperty) map[string]any {
 	}
 	if fp.SearchAnalyzer != "" {
 		out["search_analyzer"] = fp.SearchAnalyzer
+	}
+	if fp.SearchQuoteAnalyzer != "" {
+		out["search_quote_analyzer"] = fp.SearchQuoteAnalyzer
 	}
 	if fp.Normalizer != "" {
 		out["normalizer"] = fp.Normalizer
@@ -700,7 +706,12 @@ func ReconstructSyntheticSource(idxSchema *IndexSchema, rawDoc map[string]any, s
 		}
 	}
 
-	reconstructed := reconstructSyntheticObject(idxSchema, srcDoc, "", ignoredSet)
+	var reconstructed map[string]any
+	if idxSchema != nil && idxSchema.RawMapping != nil && idxSchema.RawMapping.Enabled != nil && !*idxSchema.RawMapping.Enabled {
+		reconstructed = reconstructIgnoredSourceObject(idxSchema, srcDoc, "")
+	} else {
+		reconstructed = reconstructSyntheticObject(idxSchema, srcDoc, "", ignoredSet)
+	}
 	if reconstructed == nil {
 		reconstructed = map[string]any{}
 	}
@@ -727,23 +738,12 @@ func isSyntheticExcludedBinding(idxSchema *IndexSchema, fullPath string) (FieldB
 	if idxSchema == nil {
 		return FieldBinding{}, false, false
 	}
-	if idxSchema.IsDynamicFalseUnmappedField(fullPath) {
-		return FieldBinding{}, false, true
-	}
 	b, hasBinding := idxSchema.Fields[fullPath]
 	if !hasBinding {
-		// Check if any ancestor is an `enabled: false` object
-		parts := strings.Split(fullPath, ".")
-		for i := 1; i < len(parts); i++ {
-			anc := strings.Join(parts[:i], ".")
-			if ab, ok := idxSchema.Fields[anc]; ok && ab.EnabledFalse {
-				return ab, true, true
-			}
-		}
 		return FieldBinding{}, false, false
 	}
 	if b.EnabledFalse {
-		return b, true, true
+		return b, true, false
 	}
 	esType := strings.ToLower(strings.TrimSpace(b.ESType))
 	if esType == "alias" {
@@ -800,7 +800,11 @@ func reconstructSyntheticObject(idxSchema *IndexSchema, obj map[string]any, pref
 	if len(obj) == 0 {
 		return map[string]any{}
 	}
-	obj = expandDottedKeysForSyntheticObject(idxSchema, obj, prefix)
+	if isSubobjectsFalseAtPrefix(idxSchema, prefix) {
+		obj = flattenSubmapsForNoSubobjects(obj)
+	} else {
+		obj = expandDottedKeysForSyntheticObject(idxSchema, obj, prefix)
+	}
 	out := make(map[string]any, len(obj))
 	keys := make([]string, 0, len(obj))
 	for k := range obj {
@@ -822,6 +826,12 @@ func reconstructSyntheticObject(idxSchema *IndexSchema, obj map[string]any, pref
 		fullPath := k
 		if prefix != "" {
 			fullPath = prefix + "." + k
+		}
+		if isUnmappedScopeInSynthetic(idxSchema, fullPath) {
+			if keptVal, okKeep := reconstructIgnoredSourceValue(idxSchema, rawVal, fullPath); okKeep {
+				out[k] = keptVal
+			}
+			continue
 		}
 		b, hasBinding, excluded := isSyntheticExcludedBinding(idxSchema, fullPath)
 		if excluded {
@@ -873,7 +883,8 @@ func reconstructSyntheticValue(
 				return posObj, true
 			}
 		}
-		return rawVal, true
+		normCoord, _ := reconstructIgnoredSourceValue(idxSchema, rawVal, fullPath)
+		return normCoord, true
 	}
 	if hasBinding && IsRangeFieldType(esType) {
 		return reconstructSyntheticRangeValue(idxSchema, rawVal, fullPath, b, esType, ignoredSet)
@@ -881,11 +892,12 @@ func reconstructSyntheticValue(
 
 	switch v := rawVal.(type) {
 	case map[string]any:
-		if esType == "flattened" {
+		if esType == "flattened" || esType == "rank_features" || esType == "sparse_vector" || esType == "percolator" {
 			if len(v) == 0 {
 				return nil, false
 			}
-			return v, true
+			normMap, _ := reconstructIgnoredSourceValue(idxSchema, v, fullPath)
+			return normMap, true
 		}
 		sub := reconstructSyntheticObject(idxSchema, v, fullPath, ignoredSet)
 		if len(sub) == 0 {
@@ -906,9 +918,9 @@ func reconstructSyntheticValue(
 			}
 		}
 		if hasMaps {
-			if isNested {
-				// Preserve nested array order
-				nestedOut := make([]any, 0, len(v))
+			if isNested || idxSchema == nil || hasExplicitStoreArraySourceAtPath(idxSchema, fullPath) {
+				// Preserve nested / store_array_source:true / schemaless array order
+				objs := make([]any, 0, len(v))
 				for _, elem := range v {
 					em, ok := elem.(map[string]any)
 					if !ok || em == nil {
@@ -916,30 +928,16 @@ func reconstructSyntheticValue(
 					}
 					re := reconstructSyntheticObject(idxSchema, em, fullPath, ignoredSet)
 					if len(re) > 0 {
-						nestedOut = append(nestedOut, re)
+						objs = append(objs, re)
 					}
 				}
-				if len(nestedOut) == 0 {
+				if len(objs) == 0 {
 					return nil, false
 				}
-				return nestedOut, true
+				return objs, true
 			}
-			// Non-nested object array: reconstruct each object
-			objs := make([]any, 0, len(v))
-			for _, elem := range v {
-				em, ok := elem.(map[string]any)
-				if !ok || em == nil {
-					continue
-				}
-				re := reconstructSyntheticObject(idxSchema, em, fullPath, ignoredSet)
-				if len(re) > 0 {
-					objs = append(objs, re)
-				}
-			}
-			if len(objs) == 0 {
-				return nil, false
-			}
-			return objs, true
+			// Mapped regular object array without `store_array_source: true`: flatten subfields across array elements (`20_synthetic_source.yml`)
+			return flattenSyntheticMappedObjectArray(idxSchema, v, fullPath, ignoredSet)
 		}
 
 		// Scalar array (flatten nested scalar arrays like `[[2, 1], [3]]` -> `[1, 2, 3]`)
@@ -1141,6 +1139,12 @@ func sortSyntheticScalars(scalars []any, esType string) {
 	if esType == "text" || esType == "match_only_text" || esType == "annotated-text" || esType == "annotated_text" {
 		return
 	}
+	if esType == "version" {
+		sort.SliceStable(scalars, func(i, j int) bool {
+			return CompareSemverForSynthetic(fmt.Sprintf("%v", scalars[i]), fmt.Sprintf("%v", scalars[j])) < 0
+		})
+		return
+	}
 	sort.SliceStable(scalars, func(i, j int) bool {
 		fi, okI := syntheticNumericOrderVal(scalars[i])
 		fj, okJ := syntheticNumericOrderVal(scalars[j])
@@ -1174,6 +1178,76 @@ func syntheticNumericOrderVal(v any) (float64, bool) {
 	default:
 		return 0, false
 	}
+}
+
+// CompareSemverForSynthetic compares two Elasticsearch `version` values according to
+// arbitrary-length core release segments (`1.2.3.4.5` > `1.2.3` > `1.2.3-abc+def`).
+func CompareSemverForSynthetic(a, b string) int {
+	return strings.Compare(semverSyntheticSortKey(a), semverSyntheticSortKey(b))
+}
+
+func semverSyntheticSortKey(v string) string {
+	s := strings.TrimSpace(v)
+	if idx := strings.IndexByte(s, '+'); idx >= 0 {
+		s = s[:idx]
+	}
+	core := s
+	prerelease := ""
+	hasPre := false
+	if idx := strings.IndexByte(s, '-'); idx >= 0 {
+		core = s[:idx]
+		prerelease = s[idx+1:]
+		hasPre = true
+	}
+	isDigits := func(x string) bool {
+		if len(x) == 0 {
+			return false
+		}
+		for i := 0; i < len(x); i++ {
+			if x[i] < '0' || x[i] > '9' {
+				return false
+			}
+		}
+		return true
+	}
+	pad20 := func(x string) string {
+		t := strings.TrimLeft(x, "0")
+		if t == "" {
+			t = "0"
+		}
+		if len(t) < 20 {
+			return strings.Repeat("0", 20-len(t)) + t
+		}
+		return t
+	}
+	parts := strings.Split(core, ".")
+	nSegs := len(parts)
+	if nSegs < 3 {
+		nSegs = 3
+	}
+	coreSegs := make([]string, 0, nSegs)
+	for i := 0; i < nSegs; i++ {
+		if i >= len(parts) || parts[i] == "" {
+			coreSegs = append(coreSegs, strings.Repeat("0", 20))
+		} else if isDigits(parts[i]) {
+			coreSegs = append(coreSegs, pad20(parts[i]))
+		} else {
+			coreSegs = append(coreSegs, "z:"+parts[i])
+		}
+	}
+	coreJoined := strings.Join(coreSegs, "~")
+	if hasPre {
+		preSegs := strings.Split(prerelease, ".")
+		for i, seg := range preSegs {
+			if isDigits(seg) {
+				preSegs[i] = "0:" + pad20(seg)
+			} else {
+				preSegs[i] = "1:" + seg
+			}
+		}
+		return coreJoined + "-" + strings.Join(preSegs, " ")
+	}
+	return coreJoined + "="
 }
 
 // validateCompletionValueWithContexts validates completion `weight >= 0` and mandatory `contexts`

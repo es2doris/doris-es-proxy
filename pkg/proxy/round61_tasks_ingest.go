@@ -28,6 +28,7 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"regexp"
 	"sort"
@@ -589,7 +590,13 @@ func (s *Server) handlePainlessContextDetailRound61(w http.ResponseWriter, r *ht
 		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
 		return
 	}
-	ctxName := strings.TrimSpace(r.PathValue("context"))
+	ctxName := ""
+	if r != nil {
+		ctxName = strings.TrimSpace(r.PathValue("context"))
+		if ctxName == "" && r.URL != nil {
+			ctxName = strings.TrimSpace(r.URL.Query().Get("context"))
+		}
+	}
 	if ctxName == "" || ctxName == "_context" {
 		writeJSONWithRequest(w, r, http.StatusOK, map[string]any{
 			"contexts": painlessScriptContextsListRound61(),
@@ -1404,12 +1411,9 @@ func (s *Server) buildLiveIngestNodeStats(human bool) map[string]any {
 }
 
 func summarizeIngestPipelineMapRound61(pipe map[string]any) map[string]any {
-	out := make(map[string]any, 3)
+	out := make(map[string]any, 2)
 	if pipe == nil {
 		return out
-	}
-	if desc, ok := pipe["description"]; ok {
-		out["description"] = desc
 	}
 	if ver, ok := pipe["version"]; ok {
 		out["version"] = ver
@@ -1458,6 +1462,27 @@ func (s *Server) applyWritePipelinesFullRound61(
 	)
 	res.ExecutedPipelines = execPipes
 	if err != nil {
+		if errors.Is(err, errIngestCyclicSourceRound61) {
+			pipeName := strings.TrimSpace(reqPipeline)
+			if len(execPipes) > 0 && execPipes[len(execPipes)-1] != "" {
+				pipeName = execPipes[len(execPipes)-1]
+			} else if pipeName == "" {
+				pipeName = strings.TrimSpace(defaultPipeline)
+			}
+			errIdx := curIdx
+			if errIdx == "" {
+				errIdx = rawTargetIndex
+			}
+			errID := curID
+			if errID == "" {
+				errID = docID
+			}
+			if errID == "" {
+				errID = "null"
+			}
+			return res, http.StatusBadRequest, "illegal_argument_exception",
+				fmt.Sprintf("Failed to generate the source document for ingest pipeline [%s] for document [%s/%s]", pipeName, errIdx, errID)
+		}
 		et := "illegal_argument_exception"
 		if s != nil {
 			et = s.ingestErrorTypeForReqRound60(nil, err)
@@ -1530,7 +1555,29 @@ func (s *Server) applyBulkUpsertIngestRound61(
 	upsertDoc json.RawMessage,
 	requireAlias bool,
 ) (IngestWriteResultRound61, int, string, string) {
-	return s.applyWritePipelinesFullRound61(targetIndex, docID, reqPipeline, "", routing, upsertDoc, requireAlias)
+	res, st, et, er := s.applyWritePipelinesFullRound61(targetIndex, docID, reqPipeline, "", routing, upsertDoc, requireAlias)
+	if st != 0 && (et == "fail_processor_exception" || et == "ingest_processor_exception") {
+		et = "fail_processor_exception"
+		st = http.StatusInternalServerError
+	}
+	return res, st, et, er
+}
+
+// ValidateExplicitPipelineParamRound62 rejects an explicitly supplied empty `?pipeline=` query
+// parameter (`ingest/200_default_pipeline.yml`: `pipeline: ""` -> HTTP 400).
+func ValidateExplicitPipelineParamRound62(r *http.Request) (int, string, string) {
+	if r != nil && r.URL != nil && r.URL.Query().Has("pipeline") {
+		if strings.TrimSpace(r.URL.Query().Get("pipeline")) == "" {
+			return http.StatusBadRequest, "illegal_argument_exception", "pipeline id must not be empty"
+		}
+	}
+	return 0, "", ""
+}
+
+// BulkUpsertDropVersionRound62 returns the ES 8 sentinel `_version: -3` (`Version.DROPPED_BY_INGEST`)
+// for an upsert document dropped by an ingest `drop` processor (`ingest/220_drop_processor.yml`).
+func BulkUpsertDropVersionRound62() int64 {
+	return -3
 }
 
 // formatBulkFailedItemWithPipelinesRound61 attaches `executed_pipelines` to a bulk item
@@ -1673,7 +1720,108 @@ func formatIngestDateWithWeekYearRound61(t time.Time, rawFmt string) (string, bo
 // Round 61 F20, F21, F22, F23: Tasks, UBQ/DBQ Preflight, OCC 409, & Remote Reindex
 // ============================================================================
 
-var serverRemoteReindexTransportsRound61 sync.Map // map[*Server]http.RoundTripper
+var serverRemoteReindexTransportsRound61 sync.Map     // map[*Server]http.RoundTripper
+var serverRemoteReindexSecurityConfigRound62 sync.Map // map[*Server]*remoteReindexSecurityConfigRound62
+
+type remoteReindexSecurityConfigRound62 struct {
+	mu              sync.RWMutex
+	staticWhitelist string
+	hasWhitelist    bool
+	allowPrivateIPs bool
+	lookupNetIP     func(ctx context.Context, network, host string) ([]netip.Addr, error)
+}
+
+func (s *Server) getOrCreateRemoteReindexSecurityConfigRound62() *remoteReindexSecurityConfigRound62 {
+	if s == nil {
+		return &remoteReindexSecurityConfigRound62{}
+	}
+	if v, ok := serverRemoteReindexSecurityConfigRound62.Load(s); ok {
+		return v.(*remoteReindexSecurityConfigRound62)
+	}
+	cfg := &remoteReindexSecurityConfigRound62{}
+	actual, _ := serverRemoteReindexSecurityConfigRound62.LoadOrStore(s, cfg)
+	return actual.(*remoteReindexSecurityConfigRound62)
+}
+
+// SetStaticRemoteReindexWhitelist configures the node-static `reindex.remote.whitelist`
+// (`--reindex-remote-whitelist` / `DORIS_ES_REINDEX_REMOTE_WHITELIST`) on `s`.
+func (s *Server) SetStaticRemoteReindexWhitelist(whitelist string) {
+	if s == nil {
+		return
+	}
+	cfg := s.getOrCreateRemoteReindexSecurityConfigRound62()
+	cfg.mu.Lock()
+	trimmed := strings.TrimSpace(whitelist)
+	cfg.staticWhitelist = trimmed
+	cfg.hasWhitelist = trimmed != ""
+	cfg.mu.Unlock()
+}
+
+func (s *Server) getStaticRemoteReindexWhitelistRound62() (string, bool) {
+	if s == nil {
+		return "", false
+	}
+	v, ok := serverRemoteReindexSecurityConfigRound62.Load(s)
+	if !ok {
+		return "", false
+	}
+	cfg := v.(*remoteReindexSecurityConfigRound62)
+	cfg.mu.RLock()
+	defer cfg.mu.RUnlock()
+	return cfg.staticWhitelist, cfg.hasWhitelist
+}
+
+// SetRemoteReindexAllowPrivateIPs configures whether outbound remote `_reindex` connections
+// are allowed to connect to loopback, RFC1918/RFC4193 private, link-local, or CGNAT IPs
+// (`--reindex-remote-allow-private` / `DORIS_ES_REINDEX_REMOTE_ALLOW_PRIVATE`, default false).
+func (s *Server) SetRemoteReindexAllowPrivateIPs(allow bool) {
+	if s == nil {
+		return
+	}
+	cfg := s.getOrCreateRemoteReindexSecurityConfigRound62()
+	cfg.mu.Lock()
+	cfg.allowPrivateIPs = allow
+	cfg.mu.Unlock()
+}
+
+func (s *Server) getRemoteReindexAllowPrivateIPsRound62() bool {
+	if s == nil {
+		return false
+	}
+	v, ok := serverRemoteReindexSecurityConfigRound62.Load(s)
+	if !ok {
+		return false
+	}
+	cfg := v.(*remoteReindexSecurityConfigRound62)
+	cfg.mu.RLock()
+	defer cfg.mu.RUnlock()
+	return cfg.allowPrivateIPs
+}
+
+func (s *Server) setRemoteReindexLookupNetIPForTestRound62(fn func(ctx context.Context, network, host string) ([]netip.Addr, error)) {
+	if s == nil {
+		return
+	}
+	cfg := s.getOrCreateRemoteReindexSecurityConfigRound62()
+	cfg.mu.Lock()
+	cfg.lookupNetIP = fn
+	cfg.mu.Unlock()
+}
+
+func (s *Server) getRemoteReindexLookupNetIPRound62() func(ctx context.Context, network, host string) ([]netip.Addr, error) {
+	if s != nil {
+		if v, ok := serverRemoteReindexSecurityConfigRound62.Load(s); ok {
+			cfg := v.(*remoteReindexSecurityConfigRound62)
+			cfg.mu.RLock()
+			fn := cfg.lookupNetIP
+			cfg.mu.RUnlock()
+			if fn != nil {
+				return fn
+			}
+		}
+	}
+	return net.DefaultResolver.LookupNetIP
+}
 
 // SetRemoteReindexTransport configures a custom `http.RoundTripper` for `source.remote`
 // reindex requests on `s` (used by unit/integration tests without opening raw sockets).
@@ -1717,15 +1865,61 @@ func emitESDeprecationWarningRound61(w http.ResponseWriter, s *Server, r *http.R
 	w.Header().Add("Warning", hdrVal)
 }
 
-// emitSystemIndexTasksWarningIfNeededRound61 emits the ES 7 deprecation Warning header when
-// accessing `.tasks` directly (e.g. `.tasks/_refresh` or `.tasks/_search`).
+func (s *Server) hasPersistedTasksRecordsRound62() bool {
+	if s == nil {
+		return false
+	}
+	s.mu.RLock()
+	_, hasTasksIdx := s.indices[".tasks"]
+	s.mu.RUnlock()
+	if hasTasksIdx {
+		return true
+	}
+	reg := s.getTaskRegistry()
+	reg.mu.RLock()
+	defer reg.mu.RUnlock()
+	for _, e := range reg.tasks {
+		if e == nil {
+			continue
+		}
+		e.mu.Lock()
+		done := e.completed
+		e.mu.Unlock()
+		if done {
+			return true
+		}
+	}
+	return false
+}
+
+// emitSystemIndexTasksWarningIfNeededRound61 emits the ES deprecation Warning header when
+// accessing `.tasks` directly (e.g. `.tasks/_refresh` or `.tasks/_search`) OR via an all-indices
+// operation (`rawIndex == ""`, `_all`, `*`) when persisted `.tasks` documents/records exist.
 func (s *Server) emitSystemIndexTasksWarningIfNeededRound61(w http.ResponseWriter, r *http.Request, indices []string) {
+	const tasksSysWarning = "this request accesses system indices: [.tasks], but in a future major version, direct access to system indices will be prevented by default"
+	hasAllOrEmpty := len(indices) == 0
 	for _, idx := range indices {
-		if idx == ".tasks" || strings.HasPrefix(idx, ".tasks") {
-			emitESDeprecationWarningRound61(w, s, r,
-				"this request accesses system indices: [.tasks], but in a future major version, direct access to system indices will be prevented by default")
+		trimmed := strings.TrimSpace(idx)
+		if trimmed == ".tasks" || strings.HasPrefix(trimmed, ".tasks") {
+			emitESDeprecationWarningRound61(w, s, r, tasksSysWarning)
 			return
 		}
+		if trimmed == "" || trimmed == "_all" || trimmed == "*" {
+			hasAllOrEmpty = true
+		}
+	}
+	if !hasAllOrEmpty || !s.hasPersistedTasksRecordsRound62() {
+		return
+	}
+	includeHidden := true
+	if r != nil && r.URL != nil && r.URL.Query().Has("expand_wildcards") {
+		ew := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("expand_wildcards")))
+		includeHidden = strings.Contains(ew, "hidden") || strings.Contains(ew, "all")
+	} else if s != nil && r != nil && s.isES8Mode(r) {
+		includeHidden = false
+	}
+	if includeHidden {
+		emitESDeprecationWarningRound61(w, s, r, tasksSysWarning)
 	}
 }
 
@@ -1920,18 +2114,13 @@ func (s *Server) validateByQueryPreflightWithWarningsRound61(
 
 	var rawMap map[string]any
 	hasURISearchQuery := r != nil && r.URL != nil && (strings.TrimSpace(r.URL.Query().Get("q")) != "" || strings.TrimSpace(r.URL.Query().Get("df")) != "")
-	if len(bytes.TrimSpace(bodyBytes)) > 0 {
+	hasNonEmptyBody := len(bytes.TrimSpace(bodyBytes)) > 0
+	if hasNonEmptyBody {
 		dec := json.NewDecoder(bytes.NewReader(bodyBytes))
 		dec.UseNumber()
 		if err := dec.Decode(&rawMap); err != nil {
 			return 0, 1, false, waitFC, http.StatusBadRequest, "x_content_parse_exception", err.Error()
 		}
-	} else if isDeleteByQuery && !hasURISearchQuery {
-		return 0, 1, false, waitFC, http.StatusBadRequest, "illegal_argument_exception", "Required [body]"
-	}
-	if isDeleteByQuery && !hasURISearchQuery && (rawMap == nil || rawMap["query"] == nil) {
-		return 0, 1, false, waitFC, http.StatusBadRequest, "action_request_validation_exception",
-			"Validation Failed: 1: query is missing;"
 	}
 	opLabel := "update_by_query"
 	if isDeleteByQuery {
@@ -1954,8 +2143,20 @@ func (s *Server) validateByQueryPreflightWithWarningsRound61(
 				fmt.Sprintf("[%s] unknown field [%s]", opLabel, k)
 		}
 	}
-	if srcFlag, isBool := rawMap["_source"].(bool); isBool && !srcFlag {
-		return 0, 1, false, waitFC, http.StatusBadRequest, "illegal_argument_exception", "_source:false is not supported in this context"
+	if srcVal, hasSrc := rawMap["_source"]; hasSrc {
+		if srcFlag, isBool := srcVal.(bool); isBool && !srcFlag {
+			return 0, 1, false, waitFC, http.StatusBadRequest, "illegal_argument_exception", "_source:false is not supported in this context"
+		}
+		if srcStr, isStr := srcVal.(string); isStr && strings.EqualFold(strings.TrimSpace(srcStr), "false") {
+			return 0, 1, false, waitFC, http.StatusBadRequest, "illegal_argument_exception", "_source:false is not supported in this context"
+		}
+	}
+	if !hasNonEmptyBody && isDeleteByQuery && !hasURISearchQuery {
+		return 0, 1, false, waitFC, http.StatusBadRequest, "illegal_argument_exception", "Required [body]"
+	}
+	if isDeleteByQuery && !hasURISearchQuery && (rawMap == nil || rawMap["query"] == nil) {
+		return 0, 1, false, waitFC, http.StatusBadRequest, "action_request_validation_exception",
+			"Validation Failed: 1: query is missing;"
 	}
 	if cfRaw, hasCF := rawMap["conflicts"]; hasCF && cfRaw != nil {
 		cfStr, ok := cfRaw.(string)
@@ -2232,6 +2433,83 @@ func extractJSONObjectKeysOrderedRound61(rawObj []byte) []string {
 	return keys
 }
 
+// extractNestedJSONObjectKeysOrderedRound62 extracts the ordered keys of `rawBody[outerKey][innerKey]`
+// using a streaming JSON token scan so input key order is preserved verbatim without map randomization.
+func extractNestedJSONObjectKeysOrderedRound62(rawBody []byte, outerKey, innerKey string) []string {
+	dec := json.NewDecoder(bytes.NewReader(rawBody))
+	tok, err := dec.Token()
+	if err != nil || tok != json.Delim('{') {
+		return nil
+	}
+	for dec.More() {
+		kt, kErr := dec.Token()
+		if kErr != nil {
+			return nil
+		}
+		ks, _ := kt.(string)
+		if ks != outerKey {
+			var skip json.RawMessage
+			if dec.Decode(&skip) != nil {
+				return nil
+			}
+			continue
+		}
+		var outerRaw json.RawMessage
+		if dec.Decode(&outerRaw) != nil {
+			return nil
+		}
+		innerDec := json.NewDecoder(bytes.NewReader(outerRaw))
+		iTok, iErr := innerDec.Token()
+		if iErr != nil || iTok != json.Delim('{') {
+			return nil
+		}
+		for innerDec.More() {
+			ikt, ikErr := innerDec.Token()
+			if ikErr != nil {
+				return nil
+			}
+			iks, _ := ikt.(string)
+			var valRaw json.RawMessage
+			if innerDec.Decode(&valRaw) != nil {
+				return nil
+			}
+			if iks == innerKey {
+				return extractJSONObjectKeysOrderedRound61(valRaw)
+			}
+		}
+		return nil
+	}
+	return nil
+}
+
+func validateReindexSourceQueryShapeRound62(rawBody []byte, rawQuery any) (int, string, string) {
+	if rawQuery == nil {
+		return 0, "", ""
+	}
+	qMap, ok := rawQuery.(map[string]any)
+	if !ok {
+		return http.StatusBadRequest, "parsing_exception", "[query] query malformed, must start with start_object"
+	}
+	ordered := extractNestedJSONObjectKeysOrderedRound62(rawBody, "source", "query")
+	if len(ordered) == 0 {
+		for k := range qMap {
+			ordered = append(ordered, k)
+		}
+		sort.Strings(ordered)
+	}
+	for _, qk := range ordered {
+		qv, exists := qMap[qk]
+		if !exists {
+			continue
+		}
+		if _, okObj := qv.(map[string]any); !okObj {
+			return http.StatusBadRequest, "parsing_exception",
+				fmt.Sprintf("[%s] query malformed, no start_object after query name", qk)
+		}
+	}
+	return 0, "", ""
+}
+
 // validateReindexPreflightRound61 performs full F20 preflight validation BEFORE index or
 // remote whitelist lookup, emitting ES deprecation Warning headers when needed.
 func (s *Server) validateReindexPreflightRound61(
@@ -2448,13 +2726,16 @@ func (s *Server) validateReindexPreflightRound61(
 		if err := validateRemoteReindexHostSyntaxRound61(hostStr); err != nil {
 			return 0, 1, false, waitFC, 0, nil, http.StatusBadRequest, "illegal_argument_exception", err.Error()
 		}
-		var rawTop struct {
-			Source struct {
-				Remote json.RawMessage `json:"remote"`
-			} `json:"source"`
+		orderedKeys := extractNestedJSONObjectKeysOrderedRound62(bodyBytes, "source", "remote")
+		if len(orderedKeys) == 0 {
+			var rawTop struct {
+				Source struct {
+					Remote json.RawMessage `json:"remote"`
+				} `json:"source"`
+			}
+			_ = json.Unmarshal(bodyBytes, &rawTop)
+			orderedKeys = extractJSONObjectKeysOrderedRound61(rawTop.Source.Remote)
 		}
-		_ = json.Unmarshal(bodyBytes, &rawTop)
-		orderedKeys := extractJSONObjectKeysOrderedRound61(rawTop.Source.Remote)
 		if len(orderedKeys) == 0 {
 			for k := range rm {
 				orderedKeys = append(orderedKeys, k)
@@ -2488,6 +2769,10 @@ func (s *Server) validateReindexPreflightRound61(
 		remMap = rm
 	}
 
+	if qSt, qET, qER := validateReindexSourceQueryShapeRound62(bodyBytes, srcObj["query"]); qSt != 0 {
+		return 0, 1, false, waitFC, 0, nil, qSt, qET, qER
+	}
+
 	if emitSortDeprecation {
 		emitESDeprecationWarningRound61(w, s, r, "The sort option in reindex is deprecated. Instead consider using query filtering to find the desired subset of data.")
 	}
@@ -2502,6 +2787,12 @@ func validateRemoteReindexHostSyntaxRound61(rawHost string) error {
 	u, err := url.Parse(rawHost)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" || u.RawQuery != "" || u.Fragment != "" {
 		return fmt.Errorf("[host] must be of the form [scheme]://[host]:[port], found [%s]", rawHost)
+	}
+	if u.User != nil {
+		return fmt.Errorf("[host] must not include userinfo credentials; use [remote.username] and [remote.password] instead")
+	}
+	if (u.Path != "" && u.Path != "/") || (u.RawPath != "" && u.RawPath != "/") {
+		return fmt.Errorf("[host] must be of the form [scheme]://[host]:[port] without path segments, found [%s]", rawHost)
 	}
 	hasExplicitPortSep := false
 	if strings.HasPrefix(u.Host, "[") {
@@ -2907,9 +3198,120 @@ func (s *Server) checkByQueryPointInTimeConflictRound61(indexName, docID string,
 // Round 61 F23: SSRF-Hardened `source.remote` Reindex HTTP Scroll Client
 // ============================================================================
 
-const maxRemoteReindexResponseBytes = 100 << 20 // 100 MiB
+const (
+	maxRemoteReindexResponseBytes = 100 << 20 // 100 MiB
+	maxRemoteReindexTimeout       = 60 * time.Second
+)
 
-func (s *Server) buildRemoteReindexHTTPClientRound61(remMap map[string]any) *http.Client {
+var (
+	errRemoteReindexSSRFBlockedRound62 = errors.New("remote reindex blocked disallowed IP address")
+	cgnatPrefixRound62                 = netip.MustParsePrefix("100.64.0.0/10")
+	ipv4ThisNetPrefixRound62           = netip.MustParsePrefix("0.0.0.0/8")
+	ipv4ReservedPrefixRound62          = netip.MustParsePrefix("240.0.0.0/4")
+)
+
+func isBlockedRemoteReindexIPRound62(rawAddr netip.Addr) bool {
+	if !rawAddr.IsValid() {
+		return true
+	}
+	ip := rawAddr.Unmap()
+	if ip.IsLoopback() ||
+		ip.IsPrivate() ||
+		ip.IsLinkLocalUnicast() ||
+		ip.IsLinkLocalMulticast() ||
+		ip.IsMulticast() ||
+		ip.IsUnspecified() {
+		return true
+	}
+	if ip.Is4() && (cgnatPrefixRound62.Contains(ip) || ipv4ThisNetPrefixRound62.Contains(ip) || ipv4ReservedPrefixRound62.Contains(ip)) {
+		return true
+	}
+	return false
+}
+
+func (s *Server) buildRemoteReindexDialContextRound62(connectTimeout time.Duration) func(ctx context.Context, network, addr string) (net.Conn, error) {
+	dialer := &net.Dialer{Timeout: connectTimeout, KeepAlive: -1}
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		host, port, err := net.SplitHostPort(addr)
+		if err != nil {
+			return nil, err
+		}
+		portNum, pErr := strconv.Atoi(port)
+		if pErr != nil || portNum <= 0 || portNum > 65535 {
+			return nil, fmt.Errorf("invalid remote port")
+		}
+		cleanHost := strings.Trim(strings.TrimSpace(host), "[]")
+		var addrs []netip.Addr
+		if literalIP, parseErr := netip.ParseAddr(cleanHost); parseErr == nil {
+			addrs = []netip.Addr{literalIP}
+		} else {
+			lookupFn := s.getRemoteReindexLookupNetIPRound62()
+			resolved, lErr := lookupFn(ctx, "ip", cleanHost)
+			if lErr != nil {
+				return nil, lErr
+			}
+			addrs = resolved
+		}
+		if len(addrs) == 0 {
+			return nil, fmt.Errorf("no IP addresses resolved")
+		}
+		allowPrivate := s.getRemoteReindexAllowPrivateIPsRound62()
+		validated := make([]netip.Addr, 0, len(addrs))
+		for _, rawAddr := range addrs {
+			unmapped := rawAddr.Unmap()
+			if !allowPrivate && isBlockedRemoteReindexIPRound62(unmapped) {
+				return nil, errRemoteReindexSSRFBlockedRound62
+			}
+			validated = append(validated, unmapped)
+		}
+		var lastErr error
+		for _, ip := range validated {
+			conn, dErr := dialer.DialContext(ctx, network, net.JoinHostPort(ip.String(), port))
+			if dErr == nil {
+				return conn, nil
+			}
+			lastErr = dErr
+		}
+		return nil, lastErr
+	}
+}
+
+func isBlockedRemoteReindexHeaderRound62(headerName, headerVal string) bool {
+	trimmed := strings.ToLower(strings.TrimSpace(headerName))
+	if trimmed == "" || strings.ContainsAny(headerName, "\r\n") || strings.ContainsAny(headerVal, "\r\n") {
+		return true
+	}
+	switch trimmed {
+	case "host",
+		"authorization",
+		"content-length",
+		"transfer-encoding",
+		"connection",
+		"upgrade",
+		"proxy-authorization",
+		"te",
+		"trailer",
+		"keep-alive",
+		"proxy-authenticate",
+		"proxy-connection":
+		return true
+	default:
+		return false
+	}
+}
+
+func sanitizeRemoteReindexConnectErrorRound62(baseHost string, err error) string {
+	safeHost := strings.TrimSpace(baseHost)
+	if u, pErr := url.Parse(safeHost); pErr == nil && u.Host != "" {
+		safeHost = u.Scheme + "://" + u.Host
+	}
+	if errors.Is(err, errRemoteReindexSSRFBlockedRound62) {
+		return fmt.Sprintf("connect_exception: remote host [%s] resolved to a disallowed non-public IP address", safeHost)
+	}
+	return fmt.Sprintf("connect_exception: failed to connect to remote host [%s]", safeHost)
+}
+
+func (s *Server) buildRemoteReindexHTTPClientRound61(remMap map[string]any) (*http.Client, func()) {
 	connectTimeout := 30 * time.Second
 	socketTimeout := 30 * time.Second
 	if rawCT, ok := remMap["connect_timeout"]; ok && rawCT != nil {
@@ -2922,20 +3324,31 @@ func (s *Server) buildRemoteReindexHTTPClientRound61(remMap map[string]any) *htt
 			socketTimeout = d
 		}
 	}
+	if connectTimeout > maxRemoteReindexTimeout {
+		connectTimeout = maxRemoteReindexTimeout
+	}
+	if socketTimeout > maxRemoteReindexTimeout {
+		socketTimeout = maxRemoteReindexTimeout
+	}
+	cleanup := func() {}
 	rt := s.getRemoteReindexTransportRound61()
 	if rt == nil {
-		dialer := &net.Dialer{Timeout: connectTimeout}
-		rt = &http.Transport{
+		tr := &http.Transport{
 			Proxy:                 nil, // SSRF hardening: never route through ambient HTTP_PROXY
-			DialContext:           dialer.DialContext,
+			DialContext:           s.buildRemoteReindexDialContextRound62(connectTimeout),
 			ResponseHeaderTimeout: socketTimeout,
 			TLSHandshakeTimeout:   connectTimeout,
-			DisableKeepAlives:     false,
+			DisableKeepAlives:     true,
 		}
+		rt = tr
+		cleanup = tr.CloseIdleConnections
 	}
 	totalTimeout := socketTimeout + connectTimeout
 	if socketTimeout < connectTimeout {
 		totalTimeout = socketTimeout * 2
+	}
+	if totalTimeout > 2*maxRemoteReindexTimeout {
+		totalTimeout = 2 * maxRemoteReindexTimeout
 	}
 	return &http.Client{
 		Transport: rt,
@@ -2943,7 +3356,7 @@ func (s *Server) buildRemoteReindexHTTPClientRound61(remMap map[string]any) *htt
 		CheckRedirect: func(*http.Request, []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
-	}
+	}, cleanup
 }
 
 func convertLegacyParentHitToJoinRound61(srcDoc json.RawMessage, parentID, hitType string, destSchema *schema.IndexSchema) json.RawMessage {
@@ -3098,7 +3511,8 @@ func (s *Server) executeRemoteReindexRound61(
 		batchSize = resolvedMaxDocs
 	}
 
-	client := s.buildRemoteReindexHTTPClientRound61(remMap)
+	client, closeTransport := s.buildRemoteReindexHTTPClientRound61(remMap)
+	defer closeTransport()
 	doRemoteJSON := func(method, fullURL string, reqPayload any) (int, map[string]any, error) {
 		var bodyReader io.Reader
 		if reqPayload != nil {
@@ -3117,7 +3531,11 @@ func (s *Server) executeRemoteReindexRound61(
 			req.SetBasicAuth(username, password)
 		}
 		for hk, hv := range customHdrs {
-			req.Header.Set(hk, fmt.Sprintf("%v", hv))
+			valStr := fmt.Sprintf("%v", hv)
+			if isBlockedRemoteReindexHeaderRound62(hk, valStr) {
+				continue
+			}
+			req.Header.Set(hk, valStr)
 		}
 		resp, err := client.Do(req)
 		if err != nil {
@@ -3173,7 +3591,7 @@ func (s *Server) executeRemoteReindexRound61(
 
 	statusCode, pageMap, netErr := doRemoteJSON(http.MethodPost, searchURL, searchBody)
 	if netErr != nil {
-		writeESError(w, http.StatusInternalServerError, "connect_exception", netErr.Error())
+		writeESError(w, http.StatusInternalServerError, "connect_exception", sanitizeRemoteReindexConnectErrorRound62(baseHost, netErr))
 		return
 	}
 	if statusCode >= 400 {
@@ -3484,7 +3902,7 @@ func (s *Server) executeRemoteReindexRound61(
 			"scroll_id": scrollID,
 		})
 		if scNetErr != nil {
-			writeESError(w, http.StatusInternalServerError, "connect_exception", scNetErr.Error())
+			writeESError(w, http.StatusInternalServerError, "connect_exception", sanitizeRemoteReindexConnectErrorRound62(baseHost, scNetErr))
 			return
 		}
 		if scCode >= 400 {

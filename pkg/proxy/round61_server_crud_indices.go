@@ -43,6 +43,7 @@ import (
 
 type scrollSessionStateR61CRUD struct {
 	mu              sync.Mutex
+	SessionNonce    uint64
 	Index           string
 	Req             esast.SearchRequest
 	LastSort        []any
@@ -51,6 +52,9 @@ type scrollSessionStateR61CRUD struct {
 	Exhausted       bool
 	MaxSeqNoByIndex map[string]int64
 	Tokens          []string
+	ExpiresAtMs     int64
+	Cleared         bool
+	EOFScrollID     string
 }
 
 type serverStateR61CRUD struct {
@@ -58,6 +62,8 @@ type serverStateR61CRUD struct {
 	legacyTemplateTypes       map[string]string
 	legacyTemplateHasMappings map[string]bool
 	scrollSessions            map[string]*scrollSessionStateR61CRUD
+	openScrollList            []*scrollSessionStateR61CRUD
+	pendingScrollTokens       map[string][]string
 	testRemoteWhitelist       string
 }
 
@@ -72,6 +78,7 @@ func getOrCreateServerStateR61CRUD(s *Server) *serverStateR61CRUD {
 			legacyTemplateTypes:       make(map[string]string),
 			legacyTemplateHasMappings: make(map[string]bool),
 			scrollSessions:            make(map[string]*scrollSessionStateR61CRUD),
+			pendingScrollTokens:       make(map[string][]string),
 		}
 	}
 	serverStateRegistryMuR61CRUD.RLock()
@@ -89,6 +96,7 @@ func getOrCreateServerStateR61CRUD(s *Server) *serverStateR61CRUD {
 		legacyTemplateTypes:       make(map[string]string),
 		legacyTemplateHasMappings: make(map[string]bool),
 		scrollSessions:            make(map[string]*scrollSessionStateR61CRUD),
+		pendingScrollTokens:       make(map[string][]string),
 	}
 	serverStateRegistryR61CRUD[s] = st
 	return st
@@ -1689,10 +1697,50 @@ func (s *Server) handleGetMappingsWithTypesR61CRUD(w http.ResponseWriter, r *htt
 			sort.Strings(targets)
 		}
 	} else {
-		var ok bool
-		targets, _, ok = s.resolveValidatedReadTargets(w, r, r.PathValue("index"))
-		if !ok {
+		rawIdx := strings.TrimSpace(r.PathValue("index"))
+		_, _, _, ewNone, ewErr := parseExpandWildcardsFlags(r.URL.Query().Get("expand_wildcards"))
+		if ewErr != nil {
+			if r.Method == http.MethodHead {
+				ensureESCompatHeaders(w, r)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", ewErr.Error())
 			return
+		}
+		if ewNone && (strings.ContainsAny(rawIdx, "*?") || rawIdx == "_all") {
+			var concreteOnly []string
+			for _, p := range strings.Split(rawIdx, ",") {
+				p = strings.TrimSpace(p)
+				if p != "" && p != "_all" && !strings.ContainsAny(p, "*?") && !strings.HasPrefix(p, "-") {
+					concreteOnly = append(concreteOnly, p)
+				}
+			}
+			if len(concreteOnly) == 0 {
+				allowNo := !r.URL.Query().Has("allow_no_indices") || isTruthyBoolQueryParam(r, "allow_no_indices")
+				if !allowNo {
+					if r.Method == http.MethodHead {
+						ensureESCompatHeaders(w, r)
+						w.WriteHeader(http.StatusNotFound)
+						return
+					}
+					writeESError(w, http.StatusNotFound, "index_not_found_exception", "no such index ["+rawIdx+"]")
+					return
+				}
+				targets = nil
+			} else {
+				var ok bool
+				targets, _, ok = s.resolveValidatedReadTargets(w, r, strings.Join(concreteOnly, ","))
+				if !ok {
+					return
+				}
+			}
+		} else {
+			var ok bool
+			targets, _, ok = s.resolveValidatedReadTargets(w, r, rawIdx)
+			if !ok {
+				return
+			}
 		}
 	}
 
@@ -1801,7 +1849,7 @@ func (s *Server) handlePutMappingR61CRUD(w http.ResponseWriter, r *http.Request)
 	pathType := strings.TrimSpace(r.PathValue("type"))
 	if isES8 && pathType != "" {
 		writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
-			"Types cannot be provided in put mapping requests, unless include_type_name is set to true.")
+			"Types cannot be provided in put mapping requests")
 		return
 	}
 	incType, hasInc, okInc := checkIncludeTypeNameParamR61CRUD(w, s, r, "put mapping")
@@ -1887,6 +1935,11 @@ func (s *Server) handlePutMappingR61CRUD(w http.ResponseWriter, r *http.Request)
 				}
 				if _, isObj := v.(map[string]any); isObj {
 					if k == "_doc" {
+						if isES8 {
+							writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
+								"Types cannot be provided in put mapping requests")
+							return
+						}
 						writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
 							"Types cannot be provided in put mapping requests, unless the include_type_name parameter is set to true.")
 						return
@@ -2003,6 +2056,15 @@ func (s *Server) handlePutMappingR61CRUD(w http.ResponseWriter, r *http.Request)
 				et, er := splitSchemaErrorPrefixR61CRUD(err, "illegal_argument_exception")
 				writeESError(w, http.StatusBadRequest, et, er)
 				return
+			}
+			if !s.explicitTargetESVersion {
+				mergedRT := effectiveRuntimeMappings(oldSchema, spec.Runtime)
+				if _, err := TopoSortRuntimeMappingsRound61(mergedRT); err != nil {
+					s.mu.RUnlock()
+					et, er := splitSchemaErrorPrefixR61CRUD(err, "illegal_argument_exception")
+					writeESError(w, http.StatusBadRequest, et, er)
+					return
+				}
 			}
 		}
 		mergedPreview := schema.MergeMappingSpecs(oldRaw, &spec)
@@ -2218,11 +2280,18 @@ func (s *Server) handleDeleteIndexR61CRUD(w http.ResponseWriter, r *http.Request
 					matchedPart = true
 				}
 			}
-			// In ES 7 (`!s.isES8Mode(r)`), a wildcard matching an alias fails with 400 (`TestRound11`).
-			// In ES 8 (`s.isES8Mode(r)`, `indices.delete/10_basic.yml`), wildcards never expand to aliases (`200` or `404` when `allow_no_indices=false`).
+			// In ES 7 (`!s.isES8Mode(r)`), a wildcard matching a filtered alias fails with 400 (`TestRound11`),
+			// while unfiltered wildcards do not expand to aliases (`indices.delete/10_basic.yml`).
 			if !s.isES8Mode(r) && !matchedPart && !ignoreUnavailable {
 				for aliasName, aliasTargets := range s.aliases {
-					if len(aliasTargets) > 0 && matchWildcardPattern(part, aliasName) {
+					hasAliasFilter := false
+					for _, am := range s.aliasMeta[aliasName] {
+						if am.Filter != nil || len(am.RawFilter) > 0 {
+							hasAliasFilter = true
+							break
+						}
+					}
+					if len(aliasTargets) > 0 && hasAliasFilter && matchWildcardPattern(part, aliasName) {
 						s.mu.RUnlock()
 						writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
 							fmt.Sprintf("The provided expression [%s] matches an alias, specify the corresponding concrete indices instead.", rawIndex))
@@ -2306,6 +2375,8 @@ func (s *Server) handleDeleteIndexR61CRUD(w http.ResponseWriter, r *http.Request
 		ddl := fmt.Sprintf("DROP TABLE IF EXISTS `%s`.`%s`;", idx.DorisDB, idx.DorisTable)
 		_ = s.backend.ExecDDL(r.Context(), ddl)
 	}
+	s.emitSystemIndexTasksWarningIfNeededRound61(w, r, append(append([]string(nil), targets...), rawIndex))
+	purgeDeletedIndicesAdminStateR62Admin(s, targets)
 	s.queryCache.InvalidateAll()
 	writeJSONWithRequest(w, r, http.StatusOK, map[string]any{"acknowledged": true})
 }
@@ -2955,6 +3026,18 @@ func (s *Server) resolveRealtimeAndRefreshOnGetR61CRUD(
 		realtime = *bodyRealtime
 	}
 	if r != nil && r.URL != nil {
+		if r.URL.Query().Has("force_synthetic_source") {
+			fsVal, _, fsErr := parseStrictQueryBoolParamRound59(r, "force_synthetic_source")
+			if fsErr != nil {
+				return true, http.StatusBadRequest, "illegal_argument_exception", fsErr.Error()
+			}
+			if fsVal && indexName != "" && s != nil {
+				idxSchema := s.getOrCompileReadOnlySchema(r.Context(), indexName)
+				if vErr := validateGetMGetForceSyntheticSourceR62Admin(idxSchema); vErr != nil {
+					return true, http.StatusBadRequest, "illegal_argument_exception", vErr.Error()
+				}
+			}
+		}
 		if r.URL.Query().Has("realtime") {
 			bv, _, bErr := parseStrictQueryBoolParamRound59(r, "realtime")
 			if bErr != nil {
@@ -3123,6 +3206,33 @@ func populateGetStoredFieldsAndSourceR61CRUD(
 	storedFields []string,
 	targetMap map[string]any,
 ) {
+	forceSynth, _ := targetMap[forceSynSourceMarkerKeyR62Admin].(bool)
+	delete(targetMap, forceSynSourceMarkerKeyR62Admin)
+	if forceSynth {
+		if vErr := validateGetMGetForceSyntheticSourceR62Admin(idxSchema); vErr != nil {
+			errReason := vErr.Error()
+			delete(targetMap, "found")
+			delete(targetMap, "_version")
+			delete(targetMap, "_seq_no")
+			delete(targetMap, "_primary_term")
+			delete(targetMap, "_routing")
+			targetMap["error"] = map[string]any{
+				"root_cause": []map[string]any{
+					{"type": "illegal_argument_exception", "reason": errReason, "index": indexName},
+				},
+				"type":   "illegal_argument_exception",
+				"reason": errReason,
+				"index":  indexName,
+			}
+			return
+		}
+		if idxSchema != nil && !idxSchema.SyntheticSource {
+			cpSc := *idxSchema
+			cpSc.SyntheticSource = true
+			idxSchema = &cpSc
+		}
+	}
+
 	hasStoredNone := false
 	storedRequestsSource := false
 	storedRequestsIgnored := false
@@ -3181,7 +3291,13 @@ func populateGetStoredFieldsAndSourceR61CRUD(
 	}
 
 	if wantSource {
-		if filteredSrc, ok := filterDocumentSourceRound59(hit.Source, idxSchema, effSF); ok {
+		rawSrcForFetch := hit.Source
+		if idxSchema != nil && idxSchema.SyntheticSource {
+			if synSrc := reconstructHitSyntheticSourceR61Search(hit.Source, idxSchema); synSrc != nil {
+				rawSrcForFetch = synSrc
+			}
+		}
+		if filteredSrc, ok := filterDocumentSourceRound59(rawSrcForFetch, idxSchema, effSF); ok {
 			targetMap["_source"] = filteredSrc
 			accessedFields = append(accessedFields, "_source")
 		}
@@ -3304,15 +3420,23 @@ func (s *Server) snapshotMaxSeqNoByIndexR61CRUD(rawIndex string) map[string]int6
 }
 
 func (s *Server) registerStatefulScrollR61CRUD(initialToken, rawIndex string, req *esast.SearchRequest, lastSort []any, total, fetched int64, exhausted bool, ttl time.Duration) {
-	s.registerInitialScrollContext(initialToken, ttl)
 	if initialToken == "" {
 		return
 	}
+	nonce := scrollSessionNonceSeqR62Admin.Add(1)
+	uniqueToken := attachScrollSessionNonceR62Admin(initialToken, nonce)
+	s.registerInitialScrollContext(uniqueToken, ttl)
 	var reqCopy esast.SearchRequest
 	if req != nil {
 		reqCopy = *req
 	}
+	nowMs := time.Now().UnixMilli()
+	expMs := int64(0)
+	if ttl > 0 {
+		expMs = time.Now().Add(ttl).UnixMilli()
+	}
 	sess := &scrollSessionStateR61CRUD{
+		SessionNonce:    nonce,
 		Index:           rawIndex,
 		Req:             reqCopy,
 		LastSort:        append([]any(nil), lastSort...),
@@ -3320,26 +3444,63 @@ func (s *Server) registerStatefulScrollR61CRUD(initialToken, rawIndex string, re
 		FetchedCount:    fetched,
 		Exhausted:       exhausted,
 		MaxSeqNoByIndex: s.snapshotMaxSeqNoByIndexR61CRUD(rawIndex),
-		Tokens:          []string{initialToken},
+		Tokens:          []string{uniqueToken},
+		ExpiresAtMs:     expMs,
 	}
 	st := getOrCreateServerStateR61CRUD(s)
 	st.mu.Lock()
-	st.scrollSessions[initialToken] = sess
+	sweepExpiredScrollSessionsLockedR62Admin(st, nowMs)
+	st.scrollSessions[uniqueToken] = sess
+	st.openScrollList = append(st.openScrollList, sess)
+	if st.pendingScrollTokens == nil {
+		st.pendingScrollTokens = make(map[string][]string)
+	}
+	q := append(st.pendingScrollTokens[initialToken], uniqueToken)
+	if len(q) > 64 {
+		q = q[len(q)-64:]
+	}
+	st.pendingScrollTokens[initialToken] = q
 	st.mu.Unlock()
 }
 
 func (s *Server) clearStatefulScrollR61CRUD(ids []string, clearAll bool) (bool, int) {
 	st := getOrCreateServerStateR61CRUD(s)
+	nowMs := time.Now().UnixMilli()
 	st.mu.Lock()
+	sweepExpiredScrollSessionsLockedR62Admin(st, nowMs)
 	if clearAll {
+		for _, sess := range st.openScrollList {
+			if sess != nil {
+				sess.Cleared = true
+			}
+		}
+		for _, sess := range st.scrollSessions {
+			if sess != nil {
+				sess.Cleared = true
+			}
+		}
+		st.openScrollList = nil
 		st.scrollSessions = make(map[string]*scrollSessionStateR61CRUD)
+		st.pendingScrollTokens = make(map[string][]string)
 	} else {
 		for _, id := range ids {
 			if sess := st.scrollSessions[id]; sess != nil {
+				sess.Cleared = true
 				for _, tk := range sess.Tokens {
-					delete(st.scrollSessions, tk)
+					if st.scrollSessions[tk] == sess {
+						delete(st.scrollSessions, tk)
+					}
 				}
 			}
+		}
+		if len(st.openScrollList) > 0 {
+			kept := st.openScrollList[:0]
+			for _, sess := range st.openScrollList {
+				if sess != nil && !sess.Cleared {
+					kept = append(kept, sess)
+				}
+			}
+			st.openScrollList = kept
 		}
 	}
 	st.mu.Unlock()
@@ -3408,17 +3569,31 @@ func (s *Server) filterScrollHitsBySnapshotSeqNoR61CRUD(resp map[string]any, max
 
 func (s *Server) executeStatefulScrollR61CRUD(w http.ResponseWriter, r *http.Request, scrollID string, extendTTL time.Duration) {
 	st := getOrCreateServerStateR61CRUD(s)
-	st.mu.RLock()
+	nowMs := time.Now().UnixMilli()
+	st.mu.Lock()
+	sweepExpiredScrollSessionsLockedR62Admin(st, nowMs)
 	sess := st.scrollSessions[scrollID]
-	st.mu.RUnlock()
+	st.mu.Unlock()
 
+	validatedStateless := false
 	if sess == nil {
 		cursor, ok := decodeScrollCursor(scrollID)
 		if !ok {
 			writeESError(w, http.StatusNotFound, "search_context_missing_exception", "No search context found for id ["+scrollID+"]")
 			return
 		}
+		// Check activeScrolls expiry BEFORE inserting into st.scrollSessions so expired/forged stateless probes never leak memory!
+		if !s.validateAndAdvanceScrollToken(scrollID, "", extendTTL) {
+			writeESError(w, http.StatusNotFound, "search_context_missing_exception", "No search context found for id ["+scrollID+"]")
+			return
+		}
+		validatedStateless = true
+		expMs := int64(0)
+		if extendTTL > 0 {
+			expMs = time.Now().Add(extendTTL).UnixMilli()
+		}
 		sess = &scrollSessionStateR61CRUD{
+			SessionNonce: scrollSessionNonceSeqR62Admin.Add(1),
 			Index:        cursor.Index,
 			Req:          cursor.Req,
 			LastSort:     append([]any(nil), cursor.LastSort...),
@@ -3426,34 +3601,68 @@ func (s *Server) executeStatefulScrollR61CRUD(w http.ResponseWriter, r *http.Req
 			FetchedCount: cursor.FetchedCount,
 			Exhausted:    cursor.Exhausted,
 			Tokens:       []string{scrollID},
+			ExpiresAtMs:  expMs,
 		}
 		st.mu.Lock()
 		st.scrollSessions[scrollID] = sess
+		st.openScrollList = append(st.openScrollList, sess)
 		st.mu.Unlock()
 	}
 
 	sess.mu.Lock()
 	defer sess.mu.Unlock()
 
-	// Validate that the scroll context is still alive (neither cleared nor expired),
-	// refreshing only `sess.Tokens[0]` in `s.activeScrolls` so 1 session == 1 `num_freed`.
-	rootToken := sess.Tokens[0]
-	if !s.validateAndAdvanceScrollToken(rootToken, "", extendTTL) {
+	if sess.Cleared || (sess.ExpiresAtMs > 0 && time.Now().UnixMilli() > sess.ExpiresAtMs) {
+		sess.Cleared = true
+		st.mu.Lock()
+		for _, tk := range sess.Tokens {
+			if st.scrollSessions[tk] == sess {
+				delete(st.scrollSessions, tk)
+			}
+		}
+		st.mu.Unlock()
 		writeESError(w, http.StatusNotFound, "search_context_missing_exception", "No search context found for id ["+scrollID+"]")
 		return
 	}
 
+	// Validate that the scroll context is still alive (neither cleared nor expired),
+	// refreshing only `sess.Tokens[0]` in `s.activeScrolls` so 1 session == 1 `num_freed`.
+	rootToken := sess.Tokens[0]
+	if !validatedStateless && !s.validateAndAdvanceScrollToken(rootToken, "", extendTTL) {
+		sess.Cleared = true
+		st.mu.Lock()
+		for _, tk := range sess.Tokens {
+			if st.scrollSessions[tk] == sess {
+				delete(st.scrollSessions, tk)
+			}
+		}
+		st.mu.Unlock()
+		writeESError(w, http.StatusNotFound, "search_context_missing_exception", "No search context found for id ["+scrollID+"]")
+		return
+	}
+	if extendTTL > 0 {
+		sess.ExpiresAtMs = time.Now().Add(extendTTL).UnixMilli()
+	}
+
 	writeEOFPage := func() {
-		eofScrollID := encodeScrollCursorWithFetched(sess.Index, &sess.Req, nil, sess.Total, sess.FetchedCount, true)
-		_ = s.validateAndAdvanceScrollToken(rootToken, eofScrollID, extendTTL)
+		eofScrollID := sess.EOFScrollID
+		if eofScrollID == "" {
+			eofScrollID = attachScrollSessionNonceR62Admin(
+				encodeScrollCursorWithFetched(sess.Index, &sess.Req, nil, sess.Total, sess.FetchedCount, true),
+				sess.SessionNonce,
+			)
+			sess.EOFScrollID = eofScrollID
+			_ = s.validateAndAdvanceScrollToken(rootToken, eofScrollID, extendTTL)
+			if eofScrollID != "" {
+				st.mu.Lock()
+				appendBoundedScrollTokenLockedR62Admin(st, sess, eofScrollID)
+				st.mu.Unlock()
+			}
+		} else {
+			_ = s.validateAndAdvanceScrollToken(rootToken, "", extendTTL)
+		}
 		sess.Exhausted = true
 		sess.LastSort = nil
-		if eofScrollID != "" {
-			sess.Tokens = append(sess.Tokens, eofScrollID)
-			st.mu.Lock()
-			st.scrollSessions[eofScrollID] = sess
-			st.mu.Unlock()
-		}
 		eofRel := "eq"
 		if thresh, okT := trackTotalHitsThreshold(&sess.Req); okT && thresh > 0 && sess.Total >= thresh {
 			eofRel = "gte"
@@ -3583,16 +3792,21 @@ func (s *Server) executeStatefulScrollR61CRUD(w http.ResponseWriter, r *http.Req
 	returnedNow := int64(len(collectedHits))
 	nextFetched := sess.FetchedCount + returnedNow
 	exhausted := len(curAfter) == 0 || returnedNow == 0 || (sess.Req.ShouldTrackTotalHits() && nextFetched >= total)
-	nextScrollID := encodeScrollCursorWithFetched(sess.Index, &sess.Req, curAfter, total, nextFetched, exhausted)
+	nextScrollID := attachScrollSessionNonceR62Admin(
+		encodeScrollCursorWithFetched(sess.Index, &sess.Req, curAfter, total, nextFetched, exhausted),
+		sess.SessionNonce,
+	)
 	_ = s.validateAndAdvanceScrollToken(rootToken, nextScrollID, extendTTL)
 
 	sess.LastSort = curAfter
 	sess.FetchedCount = nextFetched
 	sess.Exhausted = exhausted
+	if exhausted && sess.EOFScrollID == "" {
+		sess.EOFScrollID = nextScrollID
+	}
 	if nextScrollID != "" {
-		sess.Tokens = append(sess.Tokens, nextScrollID)
 		st.mu.Lock()
-		st.scrollSessions[nextScrollID] = sess
+		appendBoundedScrollTokenLockedR62Admin(st, sess, nextScrollID)
 		st.mu.Unlock()
 	}
 
@@ -4254,7 +4468,7 @@ func (s *Server) validateBulkDeprecatedParamsR61CRUD(r *http.Request, rawBulk []
 			for k := range meta {
 				switch k {
 				case "_index", "_id", "routing", "pipeline", "version", "version_type",
-					"if_seq_no", "if_primary_term", "require_alias", "dynamic_templates",
+					"if_seq_no", "if_primary_term", "require_alias", "require_data_stream", "dynamic_templates",
 					"_source", "_source_includes", "_source_excludes":
 				case "_type":
 					if isES8 {
@@ -4401,6 +4615,9 @@ func (s *Server) checkByQueryConflictSafeR61CRUD(
 func (s *Server) validateTSDBSearchConstraintsR61CRUD(r *http.Request, rawIndex string, req *esast.SearchRequest) (int, string, string) {
 	if s == nil {
 		return 0, "", ""
+	}
+	if scSt, scET, scER := s.checkMaxOpenScrollContextR62Admin(r, rawIndex, req); scSt != 0 {
+		return scSt, scET, scER
 	}
 	ctx := context.Background()
 	if r != nil {

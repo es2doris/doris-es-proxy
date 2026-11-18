@@ -1155,8 +1155,8 @@ func TestRound29TranspilerNestedDateBoundsRelativeNestedPathsLuceneExistsAndSubA
 			"bool": {
 				"must": [
 					{"ids": {"values": [10, 20], "boost": 3.5}},
-					{"match_bool_prefix": {"service": {"query": "check out", "fuzziness": 1}}},
-					{"multi_match": {"query": "pay gate", "type": "bool_prefix", "fields": ["service"], "fuzziness": 1}}
+					{"match_bool_prefix": {"service": {"query": "check out", "analyzer": "standard", "fuzziness": 1}}},
+					{"multi_match": {"query": "pay gate", "type": "bool_prefix", "fields": ["service"], "analyzer": "standard", "fuzziness": 1}}
 				]
 			}
 		}
@@ -3425,11 +3425,11 @@ func TestRound49TranspilerSpecCompliance(t *testing.T) {
 		t.Fatalf("F16 expected common query to compile low-freq terms 'quick' and 'brown', got %s", w)
 	}
 
-	// F17: search_as_you_type ._index_prefix in match and term queries
+	// F17 (updated in Round 62): search_as_you_type ._index_prefix routes term queries to f__sayt___index_prefix ARRAY<STRING>
 	var saytPrefixTerm esast.Query
 	_ = json.Unmarshal([]byte(`{"term": {"sayt._index_prefix": "qui"}}`), &saytPrefixTerm)
-	if w := tr.CompileQuery(&saytPrefixTerm, false, nil).WhereSQL; !strings.Contains(w, "LIKE") || !strings.Contains(w, "qui%") {
-		t.Fatalf("F17 expected term on sayt._index_prefix to compile as prefix LIKE 'qui%%', got %s", w)
+	if w := tr.CompileQuery(&saytPrefixTerm, false, nil).WhereSQL; !strings.Contains(w, "f__sayt___index_prefix") || !strings.Contains(w, "'qui'") {
+		t.Fatalf("F17 expected term on sayt._index_prefix to route to f__sayt___index_prefix 'qui', got %s", w)
 	}
 
 	// F18: version semantic version range query (1.2.0 < 1.10.0, 1.0.0-alpha < 1.0.0)

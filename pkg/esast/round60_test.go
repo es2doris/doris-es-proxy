@@ -129,13 +129,17 @@ func TestRound60_F10_F12_F15_F16_F18_F19_F25_AST(t *testing.T) {
 		}
 	}
 
-	// F12: AggSpec.Meta object & null accepted; scalar/array rejected
+	// F12: AggSpec.Meta object accepted; null/scalar/array rejected per ES aggregations/meta.yml
 	var srMeta SearchRequest
-	if err := json.Unmarshal([]byte(`{"aggs":{"a1":{"meta":{"color":"blue"},"avg":{"field":"v"}},"a2":{"meta":null,"sum":{"field":"v"}}}}`), &srMeta); err != nil {
+	if err := json.Unmarshal([]byte(`{"aggs":{"a1":{"meta":{"color":"blue"},"avg":{"field":"v"}},"a2":{"meta":{},"sum":{"field":"v"}}}}`), &srMeta); err != nil {
 		t.Fatalf("AggSpec.Meta valid unmarshal failed: %v", err)
 	}
-	if srMeta.Aggs["a1"].Meta["color"] != "blue" || srMeta.Aggs["a2"].Meta != nil {
+	if srMeta.Aggs["a1"].Meta["color"] != "blue" || len(srMeta.Aggs["a2"].Meta) != 0 {
 		t.Fatalf("unexpected AggSpec.Meta: a1=%v a2=%v", srMeta.Aggs["a1"].Meta, srMeta.Aggs["a2"].Meta)
+	}
+	var srNullMeta SearchRequest
+	if err := json.Unmarshal([]byte(`{"aggs":{"a1":{"meta":null,"avg":{"field":"v"}}}}`), &srNullMeta); err == nil || !strings.Contains(err.Error(), "Expected [START_OBJECT] under [meta]") {
+		t.Fatalf("expected Expected [START_OBJECT] under [meta] error for null meta, got: %v", err)
 	}
 	for _, badMeta := range []string{
 		`{"aggs":{"a1":{"meta":"bad","avg":{"field":"v"}}}}`,

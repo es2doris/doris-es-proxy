@@ -148,7 +148,7 @@ jobs:
         run: |
           jq empty deploy/grafana/doris-es-proxy-dashboard.json
           docker build -t es2doris/doris-es-proxy:ci .
-          docker run --rm es2doris/doris-es-proxy:ci version | grep -q "v0.17.0"
+          docker run --rm es2doris/doris-es-proxy:ci version | grep -q "v0.18.0"
 
   elastic-conformance:
     name: Upstream Elastic Conformance & Go SDK v8
@@ -173,8 +173,8 @@ jobs:
       - name: Run upstream Elastic rest-api-spec & wire-schema conformance
         run: |
           CONFORMANCE_REQUIRE_UPSTREAM=1 \
-          CONFORMANCE_MIN_V7_PASSED=1460 \
-          CONFORMANCE_MIN_V8_PASSED=2200 \
+          CONFORMANCE_MIN_V7_PASSED=1830 \
+          CONFORMANCE_MIN_V8_PASSED=3000 \
           CONFORMANCE_SUMMARY_MD="$GITHUB_STEP_SUMMARY" \
           CONFORMANCE_OUT_JSON="/tmp/conformance-scorecard.json" \
             go test -race -count=1 -v ./pkg/compliance -run 'TestUpstream|TestSpecSchemaValidatorLiveUpstreamSchema'

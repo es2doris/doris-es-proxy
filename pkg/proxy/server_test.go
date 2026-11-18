@@ -1145,7 +1145,7 @@ func TestClientSDKKibanaDiscoverAndGrafanaLogsCompat(t *testing.T) {
 
 func TestBulkCoalescerAndQueryResultCache(t *testing.T) {
 	srv := NewServer("logs_db", NewMemoryBackend(true), transpiler.TranspilerOptions{})
-	srv.SetBulkCoalesce(80*time.Millisecond, 64*1024)
+	srv.SetBulkCoalesce(150*time.Millisecond, 64*1024)
 	srv.SetQueryCacheTTL(5*time.Second, 8)
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
@@ -1177,12 +1177,14 @@ func TestBulkCoalescerAndQueryResultCache(t *testing.T) {
 
 	const workers = 8
 	var wg sync.WaitGroup
+	startGate := make(chan struct{})
 	errs := make(chan error, workers)
 	wg.Add(workers)
 	for i := 0; i < workers; i++ {
 		idx := i
 		go func() {
 			defer wg.Done()
+			<-startGate
 			code, body := doReq(
 				http.MethodPut,
 				fmt.Sprintf("/coalesce_idx/_doc/doc-%d", idx),
@@ -1193,6 +1195,7 @@ func TestBulkCoalescerAndQueryResultCache(t *testing.T) {
 			}
 		}()
 	}
+	close(startGate)
 	wg.Wait()
 	close(errs)
 	for err := range errs {

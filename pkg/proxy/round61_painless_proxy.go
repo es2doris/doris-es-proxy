@@ -18,7 +18,6 @@
 package proxy
 
 import (
-	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -400,6 +399,10 @@ func ExtractRuntimeScriptFieldDepsRound61(scriptSrc string, candidateFields map[
 		trimmed := strings.TrimSuffix(raw, ".keyword")
 		if trimmed != raw && candidateFields[trimmed] {
 			depsSet[trimmed] = true
+			return
+		}
+		if dot := strings.IndexByte(raw, '.'); dot > 0 && candidateFields[raw[:dot]] {
+			depsSet[raw[:dot]] = true
 		}
 	}
 
@@ -618,25 +621,26 @@ func extractStoredScriptIDRound61(raw any) (string, bool) {
 }
 
 // ValidateRuntimeMappingsPainlessRound61 validates inline Painless compilation and
-// topological acyclicity across merged index + search `runtime_mappings`.
-func ValidateRuntimeMappingsPainlessRound61(idxSchema *schema.IndexSchema, reqMappings map[string]esast.FieldProperty) error {
-	for _, rm := range reqMappings {
+// `on_script_error` syntax across `reqMappings` (deferring cycle/depth DFS to lazy query-time resolution).
+func ValidateRuntimeMappingsPainlessRound61(_ *schema.IndexSchema, reqMappings map[string]esast.FieldProperty) error {
+	for fName, rm := range reqMappings {
+		if onErr := strings.ToLower(strings.TrimSpace(rm.OnScriptError)); onErr != "" && onErr != "fail" && onErr != "continue" {
+			return fmt.Errorf("mapper_parsing_exception: Invalid [on_script_error] value [%s] on runtime field [%s]: must be [fail] or [continue]", rm.OnScriptError, fName)
+		}
 		if src, ok := extractPainlessSourceIfApplicableRound60(rm.Script); ok {
 			if err := painless.CompileValidate(src); err != nil {
 				return err
 			}
 		}
 	}
-	merged := effectiveRuntimeMappings(idxSchema, reqMappings)
-	if len(merged) > 0 {
-		if _, err := TopoSortRuntimeMappingsRound61(merged); err != nil {
-			return err
-		}
-	}
 	return nil
 }
 
 func coerceEmittedRuntimeValuesRound61(esType, format string, rawVals []any, nowUTC time.Time) []any {
+	return coerceRuntimeValuesWithScriptFlagR62Search(esType, format, rawVals, nowUTC, true)
+}
+
+func coerceRuntimeValuesWithScriptFlagR62Search(esType, format string, rawVals []any, nowUTC time.Time, fromScript bool) []any {
 	coerced := make([]any, 0, len(rawVals))
 	for _, rv := range rawVals {
 		if rv == nil {
@@ -645,13 +649,21 @@ func coerceEmittedRuntimeValuesRound61(esType, format string, rawVals []any, now
 		switch esType {
 		case "geo_point":
 			if gp, ok := rv.(*painless.GeoPointVal); ok && gp != nil {
-				qLat, qLon := painless.QuantizeLuceneGeoPoint(gp.Lat, gp.Lon)
-				coerced = append(coerced, map[string]any{"lat": qLat, "lon": qLon})
+				if fromScript {
+					qLat, qLon := painless.QuantizeLuceneGeoPoint(gp.Lat, gp.Lon)
+					coerced = append(coerced, map[string]any{"lat": qLat, "lon": qLon})
+				} else {
+					coerced = append(coerced, map[string]any{"lat": gp.Lat, "lon": gp.Lon})
+				}
 				continue
 			}
 			if lat, lon, err := esast.ParseGeoPoint(rv); err == nil {
-				qLat, qLon := painless.QuantizeLuceneGeoPoint(lat, lon)
-				coerced = append(coerced, map[string]any{"lat": qLat, "lon": qLon})
+				if fromScript {
+					qLat, qLon := painless.QuantizeLuceneGeoPoint(lat, lon)
+					coerced = append(coerced, map[string]any{"lat": qLat, "lon": qLon})
+				} else {
+					coerced = append(coerced, map[string]any{"lat": lat, "lon": lon})
+				}
 				continue
 			}
 		case "ip":
@@ -660,12 +672,21 @@ func coerceEmittedRuntimeValuesRound61(esType, format string, rawVals []any, now
 				if iv != nil {
 					coerced = append(coerced, iv.String())
 				}
-			default:
-				s := strings.TrimSpace(painless.FormatValueSafe(rv))
+			case string:
+				s := strings.TrimSpace(iv)
 				if parsedIP, err := painless.ParseIPAddressVal(s); err == nil {
 					coerced = append(coerced, parsedIP.String())
-				} else if s != "" {
+				} else if fromScript && s != "" {
 					coerced = append(coerced, s)
+				}
+			default:
+				if fromScript {
+					s := strings.TrimSpace(painless.FormatValueSafe(rv))
+					if parsedIP, err := painless.ParseIPAddressVal(s); err == nil {
+						coerced = append(coerced, parsedIP.String())
+					} else if s != "" {
+						coerced = append(coerced, s)
+					}
 				}
 			}
 		case "unsigned_long":
@@ -694,7 +715,7 @@ func coerceEmittedRuntimeValuesRound61(esType, format string, rawVals []any, now
 					coerced = append(coerced, i)
 				} else if u, err := strconv.ParseUint(trimmedU, 10, 64); err == nil {
 					coerced = append(coerced, u)
-				} else if f, ok := toFloat64(rv); ok && f >= 0 && f < 18446744073709551616.0 {
+				} else if f, errF := strconv.ParseFloat(trimmedU, 64); errF == nil && !math.IsNaN(f) && !math.IsInf(f, 0) && f >= 0 && f < 18446744073709551616.0 {
 					coerced = append(coerced, uint64(f))
 				}
 			default:
@@ -715,41 +736,81 @@ func coerceEmittedRuntimeValuesRound61(esType, format string, rawVals []any, now
 				} else if f, ok := toFloat64(rv); ok && f >= -9223372036854775808.0 && f < 9223372036854775808.0 {
 					coerced = append(coerced, int64(f))
 				}
+			} else if sv, okS := rv.(string); okS {
+				trimmedS := strings.TrimSpace(sv)
+				if iv, err := strconv.ParseInt(trimmedS, 10, 64); err == nil {
+					coerced = append(coerced, iv)
+				} else if f, errF := strconv.ParseFloat(trimmedS, 64); errF == nil && !math.IsNaN(f) && !math.IsInf(f, 0) && f >= -9223372036854775808.0 && f < 9223372036854775808.0 {
+					coerced = append(coerced, int64(f))
+				}
 			} else if f, ok := toFloat64(rv); ok && f >= -9223372036854775808.0 && f < 9223372036854775808.0 {
 				coerced = append(coerced, int64(f))
 			}
 		case "half_float":
 			if f, ok := toFloat64(rv); ok {
 				coerced = append(coerced, float64(painless.QuantizeHalfFloat(f)))
+			} else if sv, okS := rv.(string); okS {
+				if f, err := strconv.ParseFloat(strings.TrimSpace(sv), 64); err == nil && !math.IsNaN(f) && !math.IsInf(f, 0) {
+					coerced = append(coerced, float64(painless.QuantizeHalfFloat(f)))
+				}
 			}
 		case "float":
 			if f, ok := toFloat64(rv); ok {
 				coerced = append(coerced, float64(float32(f)))
+			} else if sv, okS := rv.(string); okS {
+				if f, err := strconv.ParseFloat(strings.TrimSpace(sv), 64); err == nil && !math.IsNaN(f) && !math.IsInf(f, 0) {
+					coerced = append(coerced, float64(float32(f)))
+				}
 			}
 		case "double", "scaled_float":
 			if f, ok := toFloat64(rv); ok {
 				coerced = append(coerced, f)
+			} else if sv, okS := rv.(string); okS {
+				if f, err := strconv.ParseFloat(strings.TrimSpace(sv), 64); err == nil && !math.IsNaN(f) && !math.IsInf(f, 0) {
+					coerced = append(coerced, f)
+				}
 			}
 		case "boolean":
 			switch bv := rv.(type) {
 			case bool:
 				coerced = append(coerced, bv)
 			case string:
-				if strings.EqualFold(strings.TrimSpace(bv), "true") || strings.TrimSpace(bv) == "1" {
+				if strings.EqualFold(strings.TrimSpace(bv), "true") || (fromScript && strings.TrimSpace(bv) == "1") {
 					coerced = append(coerced, true)
-				} else if strings.EqualFold(strings.TrimSpace(bv), "false") || strings.TrimSpace(bv) == "0" {
+				} else if strings.EqualFold(strings.TrimSpace(bv), "false") || (fromScript && strings.TrimSpace(bv) == "0") {
 					coerced = append(coerced, false)
 				}
 			}
 		case "date_nanos":
 			if ns, ok := parseDateNanosValueRound58(rv, format); ok {
 				coerced = append(coerced, ns)
-			} else if sv, ok := rv.(string); ok {
-				coerced = append(coerced, sv)
+			} else if fromScript {
+				if sv, ok := rv.(string); ok {
+					coerced = append(coerced, sv)
+				}
 			}
 		case "date":
 			if z, okZ := rv.(*painless.ZonedDateTimeVal); okZ && z != nil {
 				coerced = append(coerced, z.ToEpochMilli())
+			} else if !fromScript && strings.TrimSpace(format) != "" {
+				switch dv := rv.(type) {
+				case string:
+					if ms, ok := schema.ParseESDateWithFormatToEpochMillis(strings.TrimSpace(dv), format, nowUTC); ok {
+						coerced = append(coerced, ms)
+					}
+				case int64:
+					if ms, ok := schema.ParseESDateWithFormatToEpochMillis(strconv.FormatInt(dv, 10), format, nowUTC); ok {
+						coerced = append(coerced, ms)
+					}
+				case int:
+					if ms, ok := schema.ParseESDateWithFormatToEpochMillis(strconv.Itoa(dv), format, nowUTC); ok {
+						coerced = append(coerced, ms)
+					}
+				case json.Number:
+					if ms, ok := schema.ParseESDateWithFormatToEpochMillis(strings.TrimSpace(dv.String()), format, nowUTC); ok {
+						coerced = append(coerced, ms)
+					}
+				}
 			} else if iv, okI := rv.(int64); okI {
 				coerced = append(coerced, iv)
 			} else if nv, okN := rv.(json.Number); okN {
@@ -763,11 +824,23 @@ func coerceEmittedRuntimeValuesRound61(esType, format string, rawVals []any, now
 			} else if sv, ok := rv.(string); ok {
 				if ms, ok := schema.ParseESDateWithFormatToEpochMillis(sv, format, nowUTC); ok {
 					coerced = append(coerced, ms)
-				} else {
-					coerced = append(coerced, sv)
+				} else if fromScript {
+					if tm, errT := time.Parse("2006-01-02T15:04:05.000Z", strings.TrimSpace(sv)); errT == nil {
+						coerced = append(coerced, tm.UnixMilli())
+					} else if msDef, okDef := schema.ParseESDateToEpochMillis(sv, nowUTC); okDef {
+						coerced = append(coerced, msDef)
+					} else {
+						coerced = append(coerced, sv)
+					}
 				}
 			}
 		default:
+			if !fromScript {
+				switch rv.(type) {
+				case map[string]any, []any:
+					continue
+				}
+			}
 			coerced = append(coerced, painless.FormatValueSafe(rv))
 		}
 	}
@@ -783,141 +856,21 @@ func EvalRuntimeMappingsOnDocTopologicalRound61(
 	doc map[string]any,
 	isES8 bool,
 ) (map[string]any, bool, error) {
-	evalDoc := PrepareDocForRuntimeScriptRound61(idxSchema, doc, isES8)
 	rtMap := effectiveRuntimeMappings(idxSchema, reqMappings)
 	if len(rtMap) == 0 {
-		return evalDoc, false, nil
+		return PrepareDocForRuntimeScriptRound61(idxSchema, doc, isES8), false, nil
 	}
-	rtOrder, err := TopoSortRuntimeMappingsRound61(rtMap)
+	roots := make([]string, 0, len(rtMap))
+	for k := range rtMap {
+		roots = append(roots, k)
+	}
+	sort.Strings(roots)
+	rtOrder, err := resolveLazyRuntimeMappingsOrderR62Search(rtMap, roots)
 	if err != nil {
-		return evalDoc, false, err
+		return PrepareDocForRuntimeScriptRound61(idxSchema, doc, isES8), false, err
 	}
-
-	ftMap, _ := evalDoc["__field_types"].(map[string]string)
-	if ftMap == nil {
-		ftMap = make(map[string]string, len(rtMap))
-		evalDoc["__field_types"] = ftMap
-	}
-	fmtMap, _ := evalDoc["__field_formats"].(map[string]string)
-	if fmtMap == nil {
-		fmtMap = make(map[string]string)
-		evalDoc["__field_formats"] = fmtMap
-	}
-	strictSet, hasStrict := evalDoc["__strict_doc_fields"].(map[string]bool)
-
-	for _, fName := range rtOrder {
-		esT := strings.ToLower(strings.TrimSpace(rtMap[fName].Type))
-		if esT == "" {
-			esT = "keyword"
-		}
-		ftMap[fName] = esT
-		if strings.TrimSpace(rtMap[fName].Format) != "" {
-			fmtMap[fName] = strings.TrimSpace(rtMap[fName].Format)
-		}
-		if hasStrict && strictSet != nil {
-			strictSet[fName] = true
-		}
-	}
-
-	nowUTC := time.Now().UTC()
-	modified := false
-
-	for _, fName := range rtOrder {
-		prop := rtMap[fName]
-		esType := strings.ToLower(strings.TrimSpace(prop.Type))
-		if esType == "" {
-			esType = "keyword"
-		}
-		var rawVals []any
-		if prop.Script == nil {
-			var srcVal any
-			var found bool
-			if doc != nil {
-				if v, ok := doc[fName]; ok && v != nil {
-					srcVal, found = v, true
-				} else if v, ok := lookupNestedMapPathR61Search(doc, strings.Split(fName, ".")); ok && v != nil {
-					srcVal, found = v, true
-				}
-			}
-			if !found || srcVal == nil {
-				continue
-			}
-			if esType == "geo_point" || esType == "point" {
-				if arr, isArr := srcVal.([]any); isArr {
-					if _, _, errGP := esast.ParseGeoPoint(arr); errGP == nil {
-						rawVals = []any{arr}
-					} else {
-						rawVals = arr
-					}
-				} else {
-					rawVals = []any{srcVal}
-				}
-			} else {
-				rawVals = flattenAnyToSliceR61Search(srcVal)
-			}
-		} else {
-			scriptSrc, scriptParams := extractScriptSourceAndParams(prop.Script)
-			if strings.TrimSpace(scriptSrc) == "" {
-				continue
-			}
-			p := make(map[string]any, len(scriptParams)+4)
-			for k, v := range scriptParams {
-				p[k] = v
-			}
-			p["_source"] = doc
-			p["__keep_boolean_dups"] = isES8
-			p["__quantize_geo_point"] = true
-
-			if emitCtx, okCtx := runtimeFieldTypeToEmitContextRound60(prop.Type); okCtx && strings.Contains(scriptSrc, "emit(") {
-				emitted, errEmit := painless.EvalEmitContext(scriptSrc, emitCtx, evalDoc, doc, p, ftMap)
-				if errEmit != nil {
-					return evalDoc, modified, errEmit
-				}
-				if len(emitted) > 0 {
-					rawVals = emitted
-				}
-			} else {
-				res, evalErr := painless.Eval(evalDoc, scriptSrc, p)
-				if evalErr != nil {
-					return evalDoc, modified, evalErr
-				}
-				if emitted, ok := p["__emitted_vals"].([]any); ok && len(emitted) > 0 {
-					rawVals = emitted
-				} else if res != nil {
-					if arr, ok := res.([]any); ok {
-						rawVals = arr
-					} else {
-						rawVals = []any{res}
-					}
-				}
-			}
-		}
-		if len(rawVals) == 0 {
-			continue
-		}
-		coercedVals := coerceEmittedRuntimeValuesRound61(esType, prop.Format, rawVals, nowUTC)
-		if len(coercedVals) == 0 {
-			continue
-		}
-		var finalVal any
-		if len(coercedVals) == 1 {
-			finalVal = coercedVals[0]
-		} else {
-			finalVal = coercedVals
-		}
-		if doc != nil {
-			doc[fName] = finalVal
-			if strings.Contains(fName, ".") {
-				setIngestPath(doc, fName, finalVal)
-			}
-		}
-		evalDoc[fName] = finalVal
-		if strings.Contains(fName, ".") {
-			setRuntimeScriptDocPath(evalDoc, strings.Split(fName, "."), finalVal)
-		}
-		modified = true
-	}
-	return evalDoc, modified, nil
+	evalDoc, modified, _, rtErr := evalRuntimeMappingsOrderedOnDocR62Search(idxSchema, rtMap, rtOrder, doc, isES8)
+	return evalDoc, modified, rtErr
 }
 
 // EvalRuntimeMappingsOnHitRowsTopologicalRound61 evaluates index + search `runtime_mappings`
@@ -928,62 +881,8 @@ func (s *Server) EvalRuntimeMappingsOnHitRowsTopologicalRound61(
 	reqMappings map[string]esast.FieldProperty,
 	hits []HitRow,
 ) error {
-	rtMap := effectiveRuntimeMappings(idxSchema, reqMappings)
-	if len(rtMap) == 0 {
-		return nil
-	}
-	if _, err := TopoSortRuntimeMappingsRound61(rtMap); err != nil {
-		return err
-	}
-	if len(hits) == 0 {
-		return nil
-	}
-	isES8 := s == nil || s.isES8Mode(r)
-	for i := range hits {
-		h := &hits[i]
-		src := h.EffectiveSource()
-		var doc map[string]any
-		if len(src) > 0 {
-			dec := json.NewDecoder(bytes.NewReader(src))
-			dec.UseNumber()
-			_ = dec.Decode(&doc)
-		}
-		if doc == nil {
-			doc = make(map[string]any)
-		}
-		doc["__meta_id"] = h.ID
-		if h.Index != "" {
-			doc["__meta_index"] = h.Index
-		}
-		if h.Version > 0 {
-			doc["__meta_version"] = h.Version
-		} else {
-			doc["__meta_version"] = int64(1)
-		}
-		if h.HasSeqNo {
-			doc["__meta_seq_no"] = h.SeqNo
-		}
-		effSch := idxSchema
-		if h.Schema != nil {
-			effSch = h.Schema
-		}
-		_, modified, err := EvalRuntimeMappingsOnDocTopologicalRound61(effSch, reqMappings, doc, isES8)
-		if err != nil {
-			return err
-		}
-		if modified {
-			delete(doc, "__meta_id")
-			delete(doc, "__meta_index")
-			delete(doc, "__meta_version")
-			delete(doc, "__meta_seq_no")
-			delete(doc, "__meta_primary_term")
-			if updatedBytes, mErr := json.Marshal(doc); mErr == nil {
-				h.RawSource = updatedBytes
-			}
-		}
-		h.Schema = effSch
-	}
-	return nil
+	_, err := s.EvalRuntimeMappingsOnHitRowsLazyR62Search(r, idxSchema, reqMappings, nil, nil, hits)
+	return err
 }
 
 // ============================================================================
@@ -1075,6 +974,9 @@ func ClassifyPainlessRuntimeErrorRound61(err error) (outerType, outerReason, cau
 		if cType == "illegal_argument_exception" {
 			cType = "painless_error"
 		}
+	}
+	if idxJava := strings.Index(cReason, " (java."); idxJava > 0 && strings.HasSuffix(cReason, ")") {
+		cReason = strings.TrimSpace(cReason[:idxJava])
 	}
 	return "script_exception", "runtime error", cType, cReason, nil
 }
@@ -1282,9 +1184,17 @@ func BuildScriptScoreExplainNodeRound61(finalScore float64, scriptSource string,
 	}
 	details := make([]map[string]any, 0, 1)
 	if subQueryExplain != nil {
-		details = append(details, subQueryExplain)
+		if strings.Contains(scriptSource, "_score") {
+			details = append(details, map[string]any{
+				"value":       subQueryExplain["value"],
+				"description": "_score: ",
+				"details":     []map[string]any{subQueryExplain},
+			})
+		} else {
+			details = append(details, subQueryExplain)
+		}
 	}
-	desc := fmt.Sprintf("script score function, computed with script:\"%s\" and parameters:%s", scriptSource, paramStr)
+	desc := fmt.Sprintf("script score function, computed with script:\"Script{type=inline, lang='painless', idOrCode='%s', options={}, params=%s}\"", scriptSource, paramStr)
 	return map[string]any{
 		"value":       finalScore,
 		"description": desc,
@@ -1377,7 +1287,7 @@ func EvalUpdateScriptWithFieldsAPIRound61(
 	params["__mutable_fields_api"] = true
 	if !docExisted {
 		params["__upsert_insert_mode"] = true
-		if routingRequired && routing == "" {
+		if routing == "" {
 			params["__upsert_forbid_routing"] = true
 		}
 	}

@@ -131,6 +131,9 @@ type FieldBinding struct {
 	TimeSeriesDimension      *bool
 	TimeSeriesDimensions     []string
 	TimeSeriesMetric         string
+	IsVirtualSAYTSubfield    bool
+	FromScript               bool
+	FromRuntime              bool
 }
 
 // EffectivePositiveScoreImpact returns true unless `positive_score_impact` was explicitly set to false.
@@ -141,6 +144,9 @@ func (b FieldBinding) EffectivePositiveScoreImpact() bool {
 // SearchAsYouTypeSubfields returns the active synthetic sub-field suffixes (e.g. `._2gram`, `._3gram`, `._index_prefix`)
 // for a `search_as_you_type` field based on its `max_shingle_size` (default 3).
 func (b FieldBinding) SearchAsYouTypeSubfields() []string {
+	if b.IsVirtualSAYTSubfield {
+		return nil
+	}
 	ms := b.MaxShingleSize
 	if ms <= 0 {
 		ms = 3
@@ -230,6 +236,7 @@ type IndexSchema struct {
 	TimeSeriesStartTime      string
 	TimeSeriesEndTime        string
 	IgnoreDynamicBeyondLimit bool
+	IsRuntimeEvalSchema      bool
 }
 
 // CopyIndexMappingSettingsFrom copies index-level mapping/search limits and defaults from src into s.
@@ -316,6 +323,9 @@ func (s *IndexSchema) CopyIndexMappingSettingsFrom(src *IndexSchema) {
 	}
 	if src.IgnoreDynamicBeyondLimit {
 		s.IgnoreDynamicBeyondLimit = true
+	}
+	if src.IsRuntimeEvalSchema {
+		s.IsRuntimeEvalSchema = true
 	}
 }
 
@@ -409,9 +419,13 @@ var DefaultMultiValuedPaths = map[string]bool{
 func CompileIndexSchema(dorisDB, indexName string, mapping *esast.MappingSpec) *IndexSchema {
 	defaultCoerce := true
 	defaultIgnoreMalformed := false
+	rawDB := strings.TrimSpace(dorisDB)
+	if rawDB == "" {
+		rawDB = "default"
+	}
 	s := &IndexSchema{
 		IndexName:              indexName,
-		DorisDB:                SanitizeDorisIdentifier(dorisDB),
+		DorisDB:                rawDB,
 		DorisTable:             SanitizeDorisIdentifier(indexName),
 		Buckets:                8,
 		Fields:                 make(map[string]FieldBinding),
@@ -656,7 +670,7 @@ func MergeMappingSpecs(oldSpec, newSpec *esast.MappingSpec) *esast.MappingSpec {
 			DateDetection:      newSpec.DateDetection,
 			NumericDetection:   newSpec.NumericDetection,
 			DynamicDateFormats: newSpec.DynamicDateFormats,
-			Runtime:            deepMergeMappingPropertiesWithSubobjects(nil, newSpec.Runtime, true),
+			Runtime:            CloneFlatRuntimeMap(nil, newSpec.Runtime),
 			Properties:         deepMergeMappingPropertiesWithSubobjects(nil, newSpec.Properties, subFalse),
 		}
 	}
@@ -672,7 +686,7 @@ func MergeMappingSpecs(oldSpec, newSpec *esast.MappingSpec) *esast.MappingSpec {
 			DateDetection:      oldSpec.DateDetection,
 			NumericDetection:   oldSpec.NumericDetection,
 			DynamicDateFormats: oldSpec.DynamicDateFormats,
-			Runtime:            deepMergeMappingPropertiesWithSubobjects(nil, oldSpec.Runtime, true),
+			Runtime:            CloneFlatRuntimeMap(nil, oldSpec.Runtime),
 			Properties:         deepMergeMappingPropertiesWithSubobjects(nil, oldSpec.Properties, subFalse),
 		}
 	}
@@ -723,9 +737,35 @@ func MergeMappingSpecs(oldSpec, newSpec *esast.MappingSpec) *esast.MappingSpec {
 		DateDetection:      dateDet,
 		NumericDetection:   numDet,
 		DynamicDateFormats: dynDateFormats,
-		Runtime:            deepMergeMappingPropertiesWithSubobjects(oldSpec.Runtime, newSpec.Runtime, true),
+		Runtime:            CloneFlatRuntimeMap(oldSpec.Runtime, newSpec.Runtime),
 		Properties:         deepMergeMappingPropertiesWithSubobjects(oldSpec.Properties, newSpec.Properties, subFalse),
 	}
+}
+
+// CloneFlatRuntimeMap clones and merges `runtime` mapping definitions without expanding dotted field names
+// (such as `status.active`, `http.clientip`, or `users.first_script`) into nested object `Properties`.
+func CloneFlatRuntimeMap(dst, src map[string]esast.FieldProperty) map[string]esast.FieldProperty {
+	if len(dst) == 0 && len(src) == 0 {
+		return nil
+	}
+	out := make(map[string]esast.FieldProperty, len(dst)+len(src))
+	cloneEntry := func(fp esast.FieldProperty) esast.FieldProperty {
+		cp := deepCloneFieldProperty(fp)
+		if len(fp.Fields) > 0 {
+			cp.Fields = make(map[string]esast.FieldProperty, len(fp.Fields))
+			for fk, fv := range fp.Fields {
+				cp.Fields[fk] = deepCloneFieldProperty(fv)
+			}
+		}
+		return cp
+	}
+	for k, v := range dst {
+		out[k] = cloneEntry(v)
+	}
+	for k, v := range src {
+		out[k] = cloneEntry(v)
+	}
+	return out
 }
 
 var knownESFieldTypes = map[string]bool{
@@ -969,10 +1009,20 @@ func validateNullValueForField(fullPath, fType string, prop esast.FieldProperty)
 	switch fType {
 	case "", "text", "match_only_text", "annotated-text", "annotated_text", "search_as_you_type",
 		"nested", "object", "flattened", "percolator", "join", "dense_vector", "knn_vector", "sparse_vector",
-		"rank_feature", "rank_features", "rank_vector",
+		"rank_features", "rank_vector",
 		"alias", "binary", "wildcard", "completion", "token_count", "murmur3",
 		"histogram", "aggregate_metric_double", "geo_shape", "shape", "constant_keyword":
 		return fmt.Errorf("mapper_parsing_exception:Mapping definition for [%s] has unsupported parameters: [null_value] is not supported on [%s]", fullPath, fType)
+	}
+	if fType == "rank_feature" {
+		nv, err := prop.RankFeatureNullValue()
+		if err != nil {
+			return fmt.Errorf("mapper_parsing_exception: failed to parse [null_value] on [rank_feature] field [%s]: %w", fullPath, err)
+		}
+		if nv != nil && *nv <= 0 {
+			return esWireError(fmt.Sprintf("illegal_argument_exception: [null_value] on [rank_feature] field [%s] must be strictly positive, got [%v]", fullPath, *nv))
+		}
+		return nil
 	}
 	if IsRangeFieldType(fType) {
 		return fmt.Errorf("mapper_parsing_exception:Mapping definition for [%s] has unsupported parameters: [null_value] is not supported on [%s]", fullPath, fType)
@@ -1092,7 +1142,8 @@ func validateSingleFieldProperty(fullPath, fType string, prop esast.FieldPropert
 		}
 		if prop.Dynamic != nil || prop.Subobjects != nil || prop.Enabled != nil ||
 			prop.Index != nil || prop.DocValues != nil || prop.Store != nil ||
-			prop.Value != nil || prop.Script != nil ||
+			prop.Value != nil || prop.Script != nil || prop.OnScriptError != "" ||
+			prop.IncludeInParent != nil || prop.IncludeInRoot != nil ||
 			prop.Analyzer != "" || prop.SearchAnalyzer != "" || prop.Normalizer != "" ||
 			prop.Format != "" || prop.TimeZone != "" ||
 			prop.Dims != 0 || prop.Dimension != 0 || prop.Similarity != "" || prop.ElementType != "" ||
@@ -1106,6 +1157,34 @@ func validateSingleFieldProperty(fullPath, fType string, prop esast.FieldPropert
 			prop.PositiveScoreImpact != nil || prop.MaxShingleSize != nil || prop.DepthLimit != nil ||
 			prop.Relations != nil {
 			return fmt.Errorf("mapper_parsing_exception: Mapping definition for [%s] has unsupported parameters", fullPath)
+		}
+	}
+	if prop.IncludeInParent != nil && fType != "nested" {
+		return fmt.Errorf("mapper_parsing_exception: Mapping definition for [%s] has unsupported parameters: [include_in_parent : %v]", fullPath, *prop.IncludeInParent)
+	}
+	if prop.IncludeInRoot != nil && fType != "nested" {
+		return fmt.Errorf("mapper_parsing_exception: Mapping definition for [%s] has unsupported parameters: [include_in_root : %v]", fullPath, *prop.IncludeInRoot)
+	}
+	if _, err := esast.ValidateOnScriptError(prop.OnScriptError); err != nil {
+		return err
+	}
+	if prop.OnScriptError != "" && prop.Script == nil {
+		return fmt.Errorf("mapper_parsing_exception: [on_script_error] cannot be set without [script] on field [%s]", fullPath)
+	}
+	if prop.Script != nil {
+		switch sv := prop.Script.(type) {
+		case string:
+			if strings.TrimSpace(sv) == "" {
+				return fmt.Errorf("mapper_parsing_exception: field [%s] script cannot be empty", fullPath)
+			}
+		case map[string]any:
+			src, hasSrc := sv["source"]
+			id, hasID := sv["id"]
+			if (!hasSrc && !hasID) || (hasSrc && strings.TrimSpace(fmt.Sprintf("%v", src)) == "") || (hasID && strings.TrimSpace(fmt.Sprintf("%v", id)) == "") {
+				return fmt.Errorf("mapper_parsing_exception: field [%s] script requires non-empty [source] or [id]", fullPath)
+			}
+		default:
+			return fmt.Errorf("mapper_parsing_exception: field [%s] invalid [script]", fullPath)
 		}
 	}
 	if prop.PositiveScoreImpact != nil && fType != "rank_feature" && fType != "rank_features" {
@@ -1393,7 +1472,7 @@ func validateDynamicTemplatesSpec(templates []map[string]any) error {
 			}
 			for k := range defMap {
 				switch k {
-				case "mapping", "match", "unmatch", "match_pattern", "path_match", "path_unmatch", "match_mapping_type":
+				case "mapping", "match", "unmatch", "match_pattern", "path_match", "path_unmatch", "match_mapping_type", "unmatch_mapping_type":
 				default:
 					return fmt.Errorf("mapper_parsing_exception: dynamic template [%s] has unknown parameter [%s]", tmplName, k)
 				}
@@ -1459,16 +1538,49 @@ func validateDynamicTemplatesSpec(templates []map[string]any) error {
 					return fmt.Errorf("mapper_parsing_exception: dynamic template [%s] has invalid [match_pattern] [%s]", tmplName, mpStr)
 				}
 			}
+			if rawUMMT, hasUMMT := defMap["unmatch_mapping_type"]; hasUMMT && rawUMMT != nil {
+				validateUMMT := func(s string) error {
+					norm := strings.ToLower(strings.TrimSpace(s))
+					if !validDynamicMatchMappingTypes[norm] {
+						return fmt.Errorf("mapper_parsing_exception: dynamic template [%s] has invalid [unmatch_mapping_type] [%s]", tmplName, s)
+					}
+					return nil
+				}
+				switch v := rawUMMT.(type) {
+				case string:
+					if err := validateUMMT(v); err != nil {
+						return err
+					}
+				case []string:
+					if len(v) == 0 {
+						return fmt.Errorf("mapper_parsing_exception: dynamic template [%s] [unmatch_mapping_type] cannot be empty", tmplName)
+					}
+					for _, item := range v {
+						if err := validateUMMT(item); err != nil {
+							return err
+						}
+					}
+				case []any:
+					if len(v) == 0 {
+						return fmt.Errorf("mapper_parsing_exception: dynamic template [%s] [unmatch_mapping_type] cannot be empty", tmplName)
+					}
+					for _, item := range v {
+						s, ok := item.(string)
+						if !ok {
+							return fmt.Errorf("mapper_parsing_exception: dynamic template [%s] [unmatch_mapping_type] elements must be strings", tmplName)
+						}
+						if err := validateUMMT(s); err != nil {
+							return err
+						}
+					}
+				default:
+					return fmt.Errorf("mapper_parsing_exception: dynamic template [%s] [unmatch_mapping_type] must be a string or array of strings", tmplName)
+				}
+			}
 			for _, patKey := range []string{"match", "unmatch", "path_match", "path_unmatch"} {
 				if rawPat, hasPat := defMap[patKey]; hasPat && rawPat != nil {
-					patStr, ok := rawPat.(string)
-					if !ok {
-						return fmt.Errorf("mapper_parsing_exception: dynamic template [%s] [%s] must be a string", tmplName, patKey)
-					}
-					if isRegex {
-						if _, err := regexp.Compile(patStr); err != nil {
-							return fmt.Errorf("mapper_parsing_exception: dynamic template [%s] has invalid regex in [%s]: %w", tmplName, patKey, err)
-						}
+					if _, err := parseDynamicTemplatePatternList(rawPat, tmplName, patKey, isRegex); err != nil {
+						return err
 					}
 				}
 			}
@@ -1790,6 +1902,9 @@ func ValidateMappingSpec(m *esast.MappingSpec) error {
 		if rtProp.TimeSeriesMetric != "" {
 			return fmt.Errorf("mapper_parsing_exception: unknown parameter [time_series_metric] on runtime field [%s] of type [%s]", rtName, rtProp.Type)
 		}
+		if _, err := esast.ValidateOnScriptError(rtProp.OnScriptError); err != nil {
+			return err
+		}
 		if rtProp.Script != nil {
 			switch sv := rtProp.Script.(type) {
 			case string:
@@ -1804,6 +1919,23 @@ func ValidateMappingSpec(m *esast.MappingSpec) error {
 				}
 			default:
 				return fmt.Errorf("mapper_parsing_exception: runtime field [%s] invalid [script]", rtName)
+			}
+		}
+		if rtType == "composite" {
+			if len(rtProp.Fields) == 0 {
+				return fmt.Errorf("mapper_parsing_exception: composite runtime field [%s] requires non-empty [fields]", rtName)
+			}
+			for subName, subProp := range rtProp.Fields {
+				if strings.TrimSpace(subName) == "" {
+					return fmt.Errorf("mapper_parsing_exception: composite runtime sub-field name in [%s] cannot be empty", rtName)
+				}
+				subType := strings.ToLower(strings.TrimSpace(subProp.Type))
+				if !validRuntimeFieldTypes[subType] || subType == "composite" || subType == "lookup" {
+					return fmt.Errorf("mapper_parsing_exception: unsupported sub-field type [%s] in composite runtime field [%s.%s]", subProp.Type, rtName, subName)
+				}
+				if subProp.Script != nil {
+					return fmt.Errorf("mapper_parsing_exception: sub-field [%s.%s] of composite runtime field cannot define its own [script]", rtName, subName)
+				}
 			}
 		}
 	}
@@ -1823,7 +1955,13 @@ func ValidateMappingSpec(m *esast.MappingSpec) error {
 	}
 	allTypes := make(map[string]string)
 	for rtName, rtProp := range m.Runtime {
-		allTypes[rtName] = strings.ToLower(strings.TrimSpace(rtProp.Type))
+		rtType := strings.ToLower(strings.TrimSpace(rtProp.Type))
+		allTypes[rtName] = rtType
+		if rtType == "composite" {
+			for subName, subProp := range rtProp.Fields {
+				allTypes[rtName+"."+subName] = strings.ToLower(strings.TrimSpace(subProp.Type))
+			}
+		}
 	}
 	aliasTargets := make(map[string]string)
 	aliasPrefixes := make(map[string]string)
@@ -1967,6 +2105,16 @@ func ValidateMappingSpec(m *esast.MappingSpec) error {
 				targetType = "keyword"
 			}
 		}
+		if !exists {
+			switch target {
+			case "_id", "_index", "_routing", "_ignored":
+				exists = true
+				targetType = "keyword"
+			case "_version", "_seq_no", "_primary_term":
+				exists = true
+				targetType = "long"
+			}
+		}
 		if !exists || targetType == "" || targetType == "object" || targetType == "nested" {
 			return fmt.Errorf("mapper_parsing_exception: invalid [path] for alias [%s]: target field [%s] does not exist", aliasPath, rawTarget)
 		}
@@ -1988,8 +2136,14 @@ func ValidateMappingUpdateCompatibility(oldSpec, newSpec *esast.MappingSpec) err
 			return err
 		}
 		oldSrcNorm, _ := validateAndNormalizeMappingSourceSpec(oldSpec.Source)
+		oldMode := oldSrcNorm.effectiveMode()
+		newMode := newSrcNorm.effectiveMode()
+		if oldMode == "synthetic" && newSrcNorm.hasExplicitMode && newMode == "stored" {
+			return esWireError("illegal_argument_exception: Cannot update parameter [mode] from [synthetic] to [stored]")
+		}
+		allowedStoredToSynthetic := oldMode == "stored" && newMode == "synthetic"
 		if newSrcNorm.enabled != oldSrcNorm.enabled ||
-			newSrcNorm.effectiveMode() != oldSrcNorm.effectiveMode() ||
+			(newMode != oldMode && !allowedStoredToSynthetic) ||
 			!stringSlicesEqualExact(newSrcNorm.includes, oldSrcNorm.includes) ||
 			!stringSlicesEqualExact(newSrcNorm.excludes, oldSrcNorm.excludes) ||
 			(newSrcNorm.hasCompress && newSrcNorm.compress != oldSrcNorm.compress) ||
@@ -2040,11 +2194,16 @@ func ValidateMappingUpdateCompatibility(oldSpec, newSpec *esast.MappingSpec) err
 	if mergedSource == nil {
 		mergedSource = oldSpec.Source
 	}
+	mergedEnabled := newSpec.Enabled
+	if mergedEnabled == nil {
+		mergedEnabled = oldSpec.Enabled
+	}
 	merged := &esast.MappingSpec{
+		Enabled:          mergedEnabled,
 		Dynamic:          mergedDynamic,
 		Subobjects:       mergedSubobjects,
 		Source:           mergedSource,
-		Runtime:          deepMergeMappingPropertiesWithSubobjects(oldSpec.Runtime, newSpec.Runtime, true),
+		Runtime:          CloneFlatRuntimeMap(oldSpec.Runtime, newSpec.Runtime),
 		DynamicTemplates: mergedDynTemplates,
 		Properties:       deepMergeMappingPropertiesWithSubobjects(oldProps, newProps, rootSubFalse),
 	}
@@ -2291,13 +2450,7 @@ func deepMergeMappingPropertiesWithSubobjects(
 	}
 	out := make(map[string]esast.FieldProperty, len(dst)+len(src))
 	for k, v := range dst {
-		copied := v
-		if len(v.Meta) > 0 {
-			copied.Meta = cloneStringMap(v.Meta)
-		}
-		if len(v.Contexts) > 0 {
-			copied.Contexts = cloneCompletionContexts(v.Contexts)
-		}
+		copied := deepCloneFieldProperty(v)
 		if len(v.Properties) > 0 {
 			childSubFalse := subobjectsFalse || (v.Subobjects != nil && !*v.Subobjects)
 			copied.Properties = deepMergeMappingPropertiesWithSubobjects(nil, v.Properties, childSubFalse)
@@ -2371,22 +2524,37 @@ func deepMergeMappingPropertiesWithSubobjects(
 				merged.IgnoreMalformed = v.IgnoreMalformed
 			}
 			if v.Enabled != nil {
-				merged.Enabled = v.Enabled
+				b := *v.Enabled
+				merged.Enabled = &b
+			}
+			if v.IncludeInParent != nil {
+				b := *v.IncludeInParent
+				merged.IncludeInParent = &b
+			}
+			if v.IncludeInRoot != nil {
+				b := *v.IncludeInRoot
+				merged.IncludeInRoot = &b
 			}
 			if v.Index != nil {
-				merged.Index = v.Index
+				b := *v.Index
+				merged.Index = &b
 			}
 			if v.DocValues != nil {
-				merged.DocValues = v.DocValues
+				b := *v.DocValues
+				merged.DocValues = &b
 			}
 			if v.Dynamic != nil {
 				merged.Dynamic = v.Dynamic
 			}
 			if v.Subobjects != nil {
-				merged.Subobjects = v.Subobjects
+				b := *v.Subobjects
+				merged.Subobjects = &b
 			}
 			if v.Script != nil {
 				merged.Script = v.Script
+			}
+			if v.OnScriptError != "" {
+				merged.OnScriptError = v.OnScriptError
 			}
 			if v.Meta != nil {
 				merged.Meta = cloneStringMap(v.Meta)
@@ -2738,6 +2906,7 @@ func (s *IndexSchema) registerLeafField(
 			TimeSeriesDimension:      tsDimCopy,
 			TimeSeriesDimensions:     tsDimsCopy,
 			TimeSeriesMetric:         prop.TimeSeriesMetric,
+			FromScript:               prop.Script != nil,
 		}
 		return
 	}
@@ -2794,7 +2963,7 @@ func (s *IndexSchema) registerLeafField(
 			CorrelatedArrayCol:       corrCol,
 			RelativeJSONPath:         relJSONPath,
 			PrefilterArrayCol:        prefilterCol,
-			IsMultiValued:            (prop.MultiValued || len(relJSONPath) > 1 || DefaultMultiValuedPaths[dotPath]) && esType != "rank_feature" && esType != "dense_vector" && esType != "knn_vector",
+			IsMultiValued:            (prop.MultiValued || prop.Script != nil || len(relJSONPath) > 1 || DefaultMultiValuedPaths[dotPath]) && esType != "rank_feature" && esType != "dense_vector" && esType != "knn_vector",
 			CopyTo:                   copyTo,
 			NullValue:                prop.NullValue,
 			ConstantValue:            prop.Value,
@@ -2817,6 +2986,33 @@ func (s *IndexSchema) registerLeafField(
 			TimeSeriesDimension:      tsDimCopy,
 			TimeSeriesDimensions:     tsDimsCopy,
 			TimeSeriesMetric:         prop.TimeSeriesMetric,
+			FromScript:               prop.Script != nil,
+		}
+		if esType == "search_as_you_type" {
+			baseNestedB := s.Fields[dotPath]
+			for _, sub := range baseNestedB.SearchAsYouTypeSubfields() {
+				subPath := dotPath + sub
+				subCol := "n__" + SanitizeDorisIdentifier(subPath)
+				s.Fields[subPath] = FieldBinding{
+					ESFieldPath:           subPath,
+					SourceJSONPath:        sourceJSONPath,
+					Kind:                  StorageNestedSubfield,
+					ColumnName:            subCol,
+					DorisType:             DorisString,
+					ESType:                "search_as_you_type",
+					Analyzer:              prop.Analyzer,
+					SearchAnalyzer:        prop.SearchAnalyzer,
+					NestedPath:            activeNestedRoot,
+					CorrelatedArrayCol:    corrCol,
+					RelativeJSONPath:      relJSONPath,
+					PrefilterArrayCol:     subCol,
+					IsMultiValued:         true,
+					MaxShingleSize:        maxShingle,
+					NotIndexed:            notIndexed,
+					DocValuesFalse:        true,
+					IsVirtualSAYTSubfield: true,
+				}
+			}
 		}
 		return
 	}
@@ -2859,7 +3055,7 @@ func (s *IndexSchema) registerLeafField(
 		}
 		return
 	}
-	if (prop.MultiValued || DefaultMultiValuedPaths[dotPath]) && !IsTextLikeESType(esType) && esType != "rank_feature" {
+	if (prop.MultiValued || prop.Script != nil || DefaultMultiValuedPaths[dotPath]) && !IsTextLikeESType(esType) && esType != "rank_feature" {
 		arrColName := colName
 		if prop.UpgradedArray {
 			arrColName = "f__arr__" + SanitizeDorisIdentifier(dotPath)
@@ -2898,6 +3094,7 @@ func (s *IndexSchema) registerLeafField(
 			TimeSeriesDimension:      tsDimCopy,
 			TimeSeriesDimensions:     tsDimsCopy,
 			TimeSeriesMetric:         prop.TimeSeriesMetric,
+			FromScript:               prop.Script != nil,
 		}
 		return
 	}
@@ -2935,6 +3132,29 @@ func (s *IndexSchema) registerLeafField(
 		TimeSeriesDimension:      tsDimCopy,
 		TimeSeriesDimensions:     tsDimsCopy,
 		TimeSeriesMetric:         prop.TimeSeriesMetric,
+		FromScript:               prop.Script != nil,
+	}
+	if esType == "search_as_you_type" {
+		baseB := s.Fields[dotPath]
+		for _, sub := range baseB.SearchAsYouTypeSubfields() {
+			subPath := dotPath + sub
+			subCol := "f__" + SanitizeDorisIdentifier(subPath)
+			s.Fields[subPath] = FieldBinding{
+				ESFieldPath:           subPath,
+				SourceJSONPath:        sourceJSONPath,
+				Kind:                  StoragePromotedArray,
+				ColumnName:            subCol,
+				DorisType:             DorisString,
+				ESType:                "search_as_you_type",
+				Analyzer:              prop.Analyzer,
+				SearchAnalyzer:        prop.SearchAnalyzer,
+				IsMultiValued:         true,
+				MaxShingleSize:        maxShingle,
+				NotIndexed:            notIndexed,
+				DocValuesFalse:        true,
+				IsVirtualSAYTSubfield: true,
+			}
+		}
 	}
 }
 
@@ -2943,6 +3163,19 @@ func (s *IndexSchema) registerLeafField(
 // If `esFieldPath` ends with `.keyword` and has no explicit `.keyword` sub-field,
 // it checks the base field first and strips `.keyword` from the dynamic JSON path.
 func (s *IndexSchema) ResolveField(esFieldPath string) FieldBinding {
+	if esFieldPath == "_ignored" {
+		return FieldBinding{
+			ESFieldPath:   "_ignored",
+			ColumnName:    "_ignored",
+			Kind:          StoragePromotedArray,
+			DorisType:     DorisString,
+			ESType:        "keyword",
+			IsMultiValued: true,
+		}
+	}
+	if esFieldPath == "_tsid" && s != nil && strings.EqualFold(strings.TrimSpace(s.IndexMode), "time_series") {
+		return tsidBindingForTSDB()
+	}
 	if s == nil || s.Fields == nil {
 		cleanPath := strings.TrimSuffix(esFieldPath, ".keyword")
 		var segs []string
@@ -3058,6 +3291,16 @@ func (s *IndexSchema) ResolveField(esFieldPath string) FieldBinding {
 // `.keyword` companion binding when preferKeyword is true and a `.keyword` companion exists.
 func (s *IndexSchema) ResolveEffectiveField(esFieldPath string, preferKeyword bool) FieldBinding {
 	b := s.ResolveField(esFieldPath)
+	if !preferKeyword && b.IsVirtualSAYTSubfield && !strings.HasSuffix(esFieldPath, "._index_prefix") && s != nil {
+		for _, sfx := range []string{"._2gram", "._3gram", "._4gram"} {
+			if strings.HasSuffix(esFieldPath, sfx) {
+				if baseB, ok := s.Fields[strings.TrimSuffix(esFieldPath, sfx)]; ok {
+					baseB.ESFieldPath = esFieldPath
+					return baseB
+				}
+			}
+		}
+	}
 	if preferKeyword && b.KeywordCompanion != "" && !strings.HasSuffix(esFieldPath, ".keyword") {
 		lookupBase := esFieldPath
 		if b.AliasTarget != "" {
@@ -3100,7 +3343,7 @@ func (s *IndexSchema) ExpandFieldPattern(patternWithBoost string) []BoostedField
 	var matched []BoostedField
 	matchedSet := make(map[string]bool)
 	for k, b := range s.Fields {
-		if b.Kind == StoragePromotedVector || b.EnabledFalse {
+		if strings.HasPrefix(k, "_") || b.IsVirtualSAYTSubfield || b.Kind == StoragePromotedVector || b.EnabledFalse {
 			continue
 		}
 		if b.NotIndexed && (!s.ES8Mode || !SupportsDocValuesQueriesInES8(b)) {
@@ -3246,7 +3489,7 @@ func InferMappingFromSampleDocs(docs []json.RawMessage, existing ...*esast.Mappi
 	opts := newInferOptions(baseSpec)
 	props := make(map[string]esast.FieldProperty)
 	if baseSpec != nil && len(baseSpec.Properties) > 0 {
-		props = DeepMergeMappingProperties(nil, baseSpec.Properties)
+		props = deepMergeMappingPropertiesWithSubobjects(nil, baseSpec.Properties, !opts.subobjects)
 	}
 	totalFields := 0
 	limit := len(docs)
@@ -3272,7 +3515,7 @@ func InferMappingFromSampleDocs(docs []json.RawMessage, existing ...*esast.Mappi
 		if addedRT {
 			mergedRuntime = rtMap
 		} else if len(baseSpec.Runtime) > 0 {
-			mergedRuntime = DeepMergeMappingProperties(nil, baseSpec.Runtime)
+			mergedRuntime = CloneFlatRuntimeMap(nil, baseSpec.Runtime)
 		}
 	}
 	if len(props) == 0 {
@@ -3293,7 +3536,7 @@ func InferMappingFromSampleDocs(docs []json.RawMessage, existing ...*esast.Mappi
 		if len(mergedRuntime) > 0 {
 			out.Runtime = mergedRuntime
 		}
-		out.Properties = mergeInferredIntoExistingProps(baseSpec.Properties, inferredSpec.Properties)
+		out.Properties = mergeInferredIntoExistingPropsWithSubobjects(baseSpec.Properties, inferredSpec.Properties, !opts.subobjects)
 		return &out
 	}
 	return inferredSpec
@@ -3307,7 +3550,7 @@ func InferDynamicRuntimeFieldsFromDocs(docs []json.RawMessage, existing *esast.M
 		return nil, false
 	}
 	opts := newInferOptions(existing)
-	outRuntime := DeepMergeMappingProperties(nil, existing.Runtime)
+	outRuntime := CloneFlatRuntimeMap(nil, existing.Runtime)
 	if outRuntime == nil {
 		outRuntime = make(map[string]esast.FieldProperty)
 	}
@@ -3504,19 +3747,21 @@ func mergeRuntimeProperty(existing, incoming esast.FieldProperty) esast.FieldPro
 	return esast.FieldProperty{Type: "keyword"}
 }
 
-func mergeInferredIntoExistingProps(
+func mergeInferredIntoExistingPropsWithSubobjects(
 	existingProps, inferredProps map[string]esast.FieldProperty,
+	subobjectsFalse bool,
 ) map[string]esast.FieldProperty {
-	out := DeepMergeMappingProperties(nil, existingProps)
+	out := deepMergeMappingPropertiesWithSubobjects(nil, existingProps, subobjectsFalse)
 	for k, infProp := range inferredProps {
 		exProp, exists := out[k]
 		if !exists {
-			copied := infProp
+			copied := deepCloneFieldProperty(infProp)
+			childSubFalse := subobjectsFalse || (infProp.Subobjects != nil && !*infProp.Subobjects)
 			if len(infProp.Properties) > 0 {
-				copied.Properties = DeepMergeMappingProperties(nil, infProp.Properties)
+				copied.Properties = deepMergeMappingPropertiesWithSubobjects(nil, infProp.Properties, childSubFalse)
 			}
 			if len(infProp.Fields) > 0 {
-				copied.Fields = DeepMergeMappingProperties(nil, infProp.Fields)
+				copied.Fields = deepMergeMappingPropertiesWithSubobjects(nil, infProp.Fields, true)
 			}
 			out[k] = copied
 			continue
@@ -3526,7 +3771,8 @@ func mergeInferredIntoExistingProps(
 			continue
 		}
 		if len(infProp.Properties) > 0 {
-			exProp.Properties = mergeInferredIntoExistingProps(exProp.Properties, infProp.Properties)
+			childSubFalse := subobjectsFalse || (exProp.Subobjects != nil && !*exProp.Subobjects) || (infProp.Subobjects != nil && !*infProp.Subobjects)
+			exProp.Properties = mergeInferredIntoExistingPropsWithSubobjects(exProp.Properties, infProp.Properties, childSubFalse)
 			out[k] = exProp
 		}
 	}
@@ -3536,6 +3782,11 @@ func mergeInferredIntoExistingProps(
 func inferObjectPropertiesWithOpts(obj map[string]any, dst map[string]esast.FieldProperty, pathPrefix string, depth int, totalFields *int, opts inferOptions) {
 	if depth >= maxInferredDepth || *totalFields >= maxInferredProperties {
 		return
+	}
+	if opts.subobjects {
+		obj = expandInferDocKeysOneLevel(obj, dst)
+	} else {
+		obj = flattenSubmapsForNoSubobjects(obj)
 	}
 	keys := make([]string, 0, len(obj))
 	for k := range obj {
@@ -3816,26 +4067,21 @@ func applyMatchingDynamicTemplate(fieldName, fullPath, detectedType string, temp
 			if !matchesDynamicMappingType(rule["match_mapping_type"], detectedType) {
 				continue
 			}
+			if rawUMMT := rule["unmatch_mapping_type"]; rawUMMT != nil && matchesDynamicMappingType(rawUMMT, detectedType) {
+				continue
+			}
 			mpType, _ := rule["match_pattern"].(string)
-			if matchPat, ok := rule["match"].(string); ok && matchPat != "" {
-				if !matchDynamicTemplatePattern(matchPat, fieldName, mpType) {
-					continue
-				}
+			if hasPats, matched := matchesAnyDynamicTemplatePattern(rule["match"], fieldName, mpType); hasPats && !matched {
+				continue
 			}
-			if unmatchPat, ok := rule["unmatch"].(string); ok && unmatchPat != "" {
-				if matchDynamicTemplatePattern(unmatchPat, fieldName, mpType) {
-					continue
-				}
+			if hasPats, matched := matchesAnyDynamicTemplatePattern(rule["unmatch"], fieldName, mpType); hasPats && matched {
+				continue
 			}
-			if pathMatchPat, ok := rule["path_match"].(string); ok && pathMatchPat != "" {
-				if !matchDynamicTemplatePattern(pathMatchPat, fullPath, mpType) {
-					continue
-				}
+			if hasPats, matched := matchesAnyDynamicTemplatePattern(rule["path_match"], fullPath, mpType); hasPats && !matched {
+				continue
 			}
-			if pathUnmatchPat, ok := rule["path_unmatch"].(string); ok && pathUnmatchPat != "" {
-				if matchDynamicTemplatePattern(pathUnmatchPat, fullPath, mpType) {
-					continue
-				}
+			if hasPats, matched := matchesAnyDynamicTemplatePattern(rule["path_unmatch"], fullPath, mpType); hasPats && matched {
+				continue
 			}
 			rawMapping, hasMap := rule["mapping"]
 			if !hasMap || rawMapping == nil {
@@ -3926,10 +4172,20 @@ func inferValuePropertyWithOpts(val any, fieldName, fullPath string, depth int, 
 					return esast.FieldProperty{}, false
 				}
 				if depth+1 < maxInferredDepth {
+					childOpts := opts
+					if tmplProp.Dynamic != nil {
+						childOpts.dynamicMode = normalizeDynamicMode(tmplProp.Dynamic)
+					}
+					if tmplProp.Subobjects != nil {
+						childOpts.subobjects = *tmplProp.Subobjects
+					}
 					childProps := make(map[string]esast.FieldProperty)
-					inferObjectPropertiesWithOpts(v, childProps, fullPath, depth+1, totalFields, opts)
+					if len(tmplProp.Properties) > 0 {
+						childProps = deepMergeMappingPropertiesWithSubobjects(nil, tmplProp.Properties, !childOpts.subobjects)
+					}
+					inferObjectPropertiesWithOpts(v, childProps, fullPath, depth+1, totalFields, childOpts)
 					if len(childProps) > 0 {
-						tmplProp.Properties = DeepMergeMappingProperties(childProps, tmplProp.Properties)
+						tmplProp.Properties = childProps
 					}
 				}
 				return tmplProp, true

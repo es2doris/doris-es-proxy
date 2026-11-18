@@ -1001,7 +1001,11 @@ func validateResizeShardFactorRound59(urlPath string, srcShards, targetShards in
 	if !hasTargetShards {
 		return nil
 	}
-	if strings.Contains(urlPath, "/_split/") {
+	if strings.Contains(urlPath, "/_clone/") {
+		if targetShards != srcShards {
+			return fmt.Errorf("the number of target shards [%d] must be equal to the number of source shards [%d]", targetShards, srcShards)
+		}
+	} else if strings.Contains(urlPath, "/_split/") {
 		if targetShards <= srcShards || targetShards%srcShards != 0 {
 			return fmt.Errorf("the number of target shards [%d] must be a factor greater than the number of source shards [%d]", targetShards, srcShards)
 		}
@@ -1023,7 +1027,7 @@ func (s *Server) copyAndOverlayResizeIndexSettingsLocked(srcIndex, targetIndex s
 			cleanK := strings.TrimPrefix(k, "index.")
 			if cleanK == "uuid" || cleanK == "creation_date" || cleanK == "provided_name" ||
 				cleanK == "default_pipeline" || cleanK == "final_pipeline" ||
-				strings.HasPrefix(cleanK, "blocks.") {
+				(strings.HasPrefix(cleanK, "blocks.") && cleanK != "blocks.write") {
 				continue
 			}
 			dst[cleanK] = deepCloneIngestValue(v)
@@ -1034,6 +1038,9 @@ func (s *Server) copyAndOverlayResizeIndexSettingsLocked(srcIndex, targetIndex s
 			continue
 		}
 		dst[k] = normalizeCustomSettingValue(v)
+	}
+	if rawBW, hasBW := lookupRawIndexSettingPresenceR62Admin(reqSettings, "blocks.write"); hasBW && rawBW == nil {
+		delete(dst, "blocks.write")
 	}
 	dst["creation_date"] = strconv.FormatInt(time.Now().UnixMilli(), 10)
 	s.indexCustomSettings[targetIndex] = dst

@@ -75,7 +75,8 @@ func unmarshalAggMapWithContext(raw json.RawMessage) (map[string]AggSpec, error)
 			msg := err.Error()
 			if !strings.Contains(msg, " in [") &&
 				(strings.Contains(msg, "Expected [START_OBJECT] under [meta], but got a [VALUE_NULL]") ||
-					strings.Contains(msg, "[compression] must be greater than 0. Found [")) {
+					strings.Contains(msg, "[compression] must be greater than 0. Found [") ||
+					strings.Contains(msg, "[precisionThreshold] must be ")) {
 				return nil, fmt.Errorf("%w in [%s]", err, aggName)
 			}
 			return nil, err

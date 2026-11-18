@@ -56,7 +56,9 @@ type SuiteOptions struct {
 	SupportedClusterFeatures    map[string]bool
 	SupportedTestRunnerFeatures map[string]bool
 	Categories                  []string
+	FileFilter                  func(displayPath string) bool
 	NewHandler                  func() http.Handler
+	NewSectionHandler           func() (http.Handler, func())
 }
 
 // SectionFailure records a single failed section or parse error during scorecard execution.
@@ -138,10 +140,23 @@ func configureHandlerRemoteReindex(handler http.Handler, transport http.RoundTri
 	}
 }
 
+// ScoreMatchingFiles executes matching rest-api-spec YAML files across dirs using a file predicate
+// and a per-section handler factory with cleanup callback (e.g. for live Doris state reset).
+func ScoreMatchingFiles(
+	opts SuiteOptions,
+	matchFile func(displayPath string) bool,
+	newHandler func() (http.Handler, func()),
+	dirs ...string,
+) (*SuiteScorecard, error) {
+	opts.FileFilter = matchFile
+	opts.NewSectionHandler = newHandler
+	return ScoreDirectories(opts, dirs...)
+}
+
 // ScoreDirectories executes all rest-api-spec YAML files across dirs without aborting on failures or panics.
 func ScoreDirectories(opts SuiteOptions, dirs ...string) (*SuiteScorecard, error) {
-	if opts.NewHandler == nil {
-		return nil, fmt.Errorf("scorecard: SuiteOptions.NewHandler is required")
+	if opts.NewHandler == nil && opts.NewSectionHandler == nil {
+		return nil, fmt.Errorf("scorecard: SuiteOptions.NewHandler or NewSectionHandler is required")
 	}
 	var entries []scoredSpecEntry
 	for _, rootDir := range dirs {
@@ -169,6 +184,9 @@ func ScoreDirectories(opts SuiteOptions, dirs ...string) (*SuiteScorecard, error
 			if !strings.Contains(relSlash, "/") && cat != "" && cat != "root" {
 				disp = cat + "/" + relSlash
 			}
+			if opts.FileFilter != nil && !opts.FileFilter(disp) {
+				return nil
+			}
 			pathCopy := fullPath
 			entries = append(entries, scoredSpecEntry{
 				displayPath: disp,
@@ -188,8 +206,8 @@ func ScoreDirectories(opts SuiteOptions, dirs ...string) (*SuiteScorecard, error
 
 // ScoreSuiteFS executes all rest-api-spec YAML files in fsys without aborting on failures or panics.
 func ScoreSuiteFS(opts SuiteOptions, fsys fs.FS) (*SuiteScorecard, error) {
-	if opts.NewHandler == nil {
-		return nil, fmt.Errorf("scorecard: SuiteOptions.NewHandler is required")
+	if opts.NewHandler == nil && opts.NewSectionHandler == nil {
+		return nil, fmt.Errorf("scorecard: SuiteOptions.NewHandler or NewSectionHandler is required")
 	}
 	var entries []scoredSpecEntry
 	err := fs.WalkDir(fsys, ".", func(p string, d fs.DirEntry, walkErr error) error {
@@ -206,6 +224,9 @@ func ScoreSuiteFS(opts SuiteOptions, fsys fs.FS) (*SuiteScorecard, error) {
 			return nil
 		}
 		relSlash := filepath.ToSlash(p)
+		if opts.FileFilter != nil && !opts.FileFilter(relSlash) {
+			return nil
+		}
 		cat := deriveSpecCategory("", relSlash)
 		pathCopy := p
 		entries = append(entries, scoredSpecEntry{
@@ -248,6 +269,15 @@ func deriveSpecCategory(rootDir, relSlash string) string {
 		}
 		if afterMod != "" {
 			return afterMod
+		}
+	}
+	if plugIdx := strings.Index(rootSlash, "/x-pack/plugin/"); plugIdx >= 0 {
+		afterPlug := rootSlash[plugIdx+len("/x-pack/plugin/"):]
+		if endIdx := strings.IndexByte(afterPlug, '/'); endIdx > 0 {
+			return afterPlug[:endIdx]
+		}
+		if afterPlug != "" {
+			return afterPlug
 		}
 	}
 	base := filepath.Base(rootSlash)
@@ -338,11 +368,24 @@ func scoreEntries(opts SuiteOptions, entries []scoredSpecEntry) *SuiteScorecard 
 	}
 
 	probeClient := http.DefaultClient
+	var probeCleanup func()
 	if opts.NewHandler != nil {
 		probeHandler := opts.NewHandler()
 		probeTransport := inProcessHandlerTransport{handler: probeHandler}
 		configureHandlerRemoteReindex(probeHandler, probeTransport)
 		probeClient = &http.Client{Transport: probeTransport}
+	} else if opts.NewSectionHandler != nil {
+		var probeHandler http.Handler
+		probeHandler, probeCleanup = opts.NewSectionHandler()
+		probeTransport := inProcessHandlerTransport{handler: probeHandler}
+		configureHandlerRemoteReindex(probeHandler, probeTransport)
+		probeClient = &http.Client{Transport: probeTransport}
+	}
+	if probeCleanup != nil {
+		defer func() {
+			defer func() { _ = recover() }()
+			probeCleanup()
+		}()
 	}
 	probeCtx := newConfiguredRunnerContext(probeClient, "http://conformance.local", targetVer, clusterFeats, runnerFeats)
 
@@ -379,7 +422,7 @@ func scoreEntries(opts SuiteOptions, entries []scoredSpecEntry) *SuiteScorecard 
 
 		for _, sec := range specDoc.Sections {
 			sc.SectionsTotal++
-			skipped, secErr := executeScoredSection(opts.NewHandler, targetVer, clusterFeats, runnerFeats, specDoc, sec)
+			skipped, secErr := executeScoredSectionWithCleanup(opts.NewHandler, opts.NewSectionHandler, targetVer, clusterFeats, runnerFeats, specDoc, sec)
 			switch {
 			case skipped:
 				sc.SectionsSkipped++
@@ -452,6 +495,18 @@ func executeScoredSection(
 	specDoc *SpecDocument,
 	sec SpecSection,
 ) (skipped bool, err error) {
+	return executeScoredSectionWithCleanup(newHandler, nil, targetVer, clusterFeats, runnerFeats, specDoc, sec)
+}
+
+func executeScoredSectionWithCleanup(
+	newHandler func() http.Handler,
+	newSectionHandler func() (http.Handler, func()),
+	targetVer string,
+	clusterFeats map[string]bool,
+	runnerFeats map[string]bool,
+	specDoc *SpecDocument,
+	sec SpecSection,
+) (skipped bool, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			skipped = false
@@ -459,7 +514,19 @@ func executeScoredSection(
 		}
 	}()
 
-	handler := newHandler()
+	var handler http.Handler
+	var sectionCleanup func()
+	if newSectionHandler != nil {
+		handler, sectionCleanup = newSectionHandler()
+	} else {
+		handler = newHandler()
+	}
+	if sectionCleanup != nil {
+		defer func() {
+			defer func() { _ = recover() }()
+			sectionCleanup()
+		}()
+	}
 	transport := inProcessHandlerTransport{handler: handler}
 	configureHandlerRemoteReindex(handler, transport)
 	client := &http.Client{

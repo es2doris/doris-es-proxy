@@ -57,6 +57,17 @@ func GenerateCreateTableDDL(s *IndexSchema) string {
 	sort.Strings(fieldPaths)
 
 	seenCols := make(map[string]bool)
+	if strings.EqualFold(strings.TrimSpace(s.IndexMode), "time_series") {
+		seenCols["__tsid"] = true
+		seenCols["__tsid_key"] = true
+		cols = append(cols,
+			"    `__tsid` VARCHAR(512) NULL COMMENT 'ES TSDB _tsid'",
+			"    `__tsid_key` STRING NULL COMMENT 'ES TSDB canonical dimension key JSON'",
+		)
+		idxs = append(idxs,
+			"    INDEX `idx___tsid` (`__tsid`) USING INVERTED",
+		)
+	}
 	for _, fp := range fieldPaths {
 		b := s.Fields[fp]
 		if b.AliasTarget != "" || b.ColumnName == "" || seenCols[b.ColumnName] {
@@ -102,8 +113,8 @@ func GenerateCreateTableDDL(s *IndexSchema) string {
 			"    \"compression\" = \"zstd\",\n"+
 			"    \"function_column.sequence_col\" = \"_version\"\n"+
 			");",
-		s.DorisDB,
-		s.DorisTable,
+		escapeDorisBacktickIdent(s.DorisDB),
+		escapeDorisBacktickIdent(s.DorisTable),
 		strings.Join(allDefs, ",\n"),
 		buckets,
 	)
@@ -124,11 +135,32 @@ func GenerateAlterTableDDL(oldSchema, newSchema *IndexSchema) []string {
 
 	existingCols := make(map[string]bool)
 	if oldSchema != nil {
+		if strings.EqualFold(strings.TrimSpace(oldSchema.IndexMode), "time_series") {
+			existingCols["__tsid"] = true
+			existingCols["__tsid_key"] = true
+		}
 		for _, b := range oldSchema.Fields {
 			existingCols[b.ColumnName] = true
 		}
 		for _, c := range oldSchema.NestedRoots {
 			existingCols[c] = true
+		}
+	}
+	newDBIdent := escapeDorisBacktickIdent(newSchema.DorisDB)
+	newTblIdent := escapeDorisBacktickIdent(newSchema.DorisTable)
+	if strings.EqualFold(strings.TrimSpace(newSchema.IndexMode), "time_series") {
+		if !existingCols["__tsid"] {
+			existingCols["__tsid"] = true
+			stmts = append(stmts,
+				fmt.Sprintf("ALTER TABLE `%s`.`%s` ADD COLUMN `__tsid` VARCHAR(512) NULL COMMENT 'ES TSDB _tsid';", newDBIdent, newTblIdent),
+				fmt.Sprintf("ALTER TABLE `%s`.`%s` ADD INDEX `idx___tsid` (`__tsid`) USING INVERTED;", newDBIdent, newTblIdent),
+			)
+		}
+		if !existingCols["__tsid_key"] {
+			existingCols["__tsid_key"] = true
+			stmts = append(stmts,
+				fmt.Sprintf("ALTER TABLE `%s`.`%s` ADD COLUMN `__tsid_key` STRING NULL COMMENT 'ES TSDB canonical dimension key JSON';", newDBIdent, newTblIdent),
+			)
 		}
 	}
 
@@ -175,7 +207,7 @@ func GenerateAlterTableDDL(oldSchema, newSchema *IndexSchema) []string {
 					if idxDef != "" {
 						stmts = append(stmts, fmt.Sprintf(
 							"ALTER TABLE `%s`.`%s` ADD %s;",
-							newSchema.DorisDB, newSchema.DorisTable, idxDef,
+							newDBIdent, newTblIdent, idxDef,
 						))
 					}
 				}
@@ -186,12 +218,12 @@ func GenerateAlterTableDDL(oldSchema, newSchema *IndexSchema) []string {
 		colDef, idxDef := buildColumnAndIndexDDL(b)
 		stmts = append(stmts, fmt.Sprintf(
 			"ALTER TABLE `%s`.`%s` ADD COLUMN %s;",
-			newSchema.DorisDB, newSchema.DorisTable, colDef,
+			newDBIdent, newTblIdent, colDef,
 		))
 		if idxDef != "" {
 			stmts = append(stmts, fmt.Sprintf(
 				"ALTER TABLE `%s`.`%s` ADD %s;",
-				newSchema.DorisDB, newSchema.DorisTable, idxDef,
+				newDBIdent, newTblIdent, idxDef,
 			))
 		}
 	}
@@ -209,7 +241,7 @@ func GenerateAlterTableDDL(oldSchema, newSchema *IndexSchema) []string {
 		existingCols[corrCol] = true
 		stmts = append(stmts, fmt.Sprintf(
 			"ALTER TABLE `%s`.`%s` ADD COLUMN `%s` ARRAY<STRING> NULL COMMENT 'Correlated nested JSON elements for %s';",
-			newSchema.DorisDB, newSchema.DorisTable, corrCol, escapeDDLComment(np),
+			newDBIdent, newTblIdent, corrCol, escapeDDLComment(np),
 		))
 	}
 
@@ -320,13 +352,15 @@ func GeneratePromoteVariantFieldDDL(s *IndexSchema, esFieldPath string, esType s
 		binding.Kind = StoragePromotedArray
 		binding.DorisType = DorisString
 	}
+	dbIdent := escapeDorisBacktickIdent(s.DorisDB)
+	tblIdent := escapeDorisBacktickIdent(s.DorisTable)
 	colDef, idxDef := buildColumnAndIndexDDL(binding)
 	var stmts []string
 	if colDef != "" {
-		stmts = append(stmts, fmt.Sprintf("ALTER TABLE `%s`.`%s` ADD COLUMN %s;", s.DorisDB, s.DorisTable, colDef))
+		stmts = append(stmts, fmt.Sprintf("ALTER TABLE `%s`.`%s` ADD COLUMN %s;", dbIdent, tblIdent, colDef))
 	}
 	if idxDef != "" {
-		stmts = append(stmts, fmt.Sprintf("ALTER TABLE `%s`.`%s` ADD %s;", s.DorisDB, s.DorisTable, idxDef))
+		stmts = append(stmts, fmt.Sprintf("ALTER TABLE `%s`.`%s` ADD %s;", dbIdent, tblIdent, idxDef))
 	}
 	if !isExplicitKeyword && strings.EqualFold(esType, "text") {
 		kwPath := cleanPath + ".keyword"
@@ -343,10 +377,10 @@ func GeneratePromoteVariantFieldDDL(s *IndexSchema, esFieldPath string, esType s
 			}
 			kwColDef, kwIdxDef := buildColumnAndIndexDDL(kwBinding)
 			if kwColDef != "" {
-				stmts = append(stmts, fmt.Sprintf("ALTER TABLE `%s`.`%s` ADD COLUMN %s;", s.DorisDB, s.DorisTable, kwColDef))
+				stmts = append(stmts, fmt.Sprintf("ALTER TABLE `%s`.`%s` ADD COLUMN %s;", dbIdent, tblIdent, kwColDef))
 			}
 			if kwIdxDef != "" {
-				stmts = append(stmts, fmt.Sprintf("ALTER TABLE `%s`.`%s` ADD %s;", s.DorisDB, s.DorisTable, kwIdxDef))
+				stmts = append(stmts, fmt.Sprintf("ALTER TABLE `%s`.`%s` ADD %s;", dbIdent, tblIdent, kwIdxDef))
 			}
 		}
 	}

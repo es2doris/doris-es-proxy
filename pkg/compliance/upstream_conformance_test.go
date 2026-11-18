@@ -18,6 +18,7 @@
 package compliance
 
 import (
+	"context"
 	"encoding/json"
 	"io/fs"
 	"net/http"
@@ -33,8 +34,8 @@ import (
 )
 
 const (
-	expectedUpstreamV7YAMLCount          = 522
-	expectedUpstreamV8YAMLCount          = 735
+	expectedUpstreamV7YAMLCount          = 555
+	expectedUpstreamV8YAMLCount          = 770
 	defaultRemoteReindexWhitelistForTest = "127.0.0.1:*,[::1]:*,localhost:*,conformance.local:*"
 )
 
@@ -111,6 +112,11 @@ func collectYAMLFilesInDirs(dirs []string) ([]string, error) {
 }
 
 func newConformanceProxyHandler(targetESVersion string) http.Handler {
+	h, _ := newConformanceProxySectionHandler(targetESVersion)
+	return h
+}
+
+func newConformanceProxySectionHandler(targetESVersion string) (http.Handler, func()) {
 	srv := proxy.NewServer("es_compat", proxy.NewMemoryBackend(false), transpiler.TranspilerOptions{})
 	if targetESVersion != "" {
 		if cfg, ok := any(srv).(interface{ SetTargetESVersion(string) }); ok {
@@ -125,7 +131,9 @@ func newConformanceProxyHandler(targetESVersion string) http.Handler {
 	if wlSetter, ok := any(srv).(interface{ SetRemoteReindexWhitelistForTest(string) }); ok {
 		wlSetter.SetRemoteReindexWhitelistForTest(defaultRemoteReindexWhitelistForTest)
 	}
-	return h
+	return h, func() {
+		_ = srv.Close(context.Background())
+	}
 }
 
 func TestUpstreamYAMLParse100Percent(t *testing.T) {
@@ -254,8 +262,8 @@ func TestUpstreamElasticConformanceScorecard(t *testing.T) {
 			CorpusName:    "elasticsearch-v7.10.2",
 			TargetVersion: "7.10.2",
 			Categories:    filterCategories,
-			NewHandler: func() http.Handler {
-				return newConformanceProxyHandler("7.10.2")
+			NewSectionHandler: func() (http.Handler, func()) {
+				return newConformanceProxySectionHandler("7.10.2")
 			},
 		}, v7Dirs...)
 		if err != nil {
@@ -294,8 +302,8 @@ func TestUpstreamElasticConformanceScorecard(t *testing.T) {
 			CorpusName:    "elasticsearch-v8.15.5",
 			TargetVersion: "8.15.5",
 			Categories:    filterCategories,
-			NewHandler: func() http.Handler {
-				return newConformanceProxyHandler("8.15.5")
+			NewSectionHandler: func() (http.Handler, func()) {
+				return newConformanceProxySectionHandler("8.15.5")
 			},
 		}, v8Dirs...)
 		if err != nil {

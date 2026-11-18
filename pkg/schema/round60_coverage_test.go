@@ -361,8 +361,8 @@ func TestRound60Coverage_SyntheticSourceAndCompletionValidation(t *testing.T) {
 		"_ignored": []any{"pin_ignored", "rng_ignored", "bad_num_ignored", "bad_bool_ignored"},
 	}
 	got := ReconstructSyntheticSource(idxSchema, rawDoc, shreddedRow)
-	if _, exists := got["unmapped_dyn_false"]; exists {
-		t.Fatal("expected unmapped_dyn_false to be omitted")
+	if _, exists := got["unmapped_dyn_false"]; !exists {
+		t.Fatal("expected unmapped_dyn_false to be retained in ES 8.4+ synthetic _source")
 	}
 	if _, exists := got["secret_excluded"]; exists {
 		t.Fatal("expected secret_excluded to be filtered out")
