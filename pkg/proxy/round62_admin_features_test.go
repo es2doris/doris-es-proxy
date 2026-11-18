@@ -542,3 +542,22 @@ func TestRound62Admin_F28_ScrollBoundsExpiryAndStateCaps(t *testing.T) {
 		t.Fatalf("expected srv removed from global registries, got inAdmin=%v inCRUD=%v", inAdmin, inCRUD)
 	}
 }
+
+func TestRound62Admin_ES8SDKClientMetaNodesStatsSchema(t *testing.T) {
+	srv := NewServer("es_compat", NewMemoryBackend(false), transpiler.TranspilerOptions{})
+	t.Cleanup(func() { _ = srv.Close(context.Background()) })
+	h := srv.Handler()
+
+	code, _, _, raw := doR62AdminReq(t, h, http.MethodPut, "/_ingest/pipeline/sdk_v8_pipe", `{"processors":[{"lowercase":{"field":"category"}}]}`, nil)
+	if code != http.StatusOK {
+		t.Fatalf("PUT pipeline failed (%d): %s", code, raw)
+	}
+
+	code, _, _, raw = doR62AdminReq(t, h, http.MethodGet, "/_nodes/stats", "", map[string]string{
+		"X-Elastic-Client-Meta": "es=8.15.0p,go=1.25",
+		"User-Agent":            "go-elasticsearch/8.15.0",
+	})
+	if code != http.StatusOK || !strings.Contains(raw, `"ingested_as_first_pipeline_in_bytes"`) {
+		t.Fatalf("expected ES8 IngestStats fields via X-Elastic-Client-Meta es=8.*, got %d: %s", code, raw)
+	}
+}

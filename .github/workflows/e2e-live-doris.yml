@@ -75,6 +75,7 @@ jobs:
             --doris-dsn "root:@tcp(127.0.0.1:9030)/?interpolateParams=true&timeout=5s&readTimeout=30s&writeTimeout=30s" \
             --doris-http "http://127.0.0.1:8030" \
             --doris-db "es_sdk_e2e" \
+            --es-version "8.15.5" \
             --log-sql >/tmp/doris-es-proxy.log 2>&1 &
           PROXY_PID=$!
           trap 'kill "$PROXY_PID" 2>/dev/null || true; wait "$PROXY_PID" 2>/dev/null || true' EXIT

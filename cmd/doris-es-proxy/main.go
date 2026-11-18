@@ -153,6 +153,7 @@ func main() {
 		tlsKeyFile                = flag.String("tls-key", envOrDefault("TLS_KEY_FILE", ""), "Optional TLS private key PEM file for HTTPS (env: TLS_KEY_FILE)")
 		reindexRemoteWhitelist    = flag.String("reindex-remote-whitelist", envOrDefault("DORIS_ES_REINDEX_REMOTE_WHITELIST", ""), "Static comma-separated host:port whitelist for remote _reindex (env: DORIS_ES_REINDEX_REMOTE_WHITELIST)")
 		reindexRemoteAllowPrivate = flag.Bool("reindex-remote-allow-private", envBoolOrDefault("DORIS_ES_REINDEX_REMOTE_ALLOW_PRIVATE", false), "Allow private, loopback, link-local, and CGNAT IPs for remote _reindex (env: DORIS_ES_REINDEX_REMOTE_ALLOW_PRIVATE)")
+		esTargetVersion           = flag.String("es-version", envOrDefault("ES_TARGET_VERSION", ""), "Optional explicit Elasticsearch compatibility version (e.g. 8.15.5 or 7.10.2, env: ES_TARGET_VERSION)")
 		inMemoryMode              = flag.Bool("in-memory", envBoolOrDefault("IN_MEMORY", false), "Run with in-memory shredded Doris emulator (env: IN_MEMORY)")
 		logSQL                    = flag.Bool("log-sql", envBoolOrDefault("LOG_SQL", false), "Log transpiled Apache Doris DDL, Stream Load, HitsSQL, and AggsSQL (env: LOG_SQL)")
 	)
@@ -214,6 +215,9 @@ func main() {
 	srv := proxy.NewServer(*dorisDB, backend, transpiler.TranspilerOptions{
 		UseDoris4SearchFunc: *useDoris4SearchFunc,
 	})
+	if strings.TrimSpace(*esTargetVersion) != "" {
+		srv.SetTargetESVersion(strings.TrimSpace(*esTargetVersion))
+	}
 	srv.SetStaticRemoteReindexWhitelist(*reindexRemoteWhitelist)
 	srv.SetRemoteReindexAllowPrivateIPs(*reindexRemoteAllowPrivate)
 	if *shadowESURL != "" {

@@ -126,6 +126,21 @@ func (s *Server) isES8Mode(r *http.Request) bool {
 		if strings.Contains(accept, "compatible-with=7") || strings.Contains(ct, "compatible-with=7") {
 			return false
 		}
+		if !s.hasExplicitTargetESVersion() {
+			clientMeta := r.Header.Get("X-Elastic-Client-Meta")
+			if strings.HasPrefix(clientMeta, "es=8.") || strings.Contains(clientMeta, ",es=8.") {
+				return true
+			}
+			if strings.HasPrefix(clientMeta, "es=7.") || strings.Contains(clientMeta, ",es=7.") {
+				return false
+			}
+			if ua := r.Header.Get("User-Agent"); strings.HasPrefix(ua, "go-elasticsearch/8.") ||
+				strings.Contains(ua, "elasticsearch-py/8.") ||
+				strings.Contains(ua, "elasticsearch-java/8.") ||
+				strings.Contains(ua, "elasticsearch-js/8.") {
+				return true
+			}
+		}
 	}
 	return strings.HasPrefix(s.getTargetESVersion(), "8.")
 }
