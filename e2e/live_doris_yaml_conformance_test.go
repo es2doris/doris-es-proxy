@@ -395,8 +395,9 @@ func TestLiveDorisUpstreamYAMLConformance_E2E(t *testing.T) {
 
 	card, err := compliance.ScoreMatchingFiles(
 		compliance.SuiteOptions{
-			CorpusName:    "live-doris-v8.15.5-tier1",
-			TargetVersion: "8.15.5",
+			CorpusName:                 "live-doris-v8.15.5-tier1",
+			TargetVersion:              "8.15.5",
+			ReuseSetupForReadOnlyFiles: true,
 		},
 		matchTier1,
 		newLiveSectionHandler,

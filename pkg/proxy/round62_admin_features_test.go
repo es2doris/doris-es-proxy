@@ -27,6 +27,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -559,5 +560,61 @@ func TestRound62Admin_ES8SDKClientMetaNodesStatsSchema(t *testing.T) {
 	})
 	if code != http.StatusOK || !strings.Contains(raw, `"ingested_as_first_pipeline_in_bytes"`) {
 		t.Fatalf("expected ES8 IngestStats fields via X-Elastic-Client-Meta es=8.*, got %d: %s", code, raw)
+	}
+}
+
+func TestRound62StreamLoad_DirectBEDiscoveryAndFailover(t *testing.T) {
+	var feCalls, beCalls atomic.Int32
+	var failNextBE atomic.Bool
+
+	beSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		beCalls.Add(1)
+		_, _ = io.ReadAll(r.Body)
+		if failNextBE.CompareAndSwap(true, false) {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(`{"Status":"Fail","Message":"BE restarting"}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"Status":"Success","NumberTotalRows":1,"NumberLoadedRows":1,"NumberFilteredRows":0}`))
+	}))
+	defer beSrv.Close()
+
+	feSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		feCalls.Add(1)
+		http.Redirect(w, r, beSrv.URL+r.URL.Path, http.StatusTemporaryRedirect)
+	}))
+	defer feSrv.Close()
+
+	sl := NewStreamLoadClient(StreamLoadConfig{
+		FEHTTPEndpoint: feSrv.URL,
+		Database:       "es_db",
+		User:           "root",
+		Password:       "pw",
+	})
+
+	// 1. First load goes FE -> 307 -> BE and caches BE base URL
+	if err := sl.LoadNDJSON(context.Background(), "tbl", []byte(`{"_id":"1"}`+"\n"), true); err != nil {
+		t.Fatalf("first LoadNDJSON failed: %v", err)
+	}
+	if feCalls.Load() != 1 || beCalls.Load() != 1 {
+		t.Fatalf("expected feCalls=1 beCalls=1 after initial discovery, got fe=%d be=%d", feCalls.Load(), beCalls.Load())
+	}
+
+	// 2. Second load goes directly to cached BE without FE 307 redirect
+	if err := sl.LoadNDJSON(context.Background(), "tbl", []byte(`{"_id":"2"}`+"\n"), true); err != nil {
+		t.Fatalf("second LoadNDJSON failed: %v", err)
+	}
+	if feCalls.Load() != 1 || beCalls.Load() != 2 {
+		t.Fatalf("expected direct BE call (feCalls=1 beCalls=2), got fe=%d be=%d", feCalls.Load(), beCalls.Load())
+	}
+
+	// 3. Transient BE 503 invalidates cached BE and re-discovers via FE
+	failNextBE.Store(true)
+	if err := sl.LoadNDJSON(context.Background(), "tbl", []byte(`{"_id":"3"}`+"\n"), true); err != nil {
+		t.Fatalf("third LoadNDJSON (failover) failed: %v", err)
+	}
+	if feCalls.Load() != 2 || beCalls.Load() != 4 {
+		t.Fatalf("expected failover via FE (feCalls=2 beCalls=4), got fe=%d be=%d", feCalls.Load(), beCalls.Load())
 	}
 }

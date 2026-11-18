@@ -456,3 +456,74 @@ func TestRound62_SpecSchemaValidatorErrorResponseBaseValidation(t *testing.T) {
 		}
 	}
 }
+
+func TestRound62_ReuseSetupForReadOnlyFiles(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+	searchDir := filepath.Join(tmpDir, "search")
+	if err := os.MkdirAll(searchDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	roSpec := `---
+setup:
+  - do:
+      index:
+        index: ro_idx
+        id: "1"
+        body: { tag: "alpha", n: 10 }
+        refresh: true
+  - set: { _id: saved_id }
+
+---
+"sec_count":
+  - do:
+      count:
+        index: ro_idx
+  - match: { count: 1 }
+
+---
+"sec_get":
+  - do:
+      get:
+        index: ro_idx
+        id: $saved_id
+  - match: { _source.tag: "alpha" }
+
+---
+"sec_search":
+  - do:
+      search:
+        index: ro_idx
+        body: { query: { term: { tag: "alpha" } } }
+  - match: { hits.total.value: 1 }
+`
+	if err := os.WriteFile(filepath.Join(searchDir, "10_ro.yml"), []byte(roSpec), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var handlerCreates atomic.Int32
+	sc, err := ScoreMatchingFiles(
+		SuiteOptions{
+			CorpusName:                 "ro-shared-setup",
+			TargetVersion:              "8.15.5",
+			ReuseSetupForReadOnlyFiles: true,
+		},
+		nil,
+		func() (http.Handler, func()) {
+			handlerCreates.Add(1)
+			return newConformanceProxyHandler("8.15.5"), func() {}
+		},
+		tmpDir,
+	)
+	if err != nil {
+		t.Fatalf("ScoreMatchingFiles(ReuseSetupForReadOnlyFiles) failed: %v", err)
+	}
+	if sc.SectionsPassed != 3 || sc.SectionsFailed != 0 {
+		t.Fatalf("expected 3 passed / 0 failed, got %+v", sc)
+	}
+	// 1 probe handler + 1 shared file handler = 2 (instead of 1 + 3 = 4)
+	if handlerCreates.Load() != 2 {
+		t.Fatalf("expected 2 handler creations with shared read-only setup, got %d", handlerCreates.Load())
+	}
+}

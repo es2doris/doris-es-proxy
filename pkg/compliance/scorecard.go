@@ -59,6 +59,7 @@ type SuiteOptions struct {
 	FileFilter                  func(displayPath string) bool
 	NewHandler                  func() http.Handler
 	NewSectionHandler           func() (http.Handler, func())
+	ReuseSetupForReadOnlyFiles  bool
 }
 
 // SectionFailure records a single failed section or parse error during scorecard execution.
@@ -420,6 +421,23 @@ func scoreEntries(opts SuiteOptions, entries []scoredSpecEntry) *SuiteScorecard 
 			continue
 		}
 
+		if opts.ReuseSetupForReadOnlyFiles && isReadOnlySpecDocumentForSetupReuse(specDoc) {
+			executeReadOnlyFileWithSharedSetup(
+				opts.NewHandler,
+				opts.NewSectionHandler,
+				targetVer,
+				clusterFeats,
+				runnerFeats,
+				entry.displayPath,
+				entry.category,
+				specDoc,
+				sc,
+				cs,
+				recordFailure,
+			)
+			continue
+		}
+
 		for _, sec := range specDoc.Sections {
 			sc.SectionsTotal++
 			skipped, secErr := executeScoredSectionWithCleanup(opts.NewHandler, opts.NewSectionHandler, targetVer, clusterFeats, runnerFeats, specDoc, sec)
@@ -570,6 +588,178 @@ func executeScoredSectionWithCleanup(
 		return true, nil
 	}
 	return false, testErr
+}
+
+var readOnlySetupReuseActions = map[string]bool{
+	"search":                    true,
+	"msearch":                   true,
+	"count":                     true,
+	"explain":                   true,
+	"field_caps":                true,
+	"get":                       true,
+	"mget":                      true,
+	"exists":                    true,
+	"indices.get":               true,
+	"indices.get_mapping":       true,
+	"indices.get_field_mapping": true,
+	"indices.get_settings":      true,
+	"indices.get_alias":         true,
+	"indices.exists":            true,
+	"indices.exists_alias":      true,
+	"indices.validate_query":    true,
+	"cat.indices":               true,
+	"cat.count":                 true,
+	"cat.fielddata":             true,
+	"cat.aliases":               true,
+	"cat.segments":              true,
+	"cat.health":                true,
+	"ping":                      true,
+	"info":                      true,
+	"cluster.health":            true,
+	"cluster.state":             true,
+}
+
+func extractDoStepActionName(rawVal any) string {
+	om, ok := rawVal.(*OrderedMap)
+	if !ok || om == nil {
+		return ""
+	}
+	var actionName string
+	for _, f := range om.Fields {
+		switch f.Key {
+		case "catch", "headers", "ignore", "warnings", "warning_headers",
+			"warnings_regex", "allowed_warnings", "allowed_warnings_regex", "node_selector":
+		default:
+			actionName = f.Key
+		}
+	}
+	return actionName
+}
+
+func isReadOnlySpecDocumentForSetupReuse(specDoc *SpecDocument) bool {
+	if specDoc == nil || len(specDoc.Setup) == 0 || len(specDoc.Teardown) > 0 || len(specDoc.Sections) <= 1 {
+		return false
+	}
+	for _, sec := range specDoc.Sections {
+		for _, step := range sec.Steps {
+			if step.Op != "do" {
+				continue
+			}
+			act := extractDoStepActionName(step.Value)
+			if act == "" || !readOnlySetupReuseActions[act] {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func executeReadOnlyFileWithSharedSetup(
+	newHandler func() http.Handler,
+	newSectionHandler func() (http.Handler, func()),
+	targetVer string,
+	clusterFeats map[string]bool,
+	runnerFeats map[string]bool,
+	displayPath string,
+	category string,
+	specDoc *SpecDocument,
+	sc *SuiteScorecard,
+	cs *CategoryScore,
+	recordFailure func(file, cat, section, errMsg string),
+) {
+	var handler http.Handler
+	var fileCleanup func()
+	if newSectionHandler != nil {
+		handler, fileCleanup = newSectionHandler()
+	} else {
+		handler = newHandler()
+	}
+	if fileCleanup != nil {
+		defer func() {
+			defer func() { _ = recover() }()
+			fileCleanup()
+		}()
+	}
+
+	transport := inProcessHandlerTransport{handler: handler}
+	configureHandlerRemoteReindex(handler, transport)
+	client := &http.Client{Transport: transport}
+	setupCtx := newConfiguredRunnerContext(client, "http://conformance.local", targetVer, clusterFeats, runnerFeats)
+	defer safeCleanupRunnerContext(setupCtx)
+
+	for i, step := range specDoc.Setup {
+		stepErr := func() (err error) {
+			defer func() {
+				if r := recover(); r != nil {
+					err = fmt.Errorf("panic: %v", r)
+				}
+			}()
+			return setupCtx.execStep(step, false)
+		}()
+		if stepErr != nil {
+			var skipErr *errSkipSection
+			n := len(specDoc.Sections)
+			sc.SectionsTotal += n
+			if errors.As(stepErr, &skipErr) {
+				sc.SectionsSkipped += n
+				cs.Skipped += n
+				return
+			}
+			errMsg := fmt.Sprintf("[setup step %d (%s)] %v", i+1, step.Op, stepErr)
+			for _, sec := range specDoc.Sections {
+				sc.SectionsFailed++
+				cs.Failed++
+				recordFailure(displayPath, category, sec.Name, errMsg)
+			}
+			return
+		}
+	}
+
+	baseStash := make(map[string]any, len(setupCtx.stash))
+	for k, v := range setupCtx.stash {
+		baseStash[k] = v
+	}
+
+	runSection := func(sec SpecSection) (skipped bool, err error) {
+		defer func() {
+			if r := recover(); r != nil {
+				skipped = false
+				err = fmt.Errorf("panic: %v", r)
+			}
+		}()
+		secCtx := newConfiguredRunnerContext(client, "http://conformance.local", targetVer, clusterFeats, runnerFeats)
+		defer safeCleanupRunnerContext(secCtx)
+		for k, v := range baseStash {
+			secCtx.stash[k] = v
+		}
+		var skipErr *errSkipSection
+		for i, step := range sec.Steps {
+			if stepErr := secCtx.execStep(step, false); stepErr != nil {
+				if errors.As(stepErr, &skipErr) {
+					return true, nil
+				}
+				return false, fmt.Errorf("[step %d (%s)] %w", i+1, step.Op, stepErr)
+			}
+		}
+		return false, nil
+	}
+
+	for _, sec := range specDoc.Sections {
+		sc.SectionsTotal++
+		skipped, secErr := runSection(sec)
+		switch {
+		case skipped:
+			sc.SectionsSkipped++
+			cs.Skipped++
+		case secErr != nil:
+			sc.SectionsFailed++
+			cs.Failed++
+			recordFailure(displayPath, category, sec.Name, secErr.Error())
+		default:
+			sc.SectionsPassed++
+			cs.Passed++
+		}
+	}
 }
 
 func computePassRatePct(passed, failed int) float64 {
