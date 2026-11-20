@@ -329,6 +329,11 @@ func rewriteDorisArrayExists(q string) string {
 		}
 		if inOuterBacktick {
 			if ch == '`' {
+				if i+1 < len(q) && q[i+1] == '`' {
+					out.WriteString("``")
+					i += 2
+					continue
+				}
 				inOuterBacktick = false
 			}
 			out.WriteByte(ch)
@@ -389,6 +394,10 @@ func rewriteDorisArrayExists(q string) string {
 				}
 			} else if inBacktick {
 				if c == '`' {
+					if j+1 < len(q) && q[j+1] == '`' {
+						j += 2
+						continue
+					}
 					inBacktick = false
 				}
 			} else {
@@ -422,14 +431,7 @@ func rewriteDorisArrayExists(q string) string {
 				out.WriteString(colPart)
 				out.WriteString(")")
 			} else {
-				emptyArrType := "ARRAY<STRING>"
-				if strings.HasPrefix(colPart, "array_map(_x -> CAST(_x AS DOUBLE),") || strings.HasSuffix(colPart, " AS ARRAY<DOUBLE>)") {
-					emptyArrType = "ARRAY<DOUBLE>"
-				} else if strings.HasPrefix(colPart, "array_map(_x -> CAST(_x AS BIGINT),") || strings.HasSuffix(colPart, " AS ARRAY<BIGINT>)") {
-					emptyArrType = "ARRAY<BIGINT>"
-				} else if strings.HasPrefix(colPart, "array_map(_x -> CAST(_x AS LARGEINT),") || strings.HasSuffix(colPart, " AS ARRAY<LARGEINT>)") {
-					emptyArrType = "ARRAY<LARGEINT>"
-				}
+				emptyArrType := detectDorisArrayFallbackType(colPart)
 				out.WriteString("array_contains(array_exists(")
 				out.WriteString(lambdaPart)
 				out.WriteString(", IFNULL(")
@@ -445,6 +447,52 @@ func rewriteDorisArrayExists(q string) string {
 		}
 	}
 	return out.String()
+}
+
+func detectDorisArrayFallbackType(colPart string) string {
+	upper := strings.ToUpper(strings.TrimSpace(colPart))
+	switch {
+	case strings.HasSuffix(upper, " AS ARRAY<FLOAT>)"):
+		return "ARRAY<FLOAT>"
+	case strings.HasSuffix(upper, " AS ARRAY<BOOLEAN>)"):
+		return "ARRAY<BOOLEAN>"
+	case strings.HasSuffix(upper, " AS ARRAY<DATETIMEV2(3)>)"):
+		return "ARRAY<DATETIMEV2(3)>"
+	case strings.HasSuffix(upper, " AS ARRAY<DATETIMEV2>)"):
+		return "ARRAY<DATETIMEV2>"
+	case strings.HasSuffix(upper, " AS ARRAY<DOUBLE>)"):
+		return "ARRAY<DOUBLE>"
+	case strings.HasSuffix(upper, " AS ARRAY<BIGINT>)"):
+		return "ARRAY<BIGINT>"
+	case strings.HasSuffix(upper, " AS ARRAY<LARGEINT>)"):
+		return "ARRAY<LARGEINT>"
+	case strings.HasSuffix(upper, " AS ARRAY<INT>)"):
+		return "ARRAY<INT>"
+	}
+	if strings.HasPrefix(upper, "ARRAY_MAP(") {
+		if arrowIdx := strings.Index(upper, "->"); arrowIdx > 0 {
+			afterArrow := upper[arrowIdx+2:]
+			switch {
+			case strings.Contains(afterArrow, " AS FLOAT),"):
+				return "ARRAY<FLOAT>"
+			case strings.Contains(afterArrow, " AS BOOLEAN),"):
+				return "ARRAY<BOOLEAN>"
+			case strings.Contains(afterArrow, " AS DATETIMEV2(3)),"):
+				return "ARRAY<DATETIMEV2(3)>"
+			case strings.Contains(afterArrow, " AS DATETIMEV2),"):
+				return "ARRAY<DATETIMEV2>"
+			case strings.Contains(afterArrow, " AS DOUBLE),"):
+				return "ARRAY<DOUBLE>"
+			case strings.Contains(afterArrow, " AS BIGINT),"):
+				return "ARRAY<BIGINT>"
+			case strings.Contains(afterArrow, " AS LARGEINT),"):
+				return "ARRAY<LARGEINT>"
+			case strings.Contains(afterArrow, " AS INT),"):
+				return "ARRAY<INT>"
+			}
+		}
+	}
+	return "ARRAY<STRING>"
 }
 
 type traceMetaContextKey struct{}
@@ -510,24 +558,391 @@ func prependSQLTraceComment(ctx context.Context, q string) string {
 }
 
 func injectRawDocSelectIntoHitsSQL(q string) (string, bool) {
+	return injectHitsSelectColumns(q, true, false)
+}
+
+func injectRawDocAndRoutingSelectIntoHitsSQL(q string) (string, bool) {
+	return injectHitsSelectColumns(q, true, true)
+}
+
+func injectHitsSelectColumns(q string, includeRawDoc, includeRouting bool) (string, bool) {
+	if !includeRawDoc && !includeRouting {
+		return q, false
+	}
 	const needle = "SELECT `_id`, `_version`, `_source`, "
-	idx := strings.Index(q, needle)
-	if idx < 0 {
+	if !strings.Contains(q, needle) {
 		return q, false
 	}
-	// Only rewrite the outermost projection (either at index 0 or right after CTE `)` + newline).
-	prefix := strings.TrimSpace(q[:idx])
-	if prefix != "" && !strings.HasSuffix(prefix, ")") && !strings.HasSuffix(prefix, "*/") {
+
+	var leafExtra, passthroughExtra strings.Builder
+	if includeRawDoc {
+		leafExtra.WriteString("CAST(`_doc` AS STRING) AS `_raw_doc`, ")
+		passthroughExtra.WriteString("`_raw_doc`, ")
+	}
+	if includeRouting {
+		leafExtra.WriteString("`_routing`, ")
+		passthroughExtra.WriteString("`_routing`, ")
+	}
+	leafRepl := needle + leafExtra.String()
+	passthroughRepl := needle + passthroughExtra.String()
+
+	var out strings.Builder
+	out.Grow(len(q) + 64)
+	inSingle := false
+	inDouble := false
+	inBacktick := false
+	changed := false
+
+	for i := 0; i < len(q); {
+		ch := q[i]
+		if inSingle {
+			if ch == '\\' && i+1 < len(q) {
+				out.WriteString(q[i : i+2])
+				i += 2
+				continue
+			}
+			if ch == '\'' {
+				if i+1 < len(q) && q[i+1] == '\'' {
+					out.WriteString("''")
+					i += 2
+					continue
+				}
+				inSingle = false
+			}
+			out.WriteByte(ch)
+			i++
+			continue
+		}
+		if inDouble {
+			if ch == '\\' && i+1 < len(q) {
+				out.WriteString(q[i : i+2])
+				i += 2
+				continue
+			}
+			if ch == '"' {
+				inDouble = false
+			}
+			out.WriteByte(ch)
+			i++
+			continue
+		}
+		if inBacktick {
+			if ch == '`' {
+				if i+1 < len(q) && q[i+1] == '`' {
+					out.WriteString("``")
+					i += 2
+					continue
+				}
+				inBacktick = false
+			}
+			out.WriteByte(ch)
+			i++
+			continue
+		}
+		if ch == '/' && i+1 < len(q) && q[i+1] == '*' {
+			end := strings.Index(q[i+2:], "*/")
+			if end < 0 {
+				out.WriteString(q[i:])
+				break
+			}
+			out.WriteString(q[i : i+2+end+2])
+			i += 2 + end + 2
+			continue
+		}
+		switch ch {
+		case '\'':
+			inSingle = true
+			out.WriteByte(ch)
+			i++
+			continue
+		case '"':
+			inDouble = true
+			out.WriteByte(ch)
+			i++
+			continue
+		case '`':
+			inBacktick = true
+			out.WriteByte(ch)
+			i++
+			continue
+		}
+		if strings.HasPrefix(q[i:], needle) && isValidHitsSelectBoundary(q[:i]) {
+			if selectBlockWrapsNestedHitsSelect(q[i+len(needle):], needle) {
+				out.WriteString(passthroughRepl)
+			} else {
+				out.WriteString(leafRepl)
+			}
+			changed = true
+			i += len(needle)
+			continue
+		}
+		out.WriteByte(ch)
+		i++
+	}
+	if !changed {
 		return q, false
 	}
-	const replacement = "SELECT `_id`, `_version`, `_source`, CAST(`_doc` AS STRING) AS `_raw_doc`, "
-	return q[:idx] + replacement + q[idx+len(needle):], true
+	return out.String(), true
+}
+
+func isValidHitsSelectBoundary(prefix string) bool {
+	trimmed := strings.TrimSpace(prefix)
+	if trimmed == "" {
+		return true
+	}
+	if strings.HasSuffix(trimmed, ")") || strings.HasSuffix(trimmed, "(") || strings.HasSuffix(trimmed, "*/") {
+		return true
+	}
+	upper := strings.ToUpper(trimmed)
+	return strings.HasSuffix(upper, "UNION ALL") ||
+		strings.HasSuffix(upper, "UNION DISTINCT") ||
+		strings.HasSuffix(upper, "UNION")
+}
+
+func selectBlockWrapsNestedHitsSelect(rest string, needle string) bool {
+	depth := 0
+	inSingle := false
+	inDouble := false
+	inBacktick := false
+	for i := 0; i < len(rest); i++ {
+		ch := rest[i]
+		if inSingle {
+			if ch == '\\' && i+1 < len(rest) {
+				i++
+				continue
+			}
+			if ch == '\'' {
+				if i+1 < len(rest) && rest[i+1] == '\'' {
+					i++
+					continue
+				}
+				inSingle = false
+			}
+			continue
+		}
+		if inDouble {
+			if ch == '\\' && i+1 < len(rest) {
+				i++
+				continue
+			}
+			if ch == '"' {
+				inDouble = false
+			}
+			continue
+		}
+		if inBacktick {
+			if ch == '`' {
+				if i+1 < len(rest) && rest[i+1] == '`' {
+					i++
+					continue
+				}
+				inBacktick = false
+			}
+			continue
+		}
+		switch ch {
+		case '\'':
+			inSingle = true
+		case '"':
+			inDouble = true
+		case '`':
+			inBacktick = true
+		case '(':
+			depth++
+		case ')':
+			if depth == 0 {
+				return false
+			}
+			depth--
+		default:
+			if depth == 0 && (ch == 'F' || ch == 'f') && hasSQLKeywordAt(rest, i, "FROM") {
+				afterFrom := strings.TrimLeft(rest[i+4:], " \t\r\n")
+				if !strings.HasPrefix(afterFrom, "(") {
+					return false
+				}
+				subBody, ok := extractBalancedParenBody(afterFrom)
+				if !ok {
+					return false
+				}
+				return containsHitsSelectOutsideLiterals(subBody, needle)
+			}
+		}
+	}
+	return false
+}
+
+func hasSQLKeywordAt(s string, idx int, kw string) bool {
+	if idx < 0 || idx+len(kw) > len(s) {
+		return false
+	}
+	if !strings.EqualFold(s[idx:idx+len(kw)], kw) {
+		return false
+	}
+	if idx > 0 {
+		prev := s[idx-1]
+		if (prev >= 'a' && prev <= 'z') || (prev >= 'A' && prev <= 'Z') || (prev >= '0' && prev <= '9') || prev == '_' {
+			return false
+		}
+	}
+	if idx+len(kw) < len(s) {
+		next := s[idx+len(kw)]
+		if (next >= 'a' && next <= 'z') || (next >= 'A' && next <= 'Z') || (next >= '0' && next <= '9') || next == '_' {
+			return false
+		}
+	}
+	return true
+}
+
+func extractBalancedParenBody(s string) (string, bool) {
+	if len(s) == 0 || s[0] != '(' {
+		return "", false
+	}
+	depth := 1
+	inSingle := false
+	inDouble := false
+	inBacktick := false
+	for i := 1; i < len(s); i++ {
+		ch := s[i]
+		if inSingle {
+			if ch == '\\' && i+1 < len(s) {
+				i++
+				continue
+			}
+			if ch == '\'' {
+				if i+1 < len(s) && s[i+1] == '\'' {
+					i++
+					continue
+				}
+				inSingle = false
+			}
+			continue
+		}
+		if inDouble {
+			if ch == '\\' && i+1 < len(s) {
+				i++
+				continue
+			}
+			if ch == '"' {
+				inDouble = false
+			}
+			continue
+		}
+		if inBacktick {
+			if ch == '`' {
+				if i+1 < len(s) && s[i+1] == '`' {
+					i++
+					continue
+				}
+				inBacktick = false
+			}
+			continue
+		}
+		switch ch {
+		case '\'':
+			inSingle = true
+		case '"':
+			inDouble = true
+		case '`':
+			inBacktick = true
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 {
+				return s[1:i], true
+			}
+		}
+	}
+	return "", false
+}
+
+func containsHitsSelectOutsideLiterals(s string, needle string) bool {
+	inSingle := false
+	inDouble := false
+	inBacktick := false
+	for i := 0; i < len(s); i++ {
+		ch := s[i]
+		if inSingle {
+			if ch == '\\' && i+1 < len(s) {
+				i++
+				continue
+			}
+			if ch == '\'' {
+				if i+1 < len(s) && s[i+1] == '\'' {
+					i++
+					continue
+				}
+				inSingle = false
+			}
+			continue
+		}
+		if inDouble {
+			if ch == '\\' && i+1 < len(s) {
+				i++
+				continue
+			}
+			if ch == '"' {
+				inDouble = false
+			}
+			continue
+		}
+		if inBacktick {
+			if ch == '`' {
+				if i+1 < len(s) && s[i+1] == '`' {
+					i++
+					continue
+				}
+				inBacktick = false
+			}
+			continue
+		}
+		switch ch {
+		case '\'':
+			inSingle = true
+		case '"':
+			inDouble = true
+		case '`':
+			inBacktick = true
+		default:
+			if strings.HasPrefix(s[i:], needle) && isValidHitsSelectBoundary(s[:i]) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+type hitsRowScanLayout int
+
+const (
+	hitsRowScan5Base hitsRowScanLayout = iota
+	hitsRowScan6RawDoc
+	hitsRowScan6Routing
+	hitsRowScan7RawDocAndRouting
+	hitsRowScan7RoutingAndRawDoc
+)
+
+func classifyHitsRowScanLayout(cols []string) hitsRowScanLayout {
+	switch {
+	case len(cols) >= 7:
+		if strings.EqualFold(strings.TrimSpace(cols[3]), "_routing") {
+			return hitsRowScan7RoutingAndRawDoc
+		}
+		return hitsRowScan7RawDocAndRouting
+	case len(cols) == 6:
+		if strings.EqualFold(strings.TrimSpace(cols[3]), "_routing") {
+			return hitsRowScan6Routing
+		}
+		return hitsRowScan6RawDoc
+	default:
+		return hitsRowScan5Base
+	}
 }
 
 func (b *DorisSQLBackend) QueryHits(ctx context.Context, querySQL string) ([]HitRow, error) {
 	normSQL := normalizeDorisSQL(querySQL)
-	withRawDocSQL, hasRawDocCol := injectRawDocSelectIntoHitsSQL(normSQL)
-	execSQL := prependSQLTraceComment(ctx, withRawDocSQL)
+	withDocRoutingSQL, hasDocRoutingCols := injectRawDocAndRoutingSelectIntoHitsSQL(normSQL)
+	execSQL := prependSQLTraceComment(ctx, withDocRoutingSQL)
 	if b.logSQL.Load() {
 		log.Printf("[Doris HitsSQL]\n%s", execSQL)
 	}
@@ -535,23 +950,30 @@ func (b *DorisSQLBackend) QueryHits(ctx context.Context, querySQL string) ([]Hit
 		return nil, nil
 	}
 	rows, err := b.db.QueryContext(ctx, execSQL)
-	if err != nil && hasRawDocCol {
-		fallbackSQL := prependSQLTraceComment(ctx, normSQL)
-		if fbRows, fbErr := b.db.QueryContext(ctx, fallbackSQL); fbErr == nil {
-			rows = fbRows
-			err = nil
-			hasRawDocCol = false
+	if err != nil && hasDocRoutingCols {
+		// Graceful fallback 1: table has `_doc` VARIANT but lacks `_routing` (legacy/external Doris table).
+		if withRawDocSQL, hasRawDoc := injectRawDocSelectIntoHitsSQL(normSQL); hasRawDoc {
+			fbDocSQL := prependSQLTraceComment(ctx, withRawDocSQL)
+			if fbRows, fbErr := b.db.QueryContext(ctx, fbDocSQL); fbErr == nil {
+				rows = fbRows
+				err = nil
+			}
+		}
+		// Graceful fallback 2: bare `normSQL` when external table lacks both `_routing` and `_doc`.
+		if err != nil {
+			fallbackSQL := prependSQLTraceComment(ctx, normSQL)
+			if fbRows2, fbErr2 := b.db.QueryContext(ctx, fallbackSQL); fbErr2 == nil {
+				rows = fbRows2
+				err = nil
+			}
 		}
 	}
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = rows.Close() }()
-	if hasRawDocCol {
-		if cols, colErr := rows.Columns(); colErr == nil && len(cols) < 6 {
-			hasRawDocCol = false
-		}
-	}
+	cols, _ := rows.Columns()
+	scanLayout := classifyHitsRowScanLayout(cols)
 
 	var hits []HitRow
 	for rows.Next() {
@@ -560,13 +982,27 @@ func (b *DorisSQLBackend) QueryHits(ctx context.Context, querySQL string) ([]Hit
 		var nullVer sql.NullInt64
 		var nullSrc sql.NullString
 		var nullRawDoc sql.NullString
+		var nullRouting sql.NullString
 		var nullScore sql.NullFloat64
 		var nullTotal sql.NullInt64
-		if hasRawDocCol {
+		switch scanLayout {
+		case hitsRowScan7RawDocAndRouting:
+			if err := rows.Scan(&nullID, &nullVer, &nullSrc, &nullRawDoc, &nullRouting, &nullScore, &nullTotal); err != nil {
+				return nil, err
+			}
+		case hitsRowScan7RoutingAndRawDoc:
+			if err := rows.Scan(&nullID, &nullVer, &nullSrc, &nullRouting, &nullRawDoc, &nullScore, &nullTotal); err != nil {
+				return nil, err
+			}
+		case hitsRowScan6RawDoc:
 			if err := rows.Scan(&nullID, &nullVer, &nullSrc, &nullRawDoc, &nullScore, &nullTotal); err != nil {
 				return nil, err
 			}
-		} else {
+		case hitsRowScan6Routing:
+			if err := rows.Scan(&nullID, &nullVer, &nullSrc, &nullRouting, &nullScore, &nullTotal); err != nil {
+				return nil, err
+			}
+		default:
 			if err := rows.Scan(&nullID, &nullVer, &nullSrc, &nullScore, &nullTotal); err != nil {
 				return nil, err
 			}
@@ -576,6 +1012,9 @@ func (b *DorisSQLBackend) QueryHits(ctx context.Context, querySQL string) ([]Hit
 		}
 		h.ID = nullID.String
 		h.Version = nullVer.Int64
+		if nullRouting.Valid {
+			h.Routing = nullRouting.String
+		}
 		h.TotalHits = nullTotal.Int64
 		if nullScore.Valid {
 			h.Score = nullScore.Float64
@@ -630,6 +1069,69 @@ func (b *DorisSQLBackend) QueryAggs(ctx context.Context, aggsSQL string) ([]AggR
 	return out, rows.Err()
 }
 
+type docPointRowScanLayout int
+
+const (
+	docPointScan3Base docPointRowScanLayout = iota
+	docPointScan4DelSign
+	docPointScan4Routing
+	docPointScan5RawDocDelSign
+	docPointScan5RoutingDelSign
+	docPointScan5RawDocRouting
+	docPointScan6RawDocRoutingDelSign
+)
+
+func classifyDocPointRowScanLayout(cols []string) docPointRowScanLayout {
+	switch {
+	case len(cols) >= 6:
+		return docPointScan6RawDocRoutingDelSign
+	case len(cols) == 5:
+		c3 := strings.ToLower(strings.TrimSpace(cols[3]))
+		c4 := strings.ToLower(strings.TrimSpace(cols[4]))
+		if c3 == "_routing" {
+			return docPointScan5RoutingDelSign
+		}
+		if c4 == "_routing" {
+			return docPointScan5RawDocRouting
+		}
+		return docPointScan5RawDocDelSign
+	case len(cols) == 4:
+		if strings.EqualFold(strings.TrimSpace(cols[3]), "_routing") {
+			return docPointScan4Routing
+		}
+		return docPointScan4DelSign
+	default:
+		return docPointScan3Base
+	}
+}
+
+func scanDocPointRow(
+	rows *sql.Rows,
+	layout docPointRowScanLayout,
+	h *HitRow,
+	nullSrc *sql.NullString,
+	nullRawDoc *sql.NullString,
+	nullRouting *sql.NullString,
+	delSign *sql.NullInt64,
+) (hasDelSignCol bool, err error) {
+	switch layout {
+	case docPointScan6RawDocRoutingDelSign:
+		return true, rows.Scan(&h.ID, &h.Version, nullSrc, nullRawDoc, nullRouting, delSign)
+	case docPointScan5RawDocDelSign:
+		return true, rows.Scan(&h.ID, &h.Version, nullSrc, nullRawDoc, delSign)
+	case docPointScan5RoutingDelSign:
+		return true, rows.Scan(&h.ID, &h.Version, nullSrc, nullRouting, delSign)
+	case docPointScan5RawDocRouting:
+		return false, rows.Scan(&h.ID, &h.Version, nullSrc, nullRawDoc, nullRouting)
+	case docPointScan4Routing:
+		return false, rows.Scan(&h.ID, &h.Version, nullSrc, nullRouting)
+	case docPointScan4DelSign:
+		return true, rows.Scan(&h.ID, &h.Version, nullSrc, delSign)
+	default:
+		return false, rows.Scan(&h.ID, &h.Version, nullSrc)
+	}
+}
+
 func (b *DorisSQLBackend) GetDocByID(ctx context.Context, dbName, table, id string) (*HitRow, bool, error) {
 	if b.db == nil {
 		return nil, false, nil
@@ -637,33 +1139,25 @@ func (b *DorisSQLBackend) GetDocByID(ctx context.Context, dbName, table, id stri
 	safeDB := escapeDorisDBIdent(dbName)
 	safeTable := sanitizeAndEscapeDorisIdent(table)
 	// #nosec G201 -- identifiers are strictly sanitized via schema.SanitizeDorisIdentifier
-	q := fmt.Sprintf(
-		"SELECT `_id`, `_version`, `_source`, CAST(`_doc` AS STRING) AS `_raw_doc`, `__DORIS_DELETE_SIGN__` FROM `%s`.`%s` WHERE `_id` = ? ORDER BY `_version` DESC LIMIT 1",
-		safeDB, safeTable,
-	)
-	// #nosec G701 -- parameterized _id query on strictly sanitized identifier
-	rows, err := b.db.QueryContext(ctx, q, id)
-	if err != nil {
-		// #nosec G201 -- identifiers are strictly sanitized via schema.SanitizeDorisIdentifier
-		qNoDoc := fmt.Sprintf(
-			"SELECT `_id`, `_version`, `_source`, `__DORIS_DELETE_SIGN__` FROM `%s`.`%s` WHERE `_id` = ? ORDER BY `_version` DESC LIMIT 1",
-			safeDB, safeTable,
-		)
+	candidates := []string{
+		fmt.Sprintf("SELECT `_id`, `_version`, `_source`, CAST(`_doc` AS STRING) AS `_raw_doc`, `_routing`, `__DORIS_DELETE_SIGN__` FROM `%s`.`%s` WHERE `_id` = ? ORDER BY `_version` DESC LIMIT 1", safeDB, safeTable),
+		fmt.Sprintf("SELECT `_id`, `_version`, `_source`, CAST(`_doc` AS STRING) AS `_raw_doc`, `__DORIS_DELETE_SIGN__` FROM `%s`.`%s` WHERE `_id` = ? ORDER BY `_version` DESC LIMIT 1", safeDB, safeTable),
+		fmt.Sprintf("SELECT `_id`, `_version`, `_source`, `_routing`, `__DORIS_DELETE_SIGN__` FROM `%s`.`%s` WHERE `_id` = ? ORDER BY `_version` DESC LIMIT 1", safeDB, safeTable),
+		fmt.Sprintf("SELECT `_id`, `_version`, `_source`, `__DORIS_DELETE_SIGN__` FROM `%s`.`%s` WHERE `_id` = ? ORDER BY `_version` DESC LIMIT 1", safeDB, safeTable),
+		fmt.Sprintf("SELECT `_id`, `_version`, `_source` FROM `%s`.`%s` WHERE `_id` = ? ORDER BY `_version` DESC LIMIT 1", safeDB, safeTable),
+	}
+	var rows *sql.Rows
+	var err error
+	for i, q := range candidates {
 		// #nosec G701 -- parameterized _id query on strictly sanitized identifier
-		if fbRows, fbErr := b.db.QueryContext(ctx, qNoDoc, id); fbErr == nil {
-			rows = fbRows
+		r, qErr := b.db.QueryContext(ctx, q, id)
+		if qErr == nil {
+			rows = r
 			err = nil
-		} else {
-			// #nosec G201 -- identifiers are strictly sanitized via schema.SanitizeDorisIdentifier
-			qFallback := fmt.Sprintf(
-				"SELECT `_id`, `_version`, `_source` FROM `%s`.`%s` WHERE `_id` = ? ORDER BY `_version` DESC LIMIT 1",
-				safeDB, safeTable,
-			)
-			// #nosec G701 -- parameterized _id query on strictly sanitized identifier
-			if fbRows2, fbErr2 := b.db.QueryContext(ctx, qFallback, id); fbErr2 == nil {
-				rows = fbRows2
-				err = nil
-			}
+			break
+		}
+		if i == 0 {
+			err = qErr
 		}
 	}
 	if err != nil {
@@ -671,6 +1165,7 @@ func (b *DorisSQLBackend) GetDocByID(ctx context.Context, dbName, table, id stri
 	}
 	defer func() { _ = rows.Close() }()
 	cols, _ := rows.Columns()
+	layout := classifyDocPointRowScanLayout(cols)
 	var best HitRow
 	var bestDeleted bool
 	hasRow := false
@@ -678,26 +1173,17 @@ func (b *DorisSQLBackend) GetDocByID(ctx context.Context, dbName, table, id stri
 		var h HitRow
 		var nullSrc sql.NullString
 		var nullRawDoc sql.NullString
+		var nullRouting sql.NullString
 		var delSign sql.NullInt64
-		hasDelSignCol := false
-		switch {
-		case len(cols) >= 5:
-			hasDelSignCol = true
-			if err := rows.Scan(&h.ID, &h.Version, &nullSrc, &nullRawDoc, &delSign); err != nil {
-				return nil, false, err
-			}
-		case len(cols) == 4:
-			hasDelSignCol = true
-			if err := rows.Scan(&h.ID, &h.Version, &nullSrc, &delSign); err != nil {
-				return nil, false, err
-			}
-		default:
-			if err := rows.Scan(&h.ID, &h.Version, &nullSrc); err != nil {
-				return nil, false, err
-			}
+		hasDelSignCol, scanErr := scanDocPointRow(rows, layout, &h, &nullSrc, &nullRawDoc, &nullRouting, &delSign)
+		if scanErr != nil {
+			return nil, false, scanErr
 		}
 		if hasRow && h.Version < best.Version {
 			continue
+		}
+		if nullRouting.Valid {
+			h.Routing = nullRouting.String
 		}
 		srcStr := nullSrc.String
 		hasRow = true
@@ -763,33 +1249,25 @@ func (b *DorisSQLBackend) queryDocsBatchChunk(
 	}
 	inClause := strings.Join(placeholders, ",")
 	// #nosec G201 -- identifiers are strictly sanitized/backtick-escaped and values are bound via ? placeholders
-	q := fmt.Sprintf(
-		"SELECT `_id`, `_version`, `_source`, CAST(`_doc` AS STRING) AS `_raw_doc`, `__DORIS_DELETE_SIGN__` FROM `%s`.`%s` WHERE `_id` IN (%s) ORDER BY `_version` ASC",
-		safeDB, safeTable, inClause,
-	)
-	// #nosec G701 -- parameterized IN query on strictly sanitized identifier
-	rows, err := b.db.QueryContext(ctx, q, args...)
-	if err != nil {
-		// #nosec G201 -- identifiers are strictly sanitized/backtick-escaped and values are bound via ? placeholders
-		qNoDoc := fmt.Sprintf(
-			"SELECT `_id`, `_version`, `_source`, `__DORIS_DELETE_SIGN__` FROM `%s`.`%s` WHERE `_id` IN (%s) ORDER BY `_version` ASC",
-			safeDB, safeTable, inClause,
-		)
+	candidates := []string{
+		fmt.Sprintf("SELECT `_id`, `_version`, `_source`, CAST(`_doc` AS STRING) AS `_raw_doc`, `_routing`, `__DORIS_DELETE_SIGN__` FROM `%s`.`%s` WHERE `_id` IN (%s) ORDER BY `_version` ASC", safeDB, safeTable, inClause),
+		fmt.Sprintf("SELECT `_id`, `_version`, `_source`, CAST(`_doc` AS STRING) AS `_raw_doc`, `__DORIS_DELETE_SIGN__` FROM `%s`.`%s` WHERE `_id` IN (%s) ORDER BY `_version` ASC", safeDB, safeTable, inClause),
+		fmt.Sprintf("SELECT `_id`, `_version`, `_source`, `_routing`, `__DORIS_DELETE_SIGN__` FROM `%s`.`%s` WHERE `_id` IN (%s) ORDER BY `_version` ASC", safeDB, safeTable, inClause),
+		fmt.Sprintf("SELECT `_id`, `_version`, `_source`, `__DORIS_DELETE_SIGN__` FROM `%s`.`%s` WHERE `_id` IN (%s) ORDER BY `_version` ASC", safeDB, safeTable, inClause),
+		fmt.Sprintf("SELECT `_id`, `_version`, `_source` FROM `%s`.`%s` WHERE `_id` IN (%s) ORDER BY `_version` ASC", safeDB, safeTable, inClause),
+	}
+	var rows *sql.Rows
+	var err error
+	for i, q := range candidates {
 		// #nosec G701 -- parameterized IN query on strictly sanitized identifier
-		if fbRows, fbErr := b.db.QueryContext(ctx, qNoDoc, args...); fbErr == nil {
-			rows = fbRows
+		r, qErr := b.db.QueryContext(ctx, q, args...)
+		if qErr == nil {
+			rows = r
 			err = nil
-		} else {
-			// #nosec G201 -- identifiers are strictly sanitized/backtick-escaped and values are bound via ? placeholders
-			qFallback := fmt.Sprintf(
-				"SELECT `_id`, `_version`, `_source` FROM `%s`.`%s` WHERE `_id` IN (%s) ORDER BY `_version` ASC",
-				safeDB, safeTable, inClause,
-			)
-			// #nosec G701 -- parameterized IN query on strictly sanitized identifier
-			if fbRows2, fbErr2 := b.db.QueryContext(ctx, qFallback, args...); fbErr2 == nil {
-				rows = fbRows2
-				err = nil
-			}
+			break
+		}
+		if i == 0 {
+			err = qErr
 		}
 	}
 	if err != nil {
@@ -797,32 +1275,24 @@ func (b *DorisSQLBackend) queryDocsBatchChunk(
 	}
 	defer func() { _ = rows.Close() }()
 	cols, _ := rows.Columns()
+	layout := classifyDocPointRowScanLayout(cols)
 	for rows.Next() {
 		var h HitRow
 		var nullSrc sql.NullString
 		var nullRawDoc sql.NullString
+		var nullRouting sql.NullString
 		var delSign sql.NullInt64
-		hasDelSignCol := false
-		switch {
-		case len(cols) >= 5:
-			hasDelSignCol = true
-			if err := rows.Scan(&h.ID, &h.Version, &nullSrc, &nullRawDoc, &delSign); err != nil {
-				return err
-			}
-		case len(cols) == 4:
-			hasDelSignCol = true
-			if err := rows.Scan(&h.ID, &h.Version, &nullSrc, &delSign); err != nil {
-				return err
-			}
-		default:
-			if err := rows.Scan(&h.ID, &h.Version, &nullSrc); err != nil {
-				return err
-			}
+		hasDelSignCol, scanErr := scanDocPointRow(rows, layout, &h, &nullSrc, &nullRawDoc, &nullRouting, &delSign)
+		if scanErr != nil {
+			return scanErr
 		}
 		if prevVer, seen := maxVer[h.ID]; seen && h.Version < prevVer {
 			continue
 		}
 		maxVer[h.ID] = h.Version
+		if nullRouting.Valid {
+			h.Routing = nullRouting.String
+		}
 		srcStr := nullSrc.String
 		var isDeleted bool
 		if hasDelSignCol && delSign.Valid {
@@ -1228,6 +1698,17 @@ func (b *DorisSQLBackend) ShowBackendsTelemetry(ctx context.Context) ([]DorisBac
 			Version:               firstNonEmptyCol(m, "version"),
 		}
 		nodes = append(nodes, node)
+	}
+	if b.streamLoad != nil && len(nodes) > 0 {
+		beHosts := make([]string, 0, len(nodes))
+		for _, node := range nodes {
+			if node.Host != "" {
+				beHosts = append(beHosts, node.Host)
+			}
+		}
+		if len(beHosts) > 0 {
+			b.streamLoad.AllowBEHosts(beHosts)
+		}
 	}
 	return nodes, nil
 }

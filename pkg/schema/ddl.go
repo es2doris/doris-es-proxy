@@ -79,6 +79,17 @@ func GenerateCreateTableDDL(s *IndexSchema) string {
 		if idxDef != "" {
 			idxs = append(idxs, "    "+idxDef)
 		}
+		for _, subB := range AggregateMetricSubColumns(b) {
+			if seenCols[subB.ColumnName] {
+				continue
+			}
+			seenCols[subB.ColumnName] = true
+			sCol, sIdx := buildColumnAndIndexDDL(subB)
+			cols = append(cols, "    "+sCol)
+			if sIdx != "" {
+				idxs = append(idxs, "    "+sIdx)
+			}
+		}
 	}
 
 	// 3. Nested Correlated Element Array Columns (`n__<nested_path> ARRAY<STRING>`)
@@ -141,6 +152,9 @@ func GenerateAlterTableDDL(oldSchema, newSchema *IndexSchema) []string {
 		}
 		for _, b := range oldSchema.Fields {
 			existingCols[b.ColumnName] = true
+			for _, subB := range AggregateMetricSubColumns(b) {
+				existingCols[subB.ColumnName] = true
+			}
 		}
 		for _, c := range oldSchema.NestedRoots {
 			existingCols[c] = true
@@ -225,6 +239,17 @@ func GenerateAlterTableDDL(oldSchema, newSchema *IndexSchema) []string {
 				"ALTER TABLE `%s`.`%s` ADD %s;",
 				newDBIdent, newTblIdent, idxDef,
 			))
+		}
+		for _, subB := range AggregateMetricSubColumns(b) {
+			if existingCols[subB.ColumnName] {
+				continue
+			}
+			existingCols[subB.ColumnName] = true
+			sCol, sIdx := buildColumnAndIndexDDL(subB)
+			stmts = append(stmts, fmt.Sprintf("ALTER TABLE `%s`.`%s` ADD COLUMN %s;", newDBIdent, newTblIdent, sCol))
+			if sIdx != "" {
+				stmts = append(stmts, fmt.Sprintf("ALTER TABLE `%s`.`%s` ADD %s;", newDBIdent, newTblIdent, sIdx))
+			}
 		}
 	}
 

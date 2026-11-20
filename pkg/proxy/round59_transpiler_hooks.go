@@ -627,6 +627,7 @@ func adoptConstantKeywordValuesFromDocsRound59(idxSchema *schema.IndexSchema, do
 		if hasAdopted {
 			fb.ConstantValue = adopted
 			fb.HasConstantValue = true
+			fb.AdoptedConstantValue = true
 			idxSchema.Fields[fname] = fb
 			if idxSchema.RawMapping != nil && idxSchema.RawMapping.Properties != nil {
 				setConstantKeywordValueInPropsRound59(idxSchema.RawMapping.Properties, strings.Split(fname, "."), adopted)

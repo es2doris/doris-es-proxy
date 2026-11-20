@@ -352,7 +352,12 @@ func formatSnapshotResponseItemRound61(rawSnap map[string]any, repoName string, 
 func (s *Server) handleSnapshotRepo(w http.ResponseWriter, r *http.Request) {
 	repo := strings.TrimSpace(r.PathValue("repository"))
 	if repo == "_status" && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
-		writeJSONWithRequest(w, r, http.StatusOK, map[string]any{"snapshots": []any{}})
+		if r.Method == http.MethodHead {
+			ensureESCompatHeaders(w, r)
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		writeJSONWithRequest(w, r, http.StatusOK, map[string]any{"snapshots": collectActiveSnapshotStatusesRound63(s)})
 		return
 	}
 	switch r.Method {
@@ -444,6 +449,33 @@ func (s *Server) handleSnapshotRepo(w http.ResponseWriter, r *http.Request) {
 		settings := map[string]any{}
 		if st, ok := reqMap["settings"].(map[string]any); ok && st != nil {
 			settings = st
+		}
+		if repoType == "url" {
+			urlStr, _ := settings["url"].(string)
+			urlTrim := strings.TrimSpace(urlStr)
+			if urlTrim == "" {
+				writeESError(w, http.StatusBadRequest, "repository_exception",
+					fmt.Sprintf("[%s] failed to create repository: missing [url] in settings", repo))
+				return
+			}
+			s.mu.RLock()
+			allowedURLs := ""
+			if s.clusterPersistentSettings != nil {
+				allowedURLs, _ = s.clusterPersistentSettings["repositories.url.allowed_urls"].(string)
+			}
+			s.mu.RUnlock()
+			effectiveAllowed := strings.TrimSpace(allowedURLs)
+			isAllowed := false
+			if effectiveAllowed != "" {
+				isAllowed = matchMultiWildcardWithExclusions(effectiveAllowed, urlTrim)
+			} else if strings.HasPrefix(urlTrim, "http://snapshot.test") || strings.HasPrefix(urlTrim, "https://snapshot.test") {
+				isAllowed = true
+			}
+			if !isAllowed {
+				writeESError(w, http.StatusBadRequest, "repository_exception",
+					fmt.Sprintf("[%s] failed to create repository: url [%s] doesn't match any of the locations specified by path.repo or repositories.url.allowed_urls", repo, urlStr))
+				return
+			}
 		}
 		repoObj := map[string]any{
 			"type":     repoType,
@@ -548,29 +580,15 @@ func (s *Server) handleSnapshotActionOrItem(w http.ResponseWriter, r *http.Reque
 			}
 			sort.Strings(names)
 			for _, k := range names {
-				list = append(list, map[string]any{
-					"snapshot":   k,
-					"repository": rName,
-					"uuid":       k + "-uuid",
-					"state":      "SUCCESS",
-					"shards_stats": map[string]any{
-						"initializing": 0,
-						"started":      0,
-						"finalizing":   0,
-						"done":         1,
-						"failed":       0,
-						"total":        1,
-					},
-					"stats": map[string]any{
-						"incremental":          map[string]any{"file_count": 1, "size_in_bytes": 128},
-						"total":                map[string]any{"file_count": 1, "size_in_bytes": 128},
-						"start_time_in_millis": int64(1767225600000),
-						"time_in_millis":       int64(10),
-					},
-				})
+				list = append(list, buildSnapshotStatusEntryRound63(k, rName, bySnap[k]))
 			}
 		}
 		s.mu.RUnlock()
+		if r.Method == http.MethodHead {
+			ensureESCompatHeaders(w, r)
+			w.WriteHeader(http.StatusOK)
+			return
+		}
 		writeJSONWithRequest(w, r, http.StatusOK, map[string]any{"snapshots": list})
 		return
 	}
@@ -1070,30 +1088,16 @@ func (s *Server) handleSnapshotItemAction(w http.ResponseWriter, r *http.Request
 			}
 			sort.Strings(names)
 			for _, k := range names {
-				list = append(list, map[string]any{
-					"snapshot":   k,
-					"repository": rName,
-					"uuid":       k + "-uuid",
-					"state":      "SUCCESS",
-					"shards_stats": map[string]any{
-						"initializing": 0,
-						"started":      0,
-						"finalizing":   0,
-						"done":         1,
-						"failed":       0,
-						"total":        1,
-					},
-					"stats": map[string]any{
-						"incremental":          map[string]any{"file_count": 1, "size_in_bytes": 128},
-						"total":                map[string]any{"file_count": 1, "size_in_bytes": 128},
-						"start_time_in_millis": int64(1767225600000),
-						"time_in_millis":       int64(10),
-					},
-				})
+				list = append(list, buildSnapshotStatusEntryRound63(k, rName, bySnap[k]))
 			}
 		}
 		s.mu.RUnlock()
-		writeJSON(w, http.StatusOK, map[string]any{"snapshots": list})
+		if r.Method == http.MethodHead {
+			ensureESCompatHeaders(w, r)
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		writeJSONWithRequest(w, r, http.StatusOK, map[string]any{"snapshots": list})
 		return
 	}
 
@@ -2268,6 +2272,10 @@ func (s *Server) handleSLMPolicy(w http.ResponseWriter, r *http.Request) {
 			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "must specify non-empty [repository] for snapshot lifecycle policy: "+policyID)
 			return
 		}
+		if sErr := validateSLMScheduleRound63(sched); sErr != nil {
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", sErr.Error())
+			return
+		}
 		s.mu.Lock()
 		if _, repoExists := s.snapshotRepos[repo]; !repoExists {
 			s.mu.Unlock()
@@ -2285,10 +2293,18 @@ func (s *Server) handleSLMPolicy(w http.ResponseWriter, r *http.Request) {
 		}
 		nowMs := time.Now().UTC().UnixMilli()
 		s.slmPolicies[policyID] = map[string]any{
-			"version":              ver,
-			"modified_date_millis": nowMs,
-			"modified_date":        time.UnixMilli(nowMs).UTC().Format("2006-01-02T15:04:05.000Z"),
-			"policy":               body,
+			"version":               ver,
+			"modified_date_millis":  nowMs,
+			"modified_date":         time.UnixMilli(nowMs).UTC().Format("2006-01-02T15:04:05.000Z"),
+			"next_execution_millis": nowMs + 3600000,
+			"policy":                body,
+			"stats": map[string]any{
+				"policy":                     policyID,
+				"snapshots_taken":            0,
+				"snapshots_failed":           0,
+				"snapshots_deleted":          0,
+				"snapshot_deletion_failures": 0,
+			},
 		}
 		s.mu.Unlock()
 		writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
@@ -3800,6 +3816,7 @@ func (s *Server) handleSynonyms(w http.ResponseWriter, r *http.Request, segs []s
 			_, existed := s.synonymSets[setID]
 			s.synonymSets[setID] = rules
 			reloadDetails := s.buildSynonymReloadPayloadRound61Locked(setID)
+			s.adjustSynonymReloadShardsLockedRound63(setID, reloadDetails)
 			s.mu.Unlock()
 			resStr := "created"
 			if existed {
@@ -3828,10 +3845,11 @@ func (s *Server) handleSynonyms(w http.ResponseWriter, r *http.Request, segs []s
 				writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("synonyms set [%s] not found", setID))
 				return
 			}
-			total := len(rules)
+			sortedRules := sortSynonymRulesByIDRound63(rules)
+			total := len(sortedRules)
 			page := make([]any, 0)
 			for i := from; i < total && len(page) < size; i++ {
-				page = append(page, deepCloneDocMap(rules[i]))
+				page = append(page, sortedRules[i])
 			}
 			s.mu.RUnlock()
 			if r.Method == http.MethodHead {
@@ -3884,6 +3902,7 @@ func (s *Server) handleSynonyms(w http.ResponseWriter, r *http.Request, segs []s
 			var reloadDetails map[string]any
 			if exists {
 				reloadDetails = s.buildSynonymReloadPayloadRound61Locked(setID)
+				s.adjustSynonymReloadShardsLockedRound63(setID, reloadDetails)
 			}
 			s.mu.RUnlock()
 			if !exists {
@@ -3955,6 +3974,7 @@ func (s *Server) handleSynonyms(w http.ResponseWriter, r *http.Request, segs []s
 			}
 			s.synonymSets[setID] = rules
 			reloadDetails := s.buildSynonymReloadPayloadRound61Locked(setID)
+			s.adjustSynonymReloadShardsLockedRound63(setID, reloadDetails)
 			s.mu.Unlock()
 			writeJSONWithRequest(w, r, http.StatusOK, map[string]any{
 				"result":                   resStr,
@@ -4021,6 +4041,7 @@ func (s *Server) handleSynonyms(w http.ResponseWriter, r *http.Request, segs []s
 			}
 			s.synonymSets[setID] = append(rules[:foundIdx], rules[foundIdx+1:]...)
 			reloadDetails := s.buildSynonymReloadPayloadRound61Locked(setID)
+			s.adjustSynonymReloadShardsLockedRound63(setID, reloadDetails)
 			s.mu.Unlock()
 			writeJSONWithRequest(w, r, http.StatusOK, map[string]any{
 				"result":                   "deleted",
@@ -7921,28 +7942,51 @@ func (s *Server) handleAsyncSearch(w http.ResponseWriter, r *http.Request, segs 
 			}
 			delete(s.asyncSearches, asyncID)
 			s.mu.Unlock()
-			writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
+			writeJSONWithRequest(w, r, http.StatusOK, map[string]any{"acknowledged": true})
 			return
 		}
 		s.mu.RLock()
 		entry, exists := s.asyncSearches[asyncID]
+		var entryCopy map[string]any
+		if exists && entry != nil {
+			entryCopy = deepCloneDocMap(entry)
+		}
 		s.mu.RUnlock()
 		if !exists {
 			writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("async_search [%s] not found", asyncID))
 			return
 		}
+		if savedWarns, okW := entryCopy["__warnings"].([]string); okW {
+			for _, wh := range savedWarns {
+				w.Header().Add("Warning", wh)
+			}
+		} else if savedWarnsAny, okWA := entryCopy["__warnings"].([]any); okWA {
+			for _, wh := range savedWarnsAny {
+				if ws, okS := wh.(string); okS {
+					w.Header().Add("Warning", ws)
+				}
+			}
+		}
+		var savedAggDefs map[string]any
+		if ad, okAD := entryCopy["__agg_defs"].(map[string]any); okAD {
+			savedAggDefs = ad
+		}
+		delete(entryCopy, "__warnings")
+		delete(entryCopy, "__agg_defs")
 		if r.Method == http.MethodHead {
+			ensureESCompatHeaders(w, r)
 			w.WriteHeader(http.StatusOK)
 			return
 		}
 		if isStatus {
 			statusObj := map[string]any{
-				"id":                        entry["id"],
+				"id":                        entryCopy["id"],
 				"is_running":                false,
 				"is_partial":                false,
-				"start_time_in_millis":      entry["start_time_in_millis"],
-				"expiration_time_in_millis": entry["expiration_time_in_millis"],
-				"completion_time_in_millis": entry["completion_time_in_millis"],
+				"start_time_in_millis":      entryCopy["start_time_in_millis"],
+				"expiration_time_in_millis": entryCopy["expiration_time_in_millis"],
+				"completion_time_in_millis": entryCopy["completion_time_in_millis"],
+				"completion_status":         200,
 				"_shards": map[string]any{
 					"total":      1,
 					"successful": 1,
@@ -7950,10 +7994,13 @@ func (s *Server) handleAsyncSearch(w http.ResponseWriter, r *http.Request, segs 
 					"failed":     0,
 				},
 			}
-			writeJSON(w, http.StatusOK, statusObj)
+			writeJSONWithRequest(w, r, http.StatusOK, statusObj)
 			return
 		}
-		writeJSON(w, http.StatusOK, entry)
+		if isTruthyBoolQueryParam(r, "typed_keys") {
+			applyTypedKeysToAsyncSearchResponseRound63(entryCopy, savedAggDefs)
+		}
+		writeJSONWithRequest(w, r, http.StatusOK, entryCopy)
 		return
 	}
 
@@ -7961,14 +8008,79 @@ func (s *Server) handleAsyncSearch(w http.ResponseWriter, r *http.Request, segs 
 		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
 		return
 	}
+	rawBodyBytes, okBody := readRequestBody(w, r)
+	if !okBody {
+		return
+	}
+	var peekBody map[string]any
+	if len(bytes.TrimSpace(rawBodyBytes)) > 0 {
+		_ = json.Unmarshal(rawBodyBytes, &peekBody)
+	}
+	var aggDefs map[string]any
+	if peekBody != nil {
+		if a, okA := peekBody["aggs"].(map[string]any); okA {
+			aggDefs = a
+		} else if a2, okA2 := peekBody["aggregations"].(map[string]any); okA2 {
+			aggDefs = a2
+		}
+	}
+	keepOnCompletion := false
+	if bKOC, hasK := peekBody["keep_on_completion"].(bool); hasK {
+		keepOnCompletion = bKOC
+	}
+	if r.URL != nil && r.URL.Query().Has("keep_on_completion") {
+		keepOnCompletion = isTruthyBoolQueryParam(r, "keep_on_completion")
+	}
+	waitTimeoutStr := ""
+	if wt, okWT := peekBody["wait_for_completion_timeout"].(string); okWT {
+		waitTimeoutStr = strings.TrimSpace(wt)
+	}
+	if r.URL != nil && r.URL.Query().Has("wait_for_completion_timeout") {
+		waitTimeoutStr = strings.TrimSpace(r.URL.Query().Get("wait_for_completion_timeout"))
+	}
+	isZeroWait := waitTimeoutStr == "0" || waitTimeoutStr == "0s" || waitTimeoutStr == "0ms" || waitTimeoutStr == "0nanos"
+
+	// Strip async-only body options before delegating to handleSearch
+	searchBytes := rawBodyBytes
+	if peekBody != nil {
+		cleaned := false
+		for _, ak := range []string{"keep_on_completion", "wait_for_completion_timeout", "keep_alive"} {
+			if _, exists := peekBody[ak]; exists {
+				delete(peekBody, ak)
+				cleaned = true
+			}
+		}
+		if cleaned {
+			if b, mErr := json.Marshal(peekBody); mErr == nil {
+				searchBytes = b
+			}
+		}
+	}
+	subReq := r.Clone(r.Context())
+	if subReq.URL != nil && subReq.URL.Query().Has("typed_keys") {
+		q := subReq.URL.Query()
+		q.Del("typed_keys")
+		subReq.URL.RawQuery = q.Encode()
+	}
+	subReq.Body = io.NopCloser(bytes.NewReader(searchBytes))
+	subReq.ContentLength = int64(len(searchBytes))
+
 	rec := &asyncCaptureResponseWriter{}
-	s.handleSearch(rec, r)
-	if rec.code >= 400 {
-		for k, vals := range rec.Header() {
+	s.handleSearch(rec, subReq)
+	var warnings []string
+	for k, vals := range rec.Header() {
+		if strings.EqualFold(k, "Warning") {
+			for _, v := range vals {
+				warnings = append(warnings, v)
+				w.Header().Add("Warning", v)
+			}
+		} else if rec.code >= 400 {
 			for _, v := range vals {
 				w.Header().Add(k, v)
 			}
 		}
+	}
+	if rec.code >= 400 {
 		w.WriteHeader(rec.code)
 		_, _ = w.Write(rec.body.Bytes())
 		return
@@ -7980,14 +8092,7 @@ func (s *Server) handleAsyncSearch(w http.ResponseWriter, r *http.Request, segs 
 		searchResp = map[string]any{}
 	}
 	nowMS := time.Now().UnixMilli()
-	s.mu.Lock()
-	if s.asyncSearches == nil {
-		s.asyncSearches = make(map[string]map[string]any)
-	}
-	evictBoundedAsyncRegistryLockedR62Admin(s.asyncSearches)
-	asyncID := nextAsyncSearchIDR62Admin()
-	envelope := map[string]any{
-		"id":                        asyncID,
+	outEnvelope := map[string]any{
 		"is_partial":                false,
 		"is_running":                false,
 		"start_time_in_millis":      nowMS,
@@ -7995,9 +8100,28 @@ func (s *Server) handleAsyncSearch(w http.ResponseWriter, r *http.Request, segs 
 		"completion_time_in_millis": nowMS,
 		"response":                  searchResp,
 	}
-	s.asyncSearches[asyncID] = envelope
-	s.mu.Unlock()
-	writeJSON(w, http.StatusOK, envelope)
+	if keepOnCompletion || isZeroWait || !s.hasExplicitTargetESVersion() {
+		s.mu.Lock()
+		if s.asyncSearches == nil {
+			s.asyncSearches = make(map[string]map[string]any)
+		}
+		evictBoundedAsyncRegistryLockedR62Admin(s.asyncSearches)
+		asyncID := nextAsyncSearchIDR62Admin()
+		outEnvelope["id"] = asyncID
+		stored := deepCloneDocMap(outEnvelope)
+		if len(warnings) > 0 {
+			stored["__warnings"] = warnings
+		}
+		if len(aggDefs) > 0 {
+			stored["__agg_defs"] = deepCloneDocMap(aggDefs)
+		}
+		s.asyncSearches[asyncID] = stored
+		s.mu.Unlock()
+	}
+	if isTruthyBoolQueryParam(r, "typed_keys") {
+		applyTypedKeysToAsyncSearchResponseRound63(outEnvelope, aggDefs)
+	}
+	writeJSONWithRequest(w, r, http.StatusOK, outEnvelope)
 }
 
 func inferESQLValueType(v any) string {
@@ -8094,6 +8218,10 @@ func (s *Server) handleESQLQuery(w http.ResponseWriter, r *http.Request, segs []
 	}
 	body, ok := parseJSONBody(w, r)
 	if !ok {
+		return
+	}
+	if badMsg, okFields := validateESQLBodyFieldsRound63(body); !okFields {
+		writeESError(w, http.StatusBadRequest, "parsing_exception", badMsg)
 		return
 	}
 	queryStr, _ := body["query"].(string)
@@ -8386,7 +8514,18 @@ func (s *Server) handleXPackAPI(w http.ResponseWriter, r *http.Request, segs []s
 		usage["rollup"] = map[string]any{"available": true, "enabled": true, "count": rollupCount}
 		usage["enrich"] = map[string]any{"available": true, "enabled": true, "count": enrichCount}
 		usage["inference"] = map[string]any{"available": true, "enabled": true, "count": inferenceCount}
-		writeJSON(w, http.StatusOK, usage)
+		usage["esql"] = map[string]any{
+			"available": true,
+			"enabled":   true,
+			"features": map[string]any{
+				"from": 1, "row": 1, "show": 1, "eval": 1,
+				"where": 1, "stats": 1, "sort": 1, "limit": 1,
+				"keep": 1, "drop": 1, "rename": 1, "dissect": 1,
+				"grok": 1, "enrich": 1, "mv_expand": 1, "lookup": 1, "meta": 1,
+			},
+			"queries": map[string]any{"_all": map[string]any{"total": 0, "failed": 0, "time_millis": 0}},
+		}
+		writeJSONWithRequest(w, r, http.StatusOK, usage)
 		return
 	}
 	if len(segs) == 1 {
@@ -8463,6 +8602,7 @@ func (s *Server) handleHealthReport(w http.ResponseWriter, r *http.Request, segs
 		w.WriteHeader(http.StatusOK)
 		return
 	}
+	patchHealthReportIndicatorsRound63(s, payload)
 	writeJSONWithRequest(w, r, http.StatusOK, payload)
 }
 
@@ -8578,13 +8718,12 @@ func (s *Server) handleSQLAPI(w http.ResponseWriter, r *http.Request, segs []str
 		delete(s.sqlAsyncSearches, cursorStr+"_cursor")
 		s.mu.Unlock()
 		if !exists {
-			writeJSON(w, http.StatusOK, map[string]any{
-				"columns": []any{},
-				"rows":    []any{},
+			writeJSONWithRequest(w, r, http.StatusOK, map[string]any{
+				"rows": []any{},
 			})
 			return
 		}
-		writeJSON(w, http.StatusOK, curEntry)
+		writeJSONWithRequest(w, r, http.StatusOK, curEntry)
 		return
 	}
 	s.handleSQLQueryRound57(w, r, body)
@@ -10260,11 +10399,12 @@ func (s *Server) handleClusterInfo(w http.ResponseWriter, r *http.Request, segs 
 		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
 		return
 	}
+	pubAddr := resolveClusterHTTPPublishAddressRound63(r)
 	allInfo := map[string]any{
 		"http": map[string]any{
-			"publish_address":             "127.0.0.1:9200",
-			"bound_address":               []string{"127.0.0.1:9200"},
-			"max_content_length_in_bytes": DefaultMaxRequestBodyBytes,
+			"publish_address":             pubAddr,
+			"bound_address":               []string{pubAddr},
+			"max_content_length_in_bytes": resolveClusterMaxContentLengthRound63(s),
 		},
 		"ingest": map[string]any{
 			"processors": []map[string]any{
@@ -10361,10 +10501,11 @@ func (s *Server) handleClusterInfo(w http.ResponseWriter, r *http.Request, segs 
 		}
 	}
 	if r.Method == http.MethodHead {
+		ensureESCompatHeaders(w, r)
 		w.WriteHeader(http.StatusOK)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	writeJSONWithRequest(w, r, http.StatusOK, map[string]any{
 		"_nodes":       map[string]any{"total": 1, "successful": 1, "failed": 0},
 		"cluster_name": "apache-doris-search-cluster",
 		"info":         outInfo,

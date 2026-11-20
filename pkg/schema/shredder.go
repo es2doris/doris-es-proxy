@@ -131,6 +131,13 @@ func ShredDocumentWithNow(
 	row["_id"] = id
 	row["_version"] = version
 	row["__DORIS_DELETE_SIGN__"] = 0
+	if sizeB, hasSize := s.Fields["_size"]; hasSize && sizeB.ColumnName != "" {
+		rawLen := len(rawSource)
+		if rawLen == 0 {
+			rawLen = len(trimmed)
+		}
+		row[sizeB.ColumnName] = int64(rawLen)
+	}
 	if s.SourceDisabled() {
 		row["_source"] = ""
 	} else if inc, exc := s.SourceIncludesExcludes(); len(inc) > 0 || len(exc) > 0 {
@@ -289,8 +296,21 @@ func ShredDocumentWithNow(
 	}
 
 	for _, b := range fieldsToVisit {
+		if b.ESFieldPath == "_size" || b.ESFieldPath == "_tsid" {
+			continue
+		}
 		b = s.withEffectiveDefaults(b)
 		if b.EnabledFalse {
+			continue
+		}
+		if b.ESType == "aggregate_metric_double" {
+			mod, err := shredAggregateMetricDoubleBinding(parsedDoc, b, row, recordIgnored)
+			if err != nil {
+				return nil, err
+			}
+			if mod {
+				prunedDynamic = true
+			}
 			continue
 		}
 		if b.ESType == "rank_feature" && hasArrayValueAtPath(parsedDoc, b.SourceJSONPath) {
@@ -305,7 +325,7 @@ func ShredDocumentWithNow(
 		}
 		hasObjAtPath := false
 		if isStrictLeafFieldWithoutSubprops(s, b) && hasObjectValueAtPath(parsedDoc, b.SourceJSONPath) {
-			if b.IgnoreMalformed != nil && *b.IgnoreMalformed {
+			if !s.ES8Mode && !s.SyntheticSource && !isTypedNonStringBinding(b) && b.IgnoreMalformed != nil && *b.IgnoreMalformed {
 				recordIgnored(b.ESFieldPath)
 				hasObjAtPath = true
 			} else {
@@ -532,8 +552,12 @@ func ShredDocumentWithNow(
 							continue
 						}
 					}
-					if strVal, isStr := rv.(string); isStr && strings.TrimSpace(strVal) == "" && b.ESType != "token_count" && b.ESType != "rank_feature" && (b.Coerce == nil || *b.Coerce) && (b.ESType == "ip" || b.ESType == "geo_point" || (b.DorisType != DorisString && b.DorisType != DorisVarchar)) {
-						continue
+					if strVal, isStr := rv.(string); isStr && strings.TrimSpace(strVal) == "" && b.ESType != "token_count" && b.ESType != "murmur3" && b.ESType != "rank_feature" && (b.Coerce == nil || *b.Coerce) && (b.ESType == "ip" || b.ESType == "geo_point" || (b.DorisType != DorisString && b.DorisType != DorisVarchar)) {
+						if b.NullValue != nil {
+							rv = b.NullValue
+						} else {
+							continue
+						}
 					}
 					coerced := coerceScalarBindingForDoris(rv, b, getNow())
 					if coerced == nil {
@@ -593,8 +617,12 @@ func ShredDocumentWithNow(
 				}
 			}
 			if val != nil {
-				if strVal, isStr := val.(string); isStr && strings.TrimSpace(strVal) == "" && b.ESType != "token_count" && b.ESType != "rank_feature" && (b.Coerce == nil || *b.Coerce) && (b.ESType == "ip" || b.ESType == "geo_point" || (b.DorisType != DorisString && b.DorisType != DorisVarchar)) {
-					val = nil
+				if strVal, isStr := val.(string); isStr && strings.TrimSpace(strVal) == "" && b.ESType != "token_count" && b.ESType != "murmur3" && b.ESType != "rank_feature" && (b.Coerce == nil || *b.Coerce) && (b.ESType == "ip" || b.ESType == "geo_point" || (b.DorisType != DorisString && b.DorisType != DorisVarchar)) {
+					if b.NullValue != nil {
+						val = coerceScalarBindingForDoris(b.NullValue, b, getNow())
+					} else {
+						val = nil
+					}
 				} else {
 					coerced := coerceScalarBindingForDoris(val, b, getNow())
 					if coerced == nil {
@@ -631,7 +659,7 @@ func ShredDocumentWithNow(
 						checkB.VectorDims = docLockedDims
 						checkB.AutoDims = false
 					}
-					vec, present, vecErr := extractAndValidateTypedVectorValues(elem.m, b.RelativeJSONPath, checkB)
+					vec, present, vecErr := extractAndValidateTypedVectorValuesWithMode(elem.m, b.RelativeJSONPath, checkB, s.ES8Mode)
 					if present {
 						if vecErr != nil {
 							if b.IgnoreMalformed != nil && *b.IgnoreMalformed {
@@ -700,8 +728,12 @@ func ShredDocumentWithNow(
 					if rv == nil {
 						continue
 					}
-					if strVal, isStr := rv.(string); isStr && strings.TrimSpace(strVal) == "" && b.ESType != "token_count" && b.ESType != "version" && b.ESType != "rank_feature" && (b.Coerce == nil || *b.Coerce) {
-						continue
+					if strVal, isStr := rv.(string); isStr && strings.TrimSpace(strVal) == "" && b.ESType != "token_count" && b.ESType != "murmur3" && b.ESType != "version" && b.ESType != "rank_feature" && (b.Coerce == nil || *b.Coerce) {
+						if b.NullValue != nil {
+							rv = b.NullValue
+						} else {
+							continue
+						}
 					}
 					coerced := coerceScalarBindingForDoris(rv, b, getNow())
 					if coerced == nil {
@@ -789,7 +821,7 @@ func ShredDocumentWithNow(
 			if latestB, okLatest := s.Fields[b.ESFieldPath]; okLatest {
 				curVecB = s.withEffectiveDefaults(latestB)
 			}
-			vec, present, vecErr := extractAndValidateTypedVectorValues(parsedDoc, curVecB.SourceJSONPath, curVecB)
+			vec, present, vecErr := extractAndValidateTypedVectorValuesWithMode(parsedDoc, curVecB.SourceJSONPath, curVecB, s.ES8Mode)
 			if present {
 				if vecErr != nil {
 					if curVecB.IgnoreMalformed != nil && *curVecB.IgnoreMalformed {
@@ -1176,10 +1208,15 @@ func ShredDocumentWithNow(
 			}
 		}
 	}
+	ignoredSrcMap := extractExcessDynamicFieldsToIgnoredSource(s, parsedDoc)
 	var allTextBuilder strings.Builder
 	allTextBuilder.Grow(len(trimmed) / 2)
 	collectAllTextWithSchema(parsedDoc, s, nil, &allTextBuilder)
 	row["_all_text"] = allTextBuilder.String()
+	if len(ignoredSrcMap) > 0 {
+		parsedDoc["__ignored_source"] = ignoredSrcMap
+		prunedDynamic = true
+	}
 	row["_doc"] = buildVariantDocPayload(trimmed, parsedDoc, prunedDynamic, s)
 	if (s.SyntheticSource || isImplicitSynthMode) && !s.SourceDisabled() && !strings.EqualFold(s.SourceMode, "stored") {
 		srcInput := origDocForSynthetic
@@ -1197,7 +1234,7 @@ func ShredDocumentWithNow(
 
 func isTypedNonStringBinding(b FieldBinding) bool {
 	switch b.ESType {
-	case "long", "unsigned_long", "integer", "short", "byte", "token_count", "double", "float", "half_float", "scaled_float", "rank_feature", "date", "date_nanos", "boolean", "ip", "geo_point", "version":
+	case "long", "unsigned_long", "integer", "short", "byte", "token_count", "murmur3", "double", "float", "half_float", "scaled_float", "rank_feature", "date", "date_nanos", "boolean", "ip", "geo_point", "version":
 		return true
 	}
 	switch b.DorisType {
@@ -1698,6 +1735,23 @@ func coerceScalarBindingForDoris(val any, b FieldBinding, now time.Time) any {
 			return total
 		}
 	}
+	if b.ESType == "murmur3" {
+		if val == nil {
+			return nil
+		}
+		switch v := val.(type) {
+		case string:
+			return ComputeESMurmur3Hash(v)
+		case json.Number:
+			return ComputeESMurmur3Hash(v.String())
+		case bool:
+			return ComputeESMurmur3Hash(strconv.FormatBool(v))
+		case int, int64, uint64, float64, float32:
+			return ComputeESMurmur3Hash(fmt.Sprintf("%v", v))
+		default:
+			return nil
+		}
+	}
 	effDorisType := b.DorisType
 	if (effDorisType == DorisString || effDorisType == "") && b.ESType != "" {
 		effDorisType = mapESTypeToDoris(b.ESType)
@@ -1749,7 +1803,16 @@ func coerceScalarBindingForDoris(val any, b FieldBinding, now time.Time) any {
 	}
 	if b.ESType == "version" {
 		strVal, ok := val.(string)
-		if !ok || !ValidateSemver(strVal) {
+		if !ok {
+			return nil
+		}
+		if b.ES8Mode {
+			if strVal == "" || strings.TrimSpace(strVal) != strVal {
+				return nil
+			}
+			return strVal
+		}
+		if !ValidateSemver(strVal) {
 			return nil
 		}
 		return strVal
@@ -2625,10 +2688,14 @@ func ESDateFormatToGoLayout(pattern string) string {
 			b.WriteString("5")
 		case "SSS":
 			b.WriteString("000")
-		case "Z":
+		case "Z", "ZZ", "ZZZ":
 			b.WriteString("-0700")
-		case "X", "XX", "XXX":
+		case "ZZZZ", "ZZZZZ", "X", "XX", "XXX", "XXXX", "XXXXX":
 			b.WriteString("Z07:00")
+		case "x", "xx":
+			b.WriteString("-0700")
+		case "xxx", "xxxx", "xxxxx":
+			b.WriteString("-07:00")
 		default:
 			if ch == 'S' && len(token) >= 1 && len(token) <= 9 {
 				b.WriteString(strings.Repeat("0", len(token)))
@@ -2733,6 +2800,9 @@ func ParseESDateBoundWithFormatToEpochMillis(input, format string, now time.Time
 					return finalizeFormatMatch(t, isDateOnlyString(prefix))
 				}
 			default:
+				if wt, wDateOnly, okW := parseESWeekDatePatternR63(prefix, fmtPart); okW {
+					return finalizeFormatMatch(wt, wDateOnly)
+				}
 				layout := ESDateFormatToGoLayout(fmtPart)
 				if layout != "" {
 					if t, err := time.Parse(layout, prefix); err == nil {
@@ -2853,6 +2923,9 @@ func ParseESDateBoundWithFormatToEpochNanos(input, format string, now time.Time,
 					return finalizeFormatMatchNanos(t, isDateOnlyString(prefix))
 				}
 			default:
+				if wt, wDateOnly, okW := parseESWeekDatePatternR63(prefix, fmtPart); okW {
+					return finalizeFormatMatchNanos(wt, wDateOnly)
+				}
 				layout := ESDateFormatToGoLayout(fmtPart)
 				if layout != "" {
 					if t, err := time.Parse(layout, prefix); err == nil {
@@ -2865,6 +2938,210 @@ func ParseESDateBoundWithFormatToEpochNanos(input, format string, now time.Time,
 		return 0, false
 	}
 	return ParseESDateBoundToEpochNanos(s, now, roundUp)
+}
+
+func parseESWeekDatePatternR63(input, pat string) (time.Time, bool, bool) {
+	hasWeekTok := false
+	hasTimeTok := false
+	inQ := false
+	for i := 0; i < len(pat); i++ {
+		if pat[i] == '\'' {
+			inQ = !inQ
+			continue
+		}
+		if !inQ {
+			if pat[i] == 'Y' || pat[i] == 'w' {
+				hasWeekTok = true
+			}
+			if strings.ContainsRune("HhmsSn", rune(pat[i])) {
+				hasTimeTok = true
+			}
+		}
+	}
+	if !hasWeekTok {
+		return time.Time{}, false, false
+	}
+	type fieldRef struct {
+		letter byte
+		width  int
+	}
+	var regexBuf strings.Builder
+	regexBuf.WriteByte('^')
+	var fields []fieldRef
+	for i := 0; i < len(pat); {
+		if pat[i] == '\'' {
+			if i+1 < len(pat) && pat[i+1] == '\'' {
+				regexBuf.WriteString(regexp.QuoteMeta("'"))
+				i += 2
+				continue
+			}
+			endQ := strings.IndexByte(pat[i+1:], '\'')
+			if endQ < 0 {
+				return time.Time{}, false, false
+			}
+			regexBuf.WriteString(regexp.QuoteMeta(pat[i+1 : i+1+endQ]))
+			i += endQ + 2
+			continue
+		}
+		ch := pat[i]
+		j := i + 1
+		for j < len(pat) && pat[j] == ch {
+			j++
+		}
+		cnt := j - i
+		switch ch {
+		case 'Y', 'y', 'u', 'x':
+			if ch == 'x' && cnt <= 3 && len(fields) > 0 {
+				regexBuf.WriteString(`(Z|[+-]\d{2}:?\d{2})`)
+				fields = append(fields, fieldRef{letter: 'Z', width: cnt})
+			} else {
+				if cnt == 2 {
+					regexBuf.WriteString(`(\d{2})`)
+				} else {
+					_, _ = fmt.Fprintf(&regexBuf, `([+-]?\d{%d,})`, cnt)
+				}
+				fields = append(fields, fieldRef{letter: 'Y', width: cnt})
+			}
+		case 'w':
+			regexBuf.WriteString(`(\d{1,2})`)
+			fields = append(fields, fieldRef{letter: 'w', width: cnt})
+		case 'e', 'c':
+			regexBuf.WriteString(`([1-7])`)
+			fields = append(fields, fieldRef{letter: 'e', width: cnt})
+		case 'E':
+			regexBuf.WriteString(`([A-Za-z]+)`)
+			fields = append(fields, fieldRef{letter: 'E', width: cnt})
+		case 'H':
+			regexBuf.WriteString(`(\d{1,2})`)
+			fields = append(fields, fieldRef{letter: 'H', width: cnt})
+		case 'm':
+			regexBuf.WriteString(`(\d{1,2})`)
+			fields = append(fields, fieldRef{letter: 'm', width: cnt})
+		case 's':
+			regexBuf.WriteString(`(\d{1,2})`)
+			fields = append(fields, fieldRef{letter: 's', width: cnt})
+		case 'S', 'n':
+			regexBuf.WriteString(`(\d{1,9})`)
+			fields = append(fields, fieldRef{letter: 'S', width: cnt})
+		case 'Z', 'X':
+			regexBuf.WriteString(`(Z|[+-]\d{2}:?\d{2})`)
+			fields = append(fields, fieldRef{letter: 'Z', width: cnt})
+		default:
+			regexBuf.WriteString(regexp.QuoteMeta(pat[i:j]))
+		}
+		i = j
+	}
+	regexBuf.WriteByte('$')
+	re, err := regexp.Compile(regexBuf.String())
+	if err != nil {
+		return time.Time{}, false, false
+	}
+	m := re.FindStringSubmatch(strings.TrimSpace(input))
+	if m == nil || len(m) != len(fields)+1 {
+		return time.Time{}, false, false
+	}
+	weekYear, weekNum, isoDOW := 1970, 1, 1
+	hour, minute, sec, nsec := 0, 0, 0, 0
+	loc := time.UTC
+	for idx, f := range fields {
+		raw := m[idx+1]
+		switch f.letter {
+		case 'Y':
+			v, err := strconv.Atoi(raw)
+			if err != nil {
+				return time.Time{}, false, false
+			}
+			if f.width == 2 {
+				if v >= 70 {
+					v += 1900
+				} else {
+					v += 2000
+				}
+			}
+			weekYear = v
+		case 'w':
+			v, err := strconv.Atoi(raw)
+			if err != nil || v < 1 || v > 53 {
+				return time.Time{}, false, false
+			}
+			weekNum = v
+		case 'e':
+			v, err := strconv.Atoi(raw)
+			if err != nil || v < 1 || v > 7 {
+				return time.Time{}, false, false
+			}
+			isoDOW = v
+		case 'E':
+			low := strings.ToLower(raw)
+			switch {
+			case strings.HasPrefix(low, "mon"):
+				isoDOW = 1
+			case strings.HasPrefix(low, "tue"):
+				isoDOW = 2
+			case strings.HasPrefix(low, "wed"):
+				isoDOW = 3
+			case strings.HasPrefix(low, "thu"):
+				isoDOW = 4
+			case strings.HasPrefix(low, "fri"):
+				isoDOW = 5
+			case strings.HasPrefix(low, "sat"):
+				isoDOW = 6
+			case strings.HasPrefix(low, "sun"):
+				isoDOW = 7
+			default:
+				return time.Time{}, false, false
+			}
+		case 'H':
+			v, err := strconv.Atoi(raw)
+			if err != nil || v < 0 || v > 23 {
+				return time.Time{}, false, false
+			}
+			hour = v
+		case 'm':
+			v, err := strconv.Atoi(raw)
+			if err != nil || v < 0 || v > 59 {
+				return time.Time{}, false, false
+			}
+			minute = v
+		case 's':
+			v, err := strconv.Atoi(raw)
+			if err != nil || v < 0 || v > 59 {
+				return time.Time{}, false, false
+			}
+			sec = v
+		case 'S':
+			padded := raw + strings.Repeat("0", max(0, 9-len(raw)))
+			if v, err := strconv.Atoi(padded[:9]); err == nil {
+				nsec = v
+			}
+		case 'Z':
+			if raw != "Z" && len(raw) >= 3 && (raw[0] == '+' || raw[0] == '-') {
+				clean := strings.ReplaceAll(raw[1:], ":", "")
+				if len(clean) == 2 {
+					clean += "00"
+				}
+				if len(clean) == 4 {
+					hh, e1 := strconv.Atoi(clean[:2])
+					mm, e2 := strconv.Atoi(clean[2:4])
+					if e1 == nil && e2 == nil {
+						off := hh*3600 + mm*60
+						if raw[0] == '-' {
+							off = -off
+						}
+						loc = time.FixedZone(raw, off)
+					}
+				}
+			}
+		}
+	}
+	jan4 := time.Date(weekYear, time.January, 4, 0, 0, 0, 0, loc)
+	jan4ISO := int(jan4.Weekday())
+	if jan4ISO == 0 {
+		jan4ISO = 7
+	}
+	week1Monday := jan4.AddDate(0, 0, -(jan4ISO - 1))
+	targetDate := week1Monday.AddDate(0, 0, (weekNum-1)*7+(isoDOW-1))
+	return time.Date(targetDate.Year(), targetDate.Month(), targetDate.Day(), hour, minute, sec, nsec, loc), !hasTimeTok, true
 }
 
 // ParseESDateBoundToEpochNanos parses default-format `date_nanos` inputs (`strict_date_optional_time_nanos||epoch_millis`,
@@ -3884,7 +4161,7 @@ func deletePathInMap(curr map[string]any, path []string) bool {
 
 func isStrictLeafESType(esType string) bool {
 	switch strings.ToLower(strings.TrimSpace(esType)) {
-	case "text", "match_only_text", "keyword", "constant_keyword", "wildcard", "ip",
+	case "text", "match_only_text", "keyword", "constant_keyword", "counted_keyword", "wildcard", "ip", "murmur3",
 		"long", "unsigned_long", "integer", "short", "byte", "token_count",
 		"double", "float", "half_float", "scaled_float", "rank_feature", "boolean", "date", "date_nanos",
 		"version", "search_as_you_type", "annotated-text", "annotated_text":
@@ -4009,6 +4286,9 @@ func collectAllTextWithSchema(node any, s *IndexSchema, curPath []string, sb *st
 		}
 		sort.Strings(keys)
 		for _, k := range keys {
+			if k == "__ignored_source" {
+				continue
+			}
 			if k == "_r" && len(curPath) > 0 && s != nil && IsRangeFieldType(s.ResolveField(strings.Join(curPath, ".")).ESType) {
 				continue
 			}
@@ -4131,8 +4411,16 @@ func parseExactVectorSignedByte(elem any) (int64, bool) {
 }
 
 func extractAndValidateTypedVectorValues(node any, path []string, b FieldBinding) ([]float64, bool, error) {
+	return extractAndValidateTypedVectorValuesWithMode(node, path, b, true)
+}
+
+func extractAndValidateTypedVectorValuesWithMode(node any, path []string, b FieldBinding, es8Mode bool) ([]float64, bool, error) {
 	if node == nil {
 		return nil, false, nil
+	}
+	dimErrPfx := "mapper_parsing_exception"
+	if es8Mode {
+		dimErrPfx = "document_parsing_exception"
 	}
 	if len(path) == 0 {
 		elemType := strings.ToLower(strings.TrimSpace(b.VectorElementType))
@@ -4149,7 +4437,7 @@ func extractAndValidateTypedVectorValues(node any, path []string, b FieldBinding
 					return nil, true, fmt.Errorf("mapper_parsing_exception: failed to parse bit vector field [%s]: %w", b.ESFieldPath, err)
 				}
 				if dims > 0 && len(bits) != dims {
-					return nil, true, fmt.Errorf("mapper_parsing_exception: vector field [%s] expected [%d] bit dimensions, got [%d]", b.ESFieldPath, dims, len(bits))
+					return nil, true, esWireError(fmt.Sprintf("%s: vector field [%s] expected [%d] bit dimensions, got [%d]", dimErrPfx, b.ESFieldPath, dims, len(bits)))
 				}
 				out = bits
 			} else if arr, isArr := node.([]any); isArr {
@@ -4157,7 +4445,7 @@ func extractAndValidateTypedVectorValues(node any, path []string, b FieldBinding
 					return nil, true, fmt.Errorf("mapper_parsing_exception: failed to parse bit vector field [%s]: empty array", b.ESFieldPath)
 				}
 				if dims > 0 && len(arr)*8 != dims {
-					return nil, true, fmt.Errorf("mapper_parsing_exception: bit vector field [%s] with dims [%d] expects [%d] byte elements, got [%d]", b.ESFieldPath, dims, dims/8, len(arr))
+					return nil, true, esWireError(fmt.Sprintf("%s: bit vector field [%s] with dims [%d] expects [%d] byte elements, got [%d]", dimErrPfx, b.ESFieldPath, dims, dims/8, len(arr)))
 				}
 				out = make([]float64, 0, len(arr)*8)
 				for _, elem := range arr {
@@ -4185,9 +4473,9 @@ func extractAndValidateTypedVectorValues(node any, path []string, b FieldBinding
 				}
 				if dims > 0 && len(decoded) != dims {
 					if len(decoded) > dims {
-						return nil, true, fmt.Errorf("mapper_parsing_exception: Field [%s] of type [dense_vector] has more dimensions than defined in the mapping: [%d] > [%d]", b.ESFieldPath, len(decoded), dims)
+						return nil, true, esWireError(fmt.Sprintf("%s: Field [%s] of type [dense_vector] has more dimensions than defined in the mapping: [%d] > [%d]", dimErrPfx, b.ESFieldPath, len(decoded), dims))
 					}
-					return nil, true, fmt.Errorf("mapper_parsing_exception: The [dense_vector] field [%s] has a different number of dimensions [%d] than defined in the mapping [%d]", b.ESFieldPath, len(decoded), dims)
+					return nil, true, esWireError(fmt.Sprintf("%s: The [dense_vector] field [%s] has a different number of dimensions [%d] than defined in the mapping [%d]", dimErrPfx, b.ESFieldPath, len(decoded), dims))
 				}
 				out = decoded
 			} else {
@@ -4197,9 +4485,9 @@ func extractAndValidateTypedVectorValues(node any, path []string, b FieldBinding
 				}
 				if dims > 0 && len(arr) != dims {
 					if len(arr) > dims {
-						return nil, true, fmt.Errorf("mapper_parsing_exception: Field [%s] of type [dense_vector] has more dimensions than defined in the mapping: [%d] > [%d]", b.ESFieldPath, len(arr), dims)
+						return nil, true, esWireError(fmt.Sprintf("%s: Field [%s] of type [dense_vector] has more dimensions than defined in the mapping: [%d] > [%d]", dimErrPfx, b.ESFieldPath, len(arr), dims))
 					}
-					return nil, true, fmt.Errorf("mapper_parsing_exception: The [dense_vector] field [%s] has a different number of dimensions [%d] than defined in the mapping [%d]", b.ESFieldPath, len(arr), dims)
+					return nil, true, esWireError(fmt.Sprintf("%s: The [dense_vector] field [%s] has a different number of dimensions [%d] than defined in the mapping [%d]", dimErrPfx, b.ESFieldPath, len(arr), dims))
 				}
 				out = make([]float64, 0, len(arr))
 				for _, elem := range arr {
@@ -4223,9 +4511,9 @@ func extractAndValidateTypedVectorValues(node any, path []string, b FieldBinding
 			}
 			if dims > 0 && len(vec) != dims {
 				if len(vec) > dims {
-					return nil, true, fmt.Errorf("mapper_parsing_exception: Field [%s] of type [dense_vector] has more dimensions than defined in the mapping: [%d] > [%d]", b.ESFieldPath, len(vec), dims)
+					return nil, true, esWireError(fmt.Sprintf("%s: Field [%s] of type [dense_vector] has more dimensions than defined in the mapping: [%d] > [%d]", dimErrPfx, b.ESFieldPath, len(vec), dims))
 				}
-				return nil, true, fmt.Errorf("mapper_parsing_exception: The [dense_vector] field [%s] has a different number of dimensions [%d] than defined in the mapping [%d]", b.ESFieldPath, len(vec), dims)
+				return nil, true, esWireError(fmt.Sprintf("%s: The [dense_vector] field [%s] has a different number of dimensions [%d] than defined in the mapping [%d]", dimErrPfx, b.ESFieldPath, len(vec), dims))
 			}
 			out = vec
 		}
@@ -4259,11 +4547,11 @@ func extractAndValidateTypedVectorValues(node any, path []string, b FieldBinding
 		return nil, false, nil
 	}
 	if next, exists := m[path[0]]; exists {
-		return extractAndValidateTypedVectorValues(next, path[1:], b)
+		return extractAndValidateTypedVectorValuesWithMode(next, path[1:], b, es8Mode)
 	}
 	for i := len(path); i > 1; i-- {
 		if next, exists := m[strings.Join(path[:i], ".")]; exists {
-			return extractAndValidateTypedVectorValues(next, path[i:], b)
+			return extractAndValidateTypedVectorValuesWithMode(next, path[i:], b, es8Mode)
 		}
 	}
 	return nil, false, nil
@@ -5240,6 +5528,11 @@ func validateAndNormalizeSparseVectorFieldInDoc(curr map[string]any, path []stri
 				} else {
 					m[key] = merged
 				}
+				return true, nil
+			}
+		} else if b.ESType == "rank_features" {
+			if rawSlice, isSlice := raw.([]any); isSlice && len(rawSlice) == 0 {
+				delete(m, key)
 				return true, nil
 			}
 		}

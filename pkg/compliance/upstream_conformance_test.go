@@ -34,8 +34,8 @@ import (
 )
 
 const (
-	expectedUpstreamV7YAMLCount          = 555
-	expectedUpstreamV8YAMLCount          = 770
+	expectedUpstreamV7YAMLCount          = 587
+	expectedUpstreamV8YAMLCount          = 893
 	defaultRemoteReindexWhitelistForTest = "127.0.0.1:*,[::1]:*,localhost:*,conformance.local:*"
 )
 
@@ -111,6 +111,15 @@ func collectYAMLFilesInDirs(dirs []string) ([]string, error) {
 	return files, nil
 }
 
+type serverBackedHandler struct {
+	http.Handler
+	srv any
+}
+
+func (h serverBackedHandler) Server() any {
+	return h.srv
+}
+
 func newConformanceProxyHandler(targetESVersion string) http.Handler {
 	h, _ := newConformanceProxySectionHandler(targetESVersion)
 	return h
@@ -123,7 +132,7 @@ func newConformanceProxySectionHandler(targetESVersion string) (http.Handler, fu
 			cfg.SetTargetESVersion(targetESVersion)
 		}
 	}
-	h := srv.Handler()
+	h := serverBackedHandler{Handler: srv.Handler(), srv: srv}
 	transport := inProcessHandlerTransport{handler: h}
 	if rtSetter, ok := any(srv).(interface{ SetRemoteReindexTransport(http.RoundTripper) }); ok {
 		rtSetter.SetRemoteReindexTransport(transport)

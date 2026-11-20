@@ -110,11 +110,13 @@ func buildRangeBucketExplodeSQL(
 		bucketValSQL = fmt.Sprintf("(CAST((%s) + CAST(`_off` AS BIGINT) AS DOUBLE) * %s)", loIdxBig, ivLit)
 		return fromClause, bucketValSQL
 	}
-	loIdxBig = fmt.Sprintf("CAST(FLOOR(((%s) - %v) / %v) AS BIGINT)", effLoSQL, offset, interval)
-	hiIdxBig = fmt.Sprintf("CAST(FLOOR(((%s) - %v) / %v) AS BIGINT)", effHiSQL, offset, interval)
+	offLit := FormatSQLFloatR63(offset)
+	ivLit := FormatSQLFloatR63(interval)
+	loIdxBig = fmt.Sprintf("CAST(FLOOR(((%s) - (%s)) / (%s)) AS BIGINT)", effLoSQL, offLit, ivLit)
+	hiIdxBig = fmt.Sprintf("CAST(FLOOR(((%s) - (%s)) / (%s)) AS BIGINT)", effHiSQL, offLit, ivLit)
 	countInt := fmt.Sprintf("CAST(LEAST(GREATEST((%s) - (%s) + 1, 0), 10001) AS INT)", hiIdxBig, loIdxBig)
 	fromClause = fmt.Sprintf("%s LATERAL VIEW EXPLODE(ARRAY_RANGE(0, %s)) `_rng_t` AS `_off`", baseTable, countInt)
-	bucketValSQL = fmt.Sprintf("(CAST((%s) + CAST(`_off` AS BIGINT) AS DOUBLE) * %v + %v)", loIdxBig, interval, offset)
+	bucketValSQL = fmt.Sprintf("(CAST((%s) + CAST(`_off` AS BIGINT) AS DOUBLE) * (%s) + (%s))", loIdxBig, ivLit, offLit)
 	return fromClause, bucketValSQL
 }
 
@@ -123,9 +125,9 @@ func buildRangeBucketExplodeSQL(
 // ----------------------------------------------------------------------------
 
 // sqlDocCountRowWeightExpr returns the per-row positive integer `_doc_count` weight expression
-// (`COALESCE(CAST(json_extract_string(`_source`, '$._doc_count') AS BIGINT), 1)`).
+// (`COALESCE(TRY_CAST(json_extract_string(`_source`, '$."_doc_count"') AS BIGINT), 1)`).
 func sqlDocCountRowWeightExpr() string {
-	return "COALESCE(CAST(json_extract_string(`_source`, '$._doc_count') AS BIGINT), 1)"
+	return fmt.Sprintf("COALESCE(TRY_CAST(json_extract_string(`_source`, %s) AS BIGINT), 1)", quoteStr(`$."_doc_count"`))
 }
 
 // sqlDocCountSumExpr returns `COALESCE(SUM(COALESCE(... _doc_count ..., 1)), 0)` when enabled
@@ -257,7 +259,7 @@ func buildIPPrefixBucketKeySQL(colExpr string, ipSpec *esast.IPPrefixAggSpec) (k
 		} else if prefixLen > 0 {
 			mask32 = uint32(0xffffffff) << (32 - prefixLen)
 		}
-		maskedNum := fmt.Sprintf("(CONV(RIGHT(%s, 8), 16, 10) & %d)", hex32, int64(mask32))
+		maskedNum := fmt.Sprintf("(CAST(CONV(RIGHT(%s, 8), 16, 10) AS BIGINT) & %d)", hex32, int64(mask32))
 		baseKeySQL = fmt.Sprintf("CASE WHEN %s IS NULL THEN NULL ELSE IPV4_NUM_TO_STRING(CAST(%s AS BIGINT)) END", hex32, maskedNum)
 		sortHexSQL = fmt.Sprintf("LPAD(HEX(%s), 8, '0')", maskedNum)
 	} else {
@@ -273,7 +275,7 @@ func buildIPPrefixBucketKeySQL(colExpr string, ipSpec *esast.IPPrefixAggSpec) (k
 				chunks[i] = subExpr
 			default:
 				m := uint32(0xffffffff) << (32 - rem)
-				chunks[i] = fmt.Sprintf("LPAD(HEX(CONV(%s, 16, 10) & %d), 8, '0')", subExpr, int64(m))
+				chunks[i] = fmt.Sprintf("LPAD(HEX(CAST(CONV(%s, 16, 10) AS BIGINT) & %d), 8, '0')", subExpr, int64(m))
 			}
 		}
 		maskedHex32 := fmt.Sprintf("CONCAT(%s, %s, %s, %s)", chunks[0], chunks[1], chunks[2], chunks[3])
@@ -330,11 +332,7 @@ func unmarshalTSIDKeyMap(rawJSON string, dst *map[string]any) error {
 	}
 	for k, v := range m {
 		if num, ok := v.(json.Number); ok {
-			if iv, err := num.Int64(); err == nil {
-				m[k] = iv
-			} else if fv, errF := num.Float64(); errF == nil {
-				m[k] = fv
-			}
+			m[k] = coerceJSONNumberExactIntOrUintR63(num)
 		}
 	}
 	*dst = m
@@ -342,9 +340,8 @@ func unmarshalTSIDKeyMap(rawJSON string, dst *map[string]any) error {
 }
 
 func sqlTSIDBinarySortExpr(tsidCol string) string {
-	padded := fmt.Sprintf("RPAD(%s, CAST(CEIL(CHAR_LENGTH(%s) / 4.0) * 4 AS INT), '=')", tsidCol, tsidCol)
-	stdB64 := fmt.Sprintf("REPLACE(REPLACE(%s, '-', '+'), '_', '/')", padded)
-	return fmt.Sprintf("HEX(FROM_BASE64(%s))", stdB64)
+	return fmt.Sprintf("TRANSLATE(%s, %s, %s)",
+		tsidCol, quoteStr(base64URLAlphabetR63), quoteStr(asciiOrdered64AlphabetR63))
 }
 
 // ----------------------------------------------------------------------------
@@ -443,8 +440,8 @@ func (t *Transpiler) validateRound62AggTree(aggs map[string]esast.AggSpec, ances
 				return
 			}
 			p := *spec.RandomSampler.Probability
-			if p > 0.5 || math.IsNaN(p) || math.IsInf(p, 0) {
-				t.searchErr = esTranspilerError(fmt.Sprintf("illegal_argument_exception: [probability] must be in (0, 0.5], was [%v]", p))
+			if (p > 0.5 && p != 1.0) || math.IsNaN(p) || math.IsInf(p, 0) {
+				t.searchErr = esTranspilerError(fmt.Sprintf("illegal_argument_exception: [probability] must be between 0.0 and 0.5 or exactly 1.0, was [%v]", p))
 				return
 			}
 			for childName, childSpec := range spec.SubAggs() {
@@ -788,6 +785,9 @@ func (t *Transpiler) appendRound62TopLevelAggBranch(
 	wherePrefix string,
 	spec esast.AggSpec,
 ) bool {
+	if t.appendRound63TopLevelAggBranch(branches, subIdx, fullAggName, extraWhere, wherePrefix, spec) {
+		return true
+	}
 	switch {
 	case spec.RandomSampler != nil:
 		rsWhere := buildRandomSamplerWhereSQL(spec.RandomSampler, extraWhere)
@@ -884,11 +884,11 @@ func (t *Transpiler) appendRound62TopLevelAggBranch(
 		*subIdx++
 		*branches = append(*branches, fmt.Sprintf(
 			"SELECT `_agg_name`, `_bucket_key`, `_doc_count` FROM ("+
-				"SELECT %s AS `_agg_name`, %s AS `_bucket_key`, CAST(%s AS DOUBLE) AS `_doc_count` "+
+				"SELECT %s AS `_agg_name`, %s AS `_bucket_key`, CAST(%s AS DOUBLE) AS `_doc_count`, %s AS `_ts_ord` "+
 				"FROM `base_matched` WHERE %s "+
 				"GROUP BY `__tsid`, `__tsid_key` ORDER BY %s ASC LIMIT %d"+
-				") `_agg_sub_%d`",
-			quoteStr(fullAggName), tsBucketExpr, t.sqlDocCountSumExpr(), wCond, tsSortExpr, limit, *subIdx,
+				") `_agg_sub_%d` ORDER BY `_ts_ord` ASC LIMIT %d",
+			quoteStr(fullAggName), tsBucketExpr, t.sqlDocCountSumExpr(), tsSortExpr, wCond, tsSortExpr, limit, *subIdx, limit,
 		))
 		if subAggs := spec.SubAggs(); len(subAggs) > 0 {
 			// Restrict sub-aggregations to the top `limit` series selected by `time_series`.
@@ -944,6 +944,9 @@ func (t *Transpiler) appendRound62GroupedSubAggBranch(
 	nctx *nestedCtx,
 	subSpec esast.AggSpec,
 ) bool {
+	if t.appendRound63GroupedSubAggBranch(branches, subIdx, subFull, parentBucketExpr, fromClause, whereClause, subTableAlias, subElemAlias, nctx, subSpec) {
+		return true
+	}
 	switch {
 	case subSpec.IPPrefix != nil:
 		ipSpec := subSpec.IPPrefix
@@ -976,11 +979,11 @@ func (t *Transpiler) appendRound62GroupedSubAggBranch(
 			combKey := fmt.Sprintf("CONCAT(CAST(%s AS STRING), '\\x1f', CAST(%s AS STRING))", parentBucketExpr, keySQL)
 			*branches = append(*branches, fmt.Sprintf(
 				"SELECT `_agg_name`, `_bucket_key`, `_doc_count` FROM ("+
-					"SELECT %s AS `_agg_name`, %s AS `_bucket_key`, CAST(COUNT(*) AS DOUBLE) AS `_doc_count` "+
+					"SELECT %s AS `_agg_name`, %s AS `_bucket_key`, CAST(%s AS DOUBLE) AS `_doc_count`, %s AS `_ts_ord` "+
 					"FROM %s WHERE %s "+
 					"GROUP BY `_bucket_key`, %s ORDER BY %s ASC LIMIT %d"+
-					") `_agg_sub_%d`",
-				quoteStr(subFull), combKey, fromClause, subWhere, sortHexSQL, sortHexSQL, t.maxAggBuckets(), *subIdx,
+					") `_agg_sub_%d` ORDER BY `_ts_ord` ASC LIMIT %d",
+				quoteStr(subFull), combKey, t.sqlDocCountSumExpr(), sortHexSQL, fromClause, subWhere, sortHexSQL, sortHexSQL, t.maxAggBuckets(), *subIdx, t.maxAggBuckets(),
 			))
 			if nestedSubs := subSpec.SubAggs(); len(nestedSubs) > 0 {
 				t.appendGroupedBucketSubAggsWithNested(branches, subIdx, subFull, combKey, fromClause, subWhere, nctx, nestedSubs)
@@ -1001,11 +1004,11 @@ func (t *Transpiler) appendRound62GroupedSubAggBranch(
 		*subIdx++
 		*branches = append(*branches, fmt.Sprintf(
 			"SELECT `_agg_name`, `_bucket_key`, `_doc_count` FROM ("+
-				"SELECT %s AS `_agg_name`, %s AS `_bucket_key`, CAST(COUNT(*) AS DOUBLE) AS `_doc_count` "+
+				"SELECT %s AS `_agg_name`, %s AS `_bucket_key`, CAST(%s AS DOUBLE) AS `_doc_count`, %s AS `_ts_ord` "+
 				"FROM %s WHERE %s "+
 				"GROUP BY `_bucket_key`, `__tsid` ORDER BY %s ASC LIMIT %d"+
-				") `_agg_sub_%d`",
-			quoteStr(subFull), combKey, fromClause, subWhere, tsSortExpr, limit*100, *subIdx,
+				") `_agg_sub_%d` ORDER BY `_ts_ord` ASC LIMIT %d",
+			quoteStr(subFull), combKey, t.sqlDocCountSumExpr(), tsSortExpr, fromClause, subWhere, tsSortExpr, limit*100, *subIdx, limit*100,
 		))
 		if nestedSubs := subSpec.SubAggs(); len(nestedSubs) > 0 {
 			t.appendGroupedBucketSubAggsWithNested(branches, subIdx, subFull, combKey, fromClause, subWhere, nctx, nestedSubs)
@@ -1859,6 +1862,8 @@ func normalizeRuntimeESType(rawType string) string {
 		return "ip"
 	case "date", "date_nanos":
 		return rt
+	case "geo_point", "geo_shape":
+		return rt
 	default:
 		return ""
 	}
@@ -1884,35 +1889,35 @@ func runtimeFieldBinding(field, effType string, fp esast.FieldProperty) schema.F
 }
 
 // sqlRuntimeSourceStringExpr extracts `field` from `_source` supporting both nested JSON objects
-// (`$.a.b`) and literal dotted keys (`$."a.b"`), matching ES `SourceLookup.extractValue` semantics.
+// (`$."a"."b"`) and literal dotted keys (`$."a.b"`), matching ES `SourceLookup.extractValue` semantics (`C-13`).
 func sqlRuntimeSourceStringExpr(field string) string {
-	clean := strings.TrimSpace(field)
-	nestedPath := "$." + clean
-	if !strings.Contains(clean, ".") {
+	nestedPath, dottedPath, hasDot := BuildQuotedDorisJSONPaths(field)
+	if !hasDot {
 		return fmt.Sprintf("json_extract_string(`_source`, %s)", quoteStr(nestedPath))
 	}
-	escapedLiteral := strings.ReplaceAll(clean, `"`, `\"`)
-	dottedPath := fmt.Sprintf(`$."%s"`, escapedLiteral)
 	return fmt.Sprintf("COALESCE(json_extract_string(`_source`, %s), json_extract_string(`_source`, %s))",
 		quoteStr(nestedPath), quoteStr(dottedPath))
 }
 
 func sqlRuntimeSourceTypedExpr(field, effType string) string {
 	rawStr := sqlRuntimeSourceStringExpr(field)
-	// Strip single-element JSON array wrapper `["x"]` / `[123]` when scalar coercion is used.
+	isArrayCond := sqlRuntimeSourceJSONTypeIsArrayExpr(field)
+	// Strip single-element JSON array wrapper `["x"]` / `[123]` ONLY when `JSON_TYPE` is `'ARRAY'` (`C-08`).
 	scalarStr := fmt.Sprintf(
-		"CASE WHEN %s LIKE '[%%]' THEN CAST(element_at(CAST(%s AS ARRAY<STRING>), 1) AS STRING) ELSE %s END",
-		rawStr, rawStr, rawStr,
+		"CASE WHEN %s THEN CAST(element_at(TRY_CAST(%s AS ARRAY<STRING>), 1) AS STRING) ELSE %s END",
+		isArrayCond, rawStr, rawStr,
 	)
 	switch effType {
 	case "long":
-		return fmt.Sprintf("CAST(%s AS BIGINT)", scalarStr)
+		return fmt.Sprintf("TRY_CAST(%s AS BIGINT)", scalarStr)
 	case "double":
-		return fmt.Sprintf("CAST(%s AS DOUBLE)", scalarStr)
+		return fmt.Sprintf("TRY_CAST(%s AS DOUBLE)", scalarStr)
 	case "boolean":
 		return fmt.Sprintf("CASE WHEN LOWER(%s) IN ('true', '1') THEN TRUE WHEN LOWER(%s) IN ('false', '0') THEN FALSE ELSE NULL END", scalarStr, scalarStr)
 	case "date":
-		return fmt.Sprintf("COALESCE(CAST(%s AS BIGINT), UNIX_TIMESTAMP(REPLACE(REPLACE(%s, 'T', ' '), 'Z', '')) * 1000)", scalarStr, scalarStr)
+		return sqlRuntimeSourceDateMillisExpr(scalarStr)
+	case "date_nanos":
+		return sqlRuntimeSourceDateNanosExpr(scalarStr)
 	default:
 		return scalarStr
 	}
@@ -1920,8 +1925,9 @@ func sqlRuntimeSourceTypedExpr(field, effType string) string {
 
 func sqlRuntimeSourceArrayExpr(field string) string {
 	rawStr := sqlRuntimeSourceStringExpr(field)
-	return fmt.Sprintf("CASE WHEN %s IS NULL THEN NULL WHEN %s LIKE '[%%]' THEN CAST(%s AS ARRAY<STRING>) ELSE [%s] END",
-		rawStr, rawStr, rawStr, rawStr)
+	isArrayCond := sqlRuntimeSourceJSONTypeIsArrayExpr(field)
+	return fmt.Sprintf("CASE WHEN %s IS NULL THEN NULL WHEN %s THEN TRY_CAST(%s AS ARRAY<STRING>) ELSE [%s] END",
+		rawStr, isArrayCond, rawStr, rawStr)
 }
 
 // ----------------------------------------------------------------------------
@@ -1932,28 +1938,33 @@ func (t *Transpiler) effectiveQueryAnalyzerName(b schema.FieldBinding, explicitA
 	if exp := strings.TrimSpace(explicitAnalyzer); exp != "" {
 		return exp
 	}
+	if cfg := t.Opts.AnalysisConfig; cfg != nil {
+		if resolved := strings.TrimSpace(cfg.ResolveSearchAnalyzer(b.Analyzer, b.SearchAnalyzer)); resolved != "" {
+			return resolved
+		}
+	}
 	if sa := strings.TrimSpace(b.SearchAnalyzer); sa != "" {
 		return sa
 	}
 	if a := strings.TrimSpace(b.Analyzer); a != "" {
 		return a
 	}
-	if cfg := t.Opts.AnalysisConfig; cfg != nil {
-		if _, ok := cfg.AnalyzerDefs["default_search"]; ok {
-			return "default_search"
-		}
-		if _, ok := cfg.AnalyzerDefs["default"]; ok {
-			return "default"
-		}
-	}
 	return "standard"
 }
 
 func (t *Transpiler) hasCustomQueryAnalysis(analyzerName string) bool {
-	if t.Opts.AnalysisConfig == nil {
-		return false
-	}
 	an := strings.TrimSpace(analyzerName)
+	if t.Opts.AnalysisConfig == nil {
+		if an == "" || !analysis.IsBuiltInAnalyzer(an) {
+			return false
+		}
+		switch strings.ToLower(an) {
+		case "standard", "simple", "whitespace", "keyword", "stop":
+			return false
+		default:
+			return true
+		}
+	}
 	if an == "" {
 		_, hasDS := t.Opts.AnalysisConfig.AnalyzerDefs["default_search"]
 		_, hasD := t.Opts.AnalysisConfig.AnalyzerDefs["default"]
@@ -1988,6 +1999,10 @@ func (t *Transpiler) normalizeKeywordOrAnalyzerTerm(raw string, b schema.FieldBi
 }
 
 func (t *Transpiler) singleAnalyzedTokenSQL(field string, b schema.FieldBinding, tok string, caseSensitive bool, boost float64, scoring bool, nctx *nestedCtx) CompiledQuery {
+	return t.singleAnalyzedTokenWithFlagsR63(field, b, tok, caseSensitive, caseSensitive, boost, scoring, nctx)
+}
+
+func (t *Transpiler) singleAnalyzedTokenWithFlagsR63(field string, b schema.FieldBinding, tok string, caseSensitive, isWhitespace bool, boost float64, scoring bool, nctx *nestedCtx) CompiledQuery {
 	if b.IsVirtualSAYTSubfield && b.EffectiveArrayColumn(false) != "" && nctx == nil {
 		arrCol := b.EffectiveArrayColumn(false)
 		var pred string
@@ -2002,7 +2017,7 @@ func (t *Transpiler) singleAnalyzedTokenSQL(field string, b schema.FieldBinding,
 		}
 		return CompiledQuery{WhereSQL: pred, SafeWhereSQL: pred, ScoreSQL: sc}
 	}
-	rePat := quoteStr(buildAnalyzedTokenRegex(tok, caseSensitive))
+	rePat := quoteStr(buildAnalyzedTokenRegexExactR63(tok, caseSensitive, isWhitespace))
 	var safePred string
 	if !t.isBoundToNestedCtx(field, b, nctx) && (b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield) {
 		arrCol := b.EffectiveArrayColumn(false)
@@ -2014,6 +2029,9 @@ func (t *Transpiler) singleAnalyzedTokenSQL(field string, b schema.FieldBinding,
 	sc := "0.0"
 	if scoring {
 		sc = fmt.Sprintf("(CASE WHEN %s THEN %s ELSE 0.0 END)", safePred, strconv.FormatFloat(boost, 'g', -1, 64))
+		if bm25Sc, ok := t.compileBM25SingleTermScoreR63(field, field, b, tok, caseSensitive, boost, safePred, nctx); ok {
+			sc = bm25Sc
+		}
 	}
 	return CompiledQuery{WhereSQL: safePred, SafeWhereSQL: safePred, ScoreSQL: sc}
 }
@@ -2044,6 +2062,9 @@ func (t *Transpiler) multiTokenExactPhraseSQL(field string, b schema.FieldBindin
 		sc := "0.0"
 		if scoring {
 			sc = fmt.Sprintf("(CASE WHEN %s THEN %s ELSE 0.0 END)", pred, strconv.FormatFloat(boost, 'g', -1, 64))
+			if bm25Sc, ok := t.compileBM25PhraseScoreR63(field, field, b, terms, caseSensitive, boost, pred, nctx); ok {
+				sc = bm25Sc
+			}
 		}
 		return CompiledQuery{WhereSQL: pred, SafeWhereSQL: pred, ScoreSQL: sc}
 	}
@@ -2074,6 +2095,11 @@ func (t *Transpiler) multiTokenExactPhraseSQL(field string, b schema.FieldBindin
 	sc := "0.0"
 	if scoring {
 		sc = fmt.Sprintf("(CASE WHEN %s THEN %s ELSE 0.0 END)", pred, strconv.FormatFloat(boost, 'g', -1, 64))
+		if !trailingPrefix {
+			if bm25Sc, ok := t.compileBM25PhraseScoreR63(field, field, b, terms, caseSensitive, boost, pred, nctx); ok {
+				sc = bm25Sc
+			}
+		}
 	}
 	return CompiledQuery{WhereSQL: pred, SafeWhereSQL: pred, ScoreSQL: sc}
 }
@@ -2132,6 +2158,7 @@ func (t *Transpiler) compileMatchWithAnalysisGraph(
 
 	autoPhrase := !t.Opts.DisableSynonymsPhraseQuery
 	isAnd := strings.EqualFold(operator, "and")
+	caseSensitive, isWhitespace := analyzerCaseAndWhitespaceFlagsR63(effAn, t.Opts.AnalysisConfig, t.Opts.AnalysisOpts)
 	var segPreds, segScores []string
 
 	for _, seg := range graph.Segments {
@@ -2148,14 +2175,14 @@ func (t *Transpiler) compileMatchWithAnalysisGraph(
 				if hasNonZeroFuzziness(fuzziness) {
 					cp = t.compileFuzzyFieldWithOpts(resolved, alt[0], "or", fuzziness, false, prefixLen, fuzzyTransp, 1.0, scoring, nctx)
 				} else {
-					cp = t.singleAnalyzedTokenSQL(resolved, b, alt[0], true, 1.0, scoring, nctx)
+					cp = t.singleAnalyzedTokenWithFlagsR63(resolved, b, alt[0], caseSensitive, isWhitespace, 1.0, scoring, nctx)
 				}
 			} else if autoPhrase {
-				cp = t.multiTokenExactPhraseSQL(resolved, b, alt, 0, false, true, 1.0, scoring, nctx)
+				cp = t.multiTokenExactPhraseSQL(resolved, b, alt, 0, false, caseSensitive, 1.0, scoring, nctx)
 			} else {
 				var subParts []string
 				for _, tk := range alt {
-					subParts = append(subParts, t.singleAnalyzedTokenSQL(resolved, b, tk, true, 1.0, false, nctx).WhereSQL)
+					subParts = append(subParts, t.singleAnalyzedTokenWithFlagsR63(resolved, b, tk, caseSensitive, isWhitespace, 1.0, false, nctx).WhereSQL)
 				}
 				joiner := " OR "
 				if isAnd {
@@ -2295,11 +2322,20 @@ func (t *Transpiler) compileMatchPhraseWithAnalysisGraph(
 	if len(paths) == 0 {
 		return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}, true
 	}
-	var disj []string
+	caseSensitive, isWhitespace := analyzerCaseAndWhitespaceFlagsR63(effAn, t.Opts.AnalysisConfig, t.Opts.AnalysisOpts)
+	var disj, pathScores []string
 	for _, p := range paths {
-		cp := t.multiTokenExactPhraseSQL(resolved, b, p, slop, isPrefix, true, 1.0, false, nctx)
+		var cp CompiledQuery
+		if len(p) == 1 && !isPrefix {
+			cp = t.singleAnalyzedTokenWithFlagsR63(resolved, b, p[0], caseSensitive, isWhitespace, 1.0, scoring, nctx)
+		} else {
+			cp = t.multiTokenExactPhraseSQL(resolved, b, p, slop, isPrefix, caseSensitive, 1.0, scoring, nctx)
+		}
 		if cp.WhereSQL != "FALSE" {
 			disj = append(disj, cp.WhereSQL)
+			if scoring && cp.ScoreSQL != "0.0" {
+				pathScores = append(pathScores, cp.ScoreSQL)
+			}
 		}
 	}
 	if len(disj) == 0 {
@@ -2311,7 +2347,13 @@ func (t *Transpiler) compileMatchPhraseWithAnalysisGraph(
 	}
 	scoreSQL := "0.0"
 	if scoring {
-		scoreSQL = fmt.Sprintf("(CASE WHEN %s THEN %s ELSE 0.0 END)", whereSQL, strconv.FormatFloat(effBoost, 'g', -1, 64))
+		if len(pathScores) == 1 {
+			scoreSQL = fmt.Sprintf("(CASE WHEN %s THEN (%s * %s) ELSE 0.0 END)", whereSQL, strconv.FormatFloat(effBoost, 'g', -1, 64), pathScores[0])
+		} else if len(pathScores) > 1 {
+			scoreSQL = fmt.Sprintf("(CASE WHEN %s THEN (%s * GREATEST(%s)) ELSE 0.0 END)", whereSQL, strconv.FormatFloat(effBoost, 'g', -1, 64), strings.Join(pathScores, ", "))
+		} else {
+			scoreSQL = fmt.Sprintf("(CASE WHEN %s THEN %s ELSE 0.0 END)", whereSQL, strconv.FormatFloat(effBoost, 'g', -1, 64))
+		}
 	}
 	return CompiledQuery{WhereSQL: whereSQL, SafeWhereSQL: whereSQL, ScoreSQL: scoreSQL}, true
 }

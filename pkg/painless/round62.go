@@ -1411,6 +1411,9 @@ func expandGrokPatternRecursiveRound62(origPat, curPat string, captures *[]grokC
 			if err != nil {
 				return "", err
 			}
+			if sb.Len()+len(tail) > MaxExpandedGrokRegexLen {
+				return "", newGrokExpandedLenErrorRound63(sb.Len() + len(tail))
+			}
 			sb.WriteString(tail)
 			break
 		}
@@ -1425,6 +1428,9 @@ func expandGrokPatternRecursiveRound62(origPat, curPat string, captures *[]grokC
 			if err != nil {
 				return "", err
 			}
+			if sb.Len()+len(seg) > MaxExpandedGrokRegexLen {
+				return "", newGrokExpandedLenErrorRound63(sb.Len() + len(seg))
+			}
 			sb.WriteString(seg)
 			pos = openIdx + 2
 			continue
@@ -1433,6 +1439,9 @@ func expandGrokPatternRecursiveRound62(origPat, curPat string, captures *[]grokC
 			seg, err := validateAndRewriteRawRegexSegmentRound62(origPat, curPat[pos:openIdx], captures)
 			if err != nil {
 				return "", err
+			}
+			if sb.Len()+len(seg) > MaxExpandedGrokRegexLen {
+				return "", newGrokExpandedLenErrorRound63(sb.Len() + len(seg))
 			}
 			sb.WriteString(seg)
 		}
@@ -1478,6 +1487,10 @@ func expandGrokPatternRecursiveRound62(origPat, curPat string, captures *[]grokC
 		}
 		if semanticName != "" {
 			synGroup := fmt.Sprintf("__g%d", len(*captures))
+			groupLen := 4 + len(synGroup) + 1 + len(expanded) + 1
+			if sb.Len()+groupLen > MaxExpandedGrokRegexLen {
+				return "", newGrokExpandedLenErrorRound63(sb.Len() + groupLen)
+			}
 			*captures = append(*captures, grokCaptureSpec{
 				groupName: synGroup,
 				fieldName: semanticName,
@@ -1489,6 +1502,10 @@ func expandGrokPatternRecursiveRound62(origPat, curPat string, captures *[]grokC
 			sb.WriteString(expanded)
 			sb.WriteByte(')')
 		} else {
+			groupLen := 3 + len(expanded) + 1
+			if sb.Len()+groupLen > MaxExpandedGrokRegexLen {
+				return "", newGrokExpandedLenErrorRound63(sb.Len() + groupLen)
+			}
 			sb.WriteString("(?:")
 			sb.WriteString(expanded)
 			sb.WriteByte(')')
@@ -1503,7 +1520,7 @@ func CompileGrokPattern(pattern string) (*GrokExtractor, error) {
 	if len(pattern) > MaxRegexPatternLen {
 		return nil, &painlessExceptionError{
 			exType:  "IllegalArgumentException",
-			message: fmt.Sprintf("error compiling grok pattern [%s]: pattern exceeds maximum length (%d)", pattern, MaxRegexPatternLen),
+			message: fmt.Sprintf("error compiling grok pattern [%s]: pattern exceeds maximum length (%d)", truncatePatternForErrRound63(pattern, 128), MaxRegexPatternLen),
 		}
 	}
 	if cached, ok := globalGrokCache.get(pattern); ok {
@@ -1513,6 +1530,9 @@ func CompileGrokPattern(pattern string) (*GrokExtractor, error) {
 	regexBody, err := expandGrokPatternRecursiveRound62(pattern, pattern, &captures, 0)
 	if err != nil {
 		return nil, err
+	}
+	if len(regexBody) > MaxExpandedGrokRegexLen {
+		return nil, newGrokExpandedLenErrorRound63(len(regexBody))
 	}
 	re, rErr := regexp.Compile(regexBody)
 	if rErr != nil {
@@ -1594,7 +1614,7 @@ func assignGrokFieldPathRound62(dst map[string]any, fieldName string, val any) {
 // Extract matches `text` against the compiled Grok pattern and returns the extracted
 // map of named captures, or `nil` when `text` does not match.
 func (g *GrokExtractor) Extract(text string) map[string]any {
-	if g == nil || g.re == nil {
+	if g == nil || g.re == nil || len(text) > MaxGrokInputBytes {
 		return nil
 	}
 	loc := g.re.FindStringSubmatchIndex(text)
@@ -1732,7 +1752,7 @@ func CompileDissectPattern(pattern string) (*DissectExtractor, error) {
 // Extract matches `text` against the compiled Dissect pattern and returns the extracted
 // map of keys, or `nil` when `text` does not match.
 func (d *DissectExtractor) Extract(text string) map[string]any {
-	if d == nil {
+	if d == nil || len(text) > MaxGrokInputBytes {
 		return nil
 	}
 	if len(d.fields) == 0 {
@@ -1863,7 +1883,10 @@ func evalGrokOrDissectMethodRound62(recVal any, mBare string, evalCallArgs func(
 			if args[0] == nil {
 				return nil, true, nil
 			}
-			m := tv.Extract(fmt.Sprintf("%v", args[0]))
+			m, exErr := tv.ExtractChecked(fmt.Sprintf("%v", args[0]))
+			if exErr != nil {
+				return nil, true, exErr
+			}
 			if m == nil {
 				return nil, true, nil
 			}
@@ -1890,7 +1913,10 @@ func evalGrokOrDissectMethodRound62(recVal any, mBare string, evalCallArgs func(
 			if args[0] == nil {
 				return nil, true, nil
 			}
-			m := tv.Extract(fmt.Sprintf("%v", args[0]))
+			m, exErr := tv.ExtractChecked(fmt.Sprintf("%v", args[0]))
+			if exErr != nil {
+				return nil, true, exErr
+			}
 			if m == nil {
 				return nil, true, nil
 			}

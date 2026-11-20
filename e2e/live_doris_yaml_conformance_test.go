@@ -21,8 +21,10 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"io"
 	"io/fs"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"sort"
@@ -38,10 +40,12 @@ import (
 	"github.com/es2doris/doris-es-proxy/pkg/transpiler"
 )
 
-// liveDorisTier1UpstreamYAMLSpecs defines the curated 95-file Tier-1 upstream Elasticsearch v8.15.5
+const liveDorisRemoteReindexWhitelistForTest = "127.0.0.1:*,[::1]:*,localhost:*,conformance.local:*"
+
+// liveDorisTier1UpstreamYAMLSpecs defines the curated 136-file Tier-1 upstream Elasticsearch v8.15.5
 // YAML REST conformance corpus executed end-to-end against a live Apache Doris 4.1.3 FE+BE cluster.
 var liveDorisTier1UpstreamYAMLSpecs = []string{
-	// Bulk & Single-Doc CRUD
+	// Bulk & Single-Doc CRUD (28)
 	"bulk/10_basic.yml",
 	"bulk/12_noop.yml",
 	"bulk/20_list_of_strings.yml",
@@ -71,7 +75,7 @@ var liveDorisTier1UpstreamYAMLSpecs = []string{
 	"update/35_if_seq_no.yml",
 	"update/80_source_filtering.yml",
 
-	// Search, Pagination, Scroll, Multi-Search, Count, Explain & Field Caps
+	// Search, Pagination, Scroll, Multi-Search, Count, Explain & Field Caps (20)
 	"count/10_basic.yml",
 	"count/20_query_string.yml",
 	"explain/10_basic.yml",
@@ -93,7 +97,7 @@ var liveDorisTier1UpstreamYAMLSpecs = []string{
 	"cat.indices/10_basic.yml",
 	"cat.fielddata/10_basic.yml",
 
-	// Index Lifecycle, Mappings, Settings, Aliases & Templates
+	// Index Lifecycle, Mappings, Settings, Aliases & Templates (20)
 	"indices.create/10_basic.yml",
 	"indices.delete/10_basic.yml",
 	"indices.exists/10_basic.yml",
@@ -115,12 +119,12 @@ var liveDorisTier1UpstreamYAMLSpecs = []string{
 	"indices.rollover/10_basic.yml",
 	"indices.validate_query/10_basic.yml",
 
-	// Batch Mutations & Reindex
+	// Batch Mutations & Reindex (3)
 	"update_by_query/10_basic.yml",
 	"delete_by_query/10_basic.yml",
 	"reindex/10_basic.yml",
 
-	// Core Bucket, Metric & Pipeline Aggregations + Vector kNN + Ingest
+	// Core Bucket, Metric & Pipeline Aggregations + Vector kNN + Ingest (25)
 	"aggregations/terms.yml",
 	"aggregations/histogram.yml",
 	"aggregations/date_histogram.yml",
@@ -146,6 +150,76 @@ var liveDorisTier1UpstreamYAMLSpecs = []string{
 	"aggregations/derivative.yml",
 	"search.vectors/40_knn_search.yml",
 	"ingest/20_crud.yml",
+
+	// Round 63 Tier-1 Expansion: REST Root, Data Streams, Runtime Fields, Analysis,
+	// Mapper Extras, Percolator, Mustache, Painless, Ingest Processors & X-Pack Plugins (40)
+	"ping/10_ping.yml",
+	"info/10_info.yml",
+	"info/20_lucene_version.yml",
+	"data_stream/10_basic.yml",
+	"data_stream/20_unsupported_apis.yml",
+	"data_stream/30_auto_create_data_stream.yml",
+	"data_stream/120_data_streams_stats.yml",
+	"runtime_fields/10_keyword.yml",
+	"runtime_fields/20_long.yml",
+	"runtime_fields/30_double.yml",
+	"runtime_fields/40_runtime_mappings.yml",
+	"runtime_fields/60_boolean.yml",
+	"analysis-common/10_basic.yml",
+	"analysis-common/20_analyzers.yml",
+	"analysis-common/30_tokenizers.yml",
+	"analysis-common/40_token_filters.yml",
+	"scaled_float/10_basic.yml",
+	"token_count/10_basic.yml",
+	"match_only_text/10_basic.yml",
+	"rank_feature/10_basic.yml",
+	"percolator/10_basic.yml",
+	"percolator/20_matched_queries.yml",
+	"lang_mustache/10_basic.yml",
+	"lang_mustache/20_render_search_template.yml",
+	"lang_mustache/30_search_template.yml",
+	"painless/10_basic.yml",
+	"painless/15_update.yml",
+	"painless/20_scriptfield.yml",
+	"painless/70_execute_painless_scripts.yml",
+	"ingest/30_date_processor.yml",
+	"ingest/40_mutate.yml",
+	"ingest/90_simulate.yml",
+	"ingest/270_set_processor.yml",
+	"mapper-unsigned-long/10_basic.yml",
+	"mapper-unsigned-long/20_null_value.yml",
+	"mapper-constant-keyword/30_sort.yml",
+	"mapper-version/40_synthetic_source.yml",
+	"wildcard/20_regexp.yml",
+	"rrf/100_rank_rrf.yml",
+	"rrf/300_rrf_retriever.yml",
+}
+
+type liveInProcessHandlerTransport struct {
+	handler http.Handler
+}
+
+func (t liveInProcessHandlerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req != nil && req.URL != nil && req.URL.Port() == "0" {
+		return nil, fmt.Errorf("connect_exception: dial tcp %s: connect: connection refused", req.URL.Host)
+	}
+	if t.handler == nil {
+		return nil, fmt.Errorf("connect_exception: nil in-process handler")
+	}
+	clone := req.Clone(req.Context())
+	if clone.Body == nil {
+		clone.Body = http.NoBody
+	}
+	if clone.RequestURI == "" && clone.URL != nil {
+		clone.RequestURI = clone.URL.RequestURI()
+	}
+	rec := httptest.NewRecorder()
+	t.handler.ServeHTTP(rec, clone)
+	resp := rec.Result()
+	if resp.Body == nil {
+		resp.Body = io.NopCloser(strings.NewReader(""))
+	}
+	return resp, nil
 }
 
 func buildTier1SpecFilter() map[string]bool {
@@ -154,6 +228,52 @@ func buildTier1SpecFilter() map[string]bool {
 		set[p] = true
 	}
 	return set
+}
+
+func deriveUpstreamSpecCategory(rootDir, relSlash string) string {
+	trimmed := strings.TrimPrefix(relSlash, "./")
+	if slashIdx := strings.IndexByte(trimmed, '/'); slashIdx > 0 {
+		first := trimmed[:slashIdx]
+		rest := trimmed[slashIdx+1:]
+		if first == "specs" {
+			if subIdx := strings.IndexByte(rest, '/'); subIdx > 0 {
+				return rest[:subIdx]
+			}
+		}
+		return first
+	}
+	rootSlash := filepath.ToSlash(rootDir)
+	if modIdx := strings.Index(rootSlash, "/modules/"); modIdx >= 0 {
+		afterMod := rootSlash[modIdx+len("/modules/"):]
+		if endIdx := strings.IndexByte(afterMod, '/'); endIdx > 0 {
+			return afterMod[:endIdx]
+		}
+		if afterMod != "" {
+			return afterMod
+		}
+	}
+	if plugIdx := strings.Index(rootSlash, "/x-pack/plugin/"); plugIdx >= 0 {
+		afterPlug := rootSlash[plugIdx+len("/x-pack/plugin/"):]
+		if endIdx := strings.IndexByte(afterPlug, '/'); endIdx > 0 {
+			return afterPlug[:endIdx]
+		}
+		if afterPlug != "" {
+			return afterPlug
+		}
+	}
+	base := filepath.Base(rootSlash)
+	if base != "" && base != "." && base != "/" && base != "test" {
+		return base
+	}
+	return "root"
+}
+
+func computeUpstreamSpecDisplayPath(cleanRoot, relSlash string) string {
+	cat := deriveUpstreamSpecCategory(cleanRoot, relSlash)
+	if !strings.Contains(relSlash, "/") && cat != "" && cat != "root" {
+		return cat + "/" + relSlash
+	}
+	return relSlash
 }
 
 func resolveE2EConformanceCacheDir() string {
@@ -271,18 +391,21 @@ func waitForLiveDorisBEReady(t *testing.T, db *sql.DB, dorisDB string) {
 }
 
 // TestLiveDorisTier1SpecList_ValidatesAgainstUpstreamCache verifies that when the gitignored
-// `.cache/es-v8.15.5` corpus is populated on disk, the curated Tier-1 list resolves to 80–100
-// real upstream YAML files without typos.
+// `.cache/es-v8.15.5` corpus is populated on disk, the curated Tier-1 list resolves to 130–150
+// (specifically 136) unique upstream YAML files whose `displayPath` matches `ScoreMatchingFiles`.
 func TestLiveDorisTier1SpecList_ValidatesAgainstUpstreamCache(t *testing.T) {
+	tier1Filter := buildTier1SpecFilter()
+	if len(tier1Filter) != len(liveDorisTier1UpstreamYAMLSpecs) {
+		t.Fatalf("duplicate entries in liveDorisTier1UpstreamYAMLSpecs: unique=%d total=%d", len(tier1Filter), len(liveDorisTier1UpstreamYAMLSpecs))
+	}
+	if len(tier1Filter) < 130 || len(tier1Filter) > 150 {
+		t.Fatalf("curated Tier-1 spec count = %d, want between 130 and 150", len(tier1Filter))
+	}
+
 	v8Root := filepath.Join(resolveE2EConformanceCacheDir(), "es-v8.15.5")
 	v8Dirs, err := discoverUpstreamYAMLTestDirs(v8Root)
 	if err != nil || len(v8Dirs) == 0 {
 		t.Skipf("skipping Tier-1 spec filename check (.cache/es-v8.15.5 absent at %s)", v8Root)
-	}
-
-	tier1Filter := buildTier1SpecFilter()
-	if len(tier1Filter) < 80 || len(tier1Filter) > 100 {
-		t.Fatalf("curated Tier-1 spec count = %d, want between 80 and 100", len(tier1Filter))
 	}
 
 	found := make(map[string]bool, len(tier1Filter))
@@ -292,13 +415,17 @@ func TestLiveDorisTier1SpecList_ValidatesAgainstUpstreamCache(t *testing.T) {
 			if wErr != nil || d.IsDir() {
 				return wErr
 			}
+			lowerName := strings.ToLower(d.Name())
+			if !strings.HasSuffix(lowerName, ".yml") && !strings.HasSuffix(lowerName, ".yaml") {
+				return nil
+			}
 			rel, relErr := filepath.Rel(cleanRoot, fullPath)
 			if relErr != nil {
 				return nil
 			}
-			relSlash := filepath.ToSlash(rel)
-			if tier1Filter[relSlash] {
-				found[relSlash] = true
+			disp := computeUpstreamSpecDisplayPath(cleanRoot, filepath.ToSlash(rel))
+			if tier1Filter[disp] {
+				found[disp] = true
 			}
 			return nil
 		})
@@ -317,9 +444,44 @@ func TestLiveDorisTier1SpecList_ValidatesAgainstUpstreamCache(t *testing.T) {
 	if len(missing) > 0 {
 		t.Fatalf("curated Tier-1 specs missing from .cache/es-v8.15.5: %v", missing)
 	}
+
+	// Verify ScoreMatchingFiles agrees 100% on all 136 displayPath entries and yields >= 600 passed sections.
+	memCard, scoreErr := compliance.ScoreMatchingFiles(
+		compliance.SuiteOptions{
+			CorpusName:                 "mem-tier1-validation",
+			TargetVersion:              "8.15.5",
+			ReuseSetupForReadOnlyFiles: true,
+		},
+		func(displayPath string) bool { return tier1Filter[displayPath] },
+		func() (http.Handler, func()) {
+			srv := proxy.NewServer("es_tier1_check", proxy.NewMemoryBackend(false), transpiler.TranspilerOptions{})
+			srv.SetBulkCoalesce(0, 0)
+			srv.SetQueryCacheTTL(0, 0)
+			srv.SetTargetESVersion("8.15.5")
+			h := srv.Handler()
+			srv.SetRemoteReindexTransport(liveInProcessHandlerTransport{handler: h})
+			srv.SetRemoteReindexWhitelistForTest(liveDorisRemoteReindexWhitelistForTest)
+			return h, func() { _ = srv.Close(context.Background()) }
+		},
+		v8Dirs...,
+	)
+	if scoreErr != nil {
+		t.Fatalf("ScoreMatchingFiles validation failed: %v", scoreErr)
+	}
+	if memCard.TotalFiles != len(tier1Filter) {
+		t.Fatalf("ScoreMatchingFiles TotalFiles = %d, want %d (displayPath mismatch)", memCard.TotalFiles, len(tier1Filter))
+	}
+	if memCard.ParseErrors != 0 {
+		t.Fatalf("ScoreMatchingFiles ParseErrors = %d, want 0", memCard.ParseErrors)
+	}
+	if memCard.SectionsPassed < 600 {
+		t.Fatalf("Tier-1 136-file suite SectionsPassed = %d, want >= 600", memCard.SectionsPassed)
+	}
+	t.Logf("[Tier-1 136-File Precheck] files=%d sections=%d passed=%d failed=%d skipped=%d pass_rate=%.2f%%",
+		memCard.TotalFiles, memCard.SectionsTotal, memCard.SectionsPassed, memCard.SectionsFailed, memCard.SectionsSkipped, memCard.PassRatePct)
 }
 
-// TestLiveDorisUpstreamYAMLConformance_E2E executes the curated ~90-file Tier-1 upstream
+// TestLiveDorisUpstreamYAMLConformance_E2E executes the curated 136-file Tier-1 upstream
 // Elasticsearch v8.15.5 YAML REST conformance suite against a live Apache Doris 4.1.3 cluster
 // via ScoreMatchingFiles, resetting Doris table/catalog state cleanly between sections.
 func TestLiveDorisUpstreamYAMLConformance_E2E(t *testing.T) {
@@ -362,6 +524,7 @@ func TestLiveDorisUpstreamYAMLConformance_E2E(t *testing.T) {
 		Timeout:        30 * time.Second,
 	})
 	backend := proxy.NewDorisSQLBackend(db, slClient)
+	_, _ = backend.ShowBackendsTelemetry(context.Background())
 
 	// Ensure `_es_catalog` exists once up-front so per-section TRUNCATE is fast and deterministic.
 	initSrv := proxy.NewServer(dorisDB, backend, transpiler.TranspilerOptions{})
@@ -382,6 +545,9 @@ func TestLiveDorisUpstreamYAMLConformance_E2E(t *testing.T) {
 		srv.SetBulkCoalesce(0, 0)
 		srv.SetQueryCacheTTL(0, 0)
 		srv.SetTargetESVersion("8.15.5")
+		h := srv.Handler()
+		srv.SetRemoteReindexTransport(liveInProcessHandlerTransport{handler: h})
+		srv.SetRemoteReindexWhitelistForTest(liveDorisRemoteReindexWhitelistForTest)
 		cleanup := func() {
 			closeCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
@@ -390,7 +556,7 @@ func TestLiveDorisUpstreamYAMLConformance_E2E(t *testing.T) {
 				t.Logf("warning: resetLiveDorisDatabaseState(%s) error: %v", dorisDB, resetErr)
 			}
 		}
-		return srv.Handler(), cleanup
+		return h, cleanup
 	}
 
 	card, err := compliance.ScoreMatchingFiles(
@@ -423,13 +589,22 @@ func TestLiveDorisUpstreamYAMLConformance_E2E(t *testing.T) {
 		card.PassRatePct,
 	)
 
+	const maxLoggedFailures = 30
+	for i, f := range card.FailureSamples {
+		if i >= maxLoggedFailures {
+			t.Logf("[Live Doris YAML Failure] ... (%d additional failure samples omitted)", len(card.FailureSamples)-maxLoggedFailures)
+			break
+		}
+		t.Logf("[Live Doris YAML Failure %d/%d] file=%s section=%q err=%s", i+1, len(card.FailureSamples), f.File, f.Section, f.Error)
+	}
+
 	if outJSON := strings.TrimSpace(os.Getenv("DORIS_LIVE_YAML_OUT_JSON")); outJSON != "" {
 		if writeErr := card.WriteJSON(outJSON); writeErr != nil {
 			t.Fatalf("writing DORIS_LIVE_YAML_OUT_JSON to %s: %v", outJSON, writeErr)
 		}
 	}
 
-	minPassed := 50
+	minPassed := 600
 	if rawMin := strings.TrimSpace(os.Getenv("DORIS_LIVE_YAML_MIN_PASSED")); rawMin != "" {
 		parsedMin, convErr := strconv.Atoi(rawMin)
 		if convErr != nil {

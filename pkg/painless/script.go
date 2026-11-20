@@ -190,11 +190,12 @@ func ValidateUpdateCtxOp(op string) error {
 }
 
 // ValidateCtxVersion validates `ctx._version` after `_update` / `_update_by_query` script execution.
-// In ES 8 `_update_by_query`, `ctx._version` starts at `-1` when unmutated; if mutated to `< 0`,
+// In `_update_by_query`, `ctx._version` starts at `-1` when unmutated; if mutated to `< 0`,
 // Elasticsearch rejects it with `illegal_argument_exception: version must be >= 0`.
 func ValidateCtxVersion(version int64, mutated bool, isUBQ bool, isES8 bool) error {
+	_ = isES8
 	if !mutated {
-		if isUBQ && isES8 && version == -1 {
+		if isUBQ && version == -1 {
 			return nil
 		}
 		if version >= 0 {

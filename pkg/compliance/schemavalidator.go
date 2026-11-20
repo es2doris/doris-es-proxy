@@ -257,6 +257,15 @@ func (v *SpecSchemaValidator) HasEndpoint(endpoint string) bool {
 	return ok
 }
 
+func isSpecWildcardTargetSegment(seg string) bool {
+	switch seg {
+	case "_all", "_local", "_master":
+		return true
+	default:
+		return false
+	}
+}
+
 func matchSpecURLTemplate(method, cleanPath string, tmpl specURLTemplate) (bool, int) {
 	methodOK := false
 	for _, m := range tmpl.Methods {
@@ -279,7 +288,7 @@ func matchSpecURLTemplate(method, cleanPath string, tmpl specURLTemplate) (bool,
 	literalScore := 0
 	for i := range tSegs {
 		if strings.HasPrefix(tSegs[i], "{") && strings.HasSuffix(tSegs[i], "}") {
-			if pSegs[i] == "" || strings.HasPrefix(pSegs[i], "_") {
+			if pSegs[i] == "" || (strings.HasPrefix(pSegs[i], "_") && !isSpecWildcardTargetSegment(pSegs[i])) {
 				return false, 0
 			}
 			literalScore += 1
@@ -345,6 +354,9 @@ func (v *SpecSchemaValidator) ValidateHTTPResponse(endpoint string, statusCode i
 	if len(trimmedPayload) == 0 {
 		if ep.Response != nil {
 			if respDef, exists := v.types[ep.Response.key()]; exists {
+				if statusCode == 404 && respDef.Body != nil && respDef.Body.Kind == "no_body" {
+					return nil
+				}
 				for _, exc := range respDef.Exceptions {
 					for _, code := range exc.StatusCodes {
 						if code == statusCode && exc.Body.Kind == "no_body" {
@@ -457,7 +469,8 @@ func (v *SpecSchemaValidator) ValidateEndpointResponse(endpoint string, payload 
 		return fmt.Errorf("endpoint %q ($): empty response payload for typed response %s", epName, respKey.String())
 	}
 
-	if acceptsNonJSONMedia(ep.ResponseMediaType) && !acceptsJSONMedia(ep.ResponseMediaType) {
+	if acceptsNonJSONMedia(ep.ResponseMediaType) && (!acceptsJSONMedia(ep.ResponseMediaType) ||
+		((trimmedPayload[0] != '{' && trimmedPayload[0] != '[') && respDef.Body != nil && respDef.Body.Value != nil && respDef.Body.Value.Kind == "array_of")) {
 		return nil
 	}
 

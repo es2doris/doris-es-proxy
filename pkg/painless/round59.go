@@ -401,6 +401,33 @@ func evalAssignExprRound59Painless(sourceMap map[string]any, lhsRaw, op, rhsRaw 
 		if callVal == nil {
 			return nil, &painlessExceptionError{exType: "NullPointerException", message: "Cannot assign property on null target"}
 		}
+		if umv, isUMV := callVal.(*UpdateMetadataVal); isUMV && umv != nil {
+			expTail := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(expandDynamicBrackets(tailPath+" =", sourceMap, params, depth+1)), "="))
+			prop := decodeBracketSeg(expTail)
+			var curVal any
+			if op != "=" {
+				var gErr error
+				curVal, _, gErr = umv.getField(prop)
+				if gErr != nil {
+					return nil, gErr
+				}
+			}
+			rhsVal, err := evalRHSExprDepth(sourceMap, rhsRaw, params, depth+1)
+			if err != nil {
+				return nil, err
+			}
+			finalVal := rhsVal
+			if op != "=" {
+				finalVal, err = evalCompoundAssignRound57Painless(curVal, rhsVal, op, lhs, rhsRaw, "", params)
+				if err != nil {
+					return nil, err
+				}
+			}
+			if err := umv.setField(prop, finalVal); err != nil {
+				return nil, err
+			}
+			return finalVal, nil
+		}
 		wrapRoot := map[string]any{"_v": callVal}
 		expTail := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(expandDynamicBrackets(tailPath+" =", sourceMap, params, depth+1)), "="))
 		wrapPath := append([]string{"_v"}, strings.Split(expTail, ".")...)
@@ -586,6 +613,35 @@ func evalAssignExprRound59Painless(sourceMap map[string]any, lhsRaw, op, rhsRaw 
 					uCls.setStaticField(propPath[0], finalVal)
 					return finalVal, nil
 				}
+			}
+		}
+
+		if len(propPath) == 1 && params != nil {
+			if umv, isUMV := params[decodeBracketSeg(varName)].(*UpdateMetadataVal); isUMV && umv != nil {
+				prop := decodeBracketSeg(propPath[0])
+				var curVal any
+				if op != "=" {
+					var gErr error
+					curVal, _, gErr = umv.getField(prop)
+					if gErr != nil {
+						return nil, gErr
+					}
+				}
+				rhsVal, err := evalRHSExprDepth(sourceMap, rhsRaw, params, depth+1)
+				if err != nil {
+					return nil, err
+				}
+				finalVal := rhsVal
+				if op != "=" {
+					finalVal, err = evalCompoundAssignRound57Painless(curVal, rhsVal, op, expLHS, rhsRaw, "", params)
+					if err != nil {
+						return nil, err
+					}
+				}
+				if err := umv.setField(prop, finalVal); err != nil {
+					return nil, err
+				}
+				return finalVal, nil
 			}
 		}
 

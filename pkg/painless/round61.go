@@ -480,6 +480,21 @@ func CountStandardAnalyzerTokens(val any) (int64, bool) {
 			total += n
 			return
 		}
+		switch fv := v.(type) {
+		case float64:
+			if !math.IsNaN(fv) && !math.IsInf(fv, 0) && fv == math.Trunc(fv) {
+				hasAny = true
+				total += int64(fv)
+				return
+			}
+		case float32:
+			f64 := float64(fv)
+			if !math.IsNaN(f64) && !math.IsInf(f64, 0) && f64 == math.Trunc(f64) {
+				hasAny = true
+				total += int64(f64)
+				return
+			}
+		}
 		hasAny = true
 		total += int64(len(tokenizeStandardAnalyzerWordsRound61(fmt.Sprintf("%v", v))))
 	}
@@ -1986,9 +2001,18 @@ func evalFieldValTransformRound61(fv *FieldVal, rawLambdaArg string, sourceMap, 
 	return fv, nil
 }
 
-// UpdateMetadataVal models ES 8.4+ `metadata()` in `_update` scripts (`15_update.yml`).
+// UpdateMetadataVal models ES 8.4+ `metadata()` in `_update`, upsert, and UBQ scripts (`15_update.yml`, `25_script_upsert.yml`).
 type UpdateMetadataVal struct {
-	Params map[string]any
+	Params    map[string]any
+	SourceMap map[string]any
+	Budget    *evalBudget
+}
+
+func (m *UpdateMetadataVal) String() string {
+	if m == nil {
+		return "null"
+	}
+	return "Metadata"
 }
 
 func (m *UpdateMetadataVal) getField(prop string) (any, bool, error) {
@@ -1997,18 +2021,61 @@ func (m *UpdateMetadataVal) getField(prop string) (any, bool, error) {
 	}
 	switch prop {
 	case "id", "_id":
+		if v, ok := m.Params["_ctx_id"]; ok && v != nil {
+			return v, true, nil
+		}
+		if m.SourceMap != nil {
+			if v, ok := m.SourceMap["_id"]; ok {
+				return v, true, nil
+			}
+		}
 		return m.Params["_ctx_id"], true, nil
 	case "index", "_index":
+		if v, ok := m.Params["_ctx_index"]; ok && v != nil {
+			return v, true, nil
+		}
+		if m.SourceMap != nil {
+			if v, ok := m.SourceMap["_index"]; ok {
+				return v, true, nil
+			}
+		}
 		return m.Params["_ctx_index"], true, nil
 	case "version", "_version":
+		if v, ok := m.Params["_ctx_version"]; ok && v != nil {
+			return v, true, nil
+		}
+		if m.SourceMap != nil {
+			if v, ok := m.SourceMap["_version"]; ok {
+				return v, true, nil
+			}
+		}
 		return m.Params["_ctx_version"], true, nil
-	case "op":
-		return m.Params["_ctx_op"], true, nil
+	case "versionType", "_version_type":
+		if v, ok := m.Params["_ctx_version_type"]; ok && v != nil {
+			return v, true, nil
+		}
+		return "internal", true, nil
+	case "op", "_op":
+		if m.Budget != nil && m.Budget.hasCtxOp {
+			return m.Budget.ctxOp, true, nil
+		}
+		if v, ok := m.Params["_ctx_op"]; ok && v != nil {
+			return v, true, nil
+		}
+		return "index", true, nil
 	case "now", "_now":
-		return m.Params["_ctx_now"], true, nil
+		return resolveNowZonedDateTimeRound63(m.SourceMap, m.Params), true, nil
 	case "routing", "_routing":
+		if forbid, _ := m.Params["__forbid_metadata_routing"].(bool); forbid {
+			return nil, true, &painlessExceptionError{
+				exType:  "IllegalArgumentException",
+				message: "routing is unavailable for insert",
+			}
+		}
 		if ins, _ := m.Params["__upsert_insert_mode"].(bool); ins {
-			if reqGuard, _ := m.Params["__upsert_forbid_routing"].(bool); reqGuard {
+			reqGuard, _ := m.Params["__upsert_forbid_routing"].(bool)
+			curRouting := m.Params["_ctx_routing"]
+			if reqGuard || curRouting == nil || fmt.Sprintf("%v", curRouting) == "" {
 				return nil, true, &painlessExceptionError{
 					exType:  "IllegalArgumentException",
 					message: "routing is unavailable for insert",
@@ -2025,7 +2092,7 @@ func (m *UpdateMetadataVal) setField(prop string, val any) error {
 		return nil
 	}
 	switch prop {
-	case "op":
+	case "op", "_op":
 		opStr := fmt.Sprintf("%v", val)
 		isES8, _ := m.Params["__is_es8"].(bool)
 		if isUBQ, _ := m.Params["__is_ubq"].(bool); isUBQ {
@@ -2037,15 +2104,19 @@ func (m *UpdateMetadataVal) setField(prop string, val any) error {
 			}
 		} else {
 			switch opStr {
-			case "index", "noop", "none", "delete":
+			case "index", "noop", "none", "delete", "create":
 			default:
 				return &painlessExceptionError{
 					exType:  "IllegalArgumentException",
-					message: fmt.Sprintf("[op] must be one of [index, noop, delete], not [%s]", opStr),
+					message: fmt.Sprintf("[op] must be one of [index, noop, delete, create], not [%s]", opStr),
 				}
 			}
 		}
 		m.Params["_ctx_op"] = opStr
+		if m.Budget != nil {
+			m.Budget.ctxOp = opStr
+			m.Budget.hasCtxOp = true
+		}
 		return nil
 	case "routing", "_routing":
 		if ins, _ := m.Params["__upsert_insert_mode"].(bool); ins {

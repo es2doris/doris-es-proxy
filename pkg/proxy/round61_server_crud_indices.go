@@ -156,6 +156,7 @@ func (s *Server) effectiveTranspileOptsR61CRUD(r *http.Request) transpiler.Trans
 	if s != nil {
 		opts = s.transpileOpts
 		opts.ES8Compat = s.isES8Mode(r)
+		opts.LegacyFlatMatchScore = !s.hasExplicitTargetESVersion()
 	} else {
 		opts.ES8Compat = true
 	}
@@ -873,6 +874,7 @@ var reservedMappingRootKeysR61CRUD = map[string]bool{
 	"dynamic":              true,
 	"dynamic_templates":    true,
 	"_source":              true,
+	"_size":                true,
 	"_meta":                true,
 	"_routing":             true,
 	"_field_names":         true,
@@ -1282,11 +1284,7 @@ func (s *Server) interceptIndexTemplateTypesR61CRUD(w http.ResponseWriter, r *ht
 				return true
 			}
 		}
-		for hk, hvs := range res.Header {
-			for _, hv := range hvs {
-				w.Header().Add(hk, hv)
-			}
-		}
+		copyRecorderHeadersSetR63(w, res.Header)
 		w.WriteHeader(res.StatusCode)
 		// #nosec G705 -- JSON error response proxied from internal template handler
 		_, _ = w.Write(respBytes)
@@ -2109,7 +2107,9 @@ func (s *Server) handlePutMappingR61CRUD(w http.ResponseWriter, r *http.Request)
 			oldRaw = oldSchema.RawMapping
 		}
 		mergedSpec := schema.MergeMappingSpecs(oldRaw, &spec)
+		normalizeMappingScriptsInPlaceR62Search(mergedSpec)
 		newSchema := schema.CompileIndexSchema(s.dorisDB, indexName, mergedSpec)
+		newSchema.ES8Mode = isES8
 		if oldSchema != nil {
 			newSchema.CopyIndexMappingSettingsFrom(oldSchema)
 		} else if custom := s.indexCustomSettings[indexName]; len(custom) > 0 {
@@ -2339,11 +2339,23 @@ func (s *Server) handleDeleteIndexR61CRUD(w http.ResponseWriter, r *http.Request
 	}
 
 	modifiedAliases := make(map[string][]string)
+	modifiedDataStreams := make(map[string]map[string]any)
 	var tablesToDrop []*schema.IndexSchema
 	s.mu.Lock()
 	for _, indexName := range targets {
+		if ownerDS, isWriteIdx := isDataStreamActiveWriteIndexLockedR63(s, indexName); isWriteIdx {
+			s.mu.Unlock()
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
+				fmt.Sprintf("index [%s] is the write index for data stream [%s] and cannot be deleted", indexName, ownerDS))
+			return
+		}
+	}
+	for _, indexName := range targets {
 		if idx, ok := s.indices[indexName]; ok {
 			tablesToDrop = append(tablesToDrop, idx)
+		}
+		for dsName, dsSnap := range removeDeletedBackingIndexFromDataStreamsLockedR63(s, indexName) {
+			modifiedDataStreams[dsName] = dsSnap
 		}
 		delete(s.indices, indexName)
 		delete(s.docRouting, indexName)
@@ -2365,8 +2377,12 @@ func (s *Server) handleDeleteIndexR61CRUD(w http.ResponseWriter, r *http.Request
 	}
 	s.mu.Unlock()
 	for _, indexName := range targets {
+		s.clearTSDBIndexTombstonesR63(indexName)
 		s.deleteCatalogEntity(r.Context(), "index", indexName)
 		s.deleteCatalogEntity(r.Context(), "index_seq_state", indexName)
+	}
+	for dsName, dsSnap := range modifiedDataStreams {
+		s.persistDataStream(r.Context(), dsName, dsSnap)
 	}
 	for alias, aliasTargets := range modifiedAliases {
 		s.persistAlias(r.Context(), alias, aliasTargets)
@@ -2377,6 +2393,7 @@ func (s *Server) handleDeleteIndexR61CRUD(w http.ResponseWriter, r *http.Request
 	}
 	s.emitSystemIndexTasksWarningIfNeededRound61(w, r, append(append([]string(nil), targets...), rawIndex))
 	purgeDeletedIndicesAdminStateR62Admin(s, targets)
+	s.purgeShardRequestCacheIndicesR63(targets)
 	s.queryCache.InvalidateAll()
 	writeJSONWithRequest(w, r, http.StatusOK, map[string]any{"acknowledged": true})
 }
@@ -3261,6 +3278,15 @@ func populateGetStoredFieldsAndSourceR61CRUD(
 			accessedFields = append(accessedFields, "_routing")
 			continue
 		}
+		if sf == "_size" {
+			if idxSchema != nil {
+				if _, ok := idxSchema.Fields["_size"]; ok || (idxSchema.RawMapping != nil && schema.IsSizeMetadataEnabled(idxSchema.RawMapping)) {
+					targetMap["_size"] = int64(len(hit.EffectiveSource()))
+					accessedFields = append(accessedFields, "_size")
+				}
+			}
+			continue
+		}
 		// Wildcard or explicit stored field check against `store: true` in idxSchema.
 		if strings.ContainsAny(sf, "*?") {
 			if idxSchema != nil {
@@ -3883,6 +3909,7 @@ func (s *Server) validateAndEvolveExistingIndexR61CRUD(
 		idx = cand
 	} else if idx.RawMapping == nil || idx.RawMapping.Dynamic == nil || idx.RawMapping.Dynamic == true || idx.RawMapping.Dynamic == "true" {
 		inferred := schema.InferMappingFromSampleDocsWithES8(sampleDocs, effES8, idx.RawMapping)
+		s.recordDynamicallyInferredFieldsWave3R63(indexName, idx.RawMapping, inferred, sampleDocs)
 		mergedPreview := schema.MergeMappingSpecs(inferred, idx.RawMapping)
 		if err := schema.ValidateMappingSpec(mergedPreview); err != nil {
 			return nil, err
@@ -3906,9 +3933,14 @@ func (s *Server) validateAndEvolveExistingIndexR61CRUD(
 			idx = cand
 		}
 	}
-	if updated, err := adoptConstantKeywordValuesFromDocsRound59(idx, sampleDocs); err != nil {
+	idxCloneForCK := idx.CloneIndexSchema()
+	if updated, err := adoptConstantKeywordValuesFromDocsRound59(idxCloneForCK, sampleDocs); err != nil {
 		return nil, err
 	} else if updated {
+		s.mu.Lock()
+		s.indices[indexName] = idxCloneForCK
+		s.mu.Unlock()
+		idx = idxCloneForCK
 		s.persistIndex(ctx, indexName, idx)
 		s.queryCache.InvalidateAll()
 	}
@@ -3988,6 +4020,7 @@ func (s *Server) ensureWritableIndexSchemaWithDocsErrR61CRUD(
 			}
 		} else if tplMappings == nil || tplMappings.Dynamic == nil || tplMappings.Dynamic == true || tplMappings.Dynamic == "true" {
 			inferred := schema.InferMappingFromSampleDocsWithES8(sampleDocs, es8Mode, tplMappings)
+			s.recordDynamicallyInferredFieldsWave3R63(indexName, tplMappings, inferred, sampleDocs)
 			effectiveMappings = schema.MergeMappingSpecs(inferred, tplMappings)
 		}
 	}
@@ -4189,6 +4222,10 @@ func (s *Server) prepareTSDBDocWriteR61CRUD(
 		}
 		s.mu.RUnlock()
 	}
+	if len(idxSchema.RoutingPath) > 0 && !docHasAnyTSDBRoutingPathFieldR63(idxSchema.RoutingPath, docMap) {
+		return "", "", http.StatusBadRequest, "mapper_parsing_exception",
+			"Error extracting routing: source didn't contain any routing fields"
+	}
 	_, detID, _, rHash, err := schema.ComputeTSDBIdentityWithRoutingHash(idxSchema, docMap, idxSettings)
 	if err != nil {
 		et, er := splitSchemaErrorPrefixR61CRUD(err, "mapper_parsing_exception")
@@ -4271,7 +4308,7 @@ func applyUpdateDocWithFieldsAPIR61CRUD(
 	}
 	params["_ctx_id"] = origID
 	params["_ctx_index"] = updReq.MetaIndex
-	if updReq.MetaVersion > 0 {
+	if updReq.MetaVersion != 0 {
 		params["_ctx_version"] = updReq.MetaVersion
 	} else {
 		params["_ctx_version"] = int64(1)

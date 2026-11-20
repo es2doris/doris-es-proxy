@@ -354,6 +354,11 @@ func SerializeMappingSpec(m *esast.MappingSpec) map[string]any {
 	if m.Routing != nil && m.Routing.Required {
 		out["_routing"] = map[string]any{"required": true}
 	}
+	if len(m.Size) > 0 {
+		if en, explicit, err := ValidateSizeMetaSpec(m.Size); err == nil && explicit {
+			out["_size"] = map[string]any{"enabled": en}
+		}
+	}
 	if len(m.Meta) > 0 {
 		out["_meta"] = m.Meta
 	}
@@ -611,6 +616,27 @@ func SerializeFieldProperty(fp esast.FieldProperty) map[string]any {
 	if fp.TimeSeriesMetric != "" {
 		out["time_series_metric"] = fp.TimeSeriesMetric
 	}
+	if fp.TargetIndex != "" {
+		out["target_index"] = fp.TargetIndex
+	}
+	if fp.InputField != "" {
+		out["input_field"] = fp.InputField
+	}
+	if fp.TargetField != "" {
+		out["target_field"] = fp.TargetField
+	}
+	if fp.KeyField != "" {
+		out["key_field"] = fp.KeyField
+	}
+	if len(fp.FetchFields) > 0 {
+		out["fetch_fields"] = deepCloneSliceMapStringAny(fp.FetchFields)
+	}
+	if len(fp.Metrics) > 0 {
+		out["metrics"] = append([]string(nil), fp.Metrics...)
+	}
+	if fp.DefaultMetric != "" {
+		out["default_metric"] = fp.DefaultMetric
+	}
 	if fp.Norms != nil {
 		out["norms"] = *fp.Norms
 	}
@@ -681,8 +707,32 @@ func ReconstructSyntheticSource(idxSchema *IndexSchema, rawDoc map[string]any, s
 			}
 		}
 		if srcDoc == nil {
-			if docMap, ok := shreddedRow["_doc"].(map[string]any); ok {
-				srcDoc = docMap
+			switch dv := shreddedRow["_doc"].(type) {
+			case map[string]any:
+				srcDoc = dv
+			case json.RawMessage:
+				var decoded map[string]any
+				dec := json.NewDecoder(bytes.NewReader(dv))
+				dec.UseNumber()
+				if dec.Decode(&decoded) == nil && decoded != nil {
+					srcDoc = decoded
+				}
+			case []byte:
+				var decoded map[string]any
+				dec := json.NewDecoder(bytes.NewReader(dv))
+				dec.UseNumber()
+				if dec.Decode(&decoded) == nil && decoded != nil {
+					srcDoc = decoded
+				}
+			case string:
+				if strings.TrimSpace(dv) != "" {
+					var decoded map[string]any
+					dec := json.NewDecoder(strings.NewReader(dv))
+					dec.UseNumber()
+					if dec.Decode(&decoded) == nil && decoded != nil {
+						srcDoc = decoded
+					}
+				}
 			}
 		}
 	}
@@ -715,6 +765,7 @@ func ReconstructSyntheticSource(idxSchema *IndexSchema, rawDoc map[string]any, s
 	if reconstructed == nil {
 		reconstructed = map[string]any{}
 	}
+	mergeIgnoredSourceIntoSynthetic(idxSchema, reconstructed, shreddedRow)
 
 	if idxSchema != nil {
 		inc, exc := idxSchema.SourceIncludesExcludes()
@@ -751,12 +802,17 @@ func isSyntheticExcludedBinding(idxSchema *IndexSchema, fullPath string) (FieldB
 	}
 	// Check explicit raw FieldProperty `store` flag if `doc_values: false`
 	storedTrue := false
+	hasCapableSub := false
 	if idxSchema.RawMapping != nil {
 		if fp, ok := lookupRawFieldProperty(idxSchema.RawMapping.Properties, strings.Split(fullPath, ".")); ok {
 			if fp.Store != nil && *fp.Store {
 				storedTrue = true
 			}
+			hasCapableSub = hasSyntheticCapableSubfield(fp.Fields)
 		}
+	}
+	if esType == "murmur3" && !storedTrue && !hasCapableSub {
+		return b, true, true
 	}
 	if b.DocValuesFalse && !storedTrue {
 		switch esType {
@@ -813,6 +869,9 @@ func reconstructSyntheticObject(idxSchema *IndexSchema, obj map[string]any, pref
 	sort.Strings(keys)
 
 	for _, k := range keys {
+		if k == "__ignored_source" || (prefix == "" && k == "_size") {
+			continue
+		}
 		rawVal := obj[k]
 		if rawVal == nil {
 			continue
@@ -871,8 +930,40 @@ func reconstructSyntheticValue(
 	if rawVal == nil {
 		return nil, false
 	}
-	if hasBinding && esType == "constant_keyword" && b.HasConstantValue {
-		return b.ConstantValue, true
+	if hasBinding && esType == "constant_keyword" {
+		if ignoredSet[fullPath] {
+			return nil, false
+		}
+		if arr, isArr := rawVal.([]any); isArr && len(arr) == 0 {
+			return nil, false
+		}
+		if b.HasConstantValue && b.ConstantValue != nil {
+			if s, isStr := b.ConstantValue.(string); isStr && b.LowercaseNormalizer {
+				return strings.ToLower(s), true
+			}
+			return b.ConstantValue, true
+		}
+	}
+	if hasBinding && esType == "aggregate_metric_double" {
+		return reconstructSyntheticAggregateMetricDouble(idxSchema, rawVal, b)
+	}
+	if hasBinding && esType == "flattened" {
+		return reconstructSyntheticFlattenedValue(idxSchema, rawVal, b)
+	}
+	if hasBinding && esType == "sparse_vector" {
+		if ignoredSet[fullPath] {
+			return nil, false
+		}
+		return reconstructSyntheticSparseVectorValue(idxSchema, rawVal)
+	}
+	if hasBinding && (esType == "annotated-text" || esType == "annotated_text") {
+		if ignoredSet[fullPath] {
+			return nil, false
+		}
+		return reconstructSyntheticAnnotatedTextValue(idxSchema, rawVal, fullPath, b)
+	}
+	if hasBinding && esType == "counted_keyword" {
+		return reconstructSyntheticCountedKeywordValue(rawVal, b)
 	}
 	if isCoordinateOrVectorESType(esType) {
 		if ignoredSet[fullPath] {
@@ -881,6 +972,31 @@ func reconstructSyntheticValue(
 		if esType == "geo_point" && strings.EqualFold(strings.TrimSpace(b.TimeSeriesMetric), "position") {
 			if posObj, ok := reconstructSyntheticPositionGeoPoint(rawVal); ok {
 				return posObj, true
+			}
+		}
+		if esType == "dense_vector" || esType == "knn_vector" {
+			elemT := strings.ToLower(strings.TrimSpace(b.VectorElementType))
+			switch elemT {
+			case "byte":
+				if hexStr, isStr := rawVal.(string); isStr {
+					if decoded, err := esast.DecodeHexSignedByteVector(hexStr); err == nil {
+						outBytes := make([]any, len(decoded))
+						for i, fv := range decoded {
+							outBytes[i] = int64(fv)
+						}
+						return outBytes, true
+					}
+				}
+			case "", "float":
+				if arr, isArr := rawVal.([]any); isArr {
+					outFloats := make([]any, 0, len(arr))
+					for _, elem := range arr {
+						if fv, okF := syntheticToFloat64(elem); okF {
+							outFloats = append(outFloats, normalizeCleanFloat32AsFloat64(fv))
+						}
+					}
+					return outFloats, true
+				}
 			}
 		}
 		normCoord, _ := reconstructIgnoredSourceValue(idxSchema, rawVal, fullPath)
@@ -1057,13 +1173,15 @@ func normalizeSyntheticScalar(
 				if esType == "scaled_float" && b.ScalingFactor > 0 {
 					f = math.Round(f*b.ScalingFactor) / b.ScalingFactor
 				} else if esType == "float" {
-					f = float64(float32(f))
+					f = normalizeCleanFloat32AsFloat64(f)
 				}
 				return f, true
 			}
 			if ignoredSet[fullPath] {
 				return nil, false
 			}
+		case "date":
+			return formatSyntheticDateValue(val, effB, ignoredSet, fullPath)
 		case "boolean":
 			switch bv := val.(type) {
 			case bool:
@@ -1094,8 +1212,13 @@ func normalizeSyntheticScalar(
 		}
 	}
 	if n, isNum := val.(json.Number); isNum {
-		if i, err := n.Int64(); err == nil && !strings.ContainsAny(n.String(), ".eE") {
-			return i, true
+		if !strings.ContainsAny(n.String(), ".eE") {
+			if i, err := n.Int64(); err == nil {
+				return i, true
+			}
+			if _, errU := strconv.ParseUint(n.String(), 10, 64); errU == nil {
+				return n, true
+			}
 		}
 		if f, err := n.Float64(); err == nil {
 			return f, true
@@ -1135,8 +1258,8 @@ func sortSyntheticScalars(scalars []any, esType string) {
 	if len(scalars) <= 1 {
 		return
 	}
-	// Do not reorder pure `text` / `match_only_text` unless it is non-text or numeric/keyword/boolean/date.
-	if esType == "text" || esType == "match_only_text" || esType == "annotated-text" || esType == "annotated_text" {
+	// Do not reorder `text` / `match_only_text` / `search_as_you_type` / `annotated_text`.
+	if esType == "text" || esType == "match_only_text" || esType == "search_as_you_type" || esType == "annotated-text" || esType == "annotated_text" {
 		return
 	}
 	if esType == "version" {
@@ -1221,6 +1344,14 @@ func semverSyntheticSortKey(v string) string {
 		return t
 	}
 	parts := strings.Split(core, ".")
+	if len(parts) == 0 {
+		return "~" + v
+	}
+	for _, p := range parts {
+		if !isDigits(p) {
+			return "~" + v
+		}
+	}
 	nSegs := len(parts)
 	if nSegs < 3 {
 		nSegs = 3
@@ -1394,17 +1525,20 @@ func validateCompletionEntryContexts(docRoot map[string]any, inlineContextsRaw a
 			return fmt.Errorf("mapper_parsing_exception: unknown completion context [%s] on field [%s]", k, b.ESFieldPath)
 		}
 	}
+	anyContextResolved := false
 	for _, cd := range b.Contexts {
+		thisResolved := false
 		if inlineVal, hasInline := inlineMap[cd.Name]; hasInline {
 			ok, err := hasNonEmptyCompletionContextValue(inlineVal, cd.Type)
 			if err != nil {
 				return err
 			}
 			if ok {
-				continue
+				anyContextResolved = true
+				thisResolved = true
 			}
 		}
-		if cd.Path != "" && docRoot != nil {
+		if !thisResolved && cd.Path != "" && docRoot != nil {
 			var candidates []any
 			if strings.EqualFold(cd.Type, "geo") {
 				candidates = extractGeoPointCandidatesWithNull(docRoot, strings.Split(cd.Path, "."), nil)
@@ -1417,20 +1551,27 @@ func validateCompletionEntryContexts(docRoot map[string]any, inlineContextsRaw a
 					return err
 				}
 				if ok {
-					continue
+					anyContextResolved = true
+					thisResolved = true
 				}
 			}
 		}
-		if cd.Default != nil {
+		if !thisResolved && cd.Default != nil {
 			ok, err := hasNonEmptyCompletionContextValue(cd.Default, cd.Type)
 			if err != nil {
 				return err
 			}
 			if ok {
-				continue
+				anyContextResolved = true
+				thisResolved = true
 			}
 		}
-		return fmt.Errorf("illegal_argument_exception: missing mandatory context [%s] for completion field [%s]", cd.Name, b.ESFieldPath)
+		if !thisResolved && len(inlineMap) == 0 {
+			return fmt.Errorf("illegal_argument_exception: Contexts are mandatory in context enabled completion field [%s] (missing [%s])", b.ESFieldPath, cd.Name)
+		}
+	}
+	if !anyContextResolved {
+		return fmt.Errorf("illegal_argument_exception: Contexts are mandatory in context enabled completion field [%s]", b.ESFieldPath)
 	}
 	return nil
 }

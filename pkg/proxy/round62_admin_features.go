@@ -546,57 +546,82 @@ func lookupFieldPropertyInRawMappingR62Admin(m *esast.MappingSpec, fieldPath str
 	return esast.FieldProperty{}, false
 }
 
-func (s *Server) resolveAnalyzeFieldTargetR62Admin(
+const maxAnalyzeAliasDepthR63Admin = 16
+
+func (s *Server) resolveAnalyzeFieldTargetCheckedR63Admin(
 	ctx context.Context,
 	idxName, fieldPath string,
 	cfg *analysis.IndexAnalysisConfig,
-) (analyzer string, normalizer string) {
+	visited map[string]bool,
+	depth int,
+) (analyzer string, normalizer string, err error) {
 	idxSchema := s.getOrCompileReadOnlySchema(ctx, idxName)
 	if idxSchema != nil && idxSchema.RawMapping != nil {
 		if prop, ok := lookupFieldPropertyInRawMappingR62Admin(idxSchema.RawMapping, fieldPath); ok {
 			pType := strings.ToLower(strings.TrimSpace(prop.Type))
 			if pType == "alias" && strings.TrimSpace(prop.Path) != "" {
-				return s.resolveAnalyzeFieldTargetR62Admin(ctx, idxName, strings.TrimSpace(prop.Path), cfg)
+				nextField := strings.TrimSpace(prop.Path)
+				if visited == nil {
+					visited = make(map[string]bool, 4)
+				}
+				visited[fieldPath] = true
+				if visited[nextField] || depth >= maxAnalyzeAliasDepthR63Admin {
+					msg := fmt.Sprintf("Cycle detected in field alias [%s] referencing [%s] in index [%s]", fieldPath, nextField, idxName)
+					return "", "", fmt.Errorf("%s", msg)
+				}
+				return s.resolveAnalyzeFieldTargetCheckedR63Admin(ctx, idxName, nextField, cfg, visited, depth+1)
 			}
 			if prop.SearchAnalyzer != "" {
-				return prop.SearchAnalyzer, ""
+				return prop.SearchAnalyzer, "", nil
 			}
 			if prop.Analyzer != "" {
-				return prop.Analyzer, ""
+				return prop.Analyzer, "", nil
 			}
 			if prop.Normalizer != "" {
-				return "", prop.Normalizer
+				return "", prop.Normalizer, nil
 			}
 			switch pType {
 			case "keyword", "constant_keyword", "wildcard":
-				return "keyword", ""
+				return "keyword", "", nil
 			case "search_as_you_type":
-				return "standard", ""
+				return "standard", "", nil
 			}
 		}
 	}
 	if idxSchema != nil {
 		b := idxSchema.ResolveField(fieldPath)
 		if b.Analyzer != "" {
-			return b.Analyzer, ""
+			return b.Analyzer, "", nil
 		}
 		if b.LowercaseNormalizer {
-			return "", "lowercase"
+			return "", "lowercase", nil
 		}
 		if (b.ESType == "keyword" || b.ESType == "constant_keyword" || b.ESType == "wildcard") ||
 			(b.DorisType == schema.DorisVarchar && b.ESType == "" && b.Analyzer == "") {
-			return "keyword", ""
+			return "keyword", "", nil
 		}
 	}
 	if cfg != nil {
 		if _, hasDefSearch := cfg.AnalyzerDefs["default_search"]; hasDefSearch {
-			return "default_search", ""
+			return "default_search", "", nil
 		}
 		if _, hasDef := cfg.AnalyzerDefs["default"]; hasDef {
-			return "default", ""
+			return "default", "", nil
 		}
 	}
-	return "standard", ""
+	return "standard", "", nil
+}
+
+func (s *Server) resolveAnalyzeFieldTargetR62Admin(
+	ctx context.Context,
+	idxName, fieldPath string,
+	cfg *analysis.IndexAnalysisConfig,
+) (analyzer string, normalizer string) {
+	an, norm, err := s.resolveAnalyzeFieldTargetCheckedR63Admin(ctx, idxName, fieldPath, cfg, nil, 0)
+	if err != nil {
+		return "standard", ""
+	}
+	return an, norm
 }
 
 func parseAnalyzeTextsR62Admin(rawText any) ([]string, error) {
@@ -841,7 +866,12 @@ func (s *Server) serveAnalyzeR62Admin(w http.ResponseWriter, r *http.Request) {
 				"Validation Failed: 1: analyzer/normalizer/tokenizer/filters cannot be specified together with field;")
 			return
 		}
-		analyzerName, normalizerName = s.resolveAnalyzeFieldTargetR62Admin(r.Context(), resolvedIdx, fieldName, cfg)
+		var fieldErr error
+		analyzerName, normalizerName, fieldErr = s.resolveAnalyzeFieldTargetCheckedR63Admin(r.Context(), resolvedIdx, fieldName, cfg, nil, 0)
+		if fieldErr != nil {
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", fieldErr.Error())
+			return
+		}
 	}
 
 	// Preserve legacy cluster-wide `normalizer: "custom_normalizer"` fallback (`round38_test.go:649`).
@@ -1415,9 +1445,26 @@ func (s *Server) serveClusterRerouteR62Admin(w http.ResponseWriter, r *http.Requ
 	}
 
 	metricParam := strings.TrimSpace(r.URL.Query().Get("metric"))
-	if s.isES8Mode(r) && metricParam == "" {
+	if metricParam != "" && metricParam != "none" && metricParam != "_all" {
+		validRerouteMetrics := map[string]bool{
+			"_all": true, "none": true, "version": true, "master_node": true,
+			"nodes": true, "routing_table": true, "metadata": true, "blocks": true,
+		}
+		for _, p := range strings.Split(metricParam, ",") {
+			p = strings.TrimSpace(p)
+			if p == "" {
+				continue
+			}
+			if !validRerouteMetrics[p] {
+				writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
+					formatUnrecognizedMetricErrorRound61("/_cluster/reroute", p, validRerouteMetrics).Error())
+				return
+			}
+		}
+	}
+	if s.isES8Mode(r) && metricParam != "none" {
 		emitESDeprecationWarningRound61(w, s, r,
-			"Returning the cluster state from cluster reroute is deprecated and will be removed in a future version. Specify '?metric=none' to opt out of returning the cluster state.")
+			"The [state] field in the response to the reroute API is deprecated and will be removed in a future version. Specify ?metric=none to adopt the future behaviour.")
 	}
 
 	resp := map[string]any{
@@ -1577,14 +1624,93 @@ func collectFieldAnalyzerRefsFromRawPropsR62Admin(props map[string]esast.FieldPr
 }
 
 type fieldTypeAggR62Admin struct {
-	count           int
-	indexSet        map[string]bool
-	indexedCount    int
-	hasDocValuesCnt int
-	dimsSum         int
-	dimsMax         int
-	indexTypes      map[string]int
-	similarities    map[string]int
+	count              int
+	indexSet           map[string]bool
+	indexedCount       int
+	indexedVectorCount int
+	indexedDimsMin     int
+	indexedDimsMax     int
+	hasDocValuesCnt    int
+	dimsSum            int
+	dimsMax            int
+	indexTypes         map[string]int
+	similarities       map[string]int
+}
+
+func collectVectorPathsByTypeR63Admin(
+	props map[string]esast.FieldProperty,
+	prefix string,
+	densePaths map[string]bool,
+	sparsePaths map[string]bool,
+) {
+	for pName, prop := range props {
+		full := pName
+		if prefix != "" {
+			full = prefix + "." + pName
+		}
+		pType := strings.ToLower(strings.TrimSpace(prop.Type))
+		switch pType {
+		case "dense_vector":
+			densePaths[full] = true
+		case "sparse_vector":
+			sparsePaths[full] = true
+		}
+		if len(prop.Properties) > 0 {
+			collectVectorPathsByTypeR63Admin(prop.Properties, full, densePaths, sparsePaths)
+		}
+	}
+}
+
+func countDocVectorFieldPresenceR63Admin(doc map[string]any, path string, wantMap bool) int {
+	if len(doc) == 0 || path == "" {
+		return 0
+	}
+	parts := strings.Split(path, ".")
+	var walk func(cur any, idx int) int
+	walk = func(cur any, idx int) int {
+		if cur == nil {
+			return 0
+		}
+		if idx == len(parts) {
+			if wantMap {
+				if m, ok := cur.(map[string]any); ok && len(m) > 0 {
+					return 1
+				}
+				return 0
+			}
+			switch arr := cur.(type) {
+			case []any:
+				if len(arr) == 0 {
+					return 0
+				}
+				if _, isNestedArr := arr[0].([]any); isNestedArr {
+					cnt := 0
+					for _, sub := range arr {
+						cnt += walk(sub, idx)
+					}
+					return cnt
+				}
+				return 1
+			case []float64:
+				if len(arr) > 0 {
+					return 1
+				}
+			}
+			return 0
+		}
+		switch typed := cur.(type) {
+		case map[string]any:
+			return walk(typed[parts[idx]], idx+1)
+		case []any:
+			cnt := 0
+			for _, elem := range typed {
+				cnt += walk(elem, idx)
+			}
+			return cnt
+		}
+		return 0
+	}
+	return walk(doc, 0)
 }
 
 func walkRawPropsForClusterFieldTypesR62Admin(
@@ -1608,9 +1734,11 @@ func walkRawPropsForClusterFieldTypesR62Admin(
 			ent := agg[pType]
 			if ent == nil {
 				ent = &fieldTypeAggR62Admin{
-					indexSet:     make(map[string]bool),
-					indexTypes:   make(map[string]int),
-					similarities: make(map[string]int),
+					indexSet:       make(map[string]bool),
+					indexedDimsMin: -1,
+					indexedDimsMax: -1,
+					indexTypes:     make(map[string]int),
+					similarities:   make(map[string]int),
 				}
 				agg[pType] = ent
 			}
@@ -1641,6 +1769,16 @@ func walkRawPropsForClusterFieldTypesR62Admin(
 					ent.dimsMax = dims
 				}
 				if isIndexed {
+					ent.indexedVectorCount++
+					explicitDims := prop.EffectiveDims()
+					if explicitDims > 0 {
+						if ent.indexedDimsMin == -1 || explicitDims < ent.indexedDimsMin {
+							ent.indexedDimsMin = explicitDims
+						}
+						if ent.indexedDimsMax == -1 || explicitDims > ent.indexedDimsMax {
+							ent.indexedDimsMax = explicitDims
+						}
+					}
 					it := "hnsw"
 					if ioMap, okIO := prop.IndexOptions.(map[string]any); okIO {
 						if tStr, okT := ioMap["type"].(string); okT && tStr != "" {
@@ -1690,9 +1828,18 @@ func (s *Server) enrichClusterStatsR62Admin(
 
 	s.mu.RLock()
 	snapCount := 0
-	repoCount := len(s.snapshotRepos)
 	for _, snapsByName := range s.snapshots {
 		snapCount += len(snapsByName)
+	}
+	repoTypesByName := make(map[string]string, len(s.snapshotRepos))
+	for repoName, repoCfg := range s.snapshotRepos {
+		rType := "fs"
+		if repoCfg != nil {
+			if ts, okT := repoCfg["type"].(string); okT && strings.TrimSpace(ts) != "" {
+				rType = strings.TrimSpace(ts)
+			}
+		}
+		repoTypesByName[repoName] = rType
 	}
 	rawSettingsByIdx := make(map[string]map[string]any, len(openIndices))
 	rawMappingsByIdx := make(map[string]*esast.MappingSpec, len(openIndices))
@@ -1701,10 +1848,18 @@ func (s *Server) enrichClusterStatsR62Admin(
 			rawSettingsByIdx[idxName] = deepCloneDocMap(cs)
 		}
 		if sch := s.indices[idxName]; sch != nil && sch.RawMapping != nil {
-			rawMappingsByIdx[idxName] = sch.RawMapping
+			if cloned := sch.CloneIndexSchema(); cloned != nil && cloned.RawMapping != nil {
+				rawMappingsByIdx[idxName] = cloned.RawMapping
+			}
 		}
 	}
 	s.mu.RUnlock()
+
+	var denseValueCount, sparseValueCount int64
+	reqCtx := context.Background()
+	if r != nil && r.Context() != nil {
+		reqCtx = r.Context()
+	}
 
 	opts := s.analysisOptionsR62Admin()
 	for _, idxName := range openIndices {
@@ -1715,6 +1870,21 @@ func (s *Server) enrichClusterStatsR62Admin(
 			}
 			walkRawPropsForClusterFieldTypesR62Admin(idxName, rm.Properties, ftAgg, dedupFields, "")
 			collectFieldAnalyzerRefsFromRawPropsR62Admin(rm.Properties, &refs)
+
+			densePaths := make(map[string]bool)
+			sparsePaths := make(map[string]bool)
+			collectVectorPathsByTypeR63Admin(rm.Properties, "", densePaths, sparsePaths)
+			if len(densePaths) > 0 || len(sparsePaths) > 0 {
+				docs := s.collectIndexedDocsWithIDsRound61(reqCtx, idxName, nil)
+				for _, d := range docs {
+					for dp := range densePaths {
+						denseValueCount += int64(countDocVectorFieldPresenceR63Admin(d.Source, dp, false))
+					}
+					for sp := range sparsePaths {
+						sparseValueCount += int64(countDocVectorFieldPresenceR63Admin(d.Source, sp, true))
+					}
+				}
+			}
 		}
 		cfg, _ := analysis.ParseIndexAnalysisConfig(rawSettingsByIdx[idxName], opts)
 		analysisInputs = append(analysisInputs, analysis.IndexStatsInput{
@@ -1740,15 +1910,14 @@ func (s *Server) enrichClusterStatsR62Admin(
 			"name":                 ftName,
 			"count":                ent.count,
 			"index_count":          len(ent.indexSet),
-			"indexed_vector_count": 0,
 			"has_doc_values_count": ent.hasDocValuesCnt,
 			"indexed_count":        ent.indexedCount,
 			"script_count":         0,
 		}
-		if ftName != "dense_vector" {
-			delete(item, "indexed_vector_count")
-		} else {
-			item["indexed_vector_count"] = ent.indexedCount
+		if ftName == "dense_vector" {
+			item["indexed_vector_count"] = ent.indexedVectorCount
+			item["indexed_vector_dim_min"] = ent.indexedDimsMin
+			item["indexed_vector_dim_max"] = ent.indexedDimsMax
 			item["dims"] = map[string]any{
 				"min": ent.dimsMax,
 				"max": ent.dimsMax,
@@ -1863,8 +2032,12 @@ func (s *Server) enrichClusterStatsR62Admin(
 	}
 	indicesMap["mappings"] = mappingsStats
 	indicesMap["analysis"] = analysis.ComputeClusterAnalysisStats(analysisInputs)
+	indicesMap["dense_vector"] = map[string]any{
+		"value_count": denseValueCount,
+	}
 	indicesMap["sparse_vector"] = map[string]any{
 		"field_count": sparseFieldCount,
+		"value_count": sparseValueCount,
 	}
 	_ = totalDocs
 
@@ -1904,14 +2077,52 @@ func (s *Server) enrichClusterStatsR62Admin(
 		"memory": memPressure,
 	}
 
+	repoStatsOut := make(map[string]any, len(repoTypesByName))
+	for repoName, repoType := range repoTypesByName {
+		repoEntry := map[string]any{
+			"type": repoType,
+			"current_counts": map[string]any{
+				"snapshots":          0,
+				"clones":             0,
+				"finalizations":      0,
+				"deletions":          0,
+				"snapshot_deletions": 0,
+				"active_deletions":   0,
+				"shards": map[string]any{
+					"total":      0,
+					"complete":   0,
+					"incomplete": 0,
+					"states": map[string]any{
+						"INIT":    0,
+						"SUCCESS": 0,
+						"FAILED":  0,
+						"ABORTED": 0,
+						"MISSING": 0,
+						"WAITING": 0,
+						"QUEUED":  0,
+					},
+				},
+			},
+			"oldest_start_time_millis": 0,
+		}
+		if isHuman {
+			repoEntry["oldest_start_time"] = "1970-01-01T00:00:00.000Z"
+		}
+		repoStatsOut[repoName] = repoEntry
+	}
+
 	resp["snapshots"] = map[string]any{
 		"count":        snapCount,
-		"repositories": repoCount,
+		"repositories": repoStatsOut,
 		"current_counts": map[string]any{
-			"total":     0,
-			"clones":    0,
-			"deletes":   0,
-			"snapshots": 0,
+			"total":                 0,
+			"clones":                0,
+			"deletes":               0,
+			"snapshots":             0,
+			"shard_snapshots":       0,
+			"snapshot_deletions":    0,
+			"concurrent_operations": 0,
+			"cleanups":              0,
 		},
 	}
 }

@@ -28,6 +28,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/es2doris/doris-es-proxy/pkg/analysis"
 	"github.com/es2doris/doris-es-proxy/pkg/esast"
 	"github.com/es2doris/doris-es-proxy/pkg/schema"
 )
@@ -821,16 +822,16 @@ func (t *Transpiler) compileKNNRound61(kq *esast.KNNQuery, scoring bool, nctx *n
 			}
 			effNumCand := kq.NumCandidates
 			if effNumCand == 0 {
-				effNumCand = min(10000, max(1, int(math.Round(1.5*float64(effSize)))))
+				effNumCand = min(10000, max(1, int(math.Ceil(1.5*float64(effSize)))))
 			}
 			topLimit = effNumCand
 		}
 	}
 
 	resolvedField, b := t.resolveFieldInNestedCtx(kq.Field, false, nctx)
-	if t.Schema != nil && len(t.Schema.Fields) > 0 && (t.Opts.ES8Compat || t.Schema.ES8Mode || (t.Schema.RawMapping != nil && strings.EqualFold(fmt.Sprintf("%v", t.Schema.RawMapping.Dynamic), "strict"))) && b.Kind == schema.StorageDynamicVariant && b.ESType == "" && !t.isMappedField(resolvedField) {
+	if t.Schema != nil && (len(t.Schema.Fields) > 0 || t.Schema.IndexName != "") && (t.Opts.ES8Compat || t.Schema.ES8Mode || (t.Schema.RawMapping != nil && strings.EqualFold(fmt.Sprintf("%v", t.Schema.RawMapping.Dynamic), "strict"))) && b.Kind == schema.StorageDynamicVariant && b.ESType == "" && !t.isMappedField(resolvedField) {
 		if t.searchErr == nil {
-			t.searchErr = fmt.Errorf("query_shard_exception: failed to create query: field [%s] does not exist in the mapping", kq.Field)
+			t.searchErr = esTranspilerError(fmt.Sprintf("all_shards_failed|query_shard_exception|failed to create query: field [%s] does not exist in the mapping", kq.Field))
 		}
 		return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
 	}
@@ -1060,7 +1061,7 @@ func (t *Transpiler) compileKNNRound61(kq *esast.KNNQuery, scoring bool, nctx *n
 			corrCol = "n__" + schema.SanitizeDorisIdentifier(b.NestedPath)
 		}
 		relPath := t.nestedRelativeJSONPath(resolvedField, false, b.NestedPath)
-		childColExpr := fmt.Sprintf("CAST(json_extract_string(`_nel`, %s) AS ARRAY<FLOAT>)", quoteStr(relPath))
+		childColExpr := fmt.Sprintf("TRY_CAST(json_extract_string(`_nel`, %s) AS ARRAY<FLOAT>)", quoteStr(relPath))
 		baseCond, rawScoreExpr, simCond := buildScoreAndSimSQL(childColExpr)
 
 		childElemCond := baseCond
@@ -1111,17 +1112,14 @@ func (t *Transpiler) compileKNNRound61(kq *esast.KNNQuery, scoring bool, nctx *n
 	}
 
 	var colExpr string
-	if b.ColumnName != "" {
-		colExpr = fmt.Sprintf("`%s`", b.ColumnName)
+	if nctx != nil && nctx.elemVar != "" {
+		relPath := t.nestedRelativeJSONPath(resolvedField, false, nctx.nestedPath)
+		colExpr = fmt.Sprintf("CAST(json_extract_string(%s, %s) AS ARRAY<FLOAT>)", nctx.elemVar, quoteStr(relPath))
 	} else {
-		if t.unindexedFields != nil && resolvedField != "" {
+		if b.ColumnName == "" && t.unindexedFields != nil && resolvedField != "" {
 			t.unindexedFields[strings.TrimSuffix(resolvedField, ".keyword")] = true
 		}
-		var pathBuilder strings.Builder
-		for _, seg := range b.SourceJSONPath {
-			_, _ = fmt.Fprintf(&pathBuilder, "[%s]", quoteStr(seg))
-		}
-		colExpr = fmt.Sprintf("CAST(`_doc`%s AS ARRAY<FLOAT>)", pathBuilder.String())
+		colExpr = buildVectorSourceFallbackColExprR63(resolvedField, b)
 	}
 
 	baseCond, rawScoreExpr, simCond := buildScoreAndSimSQL(colExpr)
@@ -1490,8 +1488,62 @@ func EvaluateIntervalsRuleWithFieldLookup(
 	lookup IntervalsFieldLookupFunc,
 	scriptEval func(script *esast.ScriptSpec, span IntervalsSpan) (bool, error),
 ) ([]IntervalsSpan, bool, error) {
+	return EvaluateIntervalsRuleWithAnalysis(defaultField, rule, lookup, nil, analysis.Options{}, scriptEval)
+}
+
+// EvaluateIntervalsRuleWithAnalysis evaluates an `intervals` rule with full index `AnalysisConfig`
+// support for custom analyzers, stemmers (`english`), and `use_field` overrides.
+func EvaluateIntervalsRuleWithAnalysis(
+	defaultField string,
+	rule *esast.IntervalsRule,
+	lookup IntervalsFieldLookupFunc,
+	cfg *analysis.IndexAnalysisConfig,
+	anOpts analysis.Options,
+	scriptEval func(script *esast.ScriptSpec, span IntervalsSpan) (bool, error),
+) ([]IntervalsSpan, bool, error) {
 	if rule == nil || lookup == nil {
 		return nil, false, nil
+	}
+
+	tokenizeQuery := func(queryText, an string) []string {
+		if cfg != nil {
+			if g, err := analysis.AnalyzeForQuery(queryText, an, cfg, anOpts); err == nil {
+				if g.IsEmpty() {
+					return nil
+				}
+				var toks []string
+				for _, seg := range g.Segments {
+					if len(seg.Alternatives) > 0 && len(seg.Alternatives[0]) > 0 {
+						toks = append(toks, seg.Alternatives[0]...)
+					}
+				}
+				return toks
+			}
+		}
+		return TokenizeByAnalyzer(queryText, an)
+	}
+
+	tokenizeDoc := func(txt, an string) []AnalyzedToken {
+		if cfg != nil {
+			if an != "" {
+				if _, isCustom := cfg.AnalyzerDefs[an]; isCustom {
+					if g, err := analysis.AnalyzeForQuery(txt, an, cfg, anOpts); err == nil {
+						var out []AnalyzedToken
+						pos := 0
+						for _, seg := range g.Segments {
+							for _, alt := range seg.Alternatives {
+								for k, term := range alt {
+									out = append(out, AnalyzedToken{Term: term, Position: pos + k})
+								}
+							}
+							pos++
+						}
+						return out
+					}
+				}
+			}
+		}
+		return TokenizeByAnalyzerWithPositions(txt, an)
 	}
 
 	type cachedStream struct {
@@ -1511,7 +1563,7 @@ func EvaluateIntervalsRuleWithFieldLookup(
 		var allToks []AnalyzedToken
 		posOffset := 0
 		for _, txt := range texts {
-			toks := TokenizeByAnalyzerWithPositions(txt, an)
+			toks := tokenizeDoc(txt, an)
 			maxPos := -1
 			for _, tk := range toks {
 				shifted := AnalyzedToken{
@@ -1634,7 +1686,7 @@ func EvaluateIntervalsRuleWithFieldLookup(
 			if effAn == "" {
 				effAn = st.analyzer
 			}
-			qToks := TokenizeByAnalyzer(r.Match.Query, effAn)
+			qToks := tokenizeQuery(r.Match.Query, effAn)
 			if len(qToks) == 0 {
 				return nil, nil
 			}
@@ -1746,6 +1798,19 @@ func EvaluateIntervalsRuleWithFieldLookup(
 			if len(r.AllOf.Intervals) == 0 {
 				return nil, nil
 			}
+			if rewritten, ok := expandRewrittenAllOfIntervalsR63(r.AllOf); ok {
+				var out []IntervalsSpan
+				for bIdx := range rewritten {
+					br := rewritten[bIdx]
+					subRule := esast.IntervalsRule{AllOf: &br}
+					sl, err := evalRule(curField, &subRule)
+					if err != nil {
+						return nil, err
+					}
+					out = append(out, tagIntervalsBranchR63(minimizeIntervalsSpans(sl), bIdx+1)...)
+				}
+				return out, nil
+			}
 			subLists := make([][]IntervalsSpan, len(r.AllOf.Intervals))
 			for i := range r.AllOf.Intervals {
 				sl, err := evalRule(curField, &r.AllOf.Intervals[i])
@@ -1764,7 +1829,7 @@ func EvaluateIntervalsRuleWithFieldLookup(
 				if err != nil {
 					return nil, err
 				}
-				all = append(all, sl...)
+				all = append(all, tagIntervalsBranchR63(sl, i+1)...)
 			}
 			// Preserve non-minimal spans (e.g. `any_of: ["big", "big bad"]`) so parent `all_of(..., max_gaps: 0)`
 			// can still match `"big bad"` + `"wolf"` on `"the big bad wolf"`.

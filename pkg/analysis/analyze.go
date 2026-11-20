@@ -29,11 +29,7 @@ import (
 // multi-valued text arrays with `position_increment_gap` and `+1` char offset gaps,
 // `index.analyze.max_token_count` enforcement, `attributes` filtering, and `explain: true`.
 func Analyze(req AnalyzeRequest) (*AnalyzeResponse, error) {
-	cfg := req.Config
-	maxTokenCount := DefaultMaxTokenCount
-	if cfg != nil && cfg.MaxTokenCount > 0 {
-		maxTokenCount = cfg.MaxTokenCount
-	}
+	maxTokenCount := effectiveMaxTokenCount(req.Config)
 
 	ca, err := resolveRequestPipeline(req)
 	if err != nil {
@@ -64,20 +60,28 @@ func Analyze(req AnalyzeRequest) (*AnalyzeResponse, error) {
 	for cfIdx, cf := range ca.charFilters {
 		filteredTexts := make([]string, len(streams))
 		for sIdx := range streams {
-			streams[sIdx] = cf.apply(streams[sIdx])
+			var cfErr error
+			streams[sIdx], cfErr = cf.apply(streams[sIdx])
+			if cfErr != nil {
+				return nil, cfErr
+			}
 			filteredTexts[sIdx] = streams[sIdx].String()
 		}
 		charFilterOutputs[cfIdx] = filteredTexts
 	}
 
 	// Stage 2: Tokenize across each stream, applying position_increment_gap across multi-valued elements!
+	tokBudget := newTokenStreamBudget(maxTokenCount)
 	var tokSnapshot []Token
 	nextPos := 0
 	for sIdx, cs := range streams {
 		if sIdx > 0 && nextPos > 0 {
 			nextPos += ca.positionIncrementGap
 		}
-		elemToks := ca.tokenizer.tokenize(cs, nextPos)
+		elemToks, tokErr := ca.tokenizer.tokenize(cs, nextPos, tokBudget)
+		if tokErr != nil {
+			return nil, tokErr
+		}
 		if len(elemToks) > 0 {
 			maxPos := elemToks[0].Position
 			for _, et := range elemToks {
@@ -94,16 +98,19 @@ func Analyze(req AnalyzeRequest) (*AnalyzeResponse, error) {
 	}
 
 	var explainTokenizerToks []Token
+	var explainRetainedBytes int64
 	if req.Explain && ca.isCustom {
 		explainTokenizerToks = cloneTokenSlice(tokSnapshot)
+		explainRetainedBytes += tokBudget.usedBytes
 	}
 
 	// Stage 3: Token filters sequentially
 	curTokens := tokSnapshot
 	explainFilterSteps := make([][]Token, len(ca.tokenFilters))
 	for tfIdx, tf := range ca.tokenFilters {
+		tfBudget := newTokenStreamBudget(maxTokenCount)
 		var tfErr error
-		curTokens, tfErr = tf.apply(curTokens)
+		curTokens, tfErr = tf.apply(curTokens, tfBudget)
 		if tfErr != nil {
 			return nil, tfErr
 		}
@@ -111,6 +118,10 @@ func Analyze(req AnalyzeRequest) (*AnalyzeResponse, error) {
 			return nil, err
 		}
 		if req.Explain && ca.isCustom {
+			explainRetainedBytes += tfBudget.usedBytes
+			if explainRetainedBytes > DefaultMaxStreamBytes {
+				return nil, newIllegalArgError(fmt.Sprintf("token stream byte size has exceeded maximum allowed [%d] bytes", DefaultMaxStreamBytes))
+			}
 			explainFilterSteps[tfIdx] = cloneTokenSlice(curTokens)
 		}
 	}
@@ -153,6 +164,7 @@ func NormalizeTerm(text string, normalizerName string, cfg *IndexAnalysisConfig,
 // (including stacked tokens at the same position, multi-word synonym_graph / shingle spans,
 // articulation-point segments, and phrase path enumeration).
 func AnalyzeForQuery(text string, analyzerName string, cfg *IndexAnalysisConfig, opts Options) (QueryTokenGraph, error) {
+	maxTokenCount := effectiveMaxTokenCount(cfg)
 	effAnalyzer := strings.TrimSpace(analyzerName)
 	if effAnalyzer == "" {
 		effAnalyzer = cfg.ResolveSearchAnalyzer("", "")
@@ -162,21 +174,50 @@ func AnalyzeForQuery(text string, analyzerName string, cfg *IndexAnalysisConfig,
 		return QueryTokenGraph{}, err
 	}
 
-	cs := newCharStream(text, 0)
-	for _, cf := range ca.charFilters {
-		cs = cf.apply(cs)
-	}
-	toks := ca.tokenizer.tokenize(cs, 0)
-	for _, tf := range ca.tokenFilters {
-		toks, err = tf.apply(toks)
-		if err != nil {
-			return QueryTokenGraph{}, err
-		}
+	toks, err := runCompiledAnalyzerSingleText(ca, text, maxTokenCount)
+	if err != nil {
+		return QueryTokenGraph{}, err
 	}
 	return buildQueryTokenGraph(toks), nil
 }
 
+func runCompiledAnalyzerSingleText(ca *compiledAnalyzer, text string, maxTokenCount int) ([]Token, error) {
+	cs := newCharStream(text, 0)
+	for _, cf := range ca.charFilters {
+		var cfErr error
+		cs, cfErr = cf.apply(cs)
+		if cfErr != nil {
+			return nil, cfErr
+		}
+	}
+	tokBudget := newTokenStreamBudget(maxTokenCount)
+	toks, err := ca.tokenizer.tokenize(cs, 0, tokBudget)
+	if err != nil {
+		return nil, err
+	}
+	if err := checkMaxTokenLimit(len(toks), maxTokenCount); err != nil {
+		return nil, err
+	}
+	for _, tf := range ca.tokenFilters {
+		tfBudget := newTokenStreamBudget(maxTokenCount)
+		toks, err = tf.apply(toks, tfBudget)
+		if err != nil {
+			return nil, err
+		}
+		if err := checkMaxTokenLimit(len(toks), maxTokenCount); err != nil {
+			return nil, err
+		}
+	}
+	return toks, nil
+}
+
 func resolveRequestPipeline(req AnalyzeRequest) (*compiledAnalyzer, error) {
+	if len(req.CharFilter) > MaxFilterChainLength {
+		return nil, newIllegalArgError(fmt.Sprintf("[analyze] char_filter count [%d] exceeds maximum allowed [%d]", len(req.CharFilter), MaxFilterChainLength))
+	}
+	if len(req.Filter) > MaxFilterChainLength {
+		return nil, newIllegalArgError(fmt.Sprintf("[analyze] filter count [%d] exceeds maximum allowed [%d]", len(req.Filter), MaxFilterChainLength))
+	}
 	hasAnalyzer := strings.TrimSpace(req.Analyzer) != ""
 	hasNormalizer := strings.TrimSpace(req.Normalizer) != ""
 	hasAdhocComponents := req.Tokenizer != nil || len(req.CharFilter) > 0 || len(req.Filter) > 0
@@ -235,14 +276,22 @@ func resolveRequestPipeline(req AnalyzeRequest) (*compiledAnalyzer, error) {
 }
 
 func resolveNamedAnalyzer(name string, cfg *IndexAnalysisConfig, opts Options) (*compiledAnalyzer, error) {
-	if cfg != nil {
-		if def, ok := cfg.AnalyzerDefs[name]; ok {
-			// Recompile with current request Options (e.g. ResolveSynonymSet / EvalPredicateScript)
-			return compileDefinedAnalyzer(name, def, cfg, opts)
+	return resolveNamedAnalyzerWithCtx(name, filterBuildContext{cfg: cfg, opts: opts})
+}
+
+func resolveNamedAnalyzerWithCtx(name string, bctx filterBuildContext) (*compiledAnalyzer, error) {
+	subCtx, err := bctx.enterAnalyzer(name)
+	if err != nil {
+		return nil, err
+	}
+	if bctx.cfg != nil {
+		if def, ok := bctx.cfg.AnalyzerDefs[name]; ok {
+			// Recompile with current request Options (e.g. ResolveSynonymSet / EvalPredicateScript) and cycle guard
+			return compileDefinedAnalyzerWithCtx(name, def, subCtx)
 		}
 	}
 	if isBuiltInAnalyzerType(name) {
-		return buildBuiltInOrTypedAnalyzer(name, name, nil, cfg, opts)
+		return buildBuiltInOrTypedAnalyzerWithCtx(name, name, nil, subCtx)
 	}
 	return nil, newIllegalArgError(fmt.Sprintf("failed to find global analyzer [%s]", name))
 }
@@ -255,7 +304,7 @@ func resolveNamedNormalizer(name string, cfg *IndexAnalysisConfig, opts Options)
 	}
 	ln := strings.ToLower(strings.TrimSpace(name))
 	switch ln {
-	case "lowercase", "uppercase", "asciifolding":
+	case "lowercase", "uppercase", "asciifolding", "icu_normalizer", "icu_folding":
 		cfs, tok, tfs, err := compileCustomChain(nil, "keyword", []any{ln}, true, cfg, opts)
 		if err != nil {
 			return nil, err
@@ -271,6 +320,93 @@ func resolveNamedNormalizer(name string, cfg *IndexAnalysisConfig, opts Options)
 	default:
 		return nil, newIllegalArgError(fmt.Sprintf("failed to find normalizer [%s]", name))
 	}
+}
+
+type tokenStreamBudget struct {
+	maxTokens int
+	curTokens int
+	maxBytes  int64
+	usedBytes int64
+}
+
+func effectiveMaxTokenCount(cfg *IndexAnalysisConfig) int {
+	maxTokenCount := DefaultMaxTokenCount
+	if cfg != nil && cfg.MaxTokenCount > 0 {
+		maxTokenCount = cfg.MaxTokenCount
+	}
+	if maxTokenCount > MaxAllowedTokenCount {
+		maxTokenCount = MaxAllowedTokenCount
+	}
+	return maxTokenCount
+}
+
+func newTokenStreamBudget(maxTokens int) *tokenStreamBudget {
+	if maxTokens <= 0 {
+		maxTokens = DefaultMaxTokenCount
+	}
+	if maxTokens > MaxAllowedTokenCount {
+		maxTokens = MaxAllowedTokenCount
+	}
+	return &tokenStreamBudget{
+		maxTokens: maxTokens,
+		maxBytes:  DefaultMaxStreamBytes,
+	}
+}
+
+func (b *tokenStreamBudget) canAddOne() error {
+	if b == nil {
+		return nil
+	}
+	if b.curTokens+1 > b.maxTokens {
+		return checkMaxTokenLimit(b.curTokens+1, b.maxTokens)
+	}
+	return nil
+}
+
+func (b *tokenStreamBudget) add(termBytes int) error {
+	if termBytes > MaxTokenTermBytes {
+		return newIllegalArgError(fmt.Sprintf("token term length [%d] exceeds maximum allowed [%d] bytes", termBytes, MaxTokenTermBytes))
+	}
+	if b == nil {
+		return nil
+	}
+	if b.curTokens+1 > b.maxTokens {
+		return checkMaxTokenLimit(b.curTokens+1, b.maxTokens)
+	}
+	if b.usedBytes+int64(termBytes) > b.maxBytes {
+		return newIllegalArgError(fmt.Sprintf("token stream byte size has exceeded maximum allowed [%d] bytes", b.maxBytes))
+	}
+	b.curTokens++
+	b.usedBytes += int64(termBytes)
+	return nil
+}
+
+func (b *tokenStreamBudget) addToken(tok Token) error {
+	if len(tok.Term) > MaxTokenTermBytes {
+		return newIllegalArgError(fmt.Sprintf("token term length [%d] exceeds maximum allowed [%d] bytes", len(tok.Term), MaxTokenTermBytes))
+	}
+	if b == nil {
+		return nil
+	}
+	total := len(tok.Term) + len(tok.Payload)
+	if b.curTokens+1 > b.maxTokens {
+		return checkMaxTokenLimit(b.curTokens+1, b.maxTokens)
+	}
+	if b.usedBytes+int64(total) > b.maxBytes {
+		return newIllegalArgError(fmt.Sprintf("token stream byte size has exceeded maximum allowed [%d] bytes", b.maxBytes))
+	}
+	b.curTokens++
+	b.usedBytes += int64(total)
+	return nil
+}
+
+func (b *tokenStreamBudget) addSlice(tokens []Token) error {
+	for _, tok := range tokens {
+		if err := b.addToken(tok); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func checkMaxTokenLimit(count int, maxTokenCount int) error {
@@ -450,6 +586,10 @@ func buildQueryTokenGraph(tokens []Token) QueryTokenGraph {
 		if pl > 1 {
 			hasGraphSpans = true
 		}
+		var payloadCopy []byte
+		if tok.Payload != nil {
+			payloadCopy = append([]byte(nil), tok.Payload...)
+		}
 		qTokens[i] = QueryToken{
 			Term:           tok.Term,
 			Position:       tok.Position,
@@ -458,17 +598,30 @@ func buildQueryTokenGraph(tokens []Token) QueryTokenGraph {
 			EndOffset:      tok.EndOffset,
 			Type:           tok.Type,
 			Keyword:        tok.Keyword,
+			Payload:        payloadCopy,
 		}
 	}
 
-	// Group by Position
+	// Group by Position, deduplicating identical (Term, PositionLength) edges per position u!
+	type posEdgeKey struct {
+		term   string
+		posLen int
+	}
 	posOrder := make([]int, 0, len(qTokens))
 	byPos := make(map[int][]QueryToken)
+	seenEdgeByPos := make(map[int]map[posEdgeKey]bool)
 	for _, qt := range qTokens {
-		if _, exists := byPos[qt.Position]; !exists {
+		edgeSet, exists := seenEdgeByPos[qt.Position]
+		if !exists {
 			posOrder = append(posOrder, qt.Position)
+			edgeSet = make(map[posEdgeKey]bool)
+			seenEdgeByPos[qt.Position] = edgeSet
 		}
-		byPos[qt.Position] = append(byPos[qt.Position], qt)
+		ek := posEdgeKey{term: qt.Term, posLen: qt.PositionLength}
+		if !edgeSet[ek] {
+			edgeSet[ek] = true
+			byPos[qt.Position] = append(byPos[qt.Position], qt)
+		}
 	}
 	sort.Ints(posOrder)
 
@@ -543,6 +696,8 @@ func computeGraphSegments(qTokens []QueryToken, posOrder []int, byPos map[int][]
 	return segments
 }
 
+const maxDFSVisits = 1024
+
 func enumerateSegmentPaths(startNode, targetEnd int, byPos map[int][]QueryToken, limit int) [][]string {
 	var results [][]string
 	seenPath := make(map[string]bool)
@@ -565,11 +720,13 @@ func enumerateSegmentPaths(startNode, targetEnd int, byPos map[int][]QueryToken,
 		return targetEnd
 	}
 
+	visits := 0
 	var dfs func(node int, cur []string)
 	dfs = func(node int, cur []string) {
-		if len(results) >= limit {
+		if len(results) >= limit || visits >= maxDFSVisits {
 			return
 		}
+		visits++
 		if node >= targetEnd {
 			if len(cur) > 0 {
 				key := strings.Join(cur, "\x00")
@@ -589,12 +746,12 @@ func enumerateSegmentPaths(startNode, targetEnd int, byPos map[int][]QueryToken,
 			return
 		}
 		for _, edge := range edges {
+			if len(results) >= limit || visits >= maxDFSVisits {
+				return
+			}
 			cur = append(cur, edge.Term)
 			dfs(node+edge.PositionLength, cur)
 			cur = cur[:len(cur)-1]
-			if len(results) >= limit {
-				return
-			}
 		}
 	}
 

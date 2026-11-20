@@ -146,7 +146,11 @@ func tryExecTokenAssignment(stmt string, tok *TokenContext, params map[string]an
 			if err != nil {
 				return false, err
 			}
-			tok.Term += fmt.Sprintf("%v", val)
+			addStr := fmt.Sprintf("%v", val)
+			if len(tok.Term)+len(addStr) > MaxTokenTermBytes {
+				return false, newIllegalArgError(fmt.Sprintf("token.term length [%d] exceeds maximum allowed [%d]", len(tok.Term)+len(addStr), MaxTokenTermBytes))
+			}
+			tok.Term += addStr
 			return true, nil
 		}
 		if strings.HasPrefix(rest, "=") && !strings.HasPrefix(rest, "==") {
@@ -156,16 +160,23 @@ func tryExecTokenAssignment(stmt string, tok *TokenContext, params map[string]an
 			if err != nil {
 				return false, err
 			}
-			tok.Term = fmt.Sprintf("%v", val)
+			newTerm := fmt.Sprintf("%v", val)
+			if len(newTerm) > MaxTokenTermBytes {
+				return false, newIllegalArgError(fmt.Sprintf("token.term length [%d] exceeds maximum allowed [%d]", len(newTerm), MaxTokenTermBytes))
+			}
+			tok.Term = newTerm
 			return true, nil
 		}
 	}
 	return false, nil
 }
 
+const maxScriptExprDepth = 64
+
 type predParser struct {
 	src    string
 	pos    int
+	depth  int
 	tok    *TokenContext
 	params map[string]any
 }
@@ -190,7 +201,14 @@ func (p *predParser) matchOp(op string) bool {
 }
 
 func (p *predParser) parseExpr() (any, error) {
-	return p.parseOr()
+	p.depth++
+	if p.depth > maxScriptExprDepth {
+		p.depth--
+		return nil, newIllegalArgError(fmt.Sprintf("script expression exceeds maximum nesting depth [%d]", maxScriptExprDepth))
+	}
+	val, err := p.parseOr()
+	p.depth--
+	return val, err
 }
 
 func (p *predParser) parseOr() (any, error) {
@@ -283,11 +301,19 @@ func (p *predParser) parseAdditive() (any, error) {
 		}
 		if ch == '+' {
 			if ls, ok := left.(string); ok {
-				left = ls + fmt.Sprintf("%v", right)
+				rs := fmt.Sprintf("%v", right)
+				if len(ls)+len(rs) > MaxTokenTermBytes {
+					return nil, newIllegalArgError(fmt.Sprintf("script string length [%d] exceeds maximum allowed [%d]", len(ls)+len(rs), MaxTokenTermBytes))
+				}
+				left = ls + rs
 				continue
 			}
 			if rs, ok := right.(string); ok {
-				left = fmt.Sprintf("%v", left) + rs
+				ls := fmt.Sprintf("%v", left)
+				if len(ls)+len(rs) > MaxTokenTermBytes {
+					return nil, newIllegalArgError(fmt.Sprintf("script string length [%d] exceeds maximum allowed [%d]", len(ls)+len(rs), MaxTokenTermBytes))
+				}
+				left = ls + rs
 				continue
 			}
 			li, ok1 := toFloat64Script(left)
@@ -311,8 +337,14 @@ func (p *predParser) parseAdditive() (any, error) {
 func (p *predParser) parseUnary() (any, error) {
 	p.skipWS()
 	if p.pos < len(p.src) && p.src[p.pos] == '!' && !strings.HasPrefix(p.src[p.pos:], "!=") {
+		p.depth++
+		if p.depth > maxScriptExprDepth {
+			p.depth--
+			return nil, newIllegalArgError(fmt.Sprintf("script expression exceeds maximum nesting depth [%d]", maxScriptExprDepth))
+		}
 		p.pos++
 		v, err := p.parseUnary()
+		p.depth--
 		if err != nil {
 			return nil, err
 		}
@@ -323,8 +355,14 @@ func (p *predParser) parseUnary() (any, error) {
 		return !b, nil
 	}
 	if p.pos < len(p.src) && p.src[p.pos] == '-' {
+		p.depth++
+		if p.depth > maxScriptExprDepth {
+			p.depth--
+			return nil, newIllegalArgError(fmt.Sprintf("script expression exceeds maximum nesting depth [%d]", maxScriptExprDepth))
+		}
 		p.pos++
 		v, err := p.parseUnary()
+		p.depth--
 		if err != nil {
 			return nil, err
 		}

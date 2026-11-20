@@ -123,11 +123,8 @@ func formatJavaFloatingPainless(f float64, bits int) string {
 	if math.IsInf(f, -1) {
 		return "-Infinity"
 	}
-	if bits == 32 && math.Abs(f) > math.MaxFloat32 {
-		if f < 0 {
-			return "-Infinity"
-		}
-		return "Infinity"
+	if bits == 32 {
+		return FormatJavaFloat32(float32(f))
 	}
 	return strconv.FormatFloat(f, 'f', -1, 64)
 }

@@ -151,7 +151,7 @@ func TestTranspileOpenMetadataSearchAndFacetAggregations(t *testing.T) {
 	// Verify HitsSQL contains fulltext MATCH_ALL in WHERE, projection-safe LIKE in SELECT _score,
 	// nested pre-filter + array_exists, array_contains on tags, and function_score
 	expectedHitsSubstrings := []string{
-		"CASE WHEN (lower(`f__name`) LIKE lower('%orders%')) THEN 10.0000 ELSE 0.0 END",
+		"CASE WHEN (lower(`f__name`) LIKE lower('%orders%')) THEN (10.0000 *",
 		"`f__name` MATCH_ALL 'orders'",
 		"`f__displayName` MATCH_ALL 'orders'",
 		"array_contains(`n__columns__name`, 'user_id') AND array_contains(`n__columns__dataType`, 'INT')",

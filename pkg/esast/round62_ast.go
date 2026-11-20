@@ -178,11 +178,12 @@ func (fp FieldProperty) RankFeatureNullValue() (*float64, error) {
 	default:
 		return nil, esWireError(fmt.Sprintf("mapper_parsing_exception: [null_value] on [rank_feature] must be a positive finite float, got [%T]", fp.NullValue))
 	}
-	if math.IsNaN(fv) || math.IsInf(fv, 0) || fv <= 0 || math.Abs(fv) > math.MaxFloat32 || float32(fv) == 0 {
-		return nil, esWireError(fmt.Sprintf("illegal_argument_exception: [null_value] on [rank_feature] must be a positive normal float32, got [%v]", fv))
+	f32 := float32(fv)
+	if math.IsNaN(fv) || math.IsInf(fv, 0) || fv <= 0 || math.Abs(fv) > math.MaxFloat32 || f32 == 0 || math.Abs(float64(f32)) < 1.17549435e-38 {
+		return nil, esWireError(fmt.Sprintf("illegal_argument_exception: [null_value] must be a positive normal float for field of type [rank_feature], got [%v]", fv))
 	}
-	f32 := float64(float32(fv))
-	return &f32, nil
+	outF := float64(f32)
+	return &outF, nil
 }
 
 // IsCompositeRuntime reports whether this `FieldProperty` declares `type: "composite"` runtime field.

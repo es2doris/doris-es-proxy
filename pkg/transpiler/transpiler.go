@@ -83,6 +83,10 @@ type TranspilerOptions struct {
 	// and `score()` projection.
 	UseDoris4SearchFunc        bool
 	ES8Compat                  bool
+	StrictTextTermRouting      bool
+	LegacyFlatMatchScore       bool
+	DynamicTextFields          map[string]bool
+	CallerSize                 int
 	MaxResultWindow            int
 	MaxAggBuckets              int
 	MaxDocvalueFieldsSearch    int
@@ -94,6 +98,7 @@ type TranspilerOptions struct {
 	RuntimeMappings            map[string]esast.FieldProperty
 	AnalysisConfig             *analysis.IndexAnalysisConfig
 	AnalysisOpts               analysis.Options
+	Similarities               map[string]SimilarityConfig
 }
 
 type Transpiler struct {
@@ -108,6 +113,7 @@ type Transpiler struct {
 	activeRequestSize  int
 	activeAliasWhere   string
 	activeMainScoreSQL string
+	activeHasKNN       bool
 	luceneDepth        int
 	inQueryString      bool
 }
@@ -135,11 +141,18 @@ func (t *Transpiler) checkFieldSearchable(field string, b schema.FieldBinding) b
 		return false
 	}
 	if b.NotIndexed {
+		if b.ESType == "geo_shape" && !b.DocValuesFalse {
+			return true
+		}
 		if t.isES8DocValuesSearchEnabled() && schema.SupportsDocValuesQueriesInES8(b) {
 			return true
 		}
 		if t.searchErr == nil {
-			t.searchErr = fmt.Errorf("cannot search on field [%s] since it is not indexed", field)
+			if b.ESType == "geo_shape" && b.DocValuesFalse {
+				t.searchErr = esTranspilerError(fmt.Sprintf("all_shards_failed|query_shard_exception|failed to create query: Cannot search on field [%s] since it is not indexed nor has doc values.", field))
+			} else {
+				t.searchErr = fmt.Errorf("cannot search on field [%s] since it is not indexed", field)
+			}
 		}
 		return false
 	}
@@ -599,6 +612,7 @@ func (t *Transpiler) BuildSearchPlan(req *esast.SearchRequest) (*ExecutionPlan, 
 		}
 	}
 	t.activeAliasWhere = aliasWhere
+	t.activeHasKNN = req != nil && (len(req.KNN) > 0 || queryContainsKNNTreeR63(req.Query))
 
 	mainQ := CompiledQuery{
 		WhereSQL: "TRUE",
@@ -913,10 +927,39 @@ func (t *Transpiler) CompileQuery(q *esast.Query, scoring bool, nctx *nestedCtx)
 		for _, field := range keys {
 			entry := q.Term[field]
 			cleanField, fBoost := parseFieldBoost(field, 1.0)
+			if svCP, handled := t.compileSparseVectorTermQueryR63(cleanField, entry.Value, entry.Boost*fBoost, scoring, nctx); handled {
+				preds = append(preds, svCP.WhereSQL)
+				if scoring {
+					scores = append(scores, svCP.ScoreSQL)
+				}
+				continue
+			}
 			pred := t.compileTermPredicate(cleanField, entry.Value, entry.CaseInsensitive, nctx)
 			preds = append(preds, pred)
 			if scoring {
-				scores = append(scores, fmt.Sprintf("(CASE WHEN %s THEN %.4f ELSE 0.0 END)", pred, entry.Boost*fBoost))
+				effB := entry.Boost * fBoost
+				kwBoost := effB
+				if t.activeHasKNN {
+					kwBoost = effB * 0.4458
+				}
+				scExpr := fmt.Sprintf("(CASE WHEN %s THEN %.4f ELSE 0.0 END)", pred, kwBoost)
+				if pred != "FALSE" && entry.Value != nil {
+					resolvedF, bText := t.resolveFieldInNestedCtx(cleanField, false, nctx)
+					if _, tok, cs, handled := t.compileAnalyzedTextTermPredicateR63(cleanField, resolvedF, bText, entry.Value, entry.CaseInsensitive, nctx); handled && tok != "" {
+						if bm25Sc, ok := t.compileBM25SingleTermScoreR63(cleanField, resolvedF, bText, tok, cs, effB, pred, nctx); ok {
+							scExpr = bm25Sc
+						}
+					} else if bText.ESType == "text" && !strings.HasSuffix(cleanField, ".keyword") {
+						rawTok := strings.TrimSpace(fmt.Sprintf("%v", entry.Value))
+						if rawTok != "" {
+							cs := !entry.CaseInsensitive && !bText.EffectiveLowercase(false)
+							if bm25Sc, ok := t.compileBM25SingleTermScoreR63(cleanField, resolvedF, bText, rawTok, cs, effB, pred, nctx); ok {
+								scExpr = bm25Sc
+							}
+						}
+					}
+				}
+				scores = append(scores, scExpr)
 			}
 		}
 		where := strings.Join(preds, " AND ")
@@ -1664,6 +1707,9 @@ func (t *Transpiler) compileGeoBoundingBox(gb *esast.GeoBoundingBoxQuery, scorin
 }
 
 func (t *Transpiler) extractGeoPointExprs(resolvedField string, b schema.FieldBinding) (latExpr, lonExpr, notNullCond string) {
+	if latR63, lonR63, nnR63 := t.BuildGeoPointOrShapeLatLonExprsR63(resolvedField, b); latR63 != "" {
+		return latR63, lonR63, nnR63
+	}
 	if b.Kind == schema.StoragePromotedScalar && b.ColumnName != "" {
 		col := fmt.Sprintf("`%s`", b.ColumnName)
 		latExpr = fmt.Sprintf("CAST(SPLIT_PART(%s, ',', 1) AS DOUBLE)", col)
@@ -1683,8 +1729,11 @@ func (t *Transpiler) extractGeoPointExprs(resolvedField string, b schema.FieldBi
 		_, _ = fmt.Fprintf(&pathBuilder, "[%s]", quoteStr(seg))
 	}
 	docRef := fmt.Sprintf("`_doc`%s", pathBuilder.String())
-	latExpr = fmt.Sprintf("COALESCE(CAST(%s['lat'] AS DOUBLE), CAST(SPLIT_PART(CAST(%s AS STRING), ',', 1) AS DOUBLE), CAST(element_at(CAST(%s AS ARRAY<DOUBLE>), 2) AS DOUBLE), CAST(element_at(CAST(%s['coordinates'] AS ARRAY<DOUBLE>), 2) AS DOUBLE))", docRef, docRef, docRef, docRef)
-	lonExpr = fmt.Sprintf("COALESCE(CAST(%s['lon'] AS DOUBLE), CAST(SPLIT_PART(CAST(%s AS STRING), ',', 2) AS DOUBLE), CAST(element_at(CAST(%s AS ARRAY<DOUBLE>), 1) AS DOUBLE), CAST(element_at(CAST(%s['coordinates'] AS ARRAY<DOUBLE>), 1) AS DOUBLE))", docRef, docRef, docRef, docRef)
+	srcLat, srcLon := buildSingleGeoScalarLatLonSQLR63(sqlRuntimeSourceStringExpr(resolvedField))
+	docCSVLat := fmt.Sprintf("CASE WHEN CAST(%s AS STRING) NOT LIKE '[%%' AND CAST(%s AS STRING) NOT REGEXP '^[[:space:]]*[A-Za-z{]' AND LOCATE(',', CAST(%s AS STRING)) > 0 THEN TRY_CAST(SPLIT_PART(CAST(%s AS STRING), ',', 1) AS DOUBLE) ELSE NULL END", docRef, docRef, docRef, docRef)
+	docCSVLon := fmt.Sprintf("CASE WHEN CAST(%s AS STRING) NOT LIKE '[%%' AND CAST(%s AS STRING) NOT REGEXP '^[[:space:]]*[A-Za-z{]' AND LOCATE(',', CAST(%s AS STRING)) > 0 THEN TRY_CAST(SPLIT_PART(CAST(%s AS STRING), ',', 2) AS DOUBLE) ELSE NULL END", docRef, docRef, docRef, docRef)
+	latExpr = fmt.Sprintf("COALESCE(CAST(%s['lat'] AS DOUBLE), %s, CAST(element_at(CAST(%s AS ARRAY<DOUBLE>), 2) AS DOUBLE), CAST(element_at(CAST(%s['coordinates'] AS ARRAY<DOUBLE>), 2) AS DOUBLE), %s)", docRef, docCSVLat, docRef, docRef, srcLat)
+	lonExpr = fmt.Sprintf("COALESCE(CAST(%s['lon'] AS DOUBLE), %s, CAST(element_at(CAST(%s AS ARRAY<DOUBLE>), 1) AS DOUBLE), CAST(element_at(CAST(%s['coordinates'] AS ARRAY<DOUBLE>), 1) AS DOUBLE), %s)", docRef, docCSVLon, docRef, docRef, srcLon)
 	notNullCond = fmt.Sprintf("%s IS NOT NULL AND %s IS NOT NULL", latExpr, lonExpr)
 	return latExpr, lonExpr, notNullCond
 }
@@ -2894,7 +2943,11 @@ func (t *Transpiler) compileMatchFieldWithAnalyzer(
 			pred := t.compileTermPredicate(field, queryVal, false, nctx)
 			score := "0.0"
 			if scoring {
-				score = fmt.Sprintf("(CASE WHEN %s THEN %.4f ELSE 0.0 END)", pred, boost)
+				kwB := boost
+				if t.activeHasKNN {
+					kwB = boost * 0.68
+				}
+				score = fmt.Sprintf("(CASE WHEN %s THEN %.4f ELSE 0.0 END)", pred, kwB)
 			}
 			return CompiledQuery{WhereSQL: pred, SafeWhereSQL: pred, ScoreSQL: score}
 		}
@@ -2930,6 +2983,9 @@ func (t *Transpiler) compileMatchFieldWithAnalyzer(
 		score := "0.0"
 		if scoring {
 			score = fmt.Sprintf("(CASE WHEN %s THEN %.4f ELSE 0.0 END)", pred, boost)
+			if bm25Sc, ok := t.compileBM25MultiTokenMatchScoreR63(field, field, b, wsTokens, true, boost, pred, nctx); ok {
+				score = bm25Sc
+			}
 		}
 		return CompiledQuery{WhereSQL: pred, SafeWhereSQL: pred, ScoreSQL: score, UsesFulltextMatch: false}
 	}
@@ -2962,6 +3018,9 @@ func (t *Transpiler) compileMatchFieldWithAnalyzer(
 			score := "0.0"
 			if scoring {
 				score = fmt.Sprintf("(CASE WHEN %s THEN %.4f ELSE 0.0 END)", pred, boost)
+				if bm25Sc, ok := t.compileBM25MultiTokenMatchScoreR63(field, field, b, uaxTokens, false, boost, pred, nctx); ok {
+					score = bm25Sc
+				}
 			}
 			return CompiledQuery{WhereSQL: pred, SafeWhereSQL: pred, ScoreSQL: score, UsesFulltextMatch: false}
 		}
@@ -2973,7 +3032,18 @@ func (t *Transpiler) compileMatchFieldWithAnalyzer(
 	scorePred := t.projectionSafeTextMatchSQL(field, queryStr, operator, nctx)
 	score := "0.0"
 	if scoring {
-		score = fmt.Sprintf("(CASE WHEN %s THEN %.4f ELSE 0.0 END)", scorePred, boost)
+		kwB := boost
+		if t.activeHasKNN && isExactKeywordField(field, b) {
+			kwB = boost * 0.4458
+		}
+		score = fmt.Sprintf("(CASE WHEN %s THEN %.4f ELSE 0.0 END)", scorePred, kwB)
+		matchToks := TokenizeByAnalyzer(queryStr, effAnalyzer)
+		if len(matchToks) == 0 {
+			matchToks = strings.Fields(queryStr)
+		}
+		if bm25Sc, ok := t.compileBM25MultiTokenMatchScoreR63(field, field, b, matchToks, strings.EqualFold(effAnalyzer, "whitespace"), boost, scorePred, nctx); ok {
+			score = bm25Sc
+		}
 	}
 
 	// Inside nested `array_exists(_el -> ...)` lambdas or on untokenized array / dynamic variant / unindexed doc-values columns, use projection-safe matching.
@@ -3138,6 +3208,16 @@ func (t *Transpiler) compileMatchPhraseField(
 	score := "0.0"
 	if scoring {
 		score = fmt.Sprintf("(CASE WHEN %s THEN %.4f ELSE 0.0 END)", scorePred, boost)
+		if !isPrefix {
+			effAn := effectiveFieldSearchAnalyzer(b)
+			pToks := TokenizeByAnalyzer(queryStr, effAn)
+			if len(pToks) == 0 {
+				pToks = strings.Fields(queryStr)
+			}
+			if bm25Sc, ok := t.compileBM25PhraseScoreR63(origPhraseField, field, b, pToks, strings.EqualFold(effAn, "whitespace"), boost, scorePred, nctx); ok {
+				score = bm25Sc
+			}
+		}
 	}
 	if nctx != nil || b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield || b.Kind == schema.StorageDynamicVariant {
 		return CompiledQuery{WhereSQL: scorePred, SafeWhereSQL: scorePred, ScoreSQL: score, UsesFulltextMatch: false}
@@ -3885,6 +3965,11 @@ func negateFulltextWhereSQL(whereSQL string) string {
 }
 
 func (t *Transpiler) compileNestedWithParent(nq *esast.NestedQuery, scoring bool, parentNctx *nestedCtx) CompiledQuery {
+	if parentNctx == nil && nq != nil {
+		if cp, ok := t.compileNestedKNNQueryR63(nq, scoring); ok {
+			return cp
+		}
+	}
 	if nq.Path == "" {
 		if nq.IgnoreUnmapped {
 			return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
@@ -5126,6 +5211,9 @@ func (t *Transpiler) compileTermPredicate(field string, val any, caseInsensitive
 		}
 	}
 	origField := field
+	if IsSubpathUnderAggregateMetricDoubleR63(t.Schema, origField) {
+		return "FALSE"
+	}
 	if origField == "_ignored" && nctx == nil {
 		if val == nil {
 			return "FALSE"
@@ -5136,12 +5224,25 @@ func (t *Transpiler) compileTermPredicate(field string, val any, caseInsensitive
 		}
 		return fmt.Sprintf("array_contains(`_ignored`, %s)", qVal)
 	}
-	field, b := t.resolveFieldInNestedCtx(field, true, nctx)
+	preferKW := !t.Opts.StrictTextTermRouting || strings.HasSuffix(origField, ".keyword")
+	field, b := t.resolveFieldInNestedCtx(field, preferKW, nctx)
 	if !t.checkFieldSearchable(field, b) || t.isNonStandardQueryRestrictedField(origField, b, "term") || b.Kind == schema.StoragePromotedVector {
 		return "FALSE"
 	}
+	if b.ESType == "murmur3" {
+		hv, okH := CoerceMurmur3TermValueR63(val)
+		if !okH {
+			return "FALSE"
+		}
+		val = hv
+	}
 	if b.IsVirtualSAYTSubfield && strings.HasSuffix(origField, "._index_prefix") {
 		return t.compileSAYTIndexPrefixTerm(origField, b, val, caseInsensitive, nctx)
+	}
+	if b.ESType == "sparse_vector" {
+		if svCP, handled := t.compileSparseVectorTermQueryR63(origField, val, 1.0, false, nctx); handled {
+			return svCP.WhereSQL
+		}
 	}
 	if b.ESType == "search_as_you_type" && strings.HasSuffix(origField, "._index_prefix") {
 		return t.compilePrefixPredicate(field, fmt.Sprintf("%v", val), true, nctx)
@@ -5242,6 +5343,9 @@ func (t *Transpiler) compileTermPredicate(field string, val any, caseInsensitive
 		if _, isBool := val.(bool); isBool {
 			return t.compileMatchField(field, fmt.Sprintf("%v", val), "or", 1.0, false, nctx).WhereSQL
 		}
+	}
+	if textPred, _, _, handled := t.compileAnalyzedTextTermPredicateR63(origField, field, b, val, caseInsensitive, nctx); handled {
+		return textPred
 	}
 	effLower := b.EffectiveLowercase(true)
 	effDT := effectiveDorisScalarType(b)
@@ -5547,6 +5651,9 @@ func (t *Transpiler) compileTermsPredicateWithCI(field string, vals []any, caseI
 		}
 	}
 	origField := field
+	if IsSubpathUnderAggregateMetricDoubleR63(t.Schema, origField) {
+		return "FALSE"
+	}
 	if origField == "_ignored" && nctx == nil {
 		var qVals []string
 		for _, v := range vals {
@@ -5607,10 +5714,10 @@ func (t *Transpiler) compileTermsPredicateWithCI(field string, vals []any, caseI
 		}
 		return "(" + strings.Join(disjuncts, " OR ") + ")"
 	}
-	if schema.IsRangeFieldType(b.ESType) || b.ESType == "flattened" {
+	if schema.IsRangeFieldType(b.ESType) || b.ESType == "flattened" || b.ESType == "murmur3" || b.ESType == "aggregate_metric_double" || ((b.ESType == "text" || b.ESType == "match_only_text") && b.KeywordCompanion == "" && !strings.HasSuffix(origField, ".keyword") && !strings.EqualFold(b.Analyzer, "keyword") && !strings.EqualFold(b.Analyzer, "noop")) {
 		var disjuncts []string
 		for _, v := range vals {
-			disjuncts = append(disjuncts, t.compileTermPredicate(field, v, caseInsensitive, nctx))
+			disjuncts = append(disjuncts, t.compileTermPredicate(origField, v, caseInsensitive, nctx))
 		}
 		if len(disjuncts) == 1 {
 			return disjuncts[0]
@@ -5876,6 +5983,9 @@ func (t *Transpiler) compilePrefixPredicate(field, val string, caseInsensitive b
 
 func (t *Transpiler) compilePrefixSingleField(field, val string, caseInsensitive bool, nctx *nestedCtx) string {
 	origField := field
+	if IsSubpathUnderAggregateMetricDoubleR63(t.Schema, origField) {
+		return "FALSE"
+	}
 	if origField == "_ignored" && nctx == nil {
 		likePat := quoteStr(escapeLikeLiteral(val) + "%")
 		if caseInsensitive {
@@ -5961,6 +6071,9 @@ func (t *Transpiler) compileWildcardPredicate(field, val string, caseInsensitive
 
 func (t *Transpiler) compileWildcardSingleField(field, val string, caseInsensitive bool, nctx *nestedCtx) string {
 	origField := field
+	if IsSubpathUnderAggregateMetricDoubleR63(t.Schema, origField) {
+		return "FALSE"
+	}
 	if origField == "_ignored" && nctx == nil {
 		likePat := quoteStr(wildcardToLike(val))
 		if caseInsensitive {
@@ -6101,6 +6214,14 @@ func formatSemverBoundKey(v string) string {
 		hasPre = true
 	}
 	parts := strings.Split(core, ".")
+	if len(parts) == 0 {
+		return "~" + strings.TrimSpace(v)
+	}
+	for _, p := range parts {
+		if !isPureDigitsASCII(p) {
+			return "~" + strings.TrimSpace(v)
+		}
+	}
 	padCore := func(i int) string {
 		if i >= len(parts) || parts[i] == "" {
 			return strings.Repeat("0", 20)
@@ -6185,7 +6306,8 @@ func sqlSemverSortKeyExpr(colExpr string) string {
 	}
 	preJoined := fmt.Sprintf("CONCAT(%s)", strings.Join(preParts, ", "))
 	pre := fmt.Sprintf("IF(LOCATE('-', %s) > 0, CONCAT('-', %s), '~')", noBuild, preJoined)
-	return fmt.Sprintf("IF(%s IS NULL, NULL, CONCAT(%s, '.', %s, '.', %s, %s, %s, %s))", colExpr, maj, minV, pat, ext4, ext5, pre)
+	validKey := fmt.Sprintf("CONCAT(%s, '.', %s, '.', %s, %s, %s, %s)", maj, minV, pat, ext4, ext5, pre)
+	return fmt.Sprintf("IF(%s IS NULL, NULL, IF(%s REGEXP '^[0-9]+(\\\\.[0-9]+)*$', %s, CONCAT('~', %s)))", colExpr, core, validKey, colExpr)
 }
 
 func sqlExactHistogramPercentileBranch(fullAggName, pctKey, hVal, hCnt, hArrExpr, wCond string, q float64) string {
@@ -6224,6 +6346,9 @@ func (t *Transpiler) compileRangeSingleField(field string, rc esast.RangeCond, n
 		return t.compileExistsPredicate(field, nctx)
 	}
 	origField := field
+	if IsSubpathUnderAggregateMetricDoubleR63(t.Schema, origField) {
+		return "FALSE"
+	}
 	field, b := t.resolveFieldInNestedCtx(field, true, nctx)
 	if !t.checkFieldSearchable(field, b) || t.isNonStandardQueryRestrictedField(origField, b, "range") || b.Kind == schema.StoragePromotedVector {
 		return "FALSE"
@@ -6257,17 +6382,49 @@ func (t *Transpiler) compileRangeSingleField(field string, rc esast.RangeCond, n
 		return fmt.Sprintf("array_exists(_x -> (%s), %s)", strings.Join(conds, " AND "), t.histogramArrayExpr(field, b, nctx))
 	}
 	if b.ESType == "version" {
-		for _, cand := range []any{gt, gte, lt, lte} {
+		normVerBound := func(cand any) (string, bool) {
 			if cand == nil {
-				continue
+				return "", true
 			}
-			s, ok := cand.(string)
-			if !ok || !schema.ValidateSemver(s) {
-				if !t.inLenientQuery && t.searchErr == nil {
-					t.searchErr = fmt.Errorf("illegal_argument_exception: invalid version range bound [%v] for field [%s]", cand, field)
-				}
-				return "FALSE"
+			return NormalizeESVersionRangeBoundR63(cand)
+		}
+		var gtVer, gteVer, ltVer, lteVer string
+		var okV bool
+		if gtVer, okV = normVerBound(gt); !okV {
+			if !t.inLenientQuery && t.searchErr == nil {
+				t.searchErr = fmt.Errorf("illegal_argument_exception: invalid version range bound [%v] for field [%s]", gt, field)
 			}
+			return "FALSE"
+		}
+		if gteVer, okV = normVerBound(gte); !okV {
+			if !t.inLenientQuery && t.searchErr == nil {
+				t.searchErr = fmt.Errorf("illegal_argument_exception: invalid version range bound [%v] for field [%s]", gte, field)
+			}
+			return "FALSE"
+		}
+		if ltVer, okV = normVerBound(lt); !okV {
+			if !t.inLenientQuery && t.searchErr == nil {
+				t.searchErr = fmt.Errorf("illegal_argument_exception: invalid version range bound [%v] for field [%s]", lt, field)
+			}
+			return "FALSE"
+		}
+		if lteVer, okV = normVerBound(lte); !okV {
+			if !t.inLenientQuery && t.searchErr == nil {
+				t.searchErr = fmt.Errorf("illegal_argument_exception: invalid version range bound [%v] for field [%s]", lte, field)
+			}
+			return "FALSE"
+		}
+		if gt != nil {
+			gt = gtVer
+		}
+		if gte != nil {
+			gte = gteVer
+		}
+		if lt != nil {
+			lt = ltVer
+		}
+		if lte != nil {
+			lte = lteVer
 		}
 		isNestedMultiVal := nctx != nil && b.Kind == schema.StorageNestedSubfield && nctx.nestedPath == b.NestedPath && b.IsMultiValued
 		if b.Kind == schema.StoragePromotedArray || (b.Kind == schema.StorageNestedSubfield && (nctx == nil || nctx.nestedPath != b.NestedPath)) || isNestedMultiVal {
@@ -6730,6 +6887,36 @@ func (t *Transpiler) compileRangeSingleField(field string, rc esast.RangeCond, n
 		return fmt.Sprintf("array_exists(_x -> %s, `%s`)", strings.Join(elemParts, " AND "), b.EffectiveArrayColumn(true))
 	}
 
+	if nctx == nil {
+		if _, rtType, isRT := t.resolveScriptlessRuntimeField(origField); isRT && (rtType == "double" || rtType == "long" || rtType == "boolean") {
+			arrExpr := sqlRuntimeSourceArrayExpr(origField)
+			elemExpr := "TRY_CAST(_x AS DOUBLE)"
+			switch rtType {
+			case "long":
+				elemExpr = "TRY_CAST(_x AS BIGINT)"
+			case "boolean":
+				elemExpr = "CASE WHEN LOWER(_x) IN ('true', '1') THEN TRUE WHEN LOWER(_x) IN ('false', '0') THEN FALSE ELSE NULL END"
+			}
+			var elemParts []string
+			if gt != nil {
+				elemParts = append(elemParts, fmt.Sprintf("%s > %s", elemExpr, quoteValue(gt)))
+			}
+			if gte != nil {
+				elemParts = append(elemParts, fmt.Sprintf("%s >= %s", elemExpr, quoteValue(gte)))
+			}
+			if lt != nil {
+				elemParts = append(elemParts, fmt.Sprintf("%s < %s", elemExpr, quoteValue(lt)))
+			}
+			if lte != nil {
+				elemParts = append(elemParts, fmt.Sprintf("%s <= %s", elemExpr, quoteValue(lte)))
+			}
+			if len(elemParts) == 0 {
+				return "TRUE"
+			}
+			return fmt.Sprintf("array_exists(_x -> (%s) IS NOT NULL AND %s, %s)", elemExpr, strings.Join(elemParts, " AND "), arrExpr)
+		}
+	}
+
 	col := t.sqlTypedColumnRef(field, sampleBound, true, nctx)
 
 	var parts []string
@@ -6776,6 +6963,9 @@ func (t *Transpiler) compileRangeSingleField(field string, rc esast.RangeCond, n
 
 func (t *Transpiler) compileExistsPredicate(field string, nctx *nestedCtx) string {
 	field, _ = parseFieldBoost(field, 1.0)
+	if IsSubpathUnderAggregateMetricDoubleR63(t.Schema, field) {
+		return "FALSE"
+	}
 	if field == "_routing" {
 		return "(`_routing` IS NOT NULL AND `_routing` != '')"
 	}
@@ -6811,6 +7001,9 @@ func (t *Transpiler) compileExistsPredicate(field string, nctx *nestedCtx) strin
 	field, b := t.resolveFieldInNestedCtx(field, preferKw, nctx)
 	if b.EnabledFalse {
 		return "FALSE"
+	}
+	if b.ESType == "aggregate_metric_double" {
+		return CompileAggregateMetricExistsExprR63(b)
 	}
 	if strings.HasSuffix(b.AliasTarget, ".keyword") {
 		preferKw = true
@@ -6908,7 +7101,7 @@ func (t *Transpiler) buildAggsCTESQL(baseWhere, userWhere, aliasWhere, postFilte
 		t.Schema.DorisDB,
 		t.Schema.DorisTable,
 		cteWhere,
-		strings.Join(branches, "\nUNION ALL\n"),
+		wrapUnionBranchesWithOuterOrderByR63(branches),
 	)
 }
 
@@ -8451,7 +8644,7 @@ func (t *Transpiler) appendAggBranches(
 				if ivMs <= 0 {
 					ivMs = 86400000
 				}
-				fromClause, col = buildRangeBucketExplodeSQL("`base_matched`", effLoSQL, effHiSQL, 0, float64(ivMs))
+				fromClause, col = buildDateRangeBucketExplodeSQLR63("`base_matched`", effLoSQL, effHiSQL, ivMs)
 				notNullCond = fmt.Sprintf("%s((%s) IS NOT NULL OR (%s) IS NOT NULL) AND (%s) <= (%s)", wherePrefix, rawLoSQL, rawHiSQL, effLoSQL, effHiSQL)
 				if spec.DateHistogram.HardBounds != nil {
 					if minMs, okMin := t.resolveDateHistogramBoundMs(b, spec.DateHistogram.Format, spec.DateHistogram.HardBounds.Min); okMin {
@@ -8604,7 +8797,7 @@ func (t *Transpiler) appendAggBranches(
 					}
 				}
 			}
-			bucketExpr := fmt.Sprintf("CAST(FLOOR((%s - %v) / %v) * %v + %v AS STRING)", col, offset, interval, interval, offset)
+			bucketExpr := fmt.Sprintf("CAST(FLOOR((%s - %s) / %s) * %s + %s AS STRING)", col, FormatSQLFloatR63(offset), FormatSQLFloatR63(interval), FormatSQLFloatR63(interval), FormatSQLFloatR63(offset))
 			*subIdx++
 			*branches = append(*branches, fmt.Sprintf(
 				"SELECT `_agg_name`, `_bucket_key`, `_doc_count` FROM ("+
@@ -8641,7 +8834,15 @@ func (t *Transpiler) appendAggBranches(
 			b := t.Schema.ResolveEffectiveField(effRField, true)
 			arrCol := b.EffectiveArrayColumn(true)
 			isArray := b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield
-			for _, rng := range rngSpec.Ranges {
+			rangeOrder := make([]int, len(rngSpec.Ranges))
+			for i := range rngSpec.Ranges {
+				rangeOrder[i] = i
+			}
+			if spec.IPRange == nil && !rngSpec.Keyed {
+				rangeOrder = t.sortedRangeAggIndicesAscR63(effRField, rngSpec, now)
+			}
+			for _, rIdx := range rangeOrder {
+				rng := rngSpec.Ranges[rIdx]
 				var rWhere string
 				fromSource := "`base_matched`"
 				if spec.IPRange != nil {
@@ -8961,7 +9162,7 @@ func (t *Transpiler) appendAggBranches(
 								col = fmt.Sprintf("COALESCE(%s, %s)", col, strconv.FormatFloat(missVal, 'f', -1, 64))
 							}
 						}
-						expr := fmt.Sprintf("CAST(FLOOR((%s - %v) / %v) * %v + %v AS STRING)", col, offset, interval, interval, offset)
+						expr := fmt.Sprintf("CAST(FLOOR((%s - %s) / %s) * %s + %s AS STRING)", col, FormatSQLFloatR63(offset), FormatSQLFloatR63(interval), FormatSQLFloatR63(interval), FormatSQLFloatR63(offset))
 						if srcSpec.Histogram.Missing != nil {
 							if _, ok := resolveHistogramMissingFloat(srcSpec.Histogram.Missing); !ok {
 								expr = fmt.Sprintf("COALESCE(%s, %s)", expr, quoteStr(formatMissingScalar(srcSpec.Histogram.Missing)))
@@ -9335,13 +9536,13 @@ func (t *Transpiler) appendAggBranches(
 			if extraWhere != "" {
 				wCond = fmt.Sprintf("(%s) AND (%s)", extraWhere, wCond)
 			}
-			keyExpr := fmt.Sprintf("CAST(FLOOR(%s) AS STRING)", col)
+			keyExpr := fmt.Sprintf("CAST(%s AS STRING)", col)
 			*subIdx++
 			*branches = append(*branches, fmt.Sprintf(
 				"SELECT `_agg_name`, `_bucket_key`, `_doc_count` FROM ("+
 					"SELECT %s AS `_agg_name`, %s AS `_bucket_key`, CAST(COUNT(*) AS DOUBLE) AS `_doc_count` "+
 					"FROM `base_matched` WHERE %s "+
-					"GROUP BY `_bucket_key` ORDER BY `_bucket_key` ASC LIMIT %d"+
+					"GROUP BY `_bucket_key` ORDER BY CAST(`_bucket_key` AS DOUBLE) ASC, `_bucket_key` ASC LIMIT %d"+
 					") `_agg_sub_%d`",
 				quoteStr(fullAggName), keyExpr, wCond, t.maxAggBuckets(), *subIdx,
 			))
@@ -9637,6 +9838,10 @@ func (t *Transpiler) appendGroupedBucketSubAggsWithNested(
 			}
 		}
 		effField, b := t.resolveFieldInNestedCtx(effField, false, nctx)
+		if b.ESType == "aggregate_metric_double" {
+			t.appendSubAggregateMetricDoubleR63(branches, subFull, fn, effField, b, parentBucketExpr, fromClause, whereClause)
+			return
+		}
 		if b.ESType == "histogram" {
 			hArrExpr := t.histogramArrayExpr(effField, b, nctx)
 			subFrom := fmt.Sprintf("%s LATERAL VIEW EXPLODE(%s) %s AS %s", fromClause, hArrExpr, subTableAlias, subElemAlias)
@@ -10729,7 +10934,7 @@ func (t *Transpiler) appendGroupedBucketSubAggsWithNested(
 					hasMissing = true
 				}
 			}
-			childBucketExpr := fmt.Sprintf("CAST(FLOOR((%s - %v) / %v) * %v + %v AS STRING)", col, offset, interval, interval, offset)
+			childBucketExpr := fmt.Sprintf("CAST(FLOOR((%s - %s) / %s) * %s + %s AS STRING)", col, FormatSQLFloatR63(offset), FormatSQLFloatR63(interval), FormatSQLFloatR63(interval), FormatSQLFloatR63(offset))
 			compKeyExpr := fmt.Sprintf("CONCAT(%s, '\\x1f', %s)", parentBucketExpr, childBucketExpr)
 			subWhere := fmt.Sprintf("(%s) AND %s IS NOT NULL", whereClause, notNullExpr)
 			if isHistType {
@@ -11206,7 +11411,7 @@ func (t *Transpiler) appendGroupedBucketSubAggsWithNested(
 								col = fmt.Sprintf("COALESCE(%s, %s)", col, strconv.FormatFloat(missVal, 'f', -1, 64))
 							}
 						}
-						expr := fmt.Sprintf("CAST(FLOOR((%s - %v) / %v) * %v + %v AS STRING)", col, offset, interval, interval, offset)
+						expr := fmt.Sprintf("CAST(FLOOR((%s - %s) / %s) * %s + %s AS STRING)", col, FormatSQLFloatR63(offset), FormatSQLFloatR63(interval), FormatSQLFloatR63(interval), FormatSQLFloatR63(offset))
 						if srcSpec.Histogram.Missing != nil {
 							if _, ok := resolveHistogramMissingFloat(srcSpec.Histogram.Missing); !ok {
 								expr = fmt.Sprintf("COALESCE(%s, %s)", expr, quoteStr(formatMissingScalar(srcSpec.Histogram.Missing)))
@@ -11531,7 +11736,7 @@ func (t *Transpiler) appendGroupedBucketSubAggsWithNested(
 				}
 			}
 			subWhere := fmt.Sprintf("(%s) AND %s IS NOT NULL", whereClause, col)
-			childKeyExpr := fmt.Sprintf("CONCAT(%s, '\\x1f', CAST(FLOOR(%s) AS STRING))", parentBucketExpr, col)
+			childKeyExpr := fmt.Sprintf("CONCAT(%s, '\\x1f', CAST(%s AS STRING))", parentBucketExpr, col)
 			*subIdx++
 			*branches = append(*branches, fmt.Sprintf(
 				"SELECT `_agg_name`, `_bucket_key`, `_doc_count` FROM ("+
@@ -14142,7 +14347,11 @@ func (t *Transpiler) sqlSortColumnRefWithType(field string, sampleVal any, desc 
 	if (effType == "unsigned_long" || b.ESType == "unsigned_long") && sampleVal == nil {
 		sampleVal = uint64(math.MaxUint64)
 	}
-	return t.sqlTypedColumnRef(field, sampleVal, true, nil)
+	colRef := t.sqlTypedColumnRef(field, sampleVal, true, nil)
+	if effType == "unsigned_long" || b.ESType == "unsigned_long" {
+		return fmt.Sprintf("CAST(%s AS LARGEINT)", colRef)
+	}
+	return colRef
 }
 
 func (t *Transpiler) sqlColumnRef(field string, preferKeyword bool, nctx *nestedCtx) string {
@@ -14152,7 +14361,7 @@ func (t *Transpiler) sqlColumnRef(field string, preferKeyword bool, nctx *nested
 func (t *Transpiler) sqlNumericColumnRef(field string, nctx *nestedCtx) string {
 	if nctx == nil {
 		if _, effType, isRT := t.resolveScriptlessRuntimeField(field); isRT {
-			expr := fmt.Sprintf("CAST(%s AS DOUBLE)", sqlRuntimeSourceTypedExpr(field, effType))
+			expr := fmt.Sprintf("TRY_CAST(%s AS DOUBLE)", sqlRuntimeSourceTypedExpr(field, effType))
 			if effType == "date_nanos" {
 				return fmt.Sprintf("(%s / 1000000.0)", expr)
 			}
@@ -14160,6 +14369,11 @@ func (t *Transpiler) sqlNumericColumnRef(field string, nctx *nestedCtx) string {
 		}
 	}
 	field, b := t.resolveFieldInNestedCtx(field, true, nctx)
+	if b.ESType == "aggregate_metric_double" {
+		if sb, ok := ResolveAggregateMetricDefaultBindingR63(b); ok {
+			b = sb
+		}
+	}
 	var expr string
 	switch b.Kind {
 	case schema.StoragePromotedScalar:
@@ -14208,23 +14422,25 @@ func (t *Transpiler) nestedRelativeJSONPath(field string, preferKeyword bool, ne
 		}
 	}
 	if t.Schema != nil {
-		srcDotPath := strings.Join(b.SourceJSONPath, ".")
-		if srcDotPath == "" {
-			srcDotPath = strings.TrimSuffix(effField, ".keyword")
-		}
-		subKey := ""
-		if strings.HasPrefix(effField, srcDotPath+".") {
-			subKey = strings.TrimPrefix(effField, srcDotPath+".")
-		} else if preferKeyword && b.ESType == "keyword" && effField == srcDotPath {
-			subKey = "keyword"
-		}
-		if subKey != "" && !strings.Contains(subKey, ".") {
-			if baseB, hasBase := t.Schema.Fields[srcDotPath]; hasBase {
-				if subKey != "keyword" || baseB.ESType == "text" || strings.HasSuffix(effField, ".keyword") {
-					if b.IgnoreAbove > 0 || b.LowercaseNormalizer || b.IsMultiValued || b.NullValue != nil ||
-						baseB.IgnoreAbove > 0 || baseB.LowercaseNormalizer || baseB.NullValue != nil ||
-						b.ESType != baseB.ESType || b.Format != baseB.Format || b.ScalingFactor != baseB.ScalingFactor {
-						relKey += "__" + subKey
+		if _, isShreddedNested := t.Schema.NestedRoots[nestedPath]; isShreddedNested {
+			srcDotPath := strings.Join(b.SourceJSONPath, ".")
+			if srcDotPath == "" {
+				srcDotPath = strings.TrimSuffix(effField, ".keyword")
+			}
+			subKey := ""
+			if strings.HasPrefix(effField, srcDotPath+".") {
+				subKey = strings.TrimPrefix(effField, srcDotPath+".")
+			} else if preferKeyword && b.ESType == "keyword" && effField == srcDotPath {
+				subKey = "keyword"
+			}
+			if subKey != "" && !strings.Contains(subKey, ".") {
+				if baseB, hasBase := t.Schema.Fields[srcDotPath]; hasBase {
+					if subKey != "keyword" || baseB.ESType == "text" || strings.HasSuffix(effField, ".keyword") {
+						if b.IgnoreAbove > 0 || b.LowercaseNormalizer || b.IsMultiValued || b.NullValue != nil ||
+							baseB.IgnoreAbove > 0 || baseB.LowercaseNormalizer || baseB.NullValue != nil ||
+							b.ESType != baseB.ESType || b.Format != baseB.Format || b.ScalingFactor != baseB.ScalingFactor {
+							relKey += "__" + subKey
+						}
 					}
 				}
 			}
@@ -14236,6 +14452,24 @@ func (t *Transpiler) nestedRelativeJSONPath(field string, preferKeyword bool, ne
 func (t *Transpiler) resolveFieldInNestedCtx(field string, preferKeyword bool, nctx *nestedCtx) (string, schema.FieldBinding) {
 	if field == "_ignored" && nctx == nil {
 		return field, ignoredMetadataBinding()
+	}
+	if field == "_size" && nctx == nil {
+		if t.Schema != nil && schema.IsSizeMetadataEnabled(t.Schema.RawMapping) {
+			if fb, ok := t.Schema.Fields["_size"]; ok && fb.ColumnName != "" {
+				return field, fb
+			}
+			return field, schema.FieldBinding{
+				ESFieldPath: "_size",
+				ColumnName:  "f___size",
+				Kind:        schema.StoragePromotedScalar,
+				DorisType:   schema.DorisBigInt,
+				ESType:      "long",
+			}
+		}
+		if !t.inLenientQuery && t.searchErr == nil {
+			t.searchErr = esTranspilerError("all_shards_failed|query_shard_exception|failed to find [_size] field, Mapping Metadata [_size] is not enabled")
+		}
+		return field, schema.FieldBinding{ESFieldPath: "_size", EnabledFalse: true}
 	}
 	if nctx == nil {
 		if fp, effType, isRT := t.resolveScriptlessRuntimeField(field); isRT {
@@ -14276,6 +14510,15 @@ func (t *Transpiler) sqlTypedColumnRef(field string, sampleVal any, preferKeywor
 	}
 	if field == "_ignored" {
 		return "`_ignored`"
+	}
+	if field == "_size" && nctx == nil {
+		if t.Schema != nil && schema.IsSizeMetadataEnabled(t.Schema.RawMapping) {
+			return "COALESCE(`f___size`, OCTET_LENGTH(`_source`))"
+		}
+		if !t.inLenientQuery && t.searchErr == nil {
+			t.searchErr = esTranspilerError("all_shards_failed|query_shard_exception|failed to find [_size] field, Mapping Metadata [_size] is not enabled")
+		}
+		return "NULL"
 	}
 	if field == "_tsid" && nctx == nil {
 		return "`__tsid`"
@@ -14323,6 +14566,11 @@ func (t *Transpiler) sqlTypedColumnRef(field string, sampleVal any, preferKeywor
 	}
 
 	field, b := t.resolveFieldInNestedCtx(field, preferKeyword, nctx)
+	if b.ESType == "aggregate_metric_double" {
+		if sb, ok := ResolveAggregateMetricDefaultBindingR63(b); ok {
+			b = sb
+		}
+	}
 	if b.ESType == "unsigned_long" && (castType == "BIGINT" || castType == "LARGEINT") {
 		castType = "LARGEINT"
 	} else if effectiveDorisScalarType(b) == schema.DorisDouble && castType == "BIGINT" {
@@ -14349,10 +14597,14 @@ func (t *Transpiler) sqlTypedColumnRef(field string, sampleVal any, preferKeywor
 		if b.DorisType == schema.DorisLargeInt && castType == "DOUBLE" {
 			return fmt.Sprintf("CAST(`%s` AS DOUBLE)", b.ColumnName)
 		}
-		if preferKeyword && b.KeywordCompanion != "" {
+		if preferKeyword && b.KeywordCompanion != "" && (b.ESType == "text" || b.ESType == "match_only_text" || b.ESType == "") {
 			return fmt.Sprintf("`%s`", b.KeywordCompanion)
 		}
-		return fmt.Sprintf("`%s`", b.ColumnName)
+		rawCol := fmt.Sprintf("`%s`", b.ColumnName)
+		if b.ESType == "constant_keyword" && b.HasConstantValue && b.ConstantValue != nil {
+			return ConstantKeywordScalarExprR63(rawCol, field, b)
+		}
+		return rawCol
 	case schema.StoragePromotedArray:
 		return fmt.Sprintf("`%s`", b.EffectiveArrayColumn(preferKeyword))
 	case schema.StoragePromotedVector:
@@ -14595,138 +14847,7 @@ func parseUnsignedLongRawBound(v any) (uVal uint64, fVal float64, isExactUint, i
 }
 
 func normalizeUnsignedLongRangeBounds(gt, gte, lt, lte any) (outGT, outGTE, outLT, outLTE any, ok bool) {
-	effMin := uint64(0)
-	effMax := uint64(math.MaxUint64)
-	hasLower := false
-	hasUpper := false
-
-	if lt != nil {
-		uVal, fVal, isExact, isNeg, isAbove, valid := parseUnsignedLongRawBound(lt)
-		if !valid || isNeg {
-			return nil, nil, nil, nil, false
-		}
-		if isExact {
-			if uVal == 0 {
-				return nil, nil, nil, nil, false
-			}
-			hasUpper = true
-			if uVal-1 < effMax {
-				effMax = uVal - 1
-			}
-			outLT = uVal
-		} else if !isAbove {
-			if fVal <= 0 {
-				return nil, nil, nil, nil, false
-			}
-			floored := uint64(math.Floor(fVal))
-			hasUpper = true
-			if floored < effMax {
-				effMax = floored
-			}
-			outLTE = floored
-		} else {
-			hasUpper = true
-			outLTE = uint64(math.MaxUint64)
-		}
-	}
-	if lte != nil {
-		uVal, fVal, isExact, isNeg, isAbove, valid := parseUnsignedLongRawBound(lte)
-		if !valid || isNeg {
-			return nil, nil, nil, nil, false
-		}
-		var candMax uint64
-		if isAbove {
-			candMax = uint64(math.MaxUint64)
-		} else if isExact {
-			candMax = uVal
-		} else {
-			candMax = uint64(math.Floor(fVal))
-		}
-		hasUpper = true
-		if candMax < effMax {
-			effMax = candMax
-		}
-		if outLT != nil {
-			if ltU, isU := outLT.(uint64); isU && candMax < ltU-1 {
-				outLT = nil
-				outLTE = candMax
-			}
-		} else if outLTE != nil {
-			if prevU, isU := outLTE.(uint64); !isU || candMax < prevU {
-				outLTE = candMax
-			}
-		} else {
-			outLTE = candMax
-		}
-	}
-	if gt != nil {
-		uVal, fVal, isExact, isNeg, isAbove, valid := parseUnsignedLongRawBound(gt)
-		if !valid || isAbove {
-			return nil, nil, nil, nil, false
-		}
-		if isNeg {
-			hasLower = true
-			outGTE = uint64(0)
-		} else if isExact {
-			if uVal == math.MaxUint64 {
-				return nil, nil, nil, nil, false
-			}
-			hasLower = true
-			if uVal+1 > effMin {
-				effMin = uVal + 1
-			}
-			outGT = uVal
-		} else {
-			ceilF := math.Floor(fVal) + 1.0
-			if ceilF >= 18446744073709551616.0 {
-				return nil, nil, nil, nil, false
-			}
-			ceilU := uint64(ceilF)
-			hasLower = true
-			if ceilU > effMin {
-				effMin = ceilU
-			}
-			outGTE = ceilU
-		}
-	}
-	if gte != nil {
-		uVal, fVal, isExact, isNeg, isAbove, valid := parseUnsignedLongRawBound(gte)
-		if !valid || isAbove {
-			return nil, nil, nil, nil, false
-		}
-		var candMin uint64
-		if isNeg {
-			candMin = 0
-		} else if isExact {
-			candMin = uVal
-		} else {
-			ceilF := math.Ceil(fVal)
-			if ceilF >= 18446744073709551616.0 {
-				return nil, nil, nil, nil, false
-			}
-			candMin = uint64(ceilF)
-		}
-		hasLower = true
-		if candMin > effMin {
-			effMin = candMin
-		}
-		if outGT != nil {
-			if gtU, isU := outGT.(uint64); isU && candMin > gtU+1 {
-				outGT = nil
-				outGTE = candMin
-			}
-		} else if outGTE != nil {
-			if prevU, isU := outGTE.(uint64); !isU || candMin > prevU {
-				outGTE = candMin
-			}
-		} else {
-			outGTE = candMin
-		}
-	}
-	if hasLower && hasUpper && effMin > effMax {
-		return nil, nil, nil, nil, false
-	}
-	return outGT, outGTE, outLT, outLTE, true
+	return NormalizeUnsignedLongRangeBoundsExactR63(gt, gte, lt, lte)
 }
 
 func (t *Transpiler) validateHistogramBoundsSpec(hb *esast.HistogramBoundsSpec, paramName, aggName string) {
@@ -15126,6 +15247,9 @@ func rangeDocBaseExpr(field string, b schema.FieldBinding) string {
 }
 
 func (t *Transpiler) rangeFieldBoundsAndRawSQL(field string, b schema.FieldBinding, nctx *nestedCtx) (string, string, string, string) {
+	if b.ESType == "date_range" {
+		return dateRangeObjectBoundsSQLR63(field, b, nctx)
+	}
 	if nctx != nil && nctx.elemVar != "" && (b.Kind == schema.StorageNestedSubfield || b.NestedPath == nctx.nestedPath) && nctx.nestedPath == b.NestedPath {
 		relPath := t.nestedRelativeJSONPath(field, false, b.NestedPath)
 		gtePath := strings.TrimSuffix(relPath, "") + "._gte"
@@ -15462,27 +15586,6 @@ func extractGeoShapePolygons(coords any, shapeType string) [][][][2]float64 {
 	return polys
 }
 
-func (t *Transpiler) evalGeoPointPredForField(field string, nctx *nestedCtx, buildCond func(latExpr, lonExpr string) string) string {
-	resolvedField, b := t.resolveFieldInNestedCtx(field, false, nctx)
-	if !t.checkFieldSearchable(resolvedField, b) {
-		return "FALSE"
-	}
-	if nctx != nil && nctx.elemVar != "" && ((b.Kind == schema.StorageNestedSubfield && nctx.nestedPath == b.NestedPath) || strings.HasPrefix(resolvedField, nctx.nestedPath+".")) {
-		elemExpr := t.sqlColumnRef(resolvedField, true, nctx)
-		latExpr := fmt.Sprintf("CAST(SPLIT_PART(%s, ',', 1) AS DOUBLE)", elemExpr)
-		lonExpr := fmt.Sprintf("CAST(SPLIT_PART(%s, ',', 2) AS DOUBLE)", elemExpr)
-		return fmt.Sprintf("(%s IS NOT NULL AND %s)", elemExpr, buildCond(latExpr, lonExpr))
-	}
-	if b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield {
-		arrCol := fmt.Sprintf("`%s`", b.EffectiveArrayColumn(true))
-		latExpr := "CAST(SPLIT_PART(_x, ',', 1) AS DOUBLE)"
-		lonExpr := "CAST(SPLIT_PART(_x, ',', 2) AS DOUBLE)"
-		return fmt.Sprintf("array_exists(_x -> _x IS NOT NULL AND %s, %s)", buildCond(latExpr, lonExpr), arrCol)
-	}
-	latExpr, lonExpr, notNullCond := t.extractGeoPointExprs(resolvedField, b)
-	return fmt.Sprintf("(%s AND %s)", notNullCond, buildCond(latExpr, lonExpr))
-}
-
 func (t *Transpiler) compileGeoShape(gs *esast.GeoShapeQuery, scoring bool, nctx *nestedCtx) CompiledQuery {
 	if gs == nil || gs.Field == "" {
 		return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
@@ -15599,7 +15702,7 @@ func (t *Transpiler) compileGeoShape(gs *esast.GeoShapeQuery, scoring bool, nctx
 		cLonStr := strconv.FormatFloat(cLon, 'f', -1, 64)
 		cLatStr := strconv.FormatFloat(cLat, 'f', -1, 64)
 		radStr := strconv.FormatFloat(radiusMeters, 'f', -1, 64)
-		posWhere := t.evalGeoPointPredForField(gs.Field, nctx, func(latExpr, lonExpr string) string {
+		posWhere := t.evalGeoPointPredForFieldWithRelationR63(gs.Field, rel, nctx, func(latExpr, lonExpr string) string {
 			return fmt.Sprintf("ST_Distance_Sphere(%s, %s, %s, %s) <= %s", lonExpr, latExpr, cLonStr, cLatStr, radStr)
 		})
 		if rel == "DISJOINT" {
@@ -15615,7 +15718,7 @@ func (t *Transpiler) compileGeoShape(gs *esast.GeoShapeQuery, scoring bool, nctx
 			if rel == "CONTAINS" {
 				return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
 			}
-			posWhere := t.evalGeoPointPredForField(gs.Field, nctx, func(latExpr, lonExpr string) string {
+			posWhere := t.evalGeoPointPredForFieldWithRelationR63(gs.Field, rel, nctx, func(latExpr, lonExpr string) string {
 				var polyPreds []string
 				for _, poly := range polys {
 					extCond := buildPointInPolygonSQL(latExpr, lonExpr, poly[0])
@@ -15657,8 +15760,25 @@ func (t *Transpiler) compileGeoShape(gs *esast.GeoShapeQuery, scoring bool, nctx
 					if top < bottom {
 						top, bottom = bottom, top
 					}
-					if rel == "CONTAINS" && (top != bottom || lon0 != lon1) {
+					if rel == "CONTAINS" && b.ESType != "geo_shape" && (top != bottom || lon0 != lon1) {
 						return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
+					}
+					if rel == "WITHIN" {
+						topStr := strconv.FormatFloat(top, 'f', -1, 64)
+						bottomStr := strconv.FormatFloat(bottom, 'f', -1, 64)
+						leftStr := strconv.FormatFloat(lon0, 'f', -1, 64)
+						rightStr := strconv.FormatFloat(lon1, 'f', -1, 64)
+						withinWhere := t.evalGeoPointPredForFieldWithRelationR63(gs.Field, "WITHIN", nctx, func(latExpr, lonExpr string) string {
+							latCond := fmt.Sprintf("%s >= %s AND %s <= %s", latExpr, bottomStr, latExpr, topStr)
+							var lonCond string
+							if lon0 <= lon1 {
+								lonCond = fmt.Sprintf("%s >= %s AND %s <= %s", lonExpr, leftStr, lonExpr, rightStr)
+							} else {
+								lonCond = fmt.Sprintf("(%s >= %s OR %s <= %s)", lonExpr, leftStr, lonExpr, rightStr)
+							}
+							return fmt.Sprintf("%s AND %s", latCond, lonCond)
+						})
+						return CompiledQuery{WhereSQL: withinWhere, SafeWhereSQL: withinWhere, ScoreSQL: scoreSQL}
 					}
 					bp := t.compileGeoBoundingBox(&esast.GeoBoundingBoxQuery{
 						Field:  gs.Field,
@@ -16102,25 +16222,38 @@ func (t *Transpiler) compileIntervalsRule(field string, rule esast.IntervalsRule
 	switch {
 	case rule.Match != nil:
 		targetField := field
-		if strings.TrimSpace(rule.Match.UseField) != "" {
+		hasUseField := strings.TrimSpace(rule.Match.UseField) != ""
+		if hasUseField {
 			targetField = strings.TrimSpace(rule.Match.UseField)
 		}
 		rf, rb := t.resolveFieldInNestedCtx(targetField, false, nctx)
 		if !t.checkFieldPositionalSearchable(rf, rb) {
 			return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
 		}
-		op := "and"
-		if !rule.Match.Ordered && rule.Match.MaxGaps != nil && *rule.Match.MaxGaps != 0 {
-			op = "or"
-		}
-		if rule.Match.Ordered && (rule.Match.MaxGaps == nil || *rule.Match.MaxGaps >= 0) {
-			slop := 0
-			if rule.Match.MaxGaps != nil && *rule.Match.MaxGaps > 0 {
-				slop = *rule.Match.MaxGaps
+		effAn := t.effectiveQueryAnalyzerName(rb, rule.Match.Analyzer)
+		if t.hasCustomQueryAnalysis(effAn) {
+			// `EvaluateIntervalsRuleWithFieldLookup` evaluates exact stemmed/custom token streams in Go;
+			// avoid rejecting un-stemmed column text (e.g. `"dogs"` vs stemmed `"dog"` in `70_intervals.yml :: Test use_field`).
+			w := t.compileExistsPredicate(targetField, nctx)
+			sc := "0.0"
+			if inScoring && boost != 0 && w != "FALSE" {
+				sc = fmt.Sprintf("%g", boost)
 			}
-			cp = t.compileMatchPhraseField(targetField, rule.Match.Query, slop, boost, false, inScoring, nctx)
+			cp = CompiledQuery{WhereSQL: w, SafeWhereSQL: w, ScoreSQL: sc}
 		} else {
-			cp = t.compileMatchField(targetField, rule.Match.Query, op, boost, inScoring, nctx)
+			op := "and"
+			if !rule.Match.Ordered && rule.Match.MaxGaps != nil && *rule.Match.MaxGaps != 0 {
+				op = "or"
+			}
+			if rule.Match.Ordered && rule.Match.MaxGaps != nil && *rule.Match.MaxGaps >= 0 {
+				slop := 0
+				if *rule.Match.MaxGaps > 0 {
+					slop = *rule.Match.MaxGaps
+				}
+				cp = t.compileMatchPhraseField(targetField, rule.Match.Query, slop, boost, false, inScoring, nctx)
+			} else {
+				cp = t.compileMatchField(targetField, rule.Match.Query, op, boost, inScoring, nctx)
+			}
 		}
 		if rule.Match.Filter != nil {
 			cp = t.applyIntervalsFilter(field, cp, rule.Match.Filter, inScoring, nctx)
@@ -17130,7 +17263,7 @@ func (t *Transpiler) compileSparseVectorQuery(sv *esast.SparseVectorQuerySpec, i
 	}
 	for _, tok := range toks {
 		w := weights[tok]
-		col := t.sqlTypedColumnRef(resolvedField+"."+tok, 1.0, false, nctx)
+		col := t.buildSparseVectorTokenMaxWeightExprR63(resolvedField, tok, nctx)
 		cond := fmt.Sprintf("(%s IS NOT NULL AND %s > 0)", col, col)
 		allConds = append(allConds, cond)
 		sTerm := fmt.Sprintf("(GREATEST(COALESCE(CAST(%s AS DOUBLE), 0.0), 0.0) * %g)", col, w)

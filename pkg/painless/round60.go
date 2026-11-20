@@ -379,6 +379,16 @@ func formatValueCycleWalkRound60(v any, seen map[cycleNodeKeyRound60]bool, javaM
 			return "null"
 		}
 		return tv.String()
+	case *VersionVal:
+		if tv == nil {
+			return "null"
+		}
+		return tv.String()
+	case *UpdateMetadataVal:
+		if tv == nil {
+			return "null"
+		}
+		return tv.String()
 	case *PainlessLambda:
 		if tv == nil {
 			return "null"
@@ -1841,6 +1851,14 @@ func parseFlexibleESDateTimeRound60(v any) (time.Time, bool) {
 		for _, slashLayout := range []string{
 			"2006/01/02 15:04:05.999999999Z07:00",
 			"2006/01/02T15:04:05.999999999Z07:00",
+			"2006/01/02 15:04:05.999999999Z0700",
+			"2006/01/02T15:04:05.999999999Z0700",
+			"2006/01/02 15:04:05Z07:00",
+			"2006/01/02T15:04:05Z07:00",
+			"2006/01/02 15:04:05Z0700",
+			"2006/01/02T15:04:05Z0700",
+			"2006/01/02 15:04:05.999999999",
+			"2006/01/02T15:04:05.999999999",
 			"2006/01/02 15:04:05",
 			"2006/01/02T15:04:05",
 			"2006/01/02",
@@ -2590,7 +2608,32 @@ func normalizeSingleFieldDocValuesWithOptsRound61(raw any, fieldType string, kee
 		sort.Slice(uVals, func(i, j int) bool { return uVals[i] < uVals[j] })
 		out := make([]any, len(uVals))
 		for i, u := range uVals {
-			out[i] = newPainlessBigInteger(new(big.Int).SetUint64(u))
+			if forFieldsAPI {
+				out[i] = newPainlessBigInteger(new(big.Int).SetUint64(u))
+			} else {
+				out[i] = int64(u) // #nosec G115 -- ES unsigned_long doc['u'].value exposes signed 64-bit two's-complement long
+			}
+		}
+		return out
+
+	case "version":
+		vStrs := make([]string, 0, len(items))
+		for _, it := range items {
+			if it == nil {
+				continue
+			}
+			vStrs = append(vStrs, fmt.Sprintf("%v", it))
+		}
+		sort.Slice(vStrs, func(i, j int) bool { return CompareSemverStringsES(vStrs[i], vStrs[j]) < 0 })
+		out := make([]any, 0, len(vStrs))
+		for i, s := range vStrs {
+			if i == 0 || s != vStrs[i-1] {
+				if forFieldsAPI {
+					out = append(out, NewVersionVal(s))
+				} else {
+					out = append(out, s)
+				}
+			}
 		}
 		return out
 
@@ -2814,7 +2857,7 @@ func inferImplicitDocValueWrapperRound60(fieldPath string, items []any) []any {
 	}
 	// Heuristic wrapping when explicit `__field_types` was not supplied by caller,
 	// while avoiding wrapping plain keyword strings unless clearly temporal/geo!
-	if strings.Contains(cleanName, "date") || strings.Contains(cleanName, "time") || cleanName == "nanos" || strings.HasSuffix(cleanName, "_at") {
+	if strings.Contains(cleanName, "date") || strings.Contains(cleanName, "time") || cleanName == "nanos" || strings.HasSuffix(cleanName, "_at") || isSlashDateLiteralRound63(items[0]) {
 		allDates := true
 		zVals := make([]*ZonedDateTimeVal, 0, len(items))
 		isNano := strings.Contains(cleanName, "nano")
@@ -3014,8 +3057,13 @@ func resolveDocValuesSliceWithParamsRound60(sourceMap, params map[string]any, fi
 		rootObj := resolveParamPath(sourceMap, strings.Split(rootField, "."))
 		return ExtractFlattenedLeafStrings(rootObj, subPath), nil
 	}
+	ftMap := extractFieldTypesFromMapsRound60(sourceMap, params)
+	ft := lookupFieldTypeRound60(ftMap, fieldPath)
 	rawSlice := resolveDocValuesSlice(sourceMap, fieldPath)
 	if len(rawSlice) == 0 {
+		if cv, hasConst := lookupConstantKeywordValueRound63(sourceMap, params, cleanPath); hasConst {
+			return []any{cv}, nil
+		}
 		return rawSlice, nil
 	}
 	if _, already := rawSlice[0].(*ZonedDateTimeVal); already {
@@ -3027,11 +3075,10 @@ func resolveDocValuesSliceWithParamsRound60(sourceMap, params map[string]any, fi
 	if _, already := rawSlice[0].(*BytesRefVal); already {
 		return rawSlice, nil
 	}
-	if _, already := rawSlice[0].(*painlessBigInteger); already {
+	if _, already := rawSlice[0].(*painlessBigInteger); already && ft != "unsigned_long" {
 		return rawSlice, nil
 	}
-	ftMap := extractFieldTypesFromMapsRound60(sourceMap, params)
-	if ft := lookupFieldTypeRound60(ftMap, fieldPath); ft != "" {
+	if ft != "" {
 		keepBoolDups := isKeepBooleanDupsEnabledRound61(sourceMap, params)
 		dateFmt := lookupFieldFormatFromMapsRound61(sourceMap, params, fieldPath)
 		quantizeGeo := isGeoQuantizeEnabledRound61(sourceMap, params)
@@ -3059,12 +3106,17 @@ type FieldVal struct {
 	Root      map[string]any
 	Params    map[string]any
 	FieldType string
+	WriteMode bool
 }
 
 // FieldDocVal models an object sub-document wrapper returned by `field('records').doc(i)` / `.docs()`.
 type FieldDocVal struct {
-	Doc    map[string]any
-	Params map[string]any
+	Doc       map[string]any
+	Params    map[string]any
+	ParentFV  *FieldVal
+	ParentMap map[string]any
+	FieldPath string
+	WriteMode bool
 }
 
 func resolveFieldValRound60(name string, sourceMap, params map[string]any) (*FieldVal, error) {
@@ -3100,6 +3152,16 @@ func resolveFieldValRound60(name string, sourceMap, params map[string]any) (*Fie
 	}
 	ftMap := extractFieldTypesFromMapsRound60(sourceMap, params)
 	ft := lookupFieldTypeRound60(ftMap, name)
+	if isWriteFieldsAPIModeRound63(sourceMap, params) {
+		return &FieldVal{
+			Name:      name,
+			Values:    extractWriteFieldValuesRound63(root, name),
+			Root:      root,
+			Params:    params,
+			FieldType: ft,
+			WriteMode: true,
+		}, nil
+	}
 	if ft == "" {
 		if rootField, subPath, isFlat := resolveMappedFlattenedBaseRound61(params, name); isFlat {
 			rootObj := resolveParamPath(root, strings.Split(rootField, "."))
@@ -3130,6 +3192,11 @@ func resolveFieldValRound60(name string, sourceMap, params map[string]any) (*Fie
 	}
 	if rawVal == nil && sourceMap != nil && (root == nil || reflect.ValueOf(sourceMap).Pointer() != reflect.ValueOf(root).Pointer()) {
 		rawVal = resolveParamPath(sourceMap, strings.Split(name, "."))
+	}
+	if rawVal == nil {
+		if cv, hasConst := lookupConstantKeywordValueRound63(sourceMap, params, name); hasConst {
+			rawVal = cv
+		}
 	}
 	if rawVal != nil {
 		keepBoolDups := true
@@ -3166,6 +3233,10 @@ func (fv *FieldVal) refreshValuesRound60() {
 	if fv == nil || fv.Root == nil {
 		return
 	}
+	if fv.WriteMode {
+		fv.Values = extractWriteFieldValuesRound63(fv.Root, fv.Name)
+		return
+	}
 	raw := resolveParamPath(fv.Root, strings.Split(fv.Name, "."))
 	if raw == nil {
 		fv.Values = []any{}
@@ -3182,15 +3253,48 @@ func (fv *FieldVal) Size() int64 {
 	if fv == nil {
 		return 0
 	}
+	if fv.WriteMode && fv.Root != nil {
+		fv.refreshValuesRound60()
+	}
 	return int64(len(fv.Values))
 }
 
 func (fv *FieldVal) IsEmpty() bool {
-	return fv == nil || len(fv.Values) == 0
+	if fv == nil {
+		return true
+	}
+	if fv.WriteMode && fv.Root != nil {
+		fv.refreshValuesRound60()
+	}
+	return len(fv.Values) == 0
 }
 
 func (fv *FieldVal) GetDefault(defaultVal any) any {
-	if fv == nil || len(fv.Values) == 0 {
+	if fv == nil {
+		return coerceFieldValDefaultRound62(fv, defaultVal)
+	}
+	if fv.WriteMode && fv.Root != nil {
+		segs := strings.Split(fv.Name, ".")
+		if !hasPathInMapRound60(fv.Root, segs) {
+			return coerceFieldValDefaultRound62(fv, defaultVal)
+		}
+		raw := resolveParamPath(fv.Root, segs)
+		if raw == nil {
+			return coerceFieldValDefaultRound62(fv, defaultVal)
+		}
+		if _, defIsSlice := defaultVal.([]any); defIsSlice {
+			if s, ok := raw.([]any); ok {
+				return s
+			}
+		}
+		if _, defIsMap := defaultVal.(map[string]any); defIsMap {
+			if m, ok := raw.(map[string]any); ok {
+				return m
+			}
+		}
+		fv.refreshValuesRound60()
+	}
+	if len(fv.Values) == 0 {
 		return coerceFieldValDefaultRound62(fv, defaultVal)
 	}
 	return fv.Values[0]
@@ -4461,6 +4565,9 @@ func getOrInitMetadataMapRound60(sourceMap, params map[string]any) map[string]an
 	} else {
 		m["op"] = "index"
 	}
+	nowZDT := resolveNowZonedDateTimeRound63(sourceMap, params)
+	m["now"] = nowZDT
+	m["_now"] = nowZDT
 	budget.metadataMap = m
 	return m
 }
@@ -5345,6 +5452,22 @@ func evalRound60PreOpExpr(sourceMap map[string]any, rhs string, params map[strin
 			return newBytesRefValRound60(raw), true, nil
 		}
 	}
+	for _, vPfx := range []string{"new Version(", "new org.elasticsearch.Version("} {
+		if strings.HasPrefix(rhs, vPfx) && findMatchingDelimiter(rhs, len(vPfx)-1, '(', ')') == len(rhs)-1 {
+			inner := strings.TrimSpace(rhs[len(vPfx) : len(rhs)-1])
+			if inner == "" {
+				return NewVersionVal(""), true, nil
+			}
+			v, err := evalRHSExprDepth(sourceMap, inner, params, depth+1)
+			if err != nil {
+				return nil, true, err
+			}
+			if v == nil {
+				return nil, true, &painlessExceptionError{exType: "NullPointerException", message: "Version cannot be null"}
+			}
+			return NewVersionVal(fmt.Sprintf("%v", v)), true, nil
+		}
+	}
 	return nil, false, nil
 }
 
@@ -5385,6 +5508,13 @@ func evalRound60StaticOrBuiltinCall(fnName string, args []string, argStr string,
 		return time.Now().UnixNano(), true, nil
 
 	case "metadata":
+		if isUpdateMetadataContextRound63(sourceMap, params) {
+			return &UpdateMetadataVal{
+				Params:    params,
+				SourceMap: sourceMap,
+				Budget:    getOrInitEvalBudget(params),
+			}, true, nil
+		}
 		return getOrInitMetadataMapRound60(sourceMap, params), true, nil
 
 	case "grok", "dissect":
@@ -5846,7 +5976,19 @@ func evalRound60ZeroArgMethod(mSuffix string, recVal any, sourceMap, params map[
 			return tv.Remove(), true, nil
 		case ".deduplicate()":
 			tv.deduplicateInPlaceRound60()
-			return nil, true, nil
+			return tv, true, nil
+		case ".asBigInteger()":
+			if len(tv.Values) == 0 {
+				return nil, true, nil
+			}
+			bi, err := coerceToBigIntegerRound63(tv.Values[0], tv.Name)
+			return bi, true, err
+		case ".asLong()":
+			if len(tv.Values) == 0 {
+				return nil, true, nil
+			}
+			lv, err := coerceToLongFieldValRound63(tv.Values[0], tv.Name)
+			return lv, true, err
 		case ".asDouble()":
 			if len(tv.Values) == 0 {
 				return nil, true, nil
@@ -5891,6 +6033,27 @@ func evalRound60ZeroArgMethod(mSuffix string, recVal any, sourceMap, params map[
 		case ".docs()":
 			return tv.docsSliceRound60(), true, nil
 		case ".toString()":
+			return tv.String(), true, nil
+		}
+
+	case *FieldDocVal:
+		if tv == nil {
+			return nil, false, nil
+		}
+		switch mSuffix {
+		case ".remove()":
+			return tv.Remove(), true, nil
+		case ".exists()":
+			return tv.Exists(), true, nil
+		case ".toString()":
+			return FormatValueSafe(tv.Doc), true, nil
+		}
+
+	case *VersionVal:
+		if tv == nil {
+			return nil, false, nil
+		}
+		if mSuffix == ".toString()" {
 			return tv.String(), true, nil
 		}
 
@@ -5975,14 +6138,15 @@ func (fv *FieldVal) docAtRound60(idx int) (*FieldDocVal, bool, error) {
 		return nil, true, nil
 	}
 	raw := resolveParamPath(fv.Root, strings.Split(fv.Name, "."))
-	if raw == nil && idx == 0 && isMutableFieldsContextRound61(fv.Params) {
+	if raw == nil && idx == 0 && (fv.WriteMode || isMutableFieldsContextRound61(fv.Params)) {
 		m := make(map[string]any)
 		setValueAtPath(fv.Root, strings.Split(fv.Name, "."), m)
-		return &FieldDocVal{Doc: m, Params: fv.Params}, true, nil
+		fv.refreshValuesRound60()
+		return &FieldDocVal{Doc: m, Params: fv.Params, ParentFV: fv, ParentMap: fv.Root, FieldPath: fv.Name, WriteMode: fv.WriteMode}, true, nil
 	}
 	if m, ok := raw.(map[string]any); ok {
 		if idx == 0 {
-			return &FieldDocVal{Doc: m, Params: fv.Params}, true, nil
+			return &FieldDocVal{Doc: m, Params: fv.Params, ParentFV: fv, ParentMap: fv.Root, FieldPath: fv.Name, WriteMode: fv.WriteMode}, true, nil
 		}
 		return nil, true, &painlessExceptionError{exType: "IndexOutOfBoundsException", message: fmt.Sprintf("index %d out of bounds", idx)}
 	}
@@ -5991,7 +6155,7 @@ func (fv *FieldVal) docAtRound60(idx int) (*FieldDocVal, bool, error) {
 			return nil, true, &painlessExceptionError{exType: "IndexOutOfBoundsException", message: fmt.Sprintf("index %d out of bounds for length %d", idx, len(s))}
 		}
 		if m, okM := s[idx].(map[string]any); okM {
-			return &FieldDocVal{Doc: m, Params: fv.Params}, true, nil
+			return &FieldDocVal{Doc: m, Params: fv.Params, ParentFV: fv, ParentMap: fv.Root, FieldPath: fv.Name, WriteMode: fv.WriteMode}, true, nil
 		}
 	}
 	return nil, true, nil
@@ -6003,13 +6167,13 @@ func (fv *FieldVal) docsSliceRound60() []any {
 	}
 	raw := resolveParamPath(fv.Root, strings.Split(fv.Name, "."))
 	if m, ok := raw.(map[string]any); ok {
-		return []any{&FieldDocVal{Doc: m, Params: fv.Params}}
+		return []any{&FieldDocVal{Doc: m, Params: fv.Params, ParentFV: fv, ParentMap: fv.Root, FieldPath: fv.Name, WriteMode: fv.WriteMode}}
 	}
 	if s, ok := raw.([]any); ok {
 		out := make([]any, 0, len(s))
 		for _, el := range s {
 			if m, okM := el.(map[string]any); okM {
-				out = append(out, &FieldDocVal{Doc: m, Params: fv.Params})
+				out = append(out, &FieldDocVal{Doc: m, Params: fv.Params, ParentFV: fv, ParentMap: fv.Root, FieldPath: fv.Name, WriteMode: fv.WriteMode})
 			}
 		}
 		return out
@@ -6133,6 +6297,12 @@ func evalRound60ReceiverMethod(recVal any, mBare, argStr string, sourceMap, para
 		if tv == nil {
 			return nil, false, nil
 		}
+		if mBare == "remove" {
+			return tv.Remove(), true, nil
+		}
+		if mBare == "exists" {
+			return tv.Exists(), true, nil
+		}
 		if mBare == "field" || mBare == "$" {
 			args, err := evalCallArgs()
 			if err != nil {
@@ -6142,23 +6312,36 @@ func evalRound60ReceiverMethod(recVal any, mBare, argStr string, sourceMap, para
 				return nil, true, &painlessExceptionError{exType: "IllegalArgumentException", message: mBare + "() requires field name"}
 			}
 			subName := fmt.Sprintf("%v", args[0])
-			if dvf, handled, dvErr := resolveDenseVectorFieldValRound61(subName, tv.Doc, tv.Params); handled {
-				if dvErr != nil {
-					return nil, true, dvErr
-				}
-				if mBare == "$" {
-					if len(args) >= 2 {
-						res, gErr := dvf.GetWithDefault(args[1])
+			if !tv.WriteMode {
+				if dvf, handled, dvErr := resolveDenseVectorFieldValRound61(subName, tv.Doc, tv.Params); handled {
+					if dvErr != nil {
+						return nil, true, dvErr
+					}
+					if mBare == "$" {
+						if len(args) >= 2 {
+							res, gErr := dvf.GetWithDefault(args[1])
+							return res, true, gErr
+						}
+						res, gErr := dvf.GetValue()
 						return res, true, gErr
 					}
-					res, gErr := dvf.GetValue()
-					return res, true, gErr
+					return dvf, true, nil
 				}
-				return dvf, true, nil
 			}
-			subFV, err := resolveFieldValRound60(subName, tv.Doc, tv.Params)
-			if err != nil {
-				return nil, true, err
+			var subFV *FieldVal
+			if tv.WriteMode {
+				subFV = &FieldVal{
+					Name:      subName,
+					Values:    extractWriteFieldValuesRound63(tv.Doc, subName),
+					Root:      tv.Doc,
+					Params:    tv.Params,
+					WriteMode: true,
+				}
+			} else {
+				subFV, err = resolveFieldValRound60(subName, tv.Doc, tv.Params)
+				if err != nil {
+					return nil, true, err
+				}
 			}
 			if mBare == "$" {
 				var defVal any
@@ -6168,6 +6351,33 @@ func evalRound60ReceiverMethod(recVal any, mBare, argStr string, sourceMap, para
 				return subFV.GetDefault(defVal), true, nil
 			}
 			return subFV, true, nil
+		}
+
+	case *VersionVal:
+		if tv == nil {
+			return nil, false, nil
+		}
+		switch mBare {
+		case "compareTo":
+			args, err := evalCallArgs()
+			if err != nil {
+				return nil, true, err
+			}
+			if len(args) != 1 || args[0] == nil {
+				return nil, true, &painlessExceptionError{exType: "NullPointerException", message: "Version.compareTo requires non-null argument"}
+			}
+			return tv.CompareTo(args[0]), true, nil
+		case "equals":
+			args, err := evalCallArgs()
+			if err != nil {
+				return nil, true, err
+			}
+			if len(args) != 1 {
+				return false, true, nil
+			}
+			return tv.Equals(args[0]), true, nil
+		case "toString":
+			return tv.String(), true, nil
 		}
 
 	case *GeoPointVal:
@@ -6341,6 +6551,58 @@ func evalFieldValMethodRound60(fv *FieldVal, mBare, argStr string, evalCallArgs 
 		}
 		return outVals, true, nil
 
+	case "asBigInteger":
+		args, err := evalCallArgs()
+		if err != nil {
+			return nil, true, err
+		}
+		if len(args) == 2 {
+			idx, _ := toInt64Painless(args[0])
+			if idx < 0 || int(idx) >= len(fv.Values) {
+				res, cErr := coerceToBigIntegerRound63(args[1], fv.Name)
+				return res, true, cErr
+			}
+			res, cErr := coerceToBigIntegerRound63(fv.Values[int(idx)], fv.Name)
+			return res, true, cErr
+		}
+		if len(fv.Values) == 0 {
+			if len(args) >= 1 {
+				res, cErr := coerceToBigIntegerRound63(args[0], fv.Name)
+				return res, true, cErr
+			}
+			return nil, true, nil
+		}
+		res, cErr := coerceToBigIntegerRound63(fv.Values[0], fv.Name)
+		return res, true, cErr
+
+	case "asLong":
+		args, err := evalCallArgs()
+		if err != nil {
+			return nil, true, err
+		}
+		if len(args) == 2 {
+			idx, _ := toInt64Painless(args[0])
+			if idx < 0 || int(idx) >= len(fv.Values) {
+				res, cErr := coerceToLongFieldValRound63(args[1], fv.Name)
+				return res, true, cErr
+			}
+			res, cErr := coerceToLongFieldValRound63(fv.Values[int(idx)], fv.Name)
+			return res, true, cErr
+		}
+		if len(fv.Values) == 0 {
+			if len(args) >= 1 {
+				res, cErr := coerceToLongFieldValRound63(args[0], fv.Name)
+				return res, true, cErr
+			}
+			return nil, true, nil
+		}
+		res, cErr := coerceToLongFieldValRound63(fv.Values[0], fv.Name)
+		return res, true, cErr
+
+	case "deduplicate":
+		fv.deduplicateInPlaceRound60()
+		return fv, true, nil
+
 	case "asDouble":
 		args, err := evalCallArgs()
 		if err != nil {
@@ -6488,15 +6750,26 @@ func evalFieldValMethodRound60(fv *FieldVal, mBare, argStr string, evalCallArgs 
 			return nil, true, err
 		}
 		if fv.Root != nil && len(args) > 0 && fv.Exists() {
+			dstRoot := fv.Root
+			var dstFV *FieldVal
+			if dfv, ok := args[0].(*FieldVal); ok && dfv != nil {
+				dstFV = dfv
+				if dfv.Root != nil {
+					dstRoot = dfv.Root
+				}
+			}
 			dstName := resolveDestFieldNameRound60(args[0])
 			dstPath := strings.Split(dstName, ".")
-			if !hasPathInMapRound60(fv.Root, dstPath) {
+			if !hasPathInMapRound60(dstRoot, dstPath) {
 				val := resolveParamPath(fv.Root, strings.Split(fv.Name, "."))
 				fv.Remove()
-				setValueAtPath(fv.Root, dstPath, val)
+				setValueAtPath(dstRoot, dstPath, val)
+				if dstFV != nil {
+					dstFV.refreshValuesRound60()
+				}
 			}
 		}
-		return nil, true, nil
+		return fv, true, nil
 
 	case "overwrite":
 		args, err := evalCallArgs()
@@ -6504,12 +6777,23 @@ func evalFieldValMethodRound60(fv *FieldVal, mBare, argStr string, evalCallArgs 
 			return nil, true, err
 		}
 		if fv.Root != nil && len(args) > 0 && fv.Exists() {
+			dstRoot := fv.Root
+			var dstFV *FieldVal
+			if dfv, ok := args[0].(*FieldVal); ok && dfv != nil {
+				dstFV = dfv
+				if dfv.Root != nil {
+					dstRoot = dfv.Root
+				}
+			}
 			dstName := resolveDestFieldNameRound60(args[0])
 			val := resolveParamPath(fv.Root, strings.Split(fv.Name, "."))
 			fv.Remove()
-			setValueAtPath(fv.Root, strings.Split(dstName, "."), val)
+			setValueAtPath(dstRoot, strings.Split(dstName, "."), val)
+			if dstFV != nil {
+				dstFV.refreshValuesRound60()
+			}
 		}
-		return nil, true, nil
+		return fv, true, nil
 
 	case "removeValuesIf":
 		args, err := evalCallArgs()
@@ -6569,7 +6853,7 @@ func evalFieldValMethodRound60(fv *FieldVal, mBare, argStr string, evalCallArgs 
 					next[i] = nv
 				}
 				setValueAtPath(fv.Root, strings.Split(fv.Name, "."), next)
-			} else if cur != nil {
+			} else if hasPathInMapRound60(fv.Root, strings.Split(fv.Name, ".")) {
 				nv, err := pl.Invoke([]any{cur}, sourceMap, params, depth+1)
 				if err != nil {
 					return nil, true, err
@@ -6721,7 +7005,11 @@ func resolveWrapperPropertyRound60(curr any, seg string) (any, bool) {
 		}
 	case *UpdateMetadataVal:
 		if tv != nil {
-			if v, ok, err := tv.getField(seg); err == nil && ok {
+			v, ok, err := tv.getField(seg)
+			if err != nil {
+				panic(err)
+			}
+			if ok {
 				return v, true
 			}
 		}
@@ -7030,6 +7318,11 @@ func round60WrapperEquals(a, b any) (bool, bool) {
 			return ta == tb, true
 		}
 		return bytes.Equal(ta.Bytes[ta.Pos:ta.Lim], tb.Bytes[tb.Pos:tb.Lim]), true
+	case *VersionVal:
+		if ta == nil {
+			return b == nil, true
+		}
+		return ta.Equals(b), true
 	case []float64:
 		switch tb := b.(type) {
 		case []float64:
@@ -7057,9 +7350,9 @@ func round60WrapperEquals(a, b any) (bool, bool) {
 		return false, true
 	}
 
-	// Symmetric cases where `b` is the Round-60/61 wrapper and `a` is string/time.Time/[]any
+	// Symmetric cases where `b` is the Round-60/61/63 wrapper and `a` is string/time.Time/[]any
 	switch b.(type) {
-	case *IPAddressVal, *GeoBoundingBoxVal, *DenseVectorVal, DayOfWeekEnum, *DayOfWeekEnum, MonthEnum, *MonthEnum, *ZonedDateTimeVal, *InstantVal, *GeoPointVal, *BytesRefVal, *ByteBufferVal, []float64:
+	case *IPAddressVal, *GeoBoundingBoxVal, *DenseVectorVal, DayOfWeekEnum, *DayOfWeekEnum, MonthEnum, *MonthEnum, *ZonedDateTimeVal, *InstantVal, *GeoPointVal, *BytesRefVal, *ByteBufferVal, *VersionVal, []float64:
 		return round60WrapperEquals(b, a)
 	}
 	return false, false

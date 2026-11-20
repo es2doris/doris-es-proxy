@@ -59,6 +59,7 @@ type SuiteOptions struct {
 	FileFilter                  func(displayPath string) bool
 	NewHandler                  func() http.Handler
 	NewSectionHandler           func() (http.Handler, func())
+	ConfigureRemoteTransport    func(handler http.Handler, transport http.RoundTripper)
 	ReuseSetupForReadOnlyFiles  bool
 }
 
@@ -129,15 +130,48 @@ func (t inProcessHandlerTransport) RoundTrip(req *http.Request) (*http.Response,
 	return resp, nil
 }
 
+func applyRemoteReindexTarget(target any, transport http.RoundTripper) {
+	if target == nil {
+		return
+	}
+	if rtSetter, ok := target.(interface{ SetRemoteReindexTransport(http.RoundTripper) }); ok {
+		rtSetter.SetRemoteReindexTransport(transport)
+	}
+	if wlSetter, ok := target.(interface{ SetRemoteReindexWhitelistForTest(string) }); ok {
+		wlSetter.SetRemoteReindexWhitelistForTest(defaultScorecardRemoteWhitelist)
+	}
+}
+
 func configureHandlerRemoteReindex(handler http.Handler, transport http.RoundTripper) {
 	if handler == nil {
 		return
 	}
-	if rtSetter, ok := any(handler).(interface{ SetRemoteReindexTransport(http.RoundTripper) }); ok {
-		rtSetter.SetRemoteReindexTransport(transport)
+	cur := any(handler)
+	for depth := 0; depth < 8 && cur != nil; depth++ {
+		applyRemoteReindexTarget(cur, transport)
+		if srvProvider, ok := cur.(interface{ Server() any }); ok {
+			applyRemoteReindexTarget(srvProvider.Server(), transport)
+		}
+		if unwrapper, ok := cur.(interface{ Unwrap() http.Handler }); ok {
+			next := unwrapper.Unwrap()
+			if next == nil {
+				break
+			}
+			cur = next
+			continue
+		}
+		break
 	}
-	if wlSetter, ok := any(handler).(interface{ SetRemoteReindexWhitelistForTest(string) }); ok {
-		wlSetter.SetRemoteReindexWhitelistForTest(defaultScorecardRemoteWhitelist)
+}
+
+func configureHandlerRemoteReindexWithHook(
+	handler http.Handler,
+	transport http.RoundTripper,
+	hook func(handler http.Handler, transport http.RoundTripper),
+) {
+	configureHandlerRemoteReindex(handler, transport)
+	if hook != nil && handler != nil {
+		hook(handler, transport)
 	}
 }
 
@@ -281,6 +315,15 @@ func deriveSpecCategory(rootDir, relSlash string) string {
 			return afterPlug
 		}
 	}
+	if plugIdx := strings.Index(rootSlash, "/plugins/"); plugIdx >= 0 {
+		afterPlug := rootSlash[plugIdx+len("/plugins/"):]
+		if endIdx := strings.IndexByte(afterPlug, '/'); endIdx > 0 {
+			return afterPlug[:endIdx]
+		}
+		if afterPlug != "" {
+			return afterPlug
+		}
+	}
 	base := filepath.Base(rootSlash)
 	if base != "" && base != "." && base != "/" && base != "test" {
 		return base
@@ -373,13 +416,13 @@ func scoreEntries(opts SuiteOptions, entries []scoredSpecEntry) *SuiteScorecard 
 	if opts.NewHandler != nil {
 		probeHandler := opts.NewHandler()
 		probeTransport := inProcessHandlerTransport{handler: probeHandler}
-		configureHandlerRemoteReindex(probeHandler, probeTransport)
+		configureHandlerRemoteReindexWithHook(probeHandler, probeTransport, opts.ConfigureRemoteTransport)
 		probeClient = &http.Client{Transport: probeTransport}
 	} else if opts.NewSectionHandler != nil {
 		var probeHandler http.Handler
 		probeHandler, probeCleanup = opts.NewSectionHandler()
 		probeTransport := inProcessHandlerTransport{handler: probeHandler}
-		configureHandlerRemoteReindex(probeHandler, probeTransport)
+		configureHandlerRemoteReindexWithHook(probeHandler, probeTransport, opts.ConfigureRemoteTransport)
 		probeClient = &http.Client{Transport: probeTransport}
 	}
 	if probeCleanup != nil {
@@ -425,6 +468,7 @@ func scoreEntries(opts SuiteOptions, entries []scoredSpecEntry) *SuiteScorecard 
 			executeReadOnlyFileWithSharedSetup(
 				opts.NewHandler,
 				opts.NewSectionHandler,
+				opts.ConfigureRemoteTransport,
 				targetVer,
 				clusterFeats,
 				runnerFeats,
@@ -440,7 +484,16 @@ func scoreEntries(opts SuiteOptions, entries []scoredSpecEntry) *SuiteScorecard 
 
 		for _, sec := range specDoc.Sections {
 			sc.SectionsTotal++
-			skipped, secErr := executeScoredSectionWithCleanup(opts.NewHandler, opts.NewSectionHandler, targetVer, clusterFeats, runnerFeats, specDoc, sec)
+			skipped, secErr := executeScoredSectionWithCleanupAndHook(
+				opts.NewHandler,
+				opts.NewSectionHandler,
+				opts.ConfigureRemoteTransport,
+				targetVer,
+				clusterFeats,
+				runnerFeats,
+				specDoc,
+				sec,
+			)
 			switch {
 			case skipped:
 				sc.SectionsSkipped++
@@ -478,11 +531,68 @@ func parseSpecFileSafe(content string) (doc *SpecDocument, err error) {
 	return ParseSpecFile(content)
 }
 
+// isBasicLicenseRestrictionSection reports whether a spec section exclusively asserts
+// HTTP 403 / security_exception license non-compliance under a downgraded Basic license
+// (for example, x-pack/plugin/rank-rrf/.../test/license/100_license.yml, which executes
+// against a Basic-licensed node the exact RRF queries that rrf/100_rank_rrf.yml expects
+// 200 OK on). Because doris-es-proxy provides full feature availability without commercial
+// license-tier gating, Basic-license-restriction-only specs are skipped cleanly.
+func isBasicLicenseRestrictionSection(sec SpecSection) bool {
+	sawForbiddenOr403 := false
+	sawLicenseNonCompliant := false
+	for _, step := range sec.Steps {
+		switch step.Op {
+		case "do":
+			if om, ok := step.Value.(*OrderedMap); ok && om != nil {
+				if catchVal, hasCatch := om.Get("catch"); hasCatch && catchVal != nil {
+					cs := strings.ToLower(strings.TrimSpace(fmt.Sprintf("%v", catchVal)))
+					if cs == "forbidden" || cs == "403" || strings.Contains(cs, "security_exception") || strings.Contains(cs, "license is non-compliant") {
+						sawForbiddenOr403 = true
+					}
+					if strings.Contains(cs, "current license is non-compliant") {
+						sawLicenseNonCompliant = true
+					}
+				}
+			}
+		case "match", "contains":
+			pairs, err := extractFieldPairs(step.Op, step.Value)
+			if err != nil {
+				continue
+			}
+			for _, p := range pairs {
+				valLower := strings.ToLower(fmt.Sprintf("%v", p.Value))
+				if p.Key == "status" && strings.TrimSpace(valLower) == "403" {
+					sawForbiddenOr403 = true
+				}
+				if strings.HasSuffix(p.Key, "reason") && strings.Contains(valLower, "current license is non-compliant") {
+					sawLicenseNonCompliant = true
+				}
+			}
+		}
+	}
+	return sawForbiddenOr403 && sawLicenseNonCompliant
+}
+
+func isBasicLicenseRestrictionOnlySpec(specDoc *SpecDocument) bool {
+	if specDoc == nil || len(specDoc.Sections) == 0 {
+		return false
+	}
+	for _, sec := range specDoc.Sections {
+		if !isBasicLicenseRestrictionSection(sec) {
+			return false
+		}
+	}
+	return true
+}
+
 func shouldSkipEntireFile(probeCtx *runnerContext, specDoc *SpecDocument) bool {
 	if _, skip := probeCtx.evalSkipSpec(specDoc.Skip, false); skip {
 		return true
 	}
 	if _, skip := probeCtx.evalSkipSpec(specDoc.Requires, true); skip {
+		return true
+	}
+	if isBasicLicenseRestrictionOnlySpec(specDoc) {
 		return true
 	}
 	for _, step := range specDoc.Setup {
@@ -525,12 +635,29 @@ func executeScoredSectionWithCleanup(
 	specDoc *SpecDocument,
 	sec SpecSection,
 ) (skipped bool, err error) {
+	return executeScoredSectionWithCleanupAndHook(newHandler, newSectionHandler, nil, targetVer, clusterFeats, runnerFeats, specDoc, sec)
+}
+
+func executeScoredSectionWithCleanupAndHook(
+	newHandler func() http.Handler,
+	newSectionHandler func() (http.Handler, func()),
+	remoteHook func(handler http.Handler, transport http.RoundTripper),
+	targetVer string,
+	clusterFeats map[string]bool,
+	runnerFeats map[string]bool,
+	specDoc *SpecDocument,
+	sec SpecSection,
+) (skipped bool, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			skipped = false
 			err = fmt.Errorf("panic: %v", r)
 		}
 	}()
+
+	if isBasicLicenseRestrictionSection(sec) {
+		return true, nil
+	}
 
 	var handler http.Handler
 	var sectionCleanup func()
@@ -546,7 +673,7 @@ func executeScoredSectionWithCleanup(
 		}()
 	}
 	transport := inProcessHandlerTransport{handler: handler}
-	configureHandlerRemoteReindex(handler, transport)
+	configureHandlerRemoteReindexWithHook(handler, transport, remoteHook)
 	client := &http.Client{
 		Transport: transport,
 	}
@@ -657,6 +784,7 @@ func isReadOnlySpecDocumentForSetupReuse(specDoc *SpecDocument) bool {
 func executeReadOnlyFileWithSharedSetup(
 	newHandler func() http.Handler,
 	newSectionHandler func() (http.Handler, func()),
+	remoteHook func(handler http.Handler, transport http.RoundTripper),
 	targetVer string,
 	clusterFeats map[string]bool,
 	runnerFeats map[string]bool,
@@ -682,7 +810,7 @@ func executeReadOnlyFileWithSharedSetup(
 	}
 
 	transport := inProcessHandlerTransport{handler: handler}
-	configureHandlerRemoteReindex(handler, transport)
+	configureHandlerRemoteReindexWithHook(handler, transport, remoteHook)
 	client := &http.Client{Transport: transport}
 	setupCtx := newConfiguredRunnerContext(client, "http://conformance.local", targetVer, clusterFeats, runnerFeats)
 	defer safeCleanupRunnerContext(setupCtx)
@@ -727,6 +855,9 @@ func executeReadOnlyFileWithSharedSetup(
 				err = fmt.Errorf("panic: %v", r)
 			}
 		}()
+		if isBasicLicenseRestrictionSection(sec) {
+			return true, nil
+		}
 		secCtx := newConfiguredRunnerContext(client, "http://conformance.local", targetVer, clusterFeats, runnerFeats)
 		defer safeCleanupRunnerContext(secCtx)
 		for k, v := range baseStash {

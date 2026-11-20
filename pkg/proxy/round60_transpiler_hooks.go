@@ -113,6 +113,8 @@ func applyFieldMappingEntryRound60(fieldDef map[string]any, fb schema.FieldBindi
 		}
 	case "constant_keyword":
 		fieldDef["doc_values"] = true
+	case "murmur3", "counted_keyword":
+		fieldDef["doc_values"] = true
 	case "long", "integer", "short", "byte", "unsigned_long",
 		"double", "float", "half_float", "scaled_float":
 		fieldDef["doc_values"] = !fb.DocValuesFalse

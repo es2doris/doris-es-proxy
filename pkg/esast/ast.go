@@ -2484,7 +2484,7 @@ func validateHighlightCommonFields(
 		}
 	}
 	switch strings.ToLower(strings.TrimSpace(hType)) {
-	case "", "unified", "plain", "fvh", "fast-vector-highlighter":
+	case "", "unified", "plain", "fvh", "fast-vector-highlighter", "annotated":
 	default:
 		return fmt.Errorf("parsing_exception: [highlight] invalid highlighter type [%s]", hType)
 	}
@@ -2742,6 +2742,7 @@ type HighlightSpec struct {
 	MaxFragmentLength     *int           `json:"max_fragment_length,omitempty"`
 	Options               map[string]any `json:"options,omitempty"`
 	Fields                map[string]any `json:"fields,omitempty"`
+	OrderedFieldNames     []string       `json:"-"`
 }
 
 func (h *HighlightSpec) UnmarshalJSON(data []byte) error {
@@ -2757,6 +2758,7 @@ func (h *HighlightSpec) UnmarshalJSON(data []byte) error {
 	if err != nil {
 		return err
 	}
+	delete(cleanedMap, "fields")
 	cleanedBytes, err := json.Marshal(cleanedMap)
 	if err != nil {
 		return err
@@ -2805,22 +2807,12 @@ func (h *HighlightSpec) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	if rawFields, hasFields := rawMap["fields"]; hasFields {
-		ft := bytes.TrimSpace(rawFields)
-		if len(ft) > 0 && !bytes.Equal(ft, []byte("null")) {
-			var fMap map[string]json.RawMessage
-			if err := json.Unmarshal(ft, &fMap); err != nil {
-				return fmt.Errorf("parsing_exception: [highlight] [fields] must be an object: %w", err)
-			}
-			for fname, fRaw := range fMap {
-				if strings.TrimSpace(fname) == "" {
-					return fmt.Errorf("parsing_exception: [highlight] field name cannot be empty")
-				}
-				var hfs HighlightFieldSpec
-				if err := json.Unmarshal(fRaw, &hfs); err != nil {
-					return err
-				}
-			}
+		fieldsMap, orderedNames, err := parseFlexibleHighlightFields(rawFields)
+		if err != nil {
+			return err
 		}
+		h.Fields = fieldsMap
+		h.OrderedFieldNames = orderedNames
 	}
 	return nil
 }
@@ -7529,6 +7521,7 @@ type TermEntry struct {
 	Boost           float64 `json:"boost,omitempty"`
 	CaseInsensitive bool    `json:"case_insensitive,omitempty"`
 	HasBoost        bool    `json:"-"`
+	Name            string  `json:"-"`
 }
 
 func (t TermEntry) MarshalJSON() ([]byte, error) {
@@ -7541,16 +7534,19 @@ func (t TermEntry) MarshalJSON() ([]byte, error) {
 		Value           any      `json:"value"`
 		Boost           *float64 `json:"boost,omitempty"`
 		CaseInsensitive bool     `json:"case_insensitive,omitempty"`
+		Name            string   `json:"_name,omitempty"`
 	}{
 		Value:           t.Value,
 		Boost:           boostPtr,
 		CaseInsensitive: t.CaseInsensitive,
+		Name:            t.Name,
 	})
 }
 
 func (t *TermEntry) UnmarshalJSON(data []byte) error {
 	t.Boost = 1.0
 	t.HasBoost = false
+	t.Name = ""
 	trimmed := bytes.TrimSpace(data)
 	if len(trimmed) > 0 && trimmed[0] == '{' {
 		var rawMap map[string]json.RawMessage
@@ -7559,32 +7555,44 @@ func (t *TermEntry) UnmarshalJSON(data []byte) error {
 		}
 		for k := range rawMap {
 			switch k {
-			case "value", "boost", "case_insensitive", "_name":
+			case "value", "term", "boost", "case_insensitive", "_name":
 			default:
 				return fmt.Errorf("parsing_exception: [term] unknown field [%s]", k)
 			}
 		}
-		if _, hasVal := rawMap["value"]; !hasVal {
+		_, hasVal := rawMap["value"]
+		_, hasTerm := rawMap["term"]
+		if hasVal && hasTerm {
+			return fmt.Errorf("parsing_exception: [term] cannot specify both [value] and [term]")
+		}
+		if !hasVal && !hasTerm {
 			return fmt.Errorf("parsing_exception: [term] missing required [value] field")
 		}
 		var full struct {
 			Value           any             `json:"value"`
+			Term            any             `json:"term"`
 			Boost           json.RawMessage `json:"boost"`
 			CaseInsensitive any             `json:"case_insensitive"`
+			Name            string          `json:"_name"`
 		}
 		if err := unmarshalPreservingLargeInts(trimmed, &full); err != nil {
 			return err
 		}
-		full.Value = normalizeDecodedNumbersPreservingLargeInts(full.Value)
+		rawVal := full.Value
+		if hasTerm {
+			rawVal = full.Term
+		}
+		rawVal = normalizeDecodedNumbersPreservingLargeInts(rawVal)
 		full.CaseInsensitive = normalizeDecodedNumbersPreservingLargeInts(full.CaseInsensitive)
-		if isNonScalarOrNullValue(full.Value) {
+		if isNonScalarOrNullValue(rawVal) {
 			return fmt.Errorf("parsing_exception: [term] query does not support non-scalar or null value")
 		}
 		ci, err := parseFlexibleBool(full.CaseInsensitive)
 		if err != nil {
 			return err
 		}
-		t.Value = full.Value
+		t.Value = rawVal
+		t.Name = full.Name
 		if len(full.Boost) > 0 {
 			b, err := parseOptionalNonNegativeBoost(full.Boost)
 			if err != nil {
@@ -9668,11 +9676,13 @@ var knownAggTypeKeys = map[string]bool{
 	"time_series":               true,
 	"children":                  true,
 	"parent":                    true,
+	"counted_terms":             true,
 }
 
 // AggSpec represents an Elasticsearch aggregation definition.
 type AggSpec struct {
 	Terms                   *TermsAggSpec                  `json:"terms,omitempty"`
+	CountedTerms            *TermsAggSpec                  `json:"counted_terms,omitempty"`
 	MultiTerms              *MultiTermsAggSpec             `json:"multi_terms,omitempty"`
 	RareTerms               *RareTermsAggSpec              `json:"rare_terms,omitempty"`
 	SignificantTerms        *TermsAggSpec                  `json:"significant_terms,omitempty"`
@@ -13322,7 +13332,7 @@ func (r *RangeAggSpec) UnmarshalJSON(data []byte) error {
 	}
 	for k := range rawMap {
 		switch k {
-		case "field", "script", "ranges", "keyed", "format", "time_zone", "missing", "value_type":
+		case "field", "script", "ranges", "keyed", "format", "time_zone", "missing", "value_type", "aggs", "aggregations", "meta":
 		default:
 			return fmt.Errorf("parsing_exception: [range] unknown field [%s]", k)
 		}
@@ -14657,6 +14667,7 @@ type MappingSpec struct {
 	Enabled             *bool                    `json:"enabled,omitempty"`
 	Subobjects          *bool                    `json:"subobjects,omitempty"`
 	Routing             *RoutingMetaSpec         `json:"_routing,omitempty"`
+	Size                map[string]any           `json:"_size,omitempty"`
 	Meta                map[string]any           `json:"_meta,omitempty"`
 	Source              map[string]any           `json:"_source,omitempty"`
 	DataStreamTimestamp any                      `json:"_data_stream_timestamp,omitempty"`
@@ -14683,6 +14694,13 @@ type FieldProperty struct {
 	TimeSeriesDimension      *bool                    `json:"time_series_dimension,omitempty"`
 	TimeSeriesDimensions     []string                 `json:"time_series_dimensions,omitempty"`
 	TimeSeriesMetric         string                   `json:"time_series_metric,omitempty"`
+	TargetIndex              string                   `json:"target_index,omitempty"`
+	InputField               string                   `json:"input_field,omitempty"`
+	TargetField              string                   `json:"target_field,omitempty"`
+	KeyField                 string                   `json:"key_field,omitempty"`
+	FetchFields              []map[string]any         `json:"fetch_fields,omitempty"`
+	Metrics                  []string                 `json:"metrics,omitempty"`
+	DefaultMetric            string                   `json:"default_metric,omitempty"`
 	Path                     string                   `json:"path,omitempty"`
 	Value                    any                      `json:"value,omitempty"`
 	Script                   any                      `json:"script,omitempty"`

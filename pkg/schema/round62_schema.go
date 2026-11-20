@@ -84,8 +84,9 @@ func evaluateIndexTimeMappedScripts(s *IndexSchema, origSourceBytes []byte, pars
 	if s == nil || s.RawMapping == nil || len(s.RawMapping.Properties) == 0 {
 		return false, nil
 	}
+	evalWithSchemaFn := GetIndexFieldScriptWithSchemaEvaluator()
 	evalFn := GetIndexFieldScriptEvaluator()
-	if evalFn == nil || !hasAnyMappedFieldScript(s.RawMapping.Properties) {
+	if (evalWithSchemaFn == nil && evalFn == nil) || !hasAnyMappedFieldScript(s.RawMapping.Properties) {
 		return false, nil
 	}
 	var roSource map[string]any
@@ -112,7 +113,13 @@ func evaluateIndexTimeMappedScripts(s *IndexSchema, origSourceBytes []byte, pars
 				if onErr == "" {
 					onErr = "fail"
 				}
-				emitted, err := evalFn(fullPath, strings.ToLower(strings.TrimSpace(prop.Type)), prop.Script, onErr, roSource)
+				var emitted []any
+				var err error
+				if evalWithSchemaFn != nil {
+					emitted, err = evalWithSchemaFn(s, fullPath, strings.ToLower(strings.TrimSpace(prop.Type)), prop.Script, onErr, roSource)
+				} else {
+					emitted, err = evalFn(fullPath, strings.ToLower(strings.TrimSpace(prop.Type)), prop.Script, onErr, roSource)
+				}
 				if err != nil {
 					if onErr == "continue" {
 						continue
@@ -227,7 +234,7 @@ func InspectAutoDimsAndDynamicVectors(
 	var autoFields []FieldBinding
 	for _, k := range sortedFieldKeys(idxSchema.Fields) {
 		b := idxSchema.withEffectiveDefaults(idxSchema.Fields[k])
-		if b.AutoDims && b.VectorDims == 0 && !b.NotIndexed && (b.ESType == "dense_vector" || b.ESType == "knn_vector") {
+		if b.AutoDims && b.VectorDims == 0 && (b.ESType == "dense_vector" || b.ESType == "knn_vector") {
 			autoFields = append(autoFields, b)
 		}
 	}
@@ -542,14 +549,22 @@ func cloneFieldBindingValue(b FieldBinding) FieldBinding {
 		cp.Meta = cloneStringMap(b.Meta)
 	}
 	if len(b.Contexts) > 0 {
-		cp.Contexts = cloneCompletionContexts(b.Contexts)
+		cp.Contexts = deepCloneCompletionContexts(b.Contexts)
 	}
 	if len(b.VectorIndexOptions) > 0 {
-		opts := make(map[string]any, len(b.VectorIndexOptions))
-		for k, v := range b.VectorIndexOptions {
-			opts[k] = v
-		}
-		cp.VectorIndexOptions = opts
+		cp.VectorIndexOptions = deepCloneMapStringAny(b.VectorIndexOptions)
+	}
+	if len(b.Relations) > 0 {
+		cp.Relations = deepCloneMapStringAny(b.Relations)
+	}
+	if b.NullValue != nil {
+		cp.NullValue = deepCloneAny(b.NullValue)
+	}
+	if b.ConstantValue != nil {
+		cp.ConstantValue = deepCloneAny(b.ConstantValue)
+	}
+	if len(b.AggregateMetrics) > 0 {
+		cp.AggregateMetrics = append([]string(nil), b.AggregateMetrics...)
 	}
 	if b.Coerce != nil {
 		v := *b.Coerce
@@ -666,7 +681,43 @@ func deepCloneFieldProperty(fp esast.FieldProperty) esast.FieldProperty {
 		cp.Meta = cloneStringMap(fp.Meta)
 	}
 	if len(fp.Contexts) > 0 {
-		cp.Contexts = cloneCompletionContexts(fp.Contexts)
+		cp.Contexts = deepCloneCompletionContexts(fp.Contexts)
+	}
+	if fp.Dynamic != nil {
+		cp.Dynamic = deepCloneAny(fp.Dynamic)
+	}
+	if fp.Value != nil {
+		cp.Value = deepCloneAny(fp.Value)
+	}
+	if fp.Script != nil {
+		cp.Script = deepCloneAny(fp.Script)
+	}
+	if fp.CopyTo != nil {
+		cp.CopyTo = deepCloneAny(fp.CopyTo)
+	}
+	if fp.NullValue != nil {
+		cp.NullValue = deepCloneAny(fp.NullValue)
+	}
+	if fp.IndexPrefixes != nil {
+		cp.IndexPrefixes = deepCloneMapStringAny(fp.IndexPrefixes)
+	}
+	if fp.IndexOptions != nil {
+		cp.IndexOptions = deepCloneAny(fp.IndexOptions)
+	}
+	if fp.Boost != nil {
+		cp.Boost = deepCloneAny(fp.Boost)
+	}
+	if fp.Fielddata != nil {
+		cp.Fielddata = deepCloneAny(fp.Fielddata)
+	}
+	if fp.Relations != nil {
+		cp.Relations = deepCloneMapStringAny(fp.Relations)
+	}
+	if fp.FetchFields != nil {
+		cp.FetchFields = deepCloneSliceMapStringAny(fp.FetchFields)
+	}
+	if fp.Metrics != nil {
+		cp.Metrics = append([]string(nil), fp.Metrics...)
 	}
 	if len(fp.Fields) > 0 {
 		cp.Fields = make(map[string]esast.FieldProperty, len(fp.Fields))
@@ -711,21 +762,23 @@ func deepCloneMappingSpec(m *esast.MappingSpec) *esast.MappingSpec {
 		r := *m.Routing
 		cp.Routing = &r
 	}
-	if len(m.Meta) > 0 {
-		cp.Meta = make(map[string]any, len(m.Meta))
-		for k, v := range m.Meta {
-			cp.Meta[k] = v
-		}
+	if m.Dynamic != nil {
+		cp.Dynamic = deepCloneAny(m.Dynamic)
 	}
-	if len(m.Source) > 0 {
-		cp.Source = make(map[string]any, len(m.Source))
-		for k, v := range m.Source {
-			cp.Source[k] = v
-		}
+	if m.DataStreamTimestamp != nil {
+		cp.DataStreamTimestamp = deepCloneAny(m.DataStreamTimestamp)
 	}
-	if len(m.DynamicTemplates) > 0 {
-		cp.DynamicTemplates = make([]map[string]any, len(m.DynamicTemplates))
-		copy(cp.DynamicTemplates, m.DynamicTemplates)
+	if m.Size != nil {
+		cp.Size = deepCloneMapStringAny(m.Size)
+	}
+	if m.Meta != nil {
+		cp.Meta = deepCloneMapStringAny(m.Meta)
+	}
+	if m.Source != nil {
+		cp.Source = deepCloneMapStringAny(m.Source)
+	}
+	if m.DynamicTemplates != nil {
+		cp.DynamicTemplates = deepCloneSliceMapStringAny(m.DynamicTemplates)
 	}
 	if len(m.Runtime) > 0 {
 		cp.Runtime = make(map[string]esast.FieldProperty, len(m.Runtime))
@@ -990,6 +1043,7 @@ const (
 	tsdbDimKindLong
 	tsdbDimKindUnsignedLong
 	tsdbDimKindBool
+	tsdbDimKindIP
 )
 
 type tsdbTypedDimension struct {
@@ -999,6 +1053,7 @@ type tsdbTypedDimension struct {
 	intVal   int64
 	uintVal  uint64
 	boolVal  bool
+	ipBytes  [16]byte
 	typedVal any
 }
 
@@ -1048,9 +1103,20 @@ func encodeTSDBTypedDimensionBytes(d tsdbTypedDimension) []byte {
 		return out[:]
 	case tsdbDimKindUnsignedLong:
 		var out [9]byte
-		out[0] = 'u'
-		binary.BigEndian.PutUint64(out[1:9], d.uintVal)
+		if d.uintVal <= math.MaxInt64 {
+			out[0] = 'l'
+			binary.BigEndian.PutUint64(out[1:9], d.uintVal)
+		} else {
+			out[0] = 'u'
+			binary.BigEndian.PutUint64(out[1:9], d.uintVal^0x8000000000000000)
+		}
 		return out[:]
+	case tsdbDimKindIP:
+		out := make([]byte, 0, 1+5+len(d.canon))
+		out = append(out, 's')
+		out = appendLuceneVInt(out, len(d.canon))
+		out = append(out, d.canon...)
+		return out
 	case tsdbDimKindBool:
 		if d.boolVal {
 			return []byte{'b', 1}
@@ -1197,7 +1263,8 @@ func parseTSDBTypedDimensionScalar(fieldName string, b FieldBinding, raw any) (t
 		return tsdbTypedDimension{
 			name:     fieldName,
 			canon:    canon,
-			kind:     tsdbDimKindString,
+			kind:     tsdbDimKindIP,
+			ipBytes:  ipTo16Bytes(addr),
 			typedVal: canon,
 		}, nil
 
@@ -1268,15 +1335,24 @@ func extractTSDBTypedDimensionsFromDoc(idx *IndexSchema, doc map[string]any) ([]
 		}
 		if b.TimeSeriesDimension != nil && *b.TimeSeriesDimension {
 			if strings.EqualFold(b.ESType, "constant_keyword") && b.HasConstantValue && b.ConstantValue != nil {
-				rawVal, present := extractSingleDocPathValue(doc, strings.Split(k, "."))
-				if present && rawVal != nil {
-					td, err := parseTSDBTypedDimensionScalar(k, b, rawVal)
+				rawVals, present := extractAllDocLeafValuesAtPath(doc, strings.Split(k, "."))
+				if present && len(rawVals) > 0 {
+					tds, err := flattenAndParseTSDBDimensionValues(idx, k, b, rawVals)
 					if err != nil {
 						return nil, err
 					}
-					if !seen[k] {
+					if len(tds) > 0 && !seen[k] {
 						seen[k] = true
-						out = append(out, td)
+						out = append(out, tds...)
+					} else if !seen[k] {
+						seen[k] = true
+						cv := fmt.Sprintf("%v", b.ConstantValue)
+						out = append(out, tsdbTypedDimension{
+							name:     k,
+							canon:    cv,
+							kind:     tsdbDimKindString,
+							typedVal: cv,
+						})
 					}
 				} else if !seen[k] {
 					seen[k] = true
@@ -1290,41 +1366,54 @@ func extractTSDBTypedDimensionsFromDoc(idx *IndexSchema, doc map[string]any) ([]
 				}
 				continue
 			}
-			rawVal, present := extractSingleDocPathValue(doc, strings.Split(k, "."))
-			if !present || rawVal == nil {
-				continue
+			rawVals, present := extractAllDocLeafValuesAtPath(doc, strings.Split(k, "."))
+			if !present || len(rawVals) == 0 {
+				if b.NullValue != nil && hasExplicitNullAtPath(doc, strings.Split(k, ".")) {
+					rawVals = []any{b.NullValue}
+				} else {
+					continue
+				}
 			}
-			td, err := parseTSDBTypedDimensionScalar(k, b, rawVal)
+			tds, err := flattenAndParseTSDBDimensionValues(idx, k, b, rawVals)
 			if err != nil {
 				return nil, err
 			}
-			if !seen[k] {
+			if len(tds) > 0 && !seen[k] {
 				seen[k] = true
-				out = append(out, td)
+				out = append(out, tds...)
 			}
 		}
 		if strings.EqualFold(b.ESType, "flattened") && len(b.TimeSeriesDimensions) > 0 {
-			rawFlat, present := extractSingleDocPathValue(doc, strings.Split(k, "."))
-			if !present || rawFlat == nil {
-				continue
-			}
-			flatMap, okM := rawFlat.(map[string]any)
-			if !okM {
+			rawFlats, present := extractAllDocLeafValuesAtPath(doc, strings.Split(k, "."))
+			if !present || len(rawFlats) == 0 {
 				continue
 			}
 			for _, subDim := range b.TimeSeriesDimensions {
-				subVal, hasSub := extractSingleDocPathValue(flatMap, strings.Split(subDim, "."))
-				if !hasSub || subVal == nil {
+				fullName := k + "." + subDim
+				var subCandidates []any
+				for _, rf := range rawFlats {
+					subVals, hasSub := extractAllDocLeafValuesAtPath(rf, strings.Split(subDim, "."))
+					if hasSub {
+						subCandidates = append(subCandidates, subVals...)
+					}
+				}
+				if len(subCandidates) == 0 {
 					continue
 				}
-				fullName := k + "." + subDim
-				td, err := parseTSDBTypedDimensionScalar(fullName, FieldBinding{ESFieldPath: fullName, ESType: "keyword"}, subVal)
+				subB := FieldBinding{
+					ESFieldPath:         fullName,
+					ESType:              "keyword",
+					IgnoreAbove:         b.IgnoreAbove,
+					IgnoreMalformed:     b.IgnoreMalformed,
+					LowercaseNormalizer: b.LowercaseNormalizer,
+				}
+				tds, err := flattenAndParseTSDBDimensionValues(idx, fullName, subB, subCandidates)
 				if err != nil {
 					return nil, err
 				}
-				if !seen[fullName] {
+				if len(tds) > 0 && !seen[fullName] {
 					seen[fullName] = true
-					out = append(out, td)
+					out = append(out, tds...)
 				}
 			}
 		}
@@ -1341,7 +1430,15 @@ func ExtractTSDBDimensionKeyMap(idx *IndexSchema, doc map[string]any) (map[strin
 	}
 	out := make(map[string]any, len(dims))
 	for _, d := range dims {
-		out[d.name] = d.typedVal
+		if existing, had := out[d.name]; had {
+			if sl, isS := existing.([]any); isS {
+				out[d.name] = append(sl, d.typedVal)
+			} else {
+				out[d.name] = []any{existing, d.typedVal}
+			}
+		} else {
+			out[d.name] = d.typedVal
+		}
 	}
 	return out, nil
 }
@@ -1434,7 +1531,20 @@ func ValidateIndexModeSettings(effectiveMode string, settings map[string]any) er
 	default:
 		return esWireError(fmt.Sprintf("illegal_argument_exception: unknown index mode [%s]", effectiveMode))
 	}
-	if len(settings) == 0 || mode == "time_series" {
+	if len(settings) == 0 {
+		return nil
+	}
+	if mode == "time_series" {
+		for _, sortKey := range []string{"index.sort.field", "sort.field", "index.sort.order", "sort.order", "index.sort.mode", "sort.mode", "index.sort.missing", "sort.missing"} {
+			if _, hasSort := lookupIndexSettingPath(settings, sortKey); hasSort {
+				return esWireError("illegal_argument_exception: index sorting cannot be configured explicitly in [time_series] mode")
+			}
+		}
+		if rps, hasRPS := lookupIndexSettingPath(settings, "index.routing_partition_size", "routing_partition_size"); hasRPS {
+			if fmt.Sprintf("%v", rps) != "1" {
+				return esWireError("illegal_argument_exception: [index.routing_partition_size] is not supported in [time_series] mode")
+			}
+		}
 		return nil
 	}
 	_, rp, st, et, _ := extractRawTSDBSettingsValues(settings)
@@ -1487,7 +1597,13 @@ func isUnmappedScopeInSynthetic(idxSchema *IndexSchema, fullPath string) bool {
 			}
 		}
 	}
-	return true
+	if idxSchema.RawMapping != nil && normalizeDynamicMode(idxSchema.RawMapping.Dynamic) == "runtime" {
+		return true
+	}
+	if idxSchema.IgnoreDynamicBeyondLimit {
+		return true
+	}
+	return false
 }
 
 func reconstructIgnoredSourceValue(idxSchema *IndexSchema, rawVal any, fullPath string) (any, bool) {
@@ -1514,8 +1630,13 @@ func reconstructIgnoredSourceValue(idxSchema *IndexSchema, rawVal any, fullPath 
 		}
 		return out, true
 	case json.Number:
-		if iv, err := v.Int64(); err == nil && !strings.ContainsAny(v.String(), ".eE") {
-			return iv, true
+		if !strings.ContainsAny(v.String(), ".eE") {
+			if iv, err := v.Int64(); err == nil {
+				return iv, true
+			}
+			if _, errU := strconv.ParseUint(v.String(), 10, 64); errU == nil {
+				return v, true
+			}
 		}
 		if fv, err := v.Float64(); err == nil {
 			return fv, true
@@ -1555,16 +1676,20 @@ func reconstructIgnoredSourceObject(idxSchema *IndexSchema, obj map[string]any, 
 }
 
 func hasExplicitStoreArraySourceAtPath(idxSchema *IndexSchema, fullPath string) bool {
-	if idxSchema == nil {
+	if idxSchema == nil || fullPath == "" {
 		return false
 	}
-	if b, ok := idxSchema.Fields[fullPath]; ok && b.StoreArraySource != nil && *b.StoreArraySource {
-		return true
-	}
-	if idxSchema.RawMapping != nil {
-		if fp, ok := lookupRawFieldProperty(idxSchema.RawMapping.Properties, strings.Split(fullPath, ".")); ok {
-			if fp.StoreArraySource != nil && *fp.StoreArraySource {
-				return true
+	parts := strings.Split(fullPath, ".")
+	for i := len(parts); i >= 1; i-- {
+		cand := strings.Join(parts[:i], ".")
+		if b, ok := idxSchema.Fields[cand]; ok && b.StoreArraySource != nil && *b.StoreArraySource {
+			return true
+		}
+		if idxSchema.RawMapping != nil {
+			if fp, ok := lookupRawFieldProperty(idxSchema.RawMapping.Properties, parts[:i]); ok {
+				if fp.StoreArraySource != nil && *fp.StoreArraySource {
+					return true
+				}
 			}
 		}
 	}

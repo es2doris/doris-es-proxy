@@ -482,6 +482,8 @@ func applyAndValidateURISearchParamsRound58(r *http.Request, req *esast.SearchRe
 			Query:            qStr,
 			DefaultField:     q.Get("df"),
 			DefaultOperator:  q.Get("default_operator"),
+			Analyzer:         q.Get("analyzer"),
+			QuoteAnalyzer:    q.Get("quote_analyzer"),
 			QuoteFieldSuffix: q.Get("quote_field_suffix"),
 			AnalyzeWildcard:  awPtr,
 			Lenient:          lnPtr,

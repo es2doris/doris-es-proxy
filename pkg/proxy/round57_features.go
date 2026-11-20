@@ -985,28 +985,6 @@ func sqlExprHasAggregate(ex sqlExpr) bool {
 	return false
 }
 
-func getNestedDocVal(doc map[string]any, field string) any {
-	if doc == nil {
-		return nil
-	}
-	if v, exists := doc[field]; exists {
-		return normalizeESQLNumber(v)
-	}
-	parts := strings.Split(field, ".")
-	var cur any = doc
-	for _, p := range parts {
-		m, ok := cur.(map[string]any)
-		if !ok {
-			return nil
-		}
-		cur, ok = m[p]
-		if !ok {
-			return nil
-		}
-	}
-	return normalizeESQLNumber(cur)
-}
-
 func evalSQLExprOnRow(ex sqlExpr, row map[string]any, grpRows []map[string]any) any {
 	if ex == nil {
 		return nil
@@ -1015,7 +993,7 @@ func evalSQLExprOnRow(ex sqlExpr, row map[string]any, grpRows []map[string]any) 
 	case *sqlLitExpr:
 		return e.val
 	case *sqlColExpr:
-		return getNestedDocVal(row, e.name)
+		return getNestedOrArrayDocValRound63(row, e.name)
 	case *sqlUnaryExpr:
 		op := strings.TrimSpace(strings.ToUpper(e.op))
 		v := evalSQLExprOnRow(e.sub, row, grpRows)
@@ -1669,8 +1647,10 @@ func (s *Server) handleSQLTranslateRound57(w http.ResponseWriter, r *http.Reques
 	if stmt.limit >= 0 && stmt.limit < sizeVal {
 		sizeVal = stmt.limit
 	}
+	hasFilter := false
 	whereDSL := translateSQLWhereToDSL(stmt.where)
 	if filterMap, okF := body["filter"].(map[string]any); okF && len(filterMap) > 0 {
+		hasFilter = true
 		if stmt.where == nil {
 			whereDSL = filterMap
 		} else {
@@ -1682,6 +1662,7 @@ func (s *Server) handleSQLTranslateRound57(w http.ResponseWriter, r *http.Reques
 			}
 		}
 	}
+	mappedFields := resolveSQLTableMappedFieldsRound63(s, r.Context(), stmt.from)
 	hasAgg := len(stmt.groupBy) > 0
 	var selectFields []any
 	hasStar := false
@@ -1695,8 +1676,12 @@ func (s *Server) handleSQLTranslateRound57(w http.ResponseWriter, r *http.Reques
 		}
 	}
 	out := map[string]any{
-		"size":  sizeVal,
-		"query": whereDSL,
+		"size": sizeVal,
+	}
+	if stmt.where != nil || hasFilter {
+		out["query"] = whereDSL
+	} else {
+		out["track_total_hits"] = -1
 	}
 	if hasAgg {
 		out["size"] = 0
@@ -1760,7 +1745,20 @@ func (s *Server) handleSQLTranslateRound57(w http.ResponseWriter, r *http.Reques
 			out["aggs"] = subAggs
 		}
 	} else {
-		if !hasStar && len(selectFields) > 0 {
+		if hasStar && len(mappedFields) > 0 {
+			mNames := make([]string, 0, len(mappedFields))
+			for k := range mappedFields {
+				mNames = append(mNames, k)
+			}
+			sort.Strings(mNames)
+			starFields := make([]any, 0, len(mNames)+len(selectFields))
+			for _, k := range mNames {
+				starFields = append(starFields, map[string]any{"field": k})
+			}
+			starFields = append(starFields, selectFields...)
+			out["_source"] = false
+			out["fields"] = starFields
+		} else if !hasStar && len(selectFields) > 0 {
 			out["_source"] = false
 			out["fields"] = selectFields
 		} else {
@@ -1769,22 +1767,38 @@ func (s *Server) handleSQLTranslateRound57(w http.ResponseWriter, r *http.Reques
 		var sortList []any
 		for _, ord := range stmt.orderBy {
 			dir := "asc"
+			missing := "_last"
 			if ord.desc {
 				dir = "desc"
+				missing = "_first"
+			}
+			if ord.nullsFirst != nil {
+				if *ord.nullsFirst {
+					missing = "_first"
+				} else {
+					missing = "_last"
+				}
 			}
 			field := ord.expr.sqlExprLabel()
 			if c, okC := ord.expr.(*sqlColExpr); okC {
 				field = c.name
 			}
+			sortSpec := map[string]any{
+				"order":   dir,
+				"missing": missing,
+			}
+			if mt := mappedFields[field]; mt != "" {
+				sortSpec["unmapped_type"] = mt
+			}
 			sortList = append(sortList, map[string]any{
-				field: map[string]any{"order": dir},
+				field: sortSpec,
 			})
 		}
 		if len(sortList) > 0 {
 			out["sort"] = sortList
 		}
 	}
-	writeJSON(w, http.StatusOK, out)
+	writeJSONWithRequest(w, r, http.StatusOK, out)
 }
 
 func (s *Server) handleSQLQueryRound57(w http.ResponseWriter, r *http.Request, body map[string]any) {
@@ -2075,23 +2089,16 @@ func (s *Server) handleSQLQueryRound57(w http.ResponseWriter, r *http.Request, b
 				break
 			}
 		}
+		mappedFields := resolveSQLTableMappedFieldsRound63(s, r.Context(), stmt.from)
 		if hasStar {
 			colSet := make(map[string]bool)
+			for k := range mappedFields {
+				colSet[k] = true
+			}
 			for _, d := range docs {
 				for k := range d {
 					colSet[k] = true
 				}
-			}
-			if len(colSet) == 0 {
-				s.mu.RLock()
-				if sch, exists := s.indices[stmt.from]; exists && sch != nil {
-					for k := range sch.Fields {
-						if !strings.HasSuffix(k, ".keyword") {
-							colSet[k] = true
-						}
-					}
-				}
-				s.mu.RUnlock()
 			}
 			starCols := make([]string, 0, len(colSet))
 			for k := range colSet {
@@ -2259,11 +2266,34 @@ func (s *Server) handleSQLQueryRound57(w http.ResponseWriter, r *http.Request, b
 			if colName == "" {
 				colName = it.expr.sqlExprLabel()
 			}
-			colType := "keyword"
-			for _, rec := range records {
-				if rec.cells[ci] != nil {
-					colType = inferSQLResultType(rec.cells[ci])
-					break
+			colType := ""
+			if cExpr, okC := it.expr.(*sqlColExpr); okC {
+				switch strings.ToLower(mappedFields[cExpr.name]) {
+				case "integer", "short", "byte":
+					colType = strings.ToLower(mappedFields[cExpr.name])
+				case "long":
+					colType = "long"
+				case "double", "float", "half_float", "scaled_float":
+					colType = strings.ToLower(mappedFields[cExpr.name])
+				case "boolean":
+					colType = "boolean"
+				case "date", "date_nanos":
+					colType = "datetime"
+				case "text":
+					colType = "text"
+				case "keyword", "constant_keyword":
+					colType = "keyword"
+				case "ip":
+					colType = "ip"
+				}
+			}
+			if colType == "" {
+				colType = "keyword"
+				for _, rec := range records {
+					if rec.cells[ci] != nil {
+						colType = inferSQLResultType(rec.cells[ci])
+						break
+					}
 				}
 			}
 			columns = append(columns, map[string]any{"name": colName, "type": colType})
@@ -2284,6 +2314,9 @@ func (s *Server) handleSQLQueryRound57(w http.ResponseWriter, r *http.Request, b
 		rows = []any{}
 	}
 
+	hasWaitTimeout := body["wait_for_completion_timeout"] != nil || (r.URL != nil && r.URL.Query().Has("wait_for_completion_timeout"))
+	explicitTargetVer := s.hasExplicitTargetESVersion()
+
 	s.mu.Lock()
 	if s.sqlAsyncSearches == nil {
 		s.sqlAsyncSearches = make(map[string]map[string]any)
@@ -2291,24 +2324,37 @@ func (s *Server) handleSQLQueryRound57(w http.ResponseWriter, r *http.Request, b
 	sqlID := fmt.Sprintf("sql_%d", len(s.sqlAsyncSearches)+1)
 	var cursorID string
 	if fetchSize > 0 && len(rows) > fetchSize {
-		cursorID = sqlID + "_cur"
-		remRows := rows[fetchSize:]
+		cursorID = sqlID + "_cur_1"
+		rem := rows[fetchSize:]
 		rows = rows[:fetchSize]
-		curObj := map[string]any{
-			"columns": columns,
+		pageIdx := 1
+		for len(rem) > 0 {
+			curID := fmt.Sprintf("%s_cur_%d", sqlID, pageIdx)
+			var pageRows []any
+			var nextCurID string
+			if len(rem) > fetchSize {
+				pageRows = rem[:fetchSize]
+				rem = rem[fetchSize:]
+				pageIdx++
+				nextCurID = fmt.Sprintf("%s_cur_%d", sqlID, pageIdx)
+			} else {
+				pageRows = rem
+				rem = nil
+			}
+			curObj := map[string]any{}
+			if columnar {
+				curObj["values"] = transposeRowsToColumnar(columns, pageRows)
+			} else {
+				curObj["rows"] = pageRows
+			}
+			if nextCurID != "" {
+				curObj["cursor"] = nextCurID
+			}
+			s.sqlAsyncSearches[curID+"_cursor"] = curObj
 		}
-		if columnar {
-			curObj["values"] = transposeRowsToColumnar(columns, remRows)
-		} else {
-			curObj["rows"] = remRows
-		}
-		s.sqlAsyncSearches[cursorID+"_cursor"] = curObj
 	}
 	resp := map[string]any{
-		"id":         sqlID,
-		"is_partial": false,
-		"is_running": false,
-		"columns":    columns,
+		"columns": columns,
 	}
 	if columnar {
 		resp["values"] = transposeRowsToColumnar(columns, rows)
@@ -2318,20 +2364,32 @@ func (s *Server) handleSQLQueryRound57(w http.ResponseWriter, r *http.Request, b
 	if cursorID != "" {
 		resp["cursor"] = cursorID
 	}
-	s.sqlAsyncSearches[sqlID] = resp
+	asyncStored := deepCloneDocMap(resp)
+	asyncStored["id"] = sqlID
+	asyncStored["is_partial"] = false
+	asyncStored["is_running"] = false
+	s.sqlAsyncSearches[sqlID] = asyncStored
+	if hasWaitTimeout || !explicitTargetVer {
+		resp["id"] = sqlID
+		resp["is_partial"] = false
+		resp["is_running"] = false
+	}
 	s.mu.Unlock()
 
 	format := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("format")))
-	if format == "csv" || format == "tsv" || format == "txt" {
+	if format == "txt" {
+		ensureESCompatHeaders(w, r)
+		w.Header().Set("Content-Type", "text/plain; charset=UTF-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(formatSQLTextTableRound63(columns, rows)))
+		return
+	}
+	if format == "csv" || format == "tsv" {
 		sep := ","
 		contentType := "text/csv; charset=UTF-8"
-		switch format {
-		case "tsv":
+		if format == "tsv" {
 			sep = "\t"
 			contentType = "text/tab-separated-values; charset=UTF-8"
-		case "txt":
-			sep = " | "
-			contentType = "text/plain; charset=UTF-8"
 		}
 		var sb strings.Builder
 		colHeaders := make([]string, len(columns))
@@ -2340,17 +2398,6 @@ func (s *Server) handleSQLQueryRound57(w http.ResponseWriter, r *http.Request, b
 			colHeaders[i] = fmt.Sprintf("%v", cm["name"])
 		}
 		sb.WriteString(strings.Join(colHeaders, sep) + "\n")
-		if format == "txt" && len(colHeaders) > 0 {
-			seps := make([]string, len(colHeaders))
-			for i, h := range colHeaders {
-				wLen := len(h)
-				if wLen < 3 {
-					wLen = 3
-				}
-				seps[i] = strings.Repeat("-", wLen)
-			}
-			sb.WriteString(strings.Join(seps, "-+-") + "\n")
-		}
 		for _, rAny := range rows {
 			rSlice, _ := rAny.([]any)
 			cells := make([]string, len(rSlice))
@@ -2363,12 +2410,13 @@ func (s *Server) handleSQLQueryRound57(w http.ResponseWriter, r *http.Request, b
 			}
 			sb.WriteString(strings.Join(cells, sep) + "\n")
 		}
+		ensureESCompatHeaders(w, r)
 		w.Header().Set("Content-Type", contentType)
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(sb.String()))
 		return
 	}
-	writeJSON(w, http.StatusOK, resp)
+	writeJSONWithRequest(w, r, http.StatusOK, resp)
 }
 
 func inferSQLResultType(v any) string {
@@ -2661,6 +2709,92 @@ func evalESQLFuncRound57(name string, args []any) (any, bool) {
 		}
 		return nil, true
 
+	case "TO_IP":
+		if len(args) == 0 || args[0] == nil {
+			return nil, true
+		}
+		sVal := strings.TrimSpace(fmt.Sprintf("%v", args[0]))
+		if ValidateESQLIPStringRound63(sVal) {
+			return sVal, true
+		}
+		return nil, true
+
+	case "TO_VERSION":
+		if len(args) == 0 || args[0] == nil {
+			return nil, true
+		}
+		sVal := strings.TrimSpace(fmt.Sprintf("%v", args[0]))
+		if sVal != "" {
+			return sVal, true
+		}
+		return nil, true
+
+	case "TO_UNSIGNED_LONG":
+		if len(args) == 0 || args[0] == nil {
+			return nil, true
+		}
+		if iv, ok := toInt64(args[0]); ok && iv >= 0 {
+			return iv, true
+		}
+		if uv, err := strconv.ParseUint(strings.TrimSpace(fmt.Sprintf("%v", args[0])), 10, 64); err == nil {
+			if uv <= math.MaxInt64 {
+				return int64(uv), true
+			}
+			return strconv.FormatUint(uv, 10), true
+		}
+		return nil, true
+
+	case "MV_MEDIAN":
+		if len(args) == 0 || args[0] == nil {
+			return nil, true
+		}
+		var nums []float64
+		for _, el := range toESQLMultiValueSlice(args[0]) {
+			if fv, ok := toESQLNumber(el); ok {
+				nums = append(nums, fv)
+			}
+		}
+		if len(nums) == 0 {
+			return nil, true
+		}
+		sort.Float64s(nums)
+		mid := len(nums) / 2
+		if len(nums)%2 == 1 {
+			return nums[mid], true
+		}
+		return 0.5 * (nums[mid-1] + nums[mid]), true
+
+	case "MV_MEDIAN_ABSOLUTE_DEVIATION":
+		if len(args) == 0 || args[0] == nil {
+			return nil, true
+		}
+		var nums []float64
+		for _, el := range toESQLMultiValueSlice(args[0]) {
+			if fv, ok := toESQLNumber(el); ok {
+				nums = append(nums, fv)
+			}
+		}
+		if len(nums) == 0 {
+			return nil, true
+		}
+		sort.Float64s(nums)
+		mid := len(nums) / 2
+		var med float64
+		if len(nums)%2 == 1 {
+			med = nums[mid]
+		} else {
+			med = 0.5 * (nums[mid-1] + nums[mid])
+		}
+		devs := make([]float64, len(nums))
+		for i, x := range nums {
+			devs[i] = math.Abs(x - med)
+		}
+		sort.Float64s(devs)
+		if len(devs)%2 == 1 {
+			return devs[mid], true
+		}
+		return 0.5 * (devs[mid-1] + devs[mid]), true
+
 	// --- Multivalue (MV_*) functions ---
 	case "MV_COUNT":
 		if len(args) == 0 || args[0] == nil {
@@ -2940,7 +3074,13 @@ func evalESQLFuncRound57(name string, args []any) (any, bool) {
 		}
 		layouts := convertESDateFormatToGoLayouts(fmtPattern)
 		if len(layouts) > 0 && layouts[0] != "UNIX" && layouts[0] != "UNIX_MS" && layouts[0] != "TAI64N" {
-			return t.UTC().Format(layouts[0]), true
+			formatted := t.UTC().Format(layouts[0])
+			if len(args) >= 3 && args[2] != nil {
+				if lang, lErr := validateAndExtractIngestLocaleLangRound59(fmt.Sprintf("%v", args[2])); lErr == nil {
+					formatted = localizeFormattedDateOutputRound59(formatted, fmtPattern, lang, t.UTC())
+				}
+			}
+			return formatted, true
 		}
 		return t.UTC().Format("2006-01-02T15:04:05.000Z"), true
 
@@ -2982,12 +3122,19 @@ func toESQLMultiValueSlice(v any) []any {
 	if v == nil {
 		return nil
 	}
-	if arr, ok := v.([]any); ok {
+	switch arr := v.(type) {
+	case []any:
 		out := make([]any, 0, len(arr))
 		for _, el := range arr {
 			if el != nil {
-				out = append(out, normalizeESQLNumber(el))
+				out = append(out, toESQLMultiValueSlice(el)...)
 			}
+		}
+		return out
+	case []string:
+		out := make([]any, 0, len(arr))
+		for _, el := range arr {
+			out = append(out, el)
 		}
 		return out
 	}
@@ -3023,6 +3170,45 @@ func computeESQLMedianOrPercentile(fn, arg string, grpRows []map[string]any) (an
 	case "MEDIAN":
 		val := computeESQLPercentileValue(arg, 50.0, grpRows)
 		return val, "double", true
+	case "MEDIAN_ABSOLUTE_DEVIATION":
+		parts := splitESQLTopLevel(arg, ',')
+		fieldExpr := strings.TrimSpace(arg)
+		if len(parts) >= 1 {
+			fieldExpr = strings.TrimSpace(parts[0])
+		}
+		medVal := computeESQLPercentileValue(fieldExpr, 50.0, grpRows)
+		medF, okM := toESQLNumber(medVal)
+		if !okM {
+			return nil, "double", true
+		}
+		var devs []float64
+		for _, r := range grpRows {
+			v := evalESQLExpr(fieldExpr, r)
+			if fv, ok := toESQLNumber(v); ok {
+				devs = append(devs, math.Abs(fv-medF))
+			} else if arr, okA := v.([]any); okA {
+				for _, el := range arr {
+					if ef, okE := toESQLNumber(el); okE {
+						devs = append(devs, math.Abs(ef-medF))
+					}
+				}
+			}
+		}
+		if len(devs) == 0 {
+			return nil, "double", true
+		}
+		sort.Float64s(devs)
+		if len(devs) == 1 {
+			return devs[0], "double", true
+		}
+		pos := 0.5 * float64(len(devs)-1)
+		lo := int(math.Floor(pos))
+		hi := int(math.Ceil(pos))
+		if lo == hi {
+			return devs[lo], "double", true
+		}
+		frac := pos - float64(lo)
+		return devs[lo] + frac*(devs[hi]-devs[lo]), "double", true
 	case "PERCENTILE":
 		parts := splitESQLTopLevel(arg, ',')
 		if len(parts) < 2 {
@@ -3183,9 +3369,10 @@ func esqlStageHasKeyword(upper, kw string) bool {
 	return strings.HasPrefix(upper, kw) && len(upper) > len(kw) && unicode.IsSpace(rune(upper[len(kw)]))
 }
 
-func (s *Server) executeESQLExtraStage(
+func (s *Server) executeESQLExtraStageWithBody(
 	w http.ResponseWriter,
 	r *http.Request,
+	body map[string]any,
 	st string,
 	upper string,
 	rows []map[string]any,
@@ -3193,6 +3380,10 @@ func (s *Server) executeESQLExtraStage(
 	colTypes map[string]string,
 ) ([]map[string]any, []string, map[string]string, bool, bool) {
 	switch {
+	case esqlStageHasKeyword(upper, "LOOKUP"):
+		nextRows, nextOrder, nextTypes, okL := executeESQLLookupJoinStageWithBodyRound63(s, w, r, body, st, rows, colOrder, colTypes)
+		return nextRows, nextOrder, nextTypes, true, okL
+
 	case esqlStageHasKeyword(upper, "DISSECT"):
 		rest := strings.TrimSpace(st[len("DISSECT"):])
 		toks, err := parseESQLStageTokens(rest)
@@ -3221,7 +3412,14 @@ func (s *Server) executeESQLExtraStage(
 			if rawVal == nil {
 				continue
 			}
-			extracted, dErr := evalDissectPattern(pattern, fmt.Sprintf("%v", rawVal), appendSep)
+			msg := fmt.Sprintf("%v", rawVal)
+			if len(msg) > maxIngestGrokDissectBytesRound63 {
+				if _, chkErr := ExtractDissectCheckedRound63(pattern, msg); chkErr != nil {
+					writeESError(w, http.StatusBadRequest, "illegal_argument_exception", chkErr.Error())
+					return nil, nil, nil, true, false
+				}
+			}
+			extracted, dErr := evalDissectPattern(pattern, msg, appendSep)
 			if dErr != nil {
 				continue
 			}
@@ -3286,6 +3484,12 @@ func (s *Server) executeESQLExtraStage(
 				continue
 			}
 			msg := fmt.Sprintf("%v", rawVal)
+			if len(msg) > maxIngestGrokDissectBytesRound63 {
+				if _, chkErr := ExtractGrokCheckedRound63(pattern, msg); chkErr != nil {
+					writeESError(w, http.StatusBadRequest, "illegal_argument_exception", chkErr.Error())
+					return nil, nil, nil, true, false
+				}
+			}
 			sub := re.FindStringSubmatch(msg)
 			loc := re.FindStringSubmatchIndex(msg)
 			if sub == nil || loc == nil {
@@ -3330,9 +3534,11 @@ func (s *Server) executeESQLExtraStage(
 			return nil, nil, nil, true, false
 		}
 		var cfg map[string]any
+		polKind := "match"
 		for _, pt := range []string{"match", "range", "geo_match"} {
 			if m, okM := polCopy[pt].(map[string]any); okM {
 				cfg = m
+				polKind = pt
 				break
 			}
 		}
@@ -3341,6 +3547,7 @@ func (s *Server) executeESQLExtraStage(
 				for _, pt := range []string{"match", "range", "geo_match"} {
 					if m, okM := cSub[pt].(map[string]any); okM {
 						cfg = m
+						polKind = pt
 						break
 					}
 				}
@@ -3408,15 +3615,64 @@ func (s *Server) executeESQLExtraStage(
 			srcIndices = append(srcIndices, iv...)
 		}
 
+		enrichSummary := inspectESQLFromTargetSchemasRound63(s, r.Context(), strings.Join(srcIndices, ","))
+		isIPPolicyField := enrichSummary.colTypes[policyMatchField] == "ip"
+		if !isIPPolicyField {
+			s.mu.RLock()
+			for _, sIdx := range srcIndices {
+				if sch := s.indices[s.resolveIndexName(sIdx)]; sch != nil {
+					if fm, okF := sch.Fields[policyMatchField]; okF {
+						etLow := strings.ToLower(fm.ESType)
+						if etLow == "ip" || etLow == "ip_range" {
+							isIPPolicyField = true
+							break
+						}
+					}
+					if sch.RawMapping != nil {
+						if fp, okP := lookupMappingFieldPropRound63(sch.RawMapping.Properties, policyMatchField); okP {
+							etLow := strings.ToLower(fp.Type)
+							if etLow == "ip" || etLow == "ip_range" {
+								isIPPolicyField = true
+								break
+							}
+						}
+					}
+				}
+			}
+			s.mu.RUnlock()
+		}
+
 		lookup := make(map[string]map[string]any)
+		var ipNets []struct {
+			net *net.IPNet
+			doc map[string]any
+		}
+		addEnrichDoc := func(dm map[string]any) {
+			mv := getNestedOrArrayDocValRound63(dm, policyMatchField)
+			if mv == nil {
+				return
+			}
+			for _, mvItem := range toESQLMultiValueSlice(mv) {
+				sKey := strings.TrimSpace(fmt.Sprintf("%v", mvItem))
+				if isIPPolicyField || polKind == "range" {
+					if _, ipNet, cErr := net.ParseCIDR(sKey); cErr == nil && ipNet != nil {
+						isIPPolicyField = true
+						ipNets = append(ipNets, struct {
+							net *net.IPNet
+							doc map[string]any
+						}{net: ipNet, doc: dm})
+					} else if ip := net.ParseIP(sKey); ip != nil {
+						lookup[ip.String()] = dm
+					}
+				}
+				lookup[sKey] = dm
+			}
+		}
 		// Also check cached _docs on policy if `_execute` captured them
 		if cachedDocs, okCD := polCopy["_docs"].([]any); okCD {
 			for _, dAny := range cachedDocs {
 				if dm, okM := dAny.(map[string]any); okM {
-					mv := getNestedDocVal(dm, policyMatchField)
-					if mv != nil {
-						lookup[fmt.Sprintf("%v", mv)] = dm
-					}
+					addEnrichDoc(dm)
 				}
 			}
 		}
@@ -3437,10 +3693,7 @@ func (s *Server) executeESQLExtraStage(
 							for _, hAny := range hList {
 								if hObj, okO := hAny.(map[string]any); okO {
 									if srcMap, okS := hObj["_source"].(map[string]any); okS {
-										mv := getNestedDocVal(srcMap, policyMatchField)
-										if mv != nil {
-											lookup[fmt.Sprintf("%v", mv)] = srcMap
-										}
+										addEnrichDoc(srcMap)
 									}
 								}
 							}
@@ -3452,24 +3705,98 @@ func (s *Server) executeESQLExtraStage(
 
 		for _, ws := range withSpecs {
 			colOrder = appendUniqueESQLCol(colOrder, ws.outCol)
-			if colTypes[ws.outCol] == "" {
+			if stT := enrichSummary.colTypes[ws.srcField]; stT != "" {
+				colTypes[ws.outCol] = stT
+			} else if colTypes[ws.outCol] == "" {
 				colTypes[ws.outCol] = "keyword"
 			}
+		}
+		lookupSingleEnrichKey := func(cand string) (map[string]any, bool) {
+			if dm, ok := lookup[cand]; ok {
+				return dm, true
+			}
+			if isIPPolicyField || len(ipNets) > 0 {
+				if ip := net.ParseIP(cand); ip != nil {
+					if dm, okIP := lookup[ip.String()]; okIP {
+						return dm, true
+					}
+					for _, netEntry := range ipNets {
+						if netEntry.net.Contains(ip) {
+							return netEntry.doc, true
+						}
+					}
+				}
+			}
+			return nil, false
 		}
 		for _, row := range rows {
 			mv := getESQLFieldVal(row, onField)
 			if mv == nil {
+				for _, ws := range withSpecs {
+					if _, exists := row[ws.outCol]; !exists {
+						row[ws.outCol] = nil
+					}
+				}
 				continue
 			}
-			matchedDoc, found := lookup[fmt.Sprintf("%v", mv)]
-			if !found {
+			mvItems := toESQLMultiValueSlice(mv)
+			if isIPPolicyField {
+				for _, mvItem := range mvItems {
+					cand := strings.TrimSpace(fmt.Sprintf("%v", mvItem))
+					if !ValidateESQLIPStringRound63(cand) {
+						writeESError(w, http.StatusInternalServerError, "illegal_argument_exception",
+							fmt.Sprintf("'%s' is not an IP string literal.", cand))
+						return nil, nil, nil, true, false
+					}
+				}
+			}
+			var matchedDocs []map[string]any
+			for _, mvItem := range mvItems {
+				cand := strings.TrimSpace(fmt.Sprintf("%v", mvItem))
+				if dm, okM := lookupSingleEnrichKey(cand); okM && dm != nil {
+					matchedDocs = append(matchedDocs, dm)
+				}
+			}
+			if len(matchedDocs) == 0 {
+				for _, ws := range withSpecs {
+					if _, exists := row[ws.outCol]; !exists {
+						row[ws.outCol] = nil
+					}
+				}
 				continue
 			}
 			for _, ws := range withSpecs {
-				ev := getNestedDocVal(matchedDoc, ws.srcField)
-				row[ws.outCol] = ev
-				if ev != nil {
-					colTypes[ws.outCol] = inferESQLValueType(ev)
+				outT := colTypes[ws.outCol]
+				if len(matchedDocs) == 1 {
+					ev := getNestedOrArrayDocValRound63(matchedDocs[0], ws.srcField)
+					row[ws.outCol] = coerceESQLCellForColumnTypeRound63(ev, outT)
+				} else {
+					var collected []any
+					for _, dm := range matchedDocs {
+						ev := getNestedOrArrayDocValRound63(dm, ws.srcField)
+						if ev == nil {
+							continue
+						}
+						for _, el := range toESQLMultiValueSlice(ev) {
+							if c := coerceESQLSingleScalarRound63(el, outT); c != nil {
+								collected = append(collected, c)
+							}
+						}
+					}
+					if len(collected) == 0 {
+						row[ws.outCol] = nil
+					} else if len(collected) == 1 {
+						row[ws.outCol] = collected[0]
+					} else {
+						row[ws.outCol] = collected
+					}
+				}
+				if row[ws.outCol] != nil && enrichSummary.colTypes[ws.srcField] == "" {
+					if arr, okA := row[ws.outCol].([]any); okA && len(arr) > 0 {
+						colTypes[ws.outCol] = inferESQLValueType(arr[0])
+					} else {
+						colTypes[ws.outCol] = inferESQLValueType(row[ws.outCol])
+					}
 				}
 			}
 		}
@@ -3798,6 +4125,7 @@ type eqlStageSpec struct {
 
 type eqlQueryAST struct {
 	isSequence  bool
+	isSample    bool
 	single      eqlStageSpec
 	byKeys      []eqlExpr
 	maxspanMS   int64
@@ -3808,8 +4136,9 @@ type eqlQueryAST struct {
 }
 
 type eqlParser struct {
-	toks []eqlToken
-	pos  int
+	toks               []eqlToken
+	pos                int
+	allowImplicitWhere bool
 }
 
 func (p *eqlParser) cur() eqlToken {
@@ -3832,6 +4161,43 @@ func (p *eqlParser) peekKw(kw string) bool {
 }
 
 func (p *eqlParser) parseQuery() (*eqlQueryAST, error) {
+	if p.matchKw("sample") {
+		ast := &eqlQueryAST{isSequence: true, isSample: true}
+		if p.matchKw("by") {
+			keys, err := p.parseByKeyList()
+			if err != nil {
+				return nil, err
+			}
+			ast.byKeys = append(ast.byKeys, keys...)
+		}
+		for p.cur().kind == eqlTokLBracket {
+			p.pos++
+			st, err := p.parseStage(true)
+			if err != nil {
+				return nil, err
+			}
+			if p.cur().kind != eqlTokRBracket {
+				return nil, fmt.Errorf("expected ']' at end of sample stage")
+			}
+			p.pos++
+			if p.matchKw("by") {
+				keys, bErr := p.parseByKeyList()
+				if bErr != nil {
+					return nil, bErr
+				}
+				st.byKeys = append(st.byKeys, keys...)
+			}
+			ast.stages = append(ast.stages, st)
+		}
+		if len(ast.stages) < 1 {
+			return nil, fmt.Errorf("EQL sample requires at least 1 stage")
+		}
+		if p.cur().kind != eqlTokEOF {
+			return nil, fmt.Errorf("unexpected token [%s] after sample", p.cur().raw)
+		}
+		return ast, nil
+	}
+
 	if p.matchKw("sequence") {
 		ast := &eqlQueryAST{isSequence: true}
 		for p.peekKw("by") || p.peekKw("with") {
@@ -3889,6 +4255,13 @@ func (p *eqlParser) parseQuery() (*eqlQueryAST, error) {
 				return nil, fmt.Errorf("expected ']' at end of sequence stage")
 			}
 			p.pos++
+			if p.matchKw("by") {
+				keys, bErr := p.parseByKeyList()
+				if bErr != nil {
+					return nil, bErr
+				}
+				st.byKeys = append(st.byKeys, keys...)
+			}
 			if isAbsent {
 				if len(ast.stages) == 0 {
 					return nil, fmt.Errorf("EQL missing stage '![...]' cannot be the first stage")
@@ -3901,7 +4274,7 @@ func (p *eqlParser) parseQuery() (*eqlQueryAST, error) {
 				ast.stages = append(ast.stages, st)
 			}
 		}
-		if len(ast.stages) < 2 {
+		if len(ast.stages) == 0 || (len(ast.stages)+len(ast.absentAfter) < 2) {
 			return nil, fmt.Errorf("EQL sequence requires at least 2 stages")
 		}
 		if p.matchKw("until") {
@@ -3961,12 +4334,15 @@ func (p *eqlParser) parseStage(allowBy bool) (eqlStageSpec, error) {
 		return eqlStageSpec{}, fmt.Errorf("expected event category in EQL query, got [%s]", catTok.raw)
 	}
 	p.pos++
-	if !p.matchKw("where") {
-		return eqlStageSpec{}, fmt.Errorf("missing 'where' clause after category [%s]", catTok.val)
-	}
-	expr, err := p.parseOr()
-	if err != nil {
-		return eqlStageSpec{}, err
+	var expr eqlExpr = &eqlLitExpr{val: true}
+	if p.matchKw("where") {
+		var err error
+		expr, err = p.parseOr()
+		if err != nil {
+			return eqlStageSpec{}, err
+		}
+	} else if !p.allowImplicitWhere {
+		return eqlStageSpec{}, fmt.Errorf("expected 'where' after event category [%s]", catTok.val)
 	}
 	st := eqlStageSpec{category: catTok.val, where: expr}
 	if allowBy && p.matchKw("by") {
@@ -4171,7 +4547,7 @@ func evalEQLExpr(ex eqlExpr, doc map[string]any) (any, error) {
 	case *eqlLitExpr:
 		return e.val, nil
 	case *eqlFieldExpr:
-		return getNestedDocVal(doc, e.name), nil
+		return getNestedOrArrayDocValRound63(doc, e.name), nil
 	case *eqlNotExpr:
 		v, err := evalEQLExpr(e.sub, doc)
 		if err != nil {
@@ -4419,7 +4795,7 @@ func eqlCompareAny(lv, rv any, op string) bool {
 
 func eqlMatchesStage(st eqlStageSpec, doc map[string]any, catField string) (bool, error) {
 	if !strings.EqualFold(st.category, "any") {
-		catVal := getNestedDocVal(doc, catField)
+		catVal := getNestedOrArrayDocValRound63(doc, catField)
 		if catVal == nil || !eqlCompareAny(catVal, st.category, "==") {
 			return false, nil
 		}
@@ -4433,7 +4809,7 @@ func eqlMatchesStage(st eqlStageSpec, doc map[string]any, catField string) (bool
 }
 
 func extractEQLTimestampMillis(doc map[string]any, tsField string) int64 {
-	raw := getNestedDocVal(doc, tsField)
+	raw := getNestedOrArrayDocValRound63(doc, tsField)
 	if raw == nil {
 		return 0
 	}
@@ -4446,29 +4822,6 @@ func extractEQLTimestampMillis(doc map[string]any, tsField string) int64 {
 	return 0
 }
 
-func extractEQLJoinKeys(doc map[string]any, keyExprs []eqlExpr) ([]any, string, bool) {
-	if len(keyExprs) == 0 {
-		return []any{}, "__global__", true
-	}
-	vals := make([]any, len(keyExprs))
-	var sb strings.Builder
-	for i, ke := range keyExprs {
-		v, err := evalEQLExpr(ke, doc)
-		if err != nil || v == nil {
-			return nil, "", false
-		}
-		if arr, ok := v.([]any); ok {
-			if len(arr) == 0 || arr[0] == nil {
-				return nil, "", false
-			}
-			v = arr[0]
-		}
-		vals[i] = v
-		_, _ = fmt.Fprintf(&sb, "%T:%v|", v, v)
-	}
-	return vals, sb.String(), true
-}
-
 func (s *Server) handleEQLSearchAPIRound57(w http.ResponseWriter, r *http.Request, segs []string) {
 	if segs[0] == "_eql" && len(segs) >= 3 && segs[1] == "search" {
 		if segs[2] == "status" && len(segs) >= 4 {
@@ -4478,7 +4831,13 @@ func (s *Server) handleEQLSearchAPIRound57(w http.ResponseWriter, r *http.Reques
 			}
 			id := strings.TrimSpace(segs[3])
 			s.mu.RLock()
-			_, exists := s.eqlSearches[id]
+			entry, exists := s.eqlSearches[id]
+			expMS := time.Now().UTC().UnixMilli() + 86400000
+			if exists && entry != nil {
+				if v, okE := toInt64(entry["__expiration_ms"]); okE && v > 0 {
+					expMS = v
+				}
+			}
 			s.mu.RUnlock()
 			if !exists {
 				if r.Method == http.MethodHead {
@@ -4492,11 +4851,12 @@ func (s *Server) handleEQLSearchAPIRound57(w http.ResponseWriter, r *http.Reques
 				w.WriteHeader(http.StatusOK)
 				return
 			}
-			writeJSON(w, http.StatusOK, map[string]any{
-				"id":                id,
-				"is_running":        false,
-				"is_partial":        false,
-				"completion_status": 200,
+			writeJSONWithRequest(w, r, http.StatusOK, map[string]any{
+				"id":                        id,
+				"is_running":                false,
+				"is_partial":                false,
+				"completion_status":         200,
+				"expiration_time_in_millis": expMS,
 			})
 			return
 		}
@@ -4517,6 +4877,7 @@ func (s *Server) handleEQLSearchAPIRound57(w http.ResponseWriter, r *http.Reques
 					}
 				}
 				delete(respCopy, "__delete_on_get")
+				delete(respCopy, "__expiration_ms")
 			}
 			s.mu.Unlock()
 			if !exists {
@@ -4531,7 +4892,7 @@ func (s *Server) handleEQLSearchAPIRound57(w http.ResponseWriter, r *http.Reques
 				w.WriteHeader(http.StatusOK)
 				return
 			}
-			writeJSON(w, http.StatusOK, respCopy)
+			writeJSONWithRequest(w, r, http.StatusOK, respCopy)
 		case http.MethodDelete:
 			s.mu.Lock()
 			_, exists := s.eqlSearches[id]
@@ -4541,7 +4902,7 @@ func (s *Server) handleEQLSearchAPIRound57(w http.ResponseWriter, r *http.Reques
 				writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("eql search [%s] not found", id))
 				return
 			}
-			writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
+			writeJSONWithRequest(w, r, http.StatusOK, map[string]any{"acknowledged": true})
 		default:
 			writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
 		}
@@ -4560,9 +4921,14 @@ func (s *Server) handleEQLSearchAPIRound57(w http.ResponseWriter, r *http.Reques
 	if !ok {
 		return
 	}
+	rmDefs, rmErr := validateEQLRuntimeMappingsRound63(body["runtime_mappings"])
+	if rmErr != nil {
+		writeESError(w, http.StatusBadRequest, "action_request_validation_exception", rmErr.Error())
+		return
+	}
 	queryStr, _ := body["query"].(string)
 	if strings.TrimSpace(queryStr) == "" {
-		writeESError(w, http.StatusBadRequest, "verification_exception", "Found 1 problem\nline 1:1: [query] cannot be empty")
+		writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: [query] cannot be empty;")
 		return
 	}
 	toks, err := tokenizeEQL(queryStr)
@@ -4570,10 +4936,14 @@ func (s *Server) handleEQLSearchAPIRound57(w http.ResponseWriter, r *http.Reques
 		writeESError(w, http.StatusBadRequest, "verification_exception", err.Error())
 		return
 	}
-	parser := &eqlParser{toks: toks}
+	parser := &eqlParser{toks: toks, allowImplicitWhere: s.hasExplicitTargetESVersion()}
 	ast, err := parser.parseQuery()
 	if err != nil {
 		writeESError(w, http.StatusBadRequest, "verification_exception", err.Error())
+		return
+	}
+	if colErr := validateEQLQueryColumnsRound63(s, r.Context(), targetIndex, queryStr, ast, rmDefs); colErr != nil {
+		writeESError(w, http.StatusBadRequest, "verification_exception", colErr.Error())
 		return
 	}
 
@@ -4591,6 +4961,12 @@ func (s *Server) handleEQLSearchAPIRound57(w http.ResponseWriter, r *http.Reques
 	}
 
 	searchDSL := map[string]any{"size": 10000}
+	if body["runtime_mappings"] != nil {
+		searchDSL["runtime_mappings"] = body["runtime_mappings"]
+	}
+	if body["fields"] != nil {
+		searchDSL["fields"] = body["fields"]
+	}
 	if filterMap, okF := body["filter"].(map[string]any); okF && len(filterMap) > 0 {
 		searchDSL["query"] = filterMap
 	} else {
@@ -4601,6 +4977,13 @@ func (s *Server) handleEQLSearchAPIRound57(w http.ResponseWriter, r *http.Reques
 	if reqErr != nil {
 		writeESError(w, http.StatusInternalServerError, "internal_server_error", reqErr.Error())
 		return
+	}
+	subReq.URL.RawQuery = "ignore_unavailable=true&allow_no_indices=true"
+	if r.URL != nil {
+		qIn := r.URL.Query()
+		if qIn.Has("ignore_unavailable") || qIn.Has("allow_no_indices") {
+			subReq.URL.RawQuery = qIn.Encode()
+		}
 	}
 	if targetIndex != "" && targetIndex != "_all" {
 		subReq.SetPathValue("index", targetIndex)
@@ -4636,6 +5019,11 @@ func (s *Server) handleEQLSearchAPIRound57(w http.ResponseWriter, r *http.Reques
 		for k, v := range src {
 			normDoc[k] = normalizeESQLNumber(v)
 		}
+		hmFields, _ := hm["fields"].(map[string]any)
+		if len(hmFields) > 0 || len(rmDefs) > 0 {
+			evalEQLRuntimeFieldsOnDocRound63(normDoc, hmFields, rmDefs)
+		}
+		patchEQLHitFieldsRound63(hm, normDoc, body["fields"], rmDefs)
 		candidates = append(candidates, candidateEvent{
 			hit: hm,
 			doc: normDoc,
@@ -4643,7 +5031,12 @@ func (s *Server) handleEQLSearchAPIRound57(w http.ResponseWriter, r *http.Reques
 		})
 	}
 	sort.SliceStable(candidates, func(i, j int) bool {
-		return candidates[i].ts < candidates[j].ts
+		if candidates[i].ts != candidates[j].ts {
+			return candidates[i].ts < candidates[j].ts
+		}
+		idI, _ := candidates[i].hit["_id"].(string)
+		idJ, _ := candidates[j].hit["_id"].(string)
+		return idI < idJ
 	})
 
 	eventsOut := []any{}
@@ -4664,13 +5057,95 @@ func (s *Server) handleEQLSearchAPIRound57(w http.ResponseWriter, r *http.Reques
 				}
 			}
 		}
+	} else if ast.isSample {
+		stageKeysFor := func(stageIdx int) []eqlExpr {
+			if len(ast.stages[stageIdx].byKeys) > 0 {
+				return ast.stages[stageIdx].byKeys
+			}
+			return ast.byKeys
+		}
+		type sampleGroup struct {
+			joinKeys   []any
+			perStage   [][]int // candidate indices matching each stage
+			usedEvents map[int]bool
+		}
+		var grpOrder []string
+		groups := make(map[string]*sampleGroup)
+		for ci, cand := range candidates {
+			for stIdx, st := range ast.stages {
+				tuples := extractEQLJoinKeyTuplesRound63(cand.doc, stageKeysFor(stIdx))
+				if len(tuples) == 0 {
+					continue
+				}
+				matched, sErr := eqlMatchesStage(st, cand.doc, catField)
+				if sErr != nil {
+					writeESError(w, http.StatusBadRequest, "verification_exception", sErr.Error())
+					return
+				}
+				if !matched {
+					continue
+				}
+				for _, tup := range tuples {
+					jk := tup.key
+					g := groups[jk]
+					if g == nil {
+						g = &sampleGroup{
+							joinKeys:   tup.vals,
+							perStage:   make([][]int, len(ast.stages)),
+							usedEvents: make(map[int]bool),
+						}
+						groups[jk] = g
+						grpOrder = append(grpOrder, jk)
+					}
+					g.perStage[stIdx] = append(g.perStage[stIdx], ci)
+				}
+			}
+		}
+		for _, jk := range grpOrder {
+			g := groups[jk]
+			for {
+				chosen := make([]int, len(ast.stages))
+				usedInSample := make(map[int]bool, len(ast.stages))
+				okAll := true
+				for stIdx := range ast.stages {
+					foundEvt := -1
+					for _, ci := range g.perStage[stIdx] {
+						if !g.usedEvents[ci] && !usedInSample[ci] {
+							foundEvt = ci
+							break
+						}
+					}
+					if foundEvt < 0 {
+						okAll = false
+						break
+					}
+					chosen[stIdx] = foundEvt
+					usedInSample[foundEvt] = true
+				}
+				if !okAll {
+					break
+				}
+				evts := make([]any, len(chosen))
+				for stIdx, ci := range chosen {
+					g.usedEvents[ci] = true
+					evts[stIdx] = candidates[ci].hit
+				}
+				totalMatched++
+				if len(sequencesOut) < sizeVal {
+					sequencesOut = append(sequencesOut, map[string]any{
+						"join_keys": g.joinKeys,
+						"events":    evts,
+					})
+				}
+			}
+		}
 	} else {
 		type seqProgress struct {
 			joinKeys []any
 			events   []any
 			startTS  int64
 		}
-		active := make(map[string]*seqProgress)
+		active := make(map[string][]*seqProgress)
 		stageKeysFor := func(stageIdx int) []eqlExpr {
 			if len(ast.stages[stageIdx].byKeys) > 0 {
 				return ast.stages[stageIdx].byKeys
@@ -4691,8 +5166,8 @@ func (s *Server) handleEQLSearchAPIRound57(w http.ResponseWriter, r *http.Reques
 					if len(uKeyExprs) == 0 {
 						uKeyExprs = stageKeysFor(0)
 					}
-					if _, jk, okK := extractEQLJoinKeys(cand.doc, uKeyExprs); okK {
-						delete(active, jk)
+					for _, tup := range extractEQLJoinKeyTuplesRound63(cand.doc, uKeyExprs) {
+						delete(active, tup.key)
 					}
 				}
 			}
@@ -4708,71 +5183,149 @@ func (s *Server) handleEQLSearchAPIRound57(w http.ResponseWriter, r *http.Reques
 						if len(aKeyExprs) == 0 {
 							aKeyExprs = stageKeysFor(0)
 						}
-						if _, jk, okK := extractEQLJoinKeys(cand.doc, aKeyExprs); okK {
-							if prog, hasProg := active[jk]; hasProg && len(prog.events) == afterPos {
-								delete(active, jk)
+						for _, tup := range extractEQLJoinKeyTuplesRound63(cand.doc, aKeyExprs) {
+							jk := tup.key
+							if progs := active[jk]; len(progs) > 0 {
+								kept := progs[:0]
+								for _, pr := range progs {
+									withinSpan := !ast.hasMaxspan || cand.ts-pr.startTS <= ast.maxspanMS
+									if len(pr.events) != afterPos || !withinSpan {
+										kept = append(kept, pr)
+									}
+								}
+								if len(kept) == 0 {
+									delete(active, jk)
+								} else {
+									active[jk] = kept
+								}
 							}
 						}
 					}
 				}
 			}
 
-			// Evaluate stages from highest partial stage down to stage 0 so a single event advances at most one step per partial sequence
-			advanced := false
+			// Evaluate stages from highest partial stage down to stage 0 so a single event advances at most one partial sequence per join key (FIFO)
+			advancedKeys := make(map[string]bool)
 			for stIdx := len(ast.stages) - 1; stIdx >= 1; stIdx-- {
 				keyExprs := stageKeysFor(stIdx)
-				_, jk, okK := extractEQLJoinKeys(cand.doc, keyExprs)
-				if !okK {
+				tuples := extractEQLJoinKeyTuplesRound63(cand.doc, keyExprs)
+				if len(tuples) == 0 {
 					continue
 				}
-				prog, hasProg := active[jk]
-				if !hasProg || len(prog.events) != stIdx {
-					continue
-				}
-				if ast.hasMaxspan && cand.ts-prog.startTS > ast.maxspanMS {
-					delete(active, jk)
-					continue
-				}
-				stMatched, sErr := eqlMatchesStage(ast.stages[stIdx], cand.doc, catField)
-				if sErr != nil {
-					writeESError(w, http.StatusBadRequest, "verification_exception", sErr.Error())
-					return
-				}
-				if stMatched {
-					prog.events = append(prog.events, cand.hit)
-					advanced = true
-					if len(prog.events) == len(ast.stages) {
-						totalMatched++
-						if len(sequencesOut) < sizeVal {
-							sequencesOut = append(sequencesOut, map[string]any{
-								"join_keys": prog.joinKeys,
-								"events":    prog.events,
-							})
-						}
-						delete(active, jk)
+				stMatchedChecked := false
+				stMatched := false
+				for _, tup := range tuples {
+					jk := tup.key
+					if advancedKeys[jk] {
+						continue
 					}
-					break
+					progs := active[jk]
+					if len(progs) == 0 {
+						continue
+					}
+					if ast.hasMaxspan {
+						validProgs := progs[:0]
+						for _, pr := range progs {
+							if cand.ts-pr.startTS <= ast.maxspanMS {
+								validProgs = append(validProgs, pr)
+							}
+						}
+						progs = validProgs
+						if len(progs) == 0 {
+							delete(active, jk)
+							continue
+						}
+						active[jk] = progs
+					}
+					targetIdxInQueue := -1
+					for qi, pr := range progs {
+						if len(pr.events) == stIdx {
+							targetIdxInQueue = qi
+							break
+						}
+					}
+					if targetIdxInQueue < 0 {
+						continue
+					}
+					if !stMatchedChecked {
+						var sErr error
+						stMatched, sErr = eqlMatchesStage(ast.stages[stIdx], cand.doc, catField)
+						if sErr != nil {
+							writeESError(w, http.StatusBadRequest, "verification_exception", sErr.Error())
+							return
+						}
+						stMatchedChecked = true
+					}
+					if stMatched {
+						prog := progs[targetIdxInQueue]
+						prog.events = append(prog.events, cand.hit)
+						advancedKeys[jk] = true
+						if len(prog.events) == len(ast.stages) && len(ast.absentAfter[len(ast.stages)]) == 0 {
+							totalMatched++
+							if len(sequencesOut) < sizeVal {
+								sequencesOut = append(sequencesOut, map[string]any{
+									"join_keys": prog.joinKeys,
+									"events":    interleaveEQLMissingStageEventsRound63(prog.events, ast.absentAfter),
+								})
+							}
+							progs = append(progs[:targetIdxInQueue], progs[targetIdxInQueue+1:]...)
+							if len(progs) == 0 {
+								delete(active, jk)
+							} else {
+								active[jk] = progs
+							}
+						}
+					}
 				}
 			}
-			if !advanced {
-				keyExprs0 := stageKeysFor(0)
-				jVals, jk, okK := extractEQLJoinKeys(cand.doc, keyExprs0)
-				if !okK {
-					continue
+			keyExprs0 := stageKeysFor(0)
+			tuples0 := extractEQLJoinKeyTuplesRound63(cand.doc, keyExprs0)
+			if len(tuples0) > 0 {
+				var pendingTuples []eqlJoinKeyTupleRound63
+				for _, tup := range tuples0 {
+					if !advancedKeys[tup.key] {
+						pendingTuples = append(pendingTuples, tup)
+					}
 				}
-				st0Matched, sErr := eqlMatchesStage(ast.stages[0], cand.doc, catField)
-				if sErr != nil {
-					writeESError(w, http.StatusBadRequest, "verification_exception", sErr.Error())
-					return
-				}
-				if st0Matched {
-					if existing, hasProg := active[jk]; !hasProg || (ast.hasMaxspan && cand.ts-existing.startTS > ast.maxspanMS) {
-						active[jk] = &seqProgress{
-							joinKeys: jVals,
-							events:   []any{cand.hit},
-							startTS:  cand.ts,
+				if len(pendingTuples) > 0 {
+					st0Matched, sErr := eqlMatchesStage(ast.stages[0], cand.doc, catField)
+					if sErr != nil {
+						writeESError(w, http.StatusBadRequest, "verification_exception", sErr.Error())
+						return
+					}
+					if st0Matched {
+						for _, tup := range pendingTuples {
+							active[tup.key] = append(active[tup.key], &seqProgress{
+								joinKeys: tup.vals,
+								events:   []any{cand.hit},
+								startTS:  cand.ts,
+							})
 						}
 					}
+				}
+			}
+		}
+
+		// Emit sequences with trailing absent stages (`[a] ![b]` or `[a] [b] ![c]`) that were not aborted!
+		if len(ast.absentAfter[len(ast.stages)]) > 0 && len(active) > 0 {
+			var survivors []*seqProgress
+			for _, progs := range active {
+				for _, prog := range progs {
+					if len(prog.events) == len(ast.stages) {
+						survivors = append(survivors, prog)
+					}
+				}
+			}
+			sort.SliceStable(survivors, func(i, j int) bool {
+				return survivors[i].startTS < survivors[j].startTS
+			})
+			for _, prog := range survivors {
+				totalMatched++
+				if len(sequencesOut) < sizeVal {
+					sequencesOut = append(sequencesOut, map[string]any{
+						"join_keys": prog.joinKeys,
+						"events":    interleaveEQLMissingStageEventsRound63(prog.events, ast.absentAfter),
+					})
 				}
 			}
 		}
@@ -4813,13 +5366,14 @@ func (s *Server) handleEQLSearchAPIRound57(w http.ResponseWriter, r *http.Reques
 	if keepOnCompletion || hasWaitTimeout {
 		evictBoundedAsyncRegistryLockedR62Admin(s.eqlSearches)
 		stored := deepCloneDocMap(resp)
+		stored["__expiration_ms"] = time.Now().UTC().UnixMilli() + 86400000
 		if hasExplicitKeepFalse {
 			stored["__delete_on_get"] = true
 		}
 		s.eqlSearches[eqlID] = stored
 	}
 	s.mu.Unlock()
-	writeJSON(w, http.StatusOK, resp)
+	writeJSONWithRequest(w, r, http.StatusOK, resp)
 }
 
 // ============================================================================
@@ -5631,7 +6185,7 @@ func validateSynonymRuleString(synStr string) error {
 	if strings.Contains(trimmed, "=>") {
 		parts := strings.Split(trimmed, "=>")
 		if len(parts) != 2 {
-			return fmt.Errorf("invalid synonym rule [%s]: more than one explicit mapping (=>) specified", synStr)
+			return fmt.Errorf("invalid synonym rule [%s]: more than one explicit mapping specified on the line", synStr)
 		}
 		lhsRaw := strings.Split(parts[0], ",")
 		rhsRaw := strings.Split(parts[1], ",")
@@ -8134,7 +8688,12 @@ func (s *Server) handleSimulateIndexIngestRound57(w http.ResponseWriter, r *http
 			effPipe = docPipeOverride
 		}
 
-		if effPipe != "" && effPipe != "_none" {
+		savedAtt, savedUA, hookErr := s.collectPipelineHooksForWriteRound63(docIndex, effPipe, defaultPipe, curBytes)
+		if hookErr != nil {
+			docErr = hookErr
+		}
+
+		if docErr == nil && effPipe != "" && effPipe != "_none" {
 			pipeSpec, exists := lookupPipe(effPipe)
 			if !exists {
 				docErr = fmt.Errorf("pipeline with id [%s] does not exist", effPipe)
@@ -8187,6 +8746,10 @@ func (s *Server) handleSimulateIndexIngestRound57(w http.ResponseWriter, r *http
 					allProcResults = append(allProcResults, trace...)
 				}
 			}
+		}
+
+		if docErr == nil && !dropped && (len(savedAtt) > 0 || len(savedUA) > 0) {
+			curBytes = s.applyPostIngestEnrichmentsRound63(curBytes, savedAtt, savedUA)
 		}
 
 		if docErr == nil && !dropped && compiledSchema != nil {
