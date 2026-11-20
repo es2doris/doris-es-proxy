@@ -34,6 +34,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/es2doris/doris-es-proxy/pkg/analysis"
 	"github.com/es2doris/doris-es-proxy/pkg/esast"
 	"github.com/es2doris/doris-es-proxy/pkg/painless"
 	"github.com/es2doris/doris-es-proxy/pkg/schema"
@@ -208,39 +209,54 @@ func extractNestedChildMapsPreservingOffsetsR61Search(doc map[string]any, nested
 		return nil
 	}
 	segs := strings.Split(nestedPath, ".")
-	var cur any = doc
-	for i, seg := range segs {
-		m, ok := cur.(map[string]any)
-		if !ok {
+	var walk func(cur any, idx int) []map[string]any
+	walk = func(cur any, idx int) []map[string]any {
+		if cur == nil {
 			return nil
 		}
-		next, exists := m[seg]
-		if !exists {
-			if rem := strings.Join(segs[i:], "."); m[rem] != nil {
-				cur = m[rem]
-				break
+		if idx >= len(segs) {
+			switch v := cur.(type) {
+			case []any:
+				out := make([]map[string]any, 0, len(v))
+				for _, item := range v {
+					if em, ok := item.(map[string]any); ok {
+						out = append(out, em)
+					}
+				}
+				return out
+			case []map[string]any:
+				out := make([]map[string]any, len(v))
+				copy(out, v)
+				return out
+			case map[string]any:
+				return []map[string]any{v}
 			}
 			return nil
 		}
-		cur = next
-	}
-	switch v := cur.(type) {
-	case []any:
-		out := make([]map[string]any, len(v))
-		for i, item := range v {
-			if em, ok := item.(map[string]any); ok {
-				out[i] = em
+		switch node := cur.(type) {
+		case map[string]any:
+			if next, exists := node[segs[idx]]; exists {
+				return walk(next, idx+1)
 			}
+			if rem := strings.Join(segs[idx:], "."); node[rem] != nil {
+				return walk(node[rem], len(segs))
+			}
+		case []any:
+			var merged []map[string]any
+			for _, item := range node {
+				merged = append(merged, walk(item, idx)...)
+			}
+			return merged
+		case []map[string]any:
+			var merged []map[string]any
+			for _, item := range node {
+				merged = append(merged, walk(item, idx)...)
+			}
+			return merged
 		}
-		return out
-	case []map[string]any:
-		out := make([]map[string]any, len(v))
-		copy(out, v)
-		return out
-	case map[string]any:
-		return []map[string]any{v}
+		return nil
 	}
-	return nil
+	return walk(doc, 0)
 }
 
 // populateNestedKNNInnerHitsR61Search evaluates nested `dense_vector` kNN clauses that request `inner_hits`
@@ -280,6 +296,17 @@ func populateNestedKNNInnerHitsR61Search(
 				candidates = append(candidates, kq)
 			}
 		}
+		collectNestedKNNWithInnerHitsR63(req.Query, &candidates)
+	}
+	if req.PostFilter != nil {
+		var pfKNNs []*esast.KNNQuery
+		collectKNNClausesFromQueryR61Search(req.PostFilter, &pfKNNs)
+		for _, kq := range pfKNNs {
+			if kq.InnerHits != nil {
+				candidates = append(candidates, kq)
+			}
+		}
+		collectNestedKNNWithInnerHitsR63(req.PostFilter, &candidates)
 	}
 	if len(candidates) == 0 {
 		return nil
@@ -319,21 +346,55 @@ func populateNestedKNNInnerHitsR61Search(
 		}
 
 		children := extractNestedChildMapsPreservingOffsetsR61Search(doc, nestedPath)
-		qVec := resolveKNNQueryVectorR61Search(kq, b.VectorElementType, b.VectorDims)
+		vecMetric := b.VectorMetric
+		vecElemType := b.VectorElementType
+		vecDims := b.VectorDims
+		if vecMetric == "" || vecElemType == "" || vecDims == 0 {
+			if fp, okRaw := lookupRawPropertyWithMultiFieldR61Search(idxSchema, kq.Field); okRaw {
+				if vecMetric == "" {
+					vecMetric = fp.Similarity
+				}
+				if vecElemType == "" {
+					vecElemType = fp.ElementType
+				}
+				if vecDims == 0 {
+					vecDims = fp.Dims
+				}
+			}
+		}
+		qVec := resolveKNNQueryVectorR61Search(kq, vecElemType, vecDims)
 		boost := 1.0
 		if kq.Boost != nil {
 			boost = *kq.Boost
+		}
+
+		effSim := kq.Similarity
+		metricLower := strings.ToLower(strings.TrimSpace(vecMetric))
+		isL2Sim := kq.Similarity != nil && (metricLower == "" || metricLower == "l2_norm")
+		if isL2Sim {
+			effSim = nil
 		}
 
 		_, _, childHits := transpiler.EvaluateNestedKNNParentScore(
 			children,
 			relVecField,
 			qVec,
-			b.VectorMetric,
-			b.VectorElementType,
-			kq.Similarity,
+			vecMetric,
+			vecElemType,
+			effSim,
 			boost,
 		)
+		if isL2Sim && kq.Similarity != nil {
+			simD := *kq.Similarity
+			minScore := boost * (1.0 / (1.0 + simD*simD))
+			filtered := childHits[:0]
+			for _, ch := range childHits {
+				if ch.Score+1e-12 >= minScore {
+					filtered = append(filtered, ch)
+				}
+			}
+			childHits = filtered
+		}
 
 		ih := kq.InnerHits
 		ihName := strings.TrimSpace(ih.Name)
@@ -453,6 +514,155 @@ func populateNestedKNNInnerHitsR61Search(
 	return outInnerHits
 }
 
+func collectNestedKNNWithInnerHitsR63(q *esast.Query, out *[]*esast.KNNQuery) {
+	if q == nil || out == nil {
+		return
+	}
+	if q.Nested != nil {
+		if q.Nested.InnerHits != nil {
+			var subKNNs []*esast.KNNQuery
+			collectKNNClausesFromQueryR61Search(&q.Nested.Query, &subKNNs)
+			for _, kq := range subKNNs {
+				if kq != nil && kq.InnerHits == nil {
+					cp := *kq
+					cp.InnerHits = q.Nested.InnerHits
+					*out = append(*out, &cp)
+				}
+			}
+		}
+		collectNestedKNNWithInnerHitsR63(&q.Nested.Query, out)
+	}
+	if q.Bool != nil {
+		for i := range q.Bool.Must {
+			collectNestedKNNWithInnerHitsR63(&q.Bool.Must[i], out)
+		}
+		for i := range q.Bool.Filter {
+			collectNestedKNNWithInnerHitsR63(&q.Bool.Filter[i], out)
+		}
+		for i := range q.Bool.Should {
+			collectNestedKNNWithInnerHitsR63(&q.Bool.Should[i], out)
+		}
+	}
+	if q.ConstantScore != nil {
+		collectNestedKNNWithInnerHitsR63(&q.ConstantScore.Filter, out)
+	}
+	if q.DisMax != nil {
+		for i := range q.DisMax.Queries {
+			collectNestedKNNWithInnerHitsR63(&q.DisMax.Queries[i], out)
+		}
+	}
+	if q.Boosting != nil {
+		collectNestedKNNWithInnerHitsR63(&q.Boosting.Positive, out)
+	}
+	if q.FunctionScore != nil && q.FunctionScore.Query != nil {
+		collectNestedKNNWithInnerHitsR63(q.FunctionScore.Query, out)
+	}
+	if q.ScriptScore != nil && q.ScriptScore.Query != nil {
+		collectNestedKNNWithInnerHitsR63(q.ScriptScore.Query, out)
+	}
+}
+
+func evalNestedKNNParentScoreOnDocR63(idxSchema *schema.IndexSchema, doc map[string]any, nq *esast.NestedQuery) (float64, bool) {
+	if nq == nil || nq.Query.KNN == nil || doc == nil || idxSchema == nil {
+		return 0, false
+	}
+	if strings.EqualFold(strings.TrimSpace(nq.ScoreMode), "none") {
+		return 0, true
+	}
+	kq := nq.Query.KNN
+	b := idxSchema.ResolveField(kq.Field)
+	nestedPath := nq.Path
+	if nestedPath == "" {
+		nestedPath = b.NestedPath
+	}
+	if nestedPath == "" {
+		return 0, false
+	}
+	relVecField := strings.TrimPrefix(kq.Field, nestedPath+".")
+	if len(b.RelativeJSONPath) > 0 {
+		relVecField = strings.Join(b.RelativeJSONPath, ".")
+	}
+	children := extractNestedChildMapsPreservingOffsetsR61Search(doc, nestedPath)
+	vecMetric := b.VectorMetric
+	vecElemType := b.VectorElementType
+	vecDims := b.VectorDims
+	if vecMetric == "" || vecElemType == "" || vecDims == 0 {
+		if fp, okRaw := lookupRawPropertyWithMultiFieldR61Search(idxSchema, kq.Field); okRaw {
+			if vecMetric == "" {
+				vecMetric = fp.Similarity
+			}
+			if vecElemType == "" {
+				vecElemType = fp.ElementType
+			}
+			if vecDims == 0 {
+				vecDims = fp.Dims
+			}
+		}
+	}
+	qVec := resolveKNNQueryVectorR61Search(kq, vecElemType, vecDims)
+	if len(qVec) == 0 {
+		return 0, false
+	}
+	knnBoost := 1.0
+	if kq.Boost != nil {
+		knnBoost = *kq.Boost
+	}
+	effSim := kq.Similarity
+	metricLower := strings.ToLower(strings.TrimSpace(vecMetric))
+	isL2Sim := kq.Similarity != nil && (metricLower == "" || metricLower == "l2_norm")
+	if isL2Sim {
+		effSim = nil
+	}
+	bestSc, matched, childHits := transpiler.EvaluateNestedKNNParentScore(
+		children,
+		relVecField,
+		qVec,
+		vecMetric,
+		vecElemType,
+		effSim,
+		knnBoost,
+	)
+	if isL2Sim && kq.Similarity != nil {
+		simD := *kq.Similarity
+		minScore := knnBoost * (1.0 / (1.0 + simD*simD))
+		filtered := childHits[:0]
+		bestSc = 0
+		matched = false
+		for _, ch := range childHits {
+			if ch.Score+1e-12 >= minScore {
+				filtered = append(filtered, ch)
+				if !matched || ch.Score > bestSc {
+					bestSc = ch.Score
+					matched = true
+				}
+			}
+		}
+		childHits = filtered
+	}
+	if !matched || len(childHits) == 0 {
+		return 0, true
+	}
+	res := bestSc
+	switch strings.ToLower(strings.TrimSpace(nq.ScoreMode)) {
+	case "sum":
+		res = 0
+		for _, ch := range childHits {
+			res += ch.Score
+		}
+	case "min":
+		res = childHits[0].Score
+		for _, ch := range childHits[1:] {
+			if ch.Score < res {
+				res = ch.Score
+			}
+		}
+	}
+	if nq.Boost != nil {
+		res *= *nq.Boost
+	}
+	return res, true
+}
+
 func stripNestedPrefixSourceFilterR61Search(sf *esast.SourceFilter, nestedPath string) *esast.SourceFilter {
 	if sf == nil {
 		return nil
@@ -500,27 +710,38 @@ func extractNestedChildInnerHitFieldsR61Search(
 	nestedPrefix := nestedPath + "."
 
 	if len(ih.Fields) > 0 {
-		// Inside a nested `inner_hit`, ES returns flat field keys (`"chunks.text": ["aligned"]`) for fields under `nestedPath`.
-		var nonNestedSpecs []esast.FieldRequestSpec
-		for _, fs := range ih.Fields {
-			if strings.HasPrefix(fs.Field, nestedPrefix) {
-				relPath := strings.TrimPrefix(fs.Field, nestedPrefix)
-				if vals := collectScalarValuesAtPath(childDoc, strings.Split(relPath, ".")); len(vals) > 0 {
-					formatted, _, _, _ := formatUnifiedFieldSliceR61Search(fs.Field, fs.Field, vals, fs.Format, false, idxSchema)
-					if len(formatted) > 0 {
-						out[fs.Field] = formatted
+		subReq := &esast.SearchRequest{Fields: ih.Fields}
+		if fm, status, _, _ := extractUnifiedFieldsR61Search(hrElem, hitIdx, subReq, idxSchema, nil); status == 0 && len(fm) > 0 {
+			var flattenNestedMap func(prefix string, m map[string]any)
+			flattenNestedMap = func(prefix string, m map[string]any) {
+				for sk, sv := range m {
+					fullK := prefix + "." + sk
+					switch tv := sv.(type) {
+					case []any:
+						if len(tv) > 0 {
+							if _, isSubMap := tv[0].(map[string]any); isSubMap {
+								for _, el := range tv {
+									if em, okM := el.(map[string]any); okM {
+										flattenNestedMap(fullK, em)
+									}
+								}
+								continue
+							}
+						}
+						out[fullK] = tv
+					case map[string]any:
+						flattenNestedMap(fullK, tv)
 					}
 				}
-				continue
 			}
-			nonNestedSpecs = append(nonNestedSpecs, fs)
-		}
-		if len(nonNestedSpecs) > 0 {
-			subReq := &esast.SearchRequest{Fields: nonNestedSpecs}
-			if fm, status, _, _ := extractUnifiedFieldsR61Search(hrElem, hitIdx, subReq, idxSchema, nil); status == 0 && len(fm) > 0 {
-				for k, v := range fm {
-					out[k] = v
+			for k, v := range fm {
+				if (idxSchema == nil || !idxSchema.ES8Mode) && k == nestedPath && len(v) > 0 {
+					if em, okM := v[0].(map[string]any); okM {
+						flattenNestedMap(nestedPath, em)
+						continue
+					}
 				}
+				out[k] = v
 			}
 		}
 		// Also support relative child field names without `nestedPath.` prefix (e.g. `"paragraph_id"`).
@@ -638,9 +859,9 @@ func reconstructHitSyntheticSourceR61Search(rawSrc json.RawMessage, idxSchema *s
 	if recon == nil {
 		return nil
 	}
-	// Inject `constant_keyword` fields that are absent from `rawDoc` and canonicalize `ip` fields.
+	// Inject `constant_keyword` fields (only when present in `rawDoc` or TSDB dimension) and canonicalize `ip` fields.
 	if idxSchema != nil {
-		injectMissingConstantKeywordsInSyntheticMapR61Search(recon, idxSchema)
+		injectMissingConstantKeywordsInSyntheticMapR61Search(recon, rawDoc, idxSchema)
 		canonicalizeSyntheticIPsInMapR61Search(recon, idxSchema)
 	}
 	encoded, err := json.Marshal(recon)
@@ -691,7 +912,7 @@ func canonicalizeSyntheticIPsInMapR61Search(dst map[string]any, idxSchema *schem
 	}
 }
 
-func injectMissingConstantKeywordsInSyntheticMapR61Search(dst map[string]any, idxSchema *schema.IndexSchema) {
+func injectMissingConstantKeywordsInSyntheticMapR61Search(dst, rawDoc map[string]any, idxSchema *schema.IndexSchema) {
 	if dst == nil || idxSchema == nil || len(idxSchema.Fields) == 0 {
 		return
 	}
@@ -713,6 +934,12 @@ func injectMissingConstantKeywordsInSyntheticMapR61Search(dst map[string]any, id
 		if b.Kind == schema.StorageNestedSubfield {
 			continue
 		}
+		segs := strings.Split(k, ".")
+		if idxSchema.ES8Mode && len(rawDoc) > 0 && (!strings.EqualFold(idxSchema.IndexMode, "time_series") || b.TimeSeriesDimension == nil || !*b.TimeSeriesDimension) {
+			if _, inRaw := lookupNestedMapPathR61Search(rawDoc, segs); !inRaw {
+				continue
+			}
+		}
 		if hasFilter {
 			probe, _ := json.Marshal(map[string]any{k: b.ConstantValue})
 			filtered := schema.FilterSourceBytesIncludesExcludes(probe, inc, exc)
@@ -720,7 +947,6 @@ func injectMissingConstantKeywordsInSyntheticMapR61Search(dst map[string]any, id
 				continue
 			}
 		}
-		segs := strings.Split(k, ".")
 		if _, exists := lookupNestedMapPathR61Search(dst, segs); !exists {
 			setNestedMapPathR61Search(dst, segs, b.ConstantValue)
 		}
@@ -831,9 +1057,14 @@ func extractStoredFieldsOnlyR61Search(
 	}
 	sort.Strings(sortedStored)
 
+	hasSource := false
 	for _, pat := range sfList {
 		pat = strings.TrimSpace(pat)
-		if pat == "" || pat == "_source" {
+		if pat == "" {
+			continue
+		}
+		if pat == "_source" {
+			hasSource = true
 			continue
 		}
 		if pat == "_routing" {
@@ -883,10 +1114,11 @@ func extractStoredFieldsOnlyR61Search(
 			out[pat] = vals
 		}
 	}
+	suppressSrc := !hasSource
 	if len(out) == 0 {
-		return nil, true, false
+		return nil, suppressSrc, false
 	}
-	return out, true, false
+	return out, suppressSrc, false
 }
 
 func extractRawStoredValuesForFieldR61Search(doc map[string]any, fieldName string, idxSchema *schema.IndexSchema) []any {
@@ -1105,11 +1337,23 @@ func extractUnifiedFieldsR61Search(
 		return nil, 0, "", ""
 	}
 	if req.HasStoredFieldsNone() {
+		if len(req.Fields) > 0 {
+			return nil, http.StatusBadRequest, "illegal_argument_exception",
+				"Cannot specify both [fields] and [stored_fields] with [_none_]"
+		}
 		return nil, 0, "", ""
 	}
 	if len(req.Fields) == 0 && len(req.DocvalueFields) == 0 {
 		return nil, 0, "", ""
 	}
+	if len(req.Fields) > 0 && idxSchema != nil && idxSchema.SourceDisabled() {
+		if h.SearchScope != nil && h.SearchScope.srv != nil && !h.SearchScope.srv.isES8Mode(nil) {
+			return nil, http.StatusBadRequest, "illegal_argument_exception",
+				fmt.Sprintf("Unable to retrieve the requested [fields] since _source is disabled in the mappings for index [%s]", idxSchema.IndexName)
+		}
+	}
+
+	includeUnmappedByPat := extractIncludeUnmappedPatternsR63(scopeRawBodyR63(h.SearchScope))
 
 	if runtimeDoc == nil && h.RuntimeFields != nil {
 		runtimeDoc = h.RuntimeFields
@@ -1203,6 +1447,7 @@ func extractUnifiedFieldsR61Search(
 		}
 
 		// Expand candidate target fields
+		incUnmapped := includeUnmappedByPat[rawPattern]
 		if strings.ContainsAny(rawPattern, "*?") {
 			matchedAny := make(map[string]bool)
 			if idxSchema != nil {
@@ -1214,6 +1459,57 @@ func extractUnifiedFieldsR61Search(
 					matchedAny[fn] = true
 					if status, errT, errR := emitSingleMatchedFieldIntoOutR61Search(h, hitIdx, doc, runtimeDoc, mergedRuntimeDefs, fn, rawPattern, spec.Format, isDocvalue, idxSchema, out); status != 0 {
 						return status, errT, errR
+					}
+				}
+				if incUnmapped && !isDocvalue && !isIndexSourceDisabledRound59(idxSchema) {
+					// Emit `enabled: false` top-level/object fields directly from `_source` when `include_unmapped: true` (`330_fetch_fields.yml`)
+					for fn, fb := range idxSchema.Fields {
+						if !fb.EnabledFalse || matchedAny[fn] || !matchWildcardPattern(rawPattern, fn) {
+							continue
+						}
+						if rawVal, exists := lookupNestedMapPathR61Search(doc, strings.Split(fn, ".")); exists && rawVal != nil {
+							matchedAny[fn] = true
+							if arr, isArr := rawVal.([]any); isArr {
+								out[fn] = arr
+							} else {
+								out[fn] = []any{rawVal}
+							}
+						}
+					}
+					// Also include unmapped leaf subfields inside `nested` objects when `include_unmapped: true`
+					for nestedRoot := range idxSchema.NestedRoots {
+						if strings.Contains(nestedRoot, ".") {
+							continue
+						}
+						children := extractNestedChildMapsPreservingOffsetsR61Search(doc, nestedRoot)
+						if len(children) == 0 {
+							continue
+						}
+						var unmappedRels []string
+						seenRel := make(map[string]bool)
+						for _, ch := range children {
+							subLeaves := make(map[string][]any)
+							collectAllLeafScalarPathsExceptFlattenedR61Search(ch, "", nil, subLeaves)
+							for relK := range subLeaves {
+								fullCand := nestedRoot + "." + relK
+								if seenRel[relK] || matchedAny[fullCand] || !matchWildcardPattern(rawPattern, fullCand) {
+									continue
+								}
+								if _, isMapped := idxSchema.Fields[fullCand]; isMapped {
+									continue
+								}
+								seenRel[relK] = true
+								unmappedRels = append(unmappedRels, relK)
+							}
+						}
+						sort.Strings(unmappedRels)
+						for _, relK := range unmappedRels {
+							fullCand := nestedRoot + "." + relK
+							matchedAny[fullCand] = true
+							if st, errT, errR := mergeNestedFieldIntoUnifiedOutR61Search(doc, nestedRoot, relK, fullCand, rawPattern, spec.Format, idxSchema, out); st != 0 {
+								return st, errT, errR
+							}
+						}
 					}
 				}
 			}
@@ -1228,7 +1524,7 @@ func extractUnifiedFieldsR61Search(
 					if matchedAny[lk] || !matchWildcardPattern(rawPattern, lk) {
 						continue
 					}
-					if idxSchema != nil && idxSchema.IsDynamicFalseUnmappedField(lk) {
+					if !incUnmapped && idxSchema != nil && idxSchema.IsDynamicFalseUnmappedField(lk) {
 						continue
 					}
 					if status, errT, errR := emitSingleMatchedFieldIntoOutR61Search(h, hitIdx, doc, runtimeDoc, mergedRuntimeDefs, lk, rawPattern, spec.Format, false, idxSchema, out); status != 0 {
@@ -1237,6 +1533,19 @@ func extractUnifiedFieldsR61Search(
 				}
 			}
 			return 0, "", ""
+		}
+
+		if incUnmapped && !isDocvalue && idxSchema != nil && !isIndexSourceDisabledRound59(idxSchema) {
+			if fb, ok := idxSchema.Fields[rawPattern]; ok && fb.EnabledFalse {
+				if rawVal, exists := lookupNestedMapPathR61Search(doc, strings.Split(rawPattern, ".")); exists && rawVal != nil {
+					if arr, isArr := rawVal.([]any); isArr {
+						out[rawPattern] = arr
+					} else {
+						out[rawPattern] = []any{rawVal}
+					}
+				}
+				return 0, "", ""
+			}
 		}
 
 		return emitSingleMatchedFieldIntoOutR61Search(h, hitIdx, doc, runtimeDoc, mergedRuntimeDefs, rawPattern, rawPattern, spec.Format, isDocvalue, idxSchema, out)
@@ -1292,13 +1601,14 @@ func collectAllLeafScalarPathsExceptFlattenedR61Search(
 ) {
 	if prefix != "" && idxSchema != nil {
 		if b, ok := idxSchema.Fields[prefix]; ok {
-			if b.EnabledFalse {
-				return
-			}
-			if strings.EqualFold(b.ESType, "flattened") {
+			if b.EnabledFalse || isNonTraversableMappedLeafTypeR63(b.ESType) {
 				return
 			}
 			if idxSchema.NestedRoots != nil && idxSchema.NestedRoots[prefix] != "" {
+				return
+			}
+		} else if fp, okRaw := lookupRawPropertyWithMultiFieldR61Search(idxSchema, prefix); okRaw {
+			if (fp.Enabled != nil && !*fp.Enabled) || isNonTraversableMappedLeafTypeR63(fp.Type) {
 				return
 			}
 		}
@@ -1347,9 +1657,18 @@ func collectSchemaCandidateFetchFieldsR61Search(
 		seen[name] = true
 		out = append(out, name)
 	}
+	subobjFalse := idxSchema != nil && idxSchema.RawMapping != nil && idxSchema.RawMapping.Subobjects != nil && !*idxSchema.RawMapping.Subobjects
+	isReservedMetaName := func(n string) bool {
+		switch n {
+		case "_id", "_index", "_routing", "_version", "_seq_no", "_primary_term", "_source", "_ignored", "_size", "_field_names", "_tsid", "_ts_routing_hash", "_doc_count":
+			return true
+		}
+		return false
+	}
 	if idxSchema != nil {
+		srcDisabled := idxSchema.SourceDisabled()
 		for fn, fb := range idxSchema.Fields {
-			if fb.EnabledFalse || fb.IsVirtualSAYTSubfield {
+			if fb.EnabledFalse || fb.IsVirtualSAYTSubfield || isReservedMetaName(fn) {
 				continue
 			}
 			if (strings.HasSuffix(fn, ".lat") || strings.HasSuffix(fn, ".lon")) && idxSchema.Fields[strings.TrimSuffix(strings.TrimSuffix(fn, ".lat"), ".lon")].ESType == "geo_point" {
@@ -1357,14 +1676,18 @@ func collectSchemaCandidateFetchFieldsR61Search(
 					continue
 				}
 			}
-			if idxSchema.SourceDisabled() {
+			if srcDisabled {
+				if strings.HasPrefix(fb.AliasTarget, "_") {
+					continue
+				}
 				esT := strings.ToLower(strings.TrimSpace(fb.ESType))
-				if fb.DocValuesFalse || esT == "text" || esT == "match_only_text" || esT == "annotated-text" || esT == "annotated_text" {
+				isStored := fieldIsStoredInSchemaR61Search(idxSchema, fn)
+				if !isStored && (fb.DocValuesFalse || esT == "text" || esT == "match_only_text" || esT == "annotated-text" || esT == "annotated_text" || esT == "geo_shape" || esT == "shape") {
 					continue
 				}
 			}
-			if !includeDefaultMultiFields && strings.HasSuffix(fn, ".keyword") {
-				// Include explicit multi-fields from RawMapping, skip auto synthetic `.keyword` unless pattern has `.`
+			if !includeDefaultMultiFields && !subobjFalse && strings.HasSuffix(fn, ".keyword") {
+				// Include explicit multi-fields from RawMapping, skip auto synthetic `.keyword` unless pattern has `.` or `subobjects: false`
 				if _, ok := lookupRawPropertyWithMultiFieldR61Search(idxSchema, fn); !ok {
 					continue
 				}
@@ -1379,17 +1702,38 @@ func collectSchemaCandidateFetchFieldsR61Search(
 					if prefix != "" {
 						full = prefix + "." + k
 					}
-					if fp.Enabled != nil && !*fp.Enabled {
+					if isReservedMetaName(full) || (fp.Enabled != nil && !*fp.Enabled) {
 						continue
 					}
 					ft := strings.ToLower(strings.TrimSpace(fp.Type))
 					if ft != "" && ft != "object" && ft != "nested" {
-						add(full)
+						skipRaw := false
+						if srcDisabled {
+							if ft == "alias" && strings.HasPrefix(strings.TrimSpace(fp.Path), "_") {
+								skipRaw = true
+							}
+							isStored := fp.Store != nil && *fp.Store
+							dvFalse := fp.DocValues != nil && !*fp.DocValues
+							if !isStored && (dvFalse || ft == "text" || ft == "match_only_text" || ft == "annotated-text" || ft == "annotated_text" || ft == "geo_shape" || ft == "shape") {
+								skipRaw = true
+							}
+						}
+						if !skipRaw {
+							add(full)
+						}
 					}
 					for mfk, mfp := range fp.Fields {
 						mft := strings.ToLower(strings.TrimSpace(mfp.Type))
 						if mft != "" {
-							add(full + "." + mfk)
+							mfFull := full + "." + mfk
+							if srcDisabled {
+								isStored := mfp.Store != nil && *mfp.Store
+								dvFalse := mfp.DocValues != nil && !*mfp.DocValues
+								if !isStored && (dvFalse || mft == "text" || mft == "match_only_text" || mft == "annotated-text" || mft == "annotated_text" || mft == "geo_shape" || mft == "shape") {
+									continue
+								}
+							}
+							add(mfFull)
 						}
 					}
 					if len(fp.Properties) > 0 {
@@ -1450,6 +1794,9 @@ func extractMetadataFieldR61Search(
 		}
 		return []any{ver}, true, 0, "", ""
 	case "_seq_no":
+		if !isDocvalue && h.SearchScope != nil && h.SearchScope.srv != nil && h.SearchScope.srv.hasExplicitTargetESVersion() {
+			return nil, true, http.StatusInternalServerError, "unsupported_operation_exception", "Field [_seq_no] cannot be retrieved via [fields]; use [seq_no_primary_term] or [docvalue_fields] instead"
+		}
 		if format != "" {
 			return nil, true, http.StatusBadRequest, "illegal_argument_exception", "error fetching [_seq_no]: Field [_seq_no] of type [_seq_no] doesn't support formats."
 		}
@@ -1463,6 +1810,9 @@ func extractMetadataFieldR61Search(
 		}
 		return []any{seqNo}, true, 0, "", ""
 	case "_primary_term":
+		if !isDocvalue && h.SearchScope != nil && h.SearchScope.srv != nil && h.SearchScope.srv.hasExplicitTargetESVersion() {
+			return nil, true, http.StatusInternalServerError, "unsupported_operation_exception", "Field [_primary_term] cannot be retrieved via [fields]; use [seq_no_primary_term] or [docvalue_fields] instead"
+		}
 		return []any{int64(1)}, true, 0, "", ""
 	case "_tsid":
 		if format != "" {
@@ -1475,6 +1825,14 @@ func extractMetadataFieldR61Search(
 			if tsid, _ := row["__tsid"].(string); tsid != "" {
 				return []any{tsid}, true, 0, "", ""
 			}
+		}
+		return nil, true, 0, "", ""
+	case "_ts_routing_hash":
+		if format != "" {
+			return nil, true, http.StatusBadRequest, "illegal_argument_exception", "error fetching [_ts_routing_hash]: Field [_ts_routing_hash] of type [_ts_routing_hash] doesn't support formats."
+		}
+		if rh, ok := extractTSDBRoutingHashValueR63(h, hitIdx, idxSchema); ok {
+			return []any{rh}, true, 0, "", ""
 		}
 		return nil, true, 0, "", ""
 	case "_ignored":
@@ -1624,9 +1982,12 @@ func emitSingleMatchedFieldIntoOutR61Search(
 			return http.StatusBadRequest, "illegal_argument_exception",
 				fmt.Sprintf("Fielddata is not supported on field [%s] of type [lookup]", fieldName)
 		}
-		srv := resolveServerForSchemaOrActiveR62Search(idxSchema)
-		if srv != nil {
-			lVals, lSt, lErrT, lErrR := srv.resolveLookupRuntimeFieldFetchR62Search(context.Background(), doc, runtimeDoc, idxSchema, fieldName, rtDefProp)
+		if h.SearchScope != nil && h.SearchScope.srv != nil {
+			reqCtx := h.SearchScope.ctx
+			if reqCtx == nil {
+				reqCtx = context.Background()
+			}
+			lVals, lSt, lErrT, lErrR := h.SearchScope.srv.resolveLookupRuntimeFieldFetchR62Search(reqCtx, doc, runtimeDoc, idxSchema, fieldName, rtDefProp)
 			if lSt != 0 {
 				return lSt, lErrT, lErrR
 			}
@@ -1874,6 +2235,25 @@ func emitSingleMatchedFieldIntoOutR61Search(
 	if status != 0 {
 		return status, errT, errR
 	}
+	if isDocvalue && esType == "date" && strings.EqualFold(strings.TrimSpace(format), "epoch_millis") &&
+		h.SearchScope != nil && h.SearchScope.srv != nil && h.SearchScope.srv.hasExplicitTargetESVersion() {
+		for i, fv := range formatted {
+			if iv, ok := fv.(int64); ok {
+				formatted[i] = strconv.FormatInt(iv, 10)
+			}
+		}
+	}
+	if isDocvalue && esType == "date_nanos" && strings.EqualFold(strings.TrimSpace(format), "epoch_millis") &&
+		(h.SearchScope == nil || h.SearchScope.srv == nil || !h.SearchScope.srv.hasExplicitTargetESVersion()) {
+		for i, fv := range formatted {
+			if sv, ok := fv.(string); ok {
+				intPart := strings.SplitN(sv, ".", 2)[0]
+				if iv, errP := strconv.ParseInt(intPart, 10, 64); errP == nil {
+					formatted[i] = iv
+				}
+			}
+		}
+	}
 	if fromIndexTimeScript && isDocvalue && len(formatted) > 1 && (esType == "keyword" || esType == "ip" || esType == "boolean") {
 		dedup := make([]any, 0, len(formatted))
 		for i, fv := range formatted {
@@ -1992,17 +2372,18 @@ func resolveNestedFetchFieldR61Search(idxSchema *schema.IndexSchema, fieldName s
 	if idxSchema == nil || len(idxSchema.NestedRoots) == 0 {
 		return "", "", false
 	}
+	parts := strings.Split(fieldName, ".")
+	// Resolve outermost nested root so doubly-nested structures (`user` -> `address`) nest recursively inside `out[user]`.
+	for i := 1; i < len(parts); i++ {
+		cand := strings.Join(parts[:i], ".")
+		if idxSchema.NestedRoots[cand] != "" {
+			return cand, strings.Join(parts[i:], "."), true
+		}
+	}
 	if b.Kind == schema.StorageNestedSubfield && b.NestedPath != "" {
 		rel := strings.TrimPrefix(fieldName, b.NestedPath+".")
 		if rel != fieldName && rel != "" {
 			return b.NestedPath, rel, true
-		}
-	}
-	parts := strings.Split(fieldName, ".")
-	for i := len(parts) - 1; i >= 1; i-- {
-		cand := strings.Join(parts[:i], ".")
-		if idxSchema.NestedRoots[cand] != "" {
-			return cand, strings.Join(parts[i:], "."), true
 		}
 	}
 	return "", "", false
@@ -2018,7 +2399,21 @@ func mergeNestedFieldIntoUnifiedOutR61Search(
 	idxSchema *schema.IndexSchema,
 	out map[string][]any,
 ) (int, string, string) {
-	children := extractNestedChildMapsPreservingOffsetsR61Search(doc, nestedRoot)
+	return mergeNestedFieldWithFullPrefixR63Search(doc, nestedRoot, nestedRoot, relField, fullFieldName, requestedPattern, format, idxSchema, out)
+}
+
+func mergeNestedFieldWithFullPrefixR63Search(
+	doc map[string]any,
+	localKey string,
+	fullNestedPrefix string,
+	relField string,
+	fullFieldName string,
+	requestedPattern string,
+	format string,
+	idxSchema *schema.IndexSchema,
+	out map[string][]any,
+) (int, string, string) {
+	children := extractNestedChildMapsPreservingOffsetsR61Search(doc, localKey)
 	if len(children) == 0 {
 		return 0, "", ""
 	}
@@ -2028,7 +2423,7 @@ func mergeNestedFieldIntoUnifiedOutR61Search(
 	}
 	esType := strings.ToLower(strings.TrimSpace(b.ESType))
 
-	existing := out[nestedRoot]
+	existing := out[localKey]
 	if existing != nil && len(existing) != len(children) {
 		existing = nil
 	}
@@ -2039,9 +2434,54 @@ func mergeNestedFieldIntoUnifiedOutR61Search(
 		}
 	}
 
+	// Check if `relField` itself crosses a child nested root (`user.address` under `user`)
+	subNestedRel := ""
+	subLeafRel := ""
+	if idxSchema != nil && len(idxSchema.NestedRoots) > 0 && strings.Contains(relField, ".") {
+		rParts := strings.Split(relField, ".")
+		for i := 1; i < len(rParts); i++ {
+			candSub := strings.Join(rParts[:i], ".")
+			if idxSchema.NestedRoots[fullNestedPrefix+"."+candSub] != "" {
+				subNestedRel = candSub
+				subLeafRel = strings.Join(rParts[i:], ".")
+				break
+			}
+		}
+	}
+
 	anyPopulated := false
 	for idx, ch := range children {
 		if ch == nil {
+			continue
+		}
+		if subNestedRel != "" {
+			em, _ := existing[idx].(map[string]any)
+			if em == nil {
+				em = make(map[string]any)
+				existing[idx] = em
+			}
+			subOut := make(map[string][]any, 1)
+			if prevSub, okP := em[subNestedRel].([]any); okP {
+				subOut[subNestedRel] = prevSub
+			}
+			st, errT, errR := mergeNestedFieldWithFullPrefixR63Search(
+				ch,
+				subNestedRel,
+				fullNestedPrefix+"."+subNestedRel,
+				subLeafRel,
+				fullFieldName,
+				requestedPattern,
+				format,
+				idxSchema,
+				subOut,
+			)
+			if st != 0 {
+				return st, errT, errR
+			}
+			if len(subOut[subNestedRel]) > 0 {
+				em[subNestedRel] = subOut[subNestedRel]
+				anyPopulated = true
+			}
 			continue
 		}
 		var formatted []any
@@ -2066,11 +2506,15 @@ func mergeNestedFieldIntoUnifiedOutR61Search(
 		} else if esType == "constant_keyword" && b.HasConstantValue && b.ConstantValue != nil {
 			formatted = []any{b.ConstantValue}
 		} else {
-			relSegs := strings.Split(strings.TrimSuffix(strings.TrimSuffix(relField, ".keyword"), ".ngram"), ".")
+			defaultRelSegs := strings.Split(strings.TrimSuffix(strings.TrimSuffix(relField, ".keyword"), ".ngram"), ".")
+			relSegs := defaultRelSegs
 			if len(b.RelativeJSONPath) > 0 {
 				relSegs = b.RelativeJSONPath
 			}
 			rawVals := collectScalarValuesAtPathWithNull(ch, relSegs, b.NullValue)
+			if len(rawVals) == 0 && len(b.RelativeJSONPath) > 0 {
+				rawVals = collectScalarValuesAtPathWithNull(ch, defaultRelSegs, b.NullValue)
+			}
 			if len(rawVals) > 0 {
 				var status int
 				var errT, errR string
@@ -2090,7 +2534,22 @@ func mergeNestedFieldIntoUnifiedOutR61Search(
 			anyPopulated = true
 		}
 	}
-	if !anyPopulated {
+	if !anyPopulated && out[localKey] == nil {
+		return 0, "", ""
+	}
+	// Preserve `existing` slice indices when more subfields may still be merged; strip empty maps only if none populated?
+	// Wait: if `out[localKey]` holds `existing` with `len(children)`, wait until final or filter empty maps?
+	// Notice `existing != nil && len(existing) != len(children)` above reset `existing` when empty maps were stripped!
+	// Let's keep `existing` aligned to `children` when all children are non-empty, or strip empty maps at return if needed:
+	allNonEmpty := true
+	for _, item := range existing {
+		if em, ok := item.(map[string]any); !ok || len(em) == 0 {
+			allNonEmpty = false
+			break
+		}
+	}
+	if allNonEmpty {
+		out[localKey] = existing
 		return 0, "", ""
 	}
 	nonEmpty := make([]any, 0, len(existing))
@@ -2100,7 +2559,7 @@ func mergeNestedFieldIntoUnifiedOutR61Search(
 		}
 	}
 	if len(nonEmpty) > 0 {
-		out[nestedRoot] = nonEmpty
+		out[localKey] = nonEmpty
 	}
 	return 0, "", ""
 }
@@ -2460,10 +2919,15 @@ func extractFormattedSpatialFieldValuesR61Search(
 		return out, 0, "", ""
 	}
 	// `geo_shape` / `shape`
+	wantWKT := fLower == "wkt"
 	if arr, ok := rawNode.([]any); ok {
-		return arr, 0, "", ""
+		conv := make([]any, 0, len(arr))
+		for _, el := range arr {
+			conv = append(conv, convertSpatialWKTAndGeoJSONR63(el, wantWKT))
+		}
+		return conv, 0, "", ""
 	}
-	return []any{rawNode}, 0, "", ""
+	return []any{convertSpatialWKTAndGeoJSONR63(rawNode, wantWKT)}, 0, "", ""
 }
 
 func extractGeoPointsFromRawNodeR61Search(raw any) [][2]float64 {
@@ -3028,10 +3492,15 @@ func formatDateNanosExactR61Search(ns int64, requestedFormat string) any {
 		return ns
 	case "epoch_millis":
 		ms := ns / 1_000_000
-		if ns < 0 && ns%1_000_000 != 0 {
+		rem := ns % 1_000_000
+		if rem < 0 {
 			ms--
+			rem += 1_000_000
 		}
-		return ms
+		if rem != 0 {
+			return fmt.Sprintf("%d.%06d", ms, rem)
+		}
+		return strconv.FormatInt(ms, 10)
 	case "epoch_second":
 		sec := ns / 1_000_000_000
 		if ns < 0 && ns%1_000_000_000 != 0 {
@@ -3674,6 +4143,17 @@ func validatePipelineAggTreeR61Search(
 	for _, name := range names {
 		spec := aggs[name]
 
+		// Validate `random_sampler`: cannot sample `time_series` sub-aggregation
+		if spec.RandomSampler != nil {
+			for subName, subSpec := range spec.SubAggs() {
+				if subSpec.TimeSeries != nil {
+					return http.StatusBadRequest,
+						"illegal_argument_exception",
+						fmt.Sprintf("[random_sampler] aggregation [%s] does not support sampling [time_series] aggregation [%s]", name, subName)
+				}
+			}
+		}
+
 		// Validate `moving_fn`: requires `window > 0` and non-empty `script`
 		if spec.MovingFn != nil {
 			if spec.MovingFn.Window <= 0 {
@@ -3725,6 +4205,11 @@ func validatePipelineAggTreeR61Search(
 			}
 			if pipeType != "bucket_script" || (!allowSiblingBucketScript && !parentIsMultiBucket && !hasAncestorMultiBucket) {
 				if parentKind == "root" {
+					if pipeType == "derivative" || pipeType == "moving_fn" {
+						return http.StatusBadRequest,
+							"action_request_validation_exception",
+							fmt.Sprintf("Validation Failed: 1: %s aggregation [%s] must have a histogram, date_histogram or auto_date_histogram as parent but doesn't have a parent;", pipeType, name)
+					}
 					return http.StatusBadRequest,
 						"action_request_validation_exception",
 						fmt.Sprintf("Validation Failed: 1: %s aggregation [%s] must be declared inside of another aggregation;", pipeType, name)
@@ -4543,6 +5028,26 @@ func evaluateNestedTopHitsAggR61Search(
 		if c.parent.Routing != "" {
 			hm["_routing"] = c.parent.Routing
 		}
+		thFlags := extractTopHitsFlagsFromScopeR63(c.parent.SearchScope)
+		if thFlags.version {
+			ver := c.parent.Version
+			if ver <= 0 {
+				ver = 1
+			}
+			hm["_version"] = ver
+		}
+		if thFlags.seqNoPrimaryTerm {
+			seqNo := c.parent.SeqNo
+			if !c.parent.HasSeqNo {
+				if c.parent.Version > 0 {
+					seqNo = c.parent.Version - 1
+				} else {
+					seqNo = 0
+				}
+			}
+			hm["_seq_no"] = seqNo
+			hm["_primary_term"] = 1
+		}
 
 		elemFullBytes, _ := json.Marshal(buildSingleNestedElementDoc(nestedSegs, c.child))
 		childBytes, _ := json.Marshal(c.child)
@@ -4780,10 +5285,21 @@ func evalIntervalsCompoundQueryR61Search(
 			return painless.EvalFilter(preparedDoc, src, evalParams)
 		}
 
+		var idxAnCfg *analysis.IndexAnalysisConfig
+		var idxAnOpts analysis.Options
+		if idxSchema != nil && idxSchema.IndexName != "" {
+			activeStoredScriptsServerMu.RLock()
+			srv := activeStoredScriptsServer
+			activeStoredScriptsServerMu.RUnlock()
+			if srv != nil {
+				idxAnCfg, idxAnOpts = srv.buildIndexAnalysisConfigR62Admin(idxSchema.IndexName)
+			}
+		}
+
 		var totalScore float64
 		for _, field := range fieldNames {
 			rule := q.Intervals[field]
-			spans, okSpan, evalErr := transpiler.EvaluateIntervalsRuleWithFieldLookup(field, &rule, lookup, scriptEval)
+			spans, okSpan, evalErr := transpiler.EvaluateIntervalsRuleWithAnalysis(field, &rule, lookup, idxAnCfg, idxAnOpts, scriptEval)
 			if evalErr != nil {
 				return false, 0, evalErr
 			}
@@ -4795,7 +5311,21 @@ func evalIntervalsCompoundQueryR61Search(
 				if rule.Boost != nil {
 					boost = *rule.Boost
 				}
-				totalScore += transpiler.ScoreIntervalsSpans(spans, boost)
+				scoringSpans := spans
+				if rule.AllOf != nil && rule.AllOf.MaxGaps != nil && *rule.AllOf.MaxGaps == 0 {
+					minExt := intervalsRuleMinExtentR63(&rule)
+					if minExt > 0 {
+						scoringSpans = make([]transpiler.IntervalsSpan, len(spans))
+						copy(scoringSpans, spans)
+						for si := range scoringSpans {
+							extGap := (scoringSpans[si].End - scoringSpans[si].Start + 1) - minExt
+							if extGap > scoringSpans[si].Gaps {
+								scoringSpans[si].Gaps = extGap
+							}
+						}
+					}
+				}
+				totalScore += transpiler.ScoreIntervalsSpans(scoringSpans, boost)
 			}
 		}
 		return true, totalScore, nil
@@ -5008,6 +5538,38 @@ func evalIntervalsCompoundQueryR61Search(
 		sc = evalQueryScriptScoreOnDocWithSchema(idxSchema, doc, q, sc)
 	}
 	return true, sc, nil
+}
+
+func intervalsRuleMinExtentR63(r *esast.IntervalsRule) int {
+	if r == nil {
+		return 0
+	}
+	switch {
+	case r.Match != nil:
+		toks := transpiler.TokenizeByAnalyzer(r.Match.Query, r.Match.Analyzer)
+		if len(toks) > 0 {
+			return len(toks)
+		}
+		return 1
+	case r.Prefix != nil, r.Wildcard != nil, r.Fuzzy != nil:
+		return 1
+	case r.AllOf != nil:
+		sum := 0
+		for i := range r.AllOf.Intervals {
+			sum += intervalsRuleMinExtentR63(&r.AllOf.Intervals[i])
+		}
+		return sum
+	case r.AnyOf != nil:
+		minExt := 0
+		for i := range r.AnyOf.Intervals {
+			ext := intervalsRuleMinExtentR63(&r.AnyOf.Intervals[i])
+			if ext > 0 && (minExt == 0 || ext < minExt) {
+				minExt = ext
+			}
+		}
+		return minExt
+	}
+	return 0
 }
 
 func resolveBoolMinShouldMatchR61Search(bq *esast.BoolQuery, numShould int) int {
@@ -5449,7 +6011,8 @@ func checkHighlightDocMaxAnalyzedOffsetR61Search(
 			if effType == "fvh" || effType == "fast-vector-highlighter" {
 				// FVH uses stored term vectors unless `matched_fields` references non-FVH subfields; check synthetic multi-value guard!
 				if idxSchema != nil && idxSchema.SyntheticSource && !fieldIsStoredInSchemaR61Search(idxSchema, cf) {
-					if rawNode, exists := lookupNestedMapPathR61Search(doc, strings.Split(cf, ".")); exists {
+					fvhSegs := effectiveTokenCountSourceSegsR61Search(cf, idxSchema.ResolveField(cf), idxSchema)
+					if rawNode, exists := lookupNestedMapPathR61Search(doc, fvhSegs); exists {
 						if arr, isArr := rawNode.([]any); isArr && len(arr) > 1 {
 							return -1,
 								http.StatusBadRequest,
@@ -7181,6 +7744,45 @@ func collectNamedQueryScoresR61Search(
 		m, sc, err := evalIntervalsCompoundQueryR61Search(curSchema, curDoc, cur, true, inScoring)
 		matched = err == nil && m
 		clauseScore = sc
+	} else if cur.KNN != nil {
+		kq := cur.KNN
+		var b schema.FieldBinding
+		if curSchema != nil {
+			b = curSchema.ResolveField(kq.Field)
+		}
+		vecMetric := b.VectorMetric
+		vecElemType := b.VectorElementType
+		vecDims := b.VectorDims
+		if (vecMetric == "" || vecElemType == "" || vecDims == 0) && curSchema != nil {
+			if fp, okRaw := lookupRawPropertyWithMultiFieldR61Search(curSchema, kq.Field); okRaw {
+				if vecMetric == "" {
+					vecMetric = fp.Similarity
+				}
+				if vecElemType == "" {
+					vecElemType = fp.ElementType
+				}
+				if vecDims == 0 {
+					vecDims = fp.Dims
+				}
+			}
+		}
+		qVec := resolveKNNQueryVectorR61Search(kq, vecElemType, vecDims)
+		boost := 1.0
+		if kq.Boost != nil {
+			boost = *kq.Boost
+		}
+		filterOK := true
+		for i := range kq.Filter {
+			if !evalBranchMatchesDoc(curSchema, curDoc, &kq.Filter[i]) {
+				filterOK = false
+				break
+			}
+		}
+		if filterOK {
+			sc, okK, _ := transpiler.EvaluateNestedKNNParentScore([]map[string]any{curDoc}, kq.Field, qVec, vecMetric, vecElemType, kq.Similarity, boost)
+			matched = okK
+			clauseScore = sc
+		}
 	} else {
 		matched = evalBranchMatchesDoc(curSchema, curDoc, cur)
 		if matched && inScoring {
@@ -7195,13 +7797,17 @@ func collectNamedQueryScoresR61Search(
 		return
 	}
 
-	if name := extractDirectQueryClauseName(cur); name != "" {
+	clauseName := extractDirectQueryClauseName(cur)
+	if clauseName == "" && cur.KNN != nil {
+		clauseName = strings.TrimSpace(cur.KNN.Name)
+	}
+	if clauseName != "" {
 		sc := clauseScore
 		if !inScoring {
 			sc = 0.0
 		}
-		if prev, exists := out[name]; !exists || sc > prev {
-			out[name] = sc
+		if prev, exists := out[clauseName]; !exists || sc > prev {
+			out[clauseName] = sc
 		}
 	}
 
@@ -7668,6 +8274,9 @@ func evalSearchScriptFieldsR61Search(
 		if h.HasSeqNo {
 			docMap["__meta_seq_no"] = h.SeqNo
 		}
+		if s != nil {
+			s.populateMissingTokenCountValuesFromBackendR63(idxSchema, h.ID, docMap)
+		}
 
 		for _, entry := range parsedEntries {
 			if entry.source == "" {
@@ -7787,10 +8396,8 @@ func evalAndValidateSearchScriptScoreR61Search(
 						return 0, false, 0, nil
 					}
 					subBase = innerSc
-				} else if subBase == 1.0 {
+				} else {
 					subBase = scoreNonScriptClauseOnDoc(idxSchema, doc, q.ScriptScore.Query)
-				} else if q.ScriptScore.Boost != nil && *q.ScriptScore.Boost != 0 {
-					subBase = subBase / (*q.ScriptScore.Boost)
 				}
 			}
 		}
@@ -8471,7 +9078,15 @@ func reEvaluatePipelineAggsTreeR61Search(aggs map[string]esast.AggSpec, aggsOut 
 				}
 			}
 			if canReEvalSub {
-				subMap["buckets"] = evaluateChildPipelineAggs(rawB, subAggs)
+				rawB = evaluateChildPipelineAggs(rawB, subAggs)
+				subMap["buckets"] = rawB
+			}
+			if aggsHaveKeepValuesScriptPipelineR63(subAggs) {
+				updatedB, kvErr := validateAndApplyKeepValuesScriptPipelinesR63(rawB, subAggs)
+				if kvErr != nil {
+					return kvErr
+				}
+				subMap["buckets"] = updatedB
 			}
 		case []any:
 			conv := make([]map[string]any, 0, len(rawB))
@@ -8491,7 +9106,15 @@ func reEvaluatePipelineAggsTreeR61Search(aggs map[string]esast.AggSpec, aggsOut 
 				}
 			}
 			if canReEvalSub {
-				subMap["buckets"] = evaluateChildPipelineAggs(conv, subAggs)
+				conv = evaluateChildPipelineAggs(conv, subAggs)
+				subMap["buckets"] = conv
+			}
+			if aggsHaveKeepValuesScriptPipelineR63(subAggs) {
+				updatedConv, kvErr := validateAndApplyKeepValuesScriptPipelinesR63(conv, subAggs)
+				if kvErr != nil {
+					return kvErr
+				}
+				subMap["buckets"] = updatedConv
 			}
 		case map[string]any:
 			for _, item := range rawB {

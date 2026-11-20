@@ -631,8 +631,8 @@ func TestRound61AdminCatStats_F8_F11_F12_SynonymsSnapshotsRetrieverAndFieldCaps(
 		t.Fatalf("GET /_synonyms/my_syns failed: %d %s", code, raw)
 	}
 	synArr := m["synonyms_set"].([]any)
-	if len(synArr) != 2 || synArr[0].(map[string]any)["id"] != "r2" || synArr[1].(map[string]any)["id"] != "r1" {
-		t.Fatalf("expected insertion order [r2, r1] preserved, got %s", raw)
+	if len(synArr) != 2 || synArr[0].(map[string]any)["id"] != "r1" || synArr[1].(map[string]any)["id"] != "r2" {
+		t.Fatalf("expected id-sorted order [r1, r2], got %s", raw)
 	}
 	if c, _, _, _ := doRound61AdminReq(t, h8, http.MethodGet, "/_synonyms/my_syns?from=-1", "", nil); c != http.StatusBadRequest {
 		t.Fatalf("expected 400 on negative from, got %d", c)

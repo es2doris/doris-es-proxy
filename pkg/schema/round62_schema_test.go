@@ -615,7 +615,8 @@ func TestRound62_ScriptHook_Ignored_SAYT_SparseVector_DateNanos_DynamicTemplates
 	}
 
 	// Register index-time script evaluator hook and verify emitted values shred into column while _source stays untouched!
-	defer RegisterIndexFieldScriptEvaluator(nil)
+	prevEval1 := GetIndexFieldScriptEvaluator()
+	defer RegisterIndexFieldScriptEvaluator(prevEval1)
 	RegisterIndexFieldScriptEvaluator(func(fieldPath, esType string, scriptSpec any, onScriptError string, sourceDoc map[string]any) ([]any, error) {
 		if fieldPath == "safe_calc" {
 			return nil, fmt.Errorf("simulated painless error")
@@ -653,7 +654,7 @@ func TestRound62_ScriptHook_Ignored_SAYT_SparseVector_DateNanos_DynamicTemplates
 	if _, err := ShredDocument(scriptIdx, "s2", 1, false, []byte(rawIn)); err == nil || !strings.Contains(err.Error(), "boom_fail") {
 		t.Fatalf("expected on_script_error=fail to propagate error, got %v", err)
 	}
-	RegisterIndexFieldScriptEvaluator(nil)
+	RegisterIndexFieldScriptEvaluator(prevEval1)
 
 	// 2. `_ignored` resolves to native StoragePromotedArray (`ColumnName: "_ignored"`)
 	igB := scriptIdx.ResolveField("_ignored")
@@ -867,7 +868,8 @@ func TestRound62_AdditionalEdgeCasesAndDeepCloneCoverage(t *testing.T) {
 		}
 	}`), &deepScriptSpec)
 	deepScriptIdx := CompileIndexSchema("es_db", "r62_deep_script", &deepScriptSpec)
-	defer RegisterIndexFieldScriptEvaluator(nil)
+	prevEval2 := GetIndexFieldScriptEvaluator()
+	defer RegisterIndexFieldScriptEvaluator(prevEval2)
 	RegisterIndexFieldScriptEvaluator(func(fieldPath, esType string, scriptSpec any, onScriptError string, sourceDoc map[string]any) ([]any, error) {
 		if fieldPath == "grp.tags" {
 			return []any{"t1", "t2"}, nil
@@ -877,7 +879,7 @@ func TestRound62_AdditionalEdgeCasesAndDeepCloneCoverage(t *testing.T) {
 	if _, err := ShredDocument(deepScriptIdx, "ds1", 1, false, []byte(`{}`)); err != nil {
 		t.Fatalf("deep script shred failed: %v", err)
 	}
-	RegisterIndexFieldScriptEvaluator(nil)
+	RegisterIndexFieldScriptEvaluator(prevEval2)
 
 	// 3. `flattenSubmapsForNoSubobjects` in `ReconstructSyntheticSource` + literal dotted doc in `ShredDocument`
 	var rootNoSub esast.MappingSpec

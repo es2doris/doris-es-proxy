@@ -117,6 +117,7 @@ type round61AdminState struct {
 	ingestTotal     round61IngestCounters
 	ingestPipelines map[string]*round61PipelineStats
 	flushedOps      map[string]round61TranslogFlushMark
+	syncedFlushIDs  map[string]string
 	recoverySources map[string]string
 	reqCacheHits    map[string]int64
 	reqCacheMisses  map[string]int64
@@ -138,6 +139,7 @@ func getOrCreateRound61AdminState(s *Server) *round61AdminState {
 			docTypeCounts:   make(map[string]map[string]*round61DocTypeCounters),
 			ingestPipelines: make(map[string]*round61PipelineStats),
 			flushedOps:      make(map[string]round61TranslogFlushMark),
+			syncedFlushIDs:  make(map[string]string),
 			recoverySources: make(map[string]string),
 			reqCacheHits:    make(map[string]int64),
 			reqCacheMisses:  make(map[string]int64),
@@ -166,12 +168,36 @@ func getOrCreateRound61AdminState(s *Server) *round61AdminState {
 		docTypeCounts:   make(map[string]map[string]*round61DocTypeCounters),
 		ingestPipelines: make(map[string]*round61PipelineStats),
 		flushedOps:      make(map[string]round61TranslogFlushMark),
+		syncedFlushIDs:  make(map[string]string),
 		recoverySources: make(map[string]string),
 		reqCacheHits:    make(map[string]int64),
 		reqCacheMisses:  make(map[string]int64),
 	}
 	round61AdminRegistry[s] = st
 	return st
+}
+
+func setSyncedFlushIDR63Admin(s *Server, indexName, syncID string) {
+	if s == nil || indexName == "" {
+		return
+	}
+	st := getOrCreateRound61AdminState(s)
+	st.mu.Lock()
+	if st.syncedFlushIDs == nil {
+		st.syncedFlushIDs = make(map[string]string)
+	}
+	st.syncedFlushIDs[indexName] = syncID
+	st.mu.Unlock()
+}
+
+func getSyncedFlushIDR63Admin(s *Server, indexName string) string {
+	if s == nil || indexName == "" {
+		return ""
+	}
+	st := getOrCreateRound61AdminState(s)
+	st.mu.RLock()
+	defer st.mu.RUnlock()
+	return st.syncedFlushIDs[indexName]
 }
 
 func resetRound61AdminState(s *Server) {
@@ -617,7 +643,7 @@ func recordSearchFieldUsageRound61(s *Server, indexNames []string, bodyBytes []b
 				fc.knnVectors++
 			} else if tc.isRange || isNumericOrDateESTypeRound61(esType) {
 				fc.points++
-				if esType == "date" || esType == "date_nanos" {
+				if esType == "date" || esType == "date_nanos" || (tc.isRange && esType != "text" && esType != "match_only_text") {
 					fc.docValues++
 				}
 			} else {
@@ -744,31 +770,6 @@ func isIndexSoftDeletesDisabledR62Admin(s *Server, indexName string) (disabled b
 		}
 	}
 	return disabled, retentionTrimmed
-}
-
-func recordIndexRequestCacheStatR62Admin(s *Server, targets []string, isHit bool) {
-	if s == nil || len(targets) == 0 {
-		return
-	}
-	st := getOrCreateRound61AdminState(s)
-	st.mu.Lock()
-	if st.reqCacheHits == nil {
-		st.reqCacheHits = make(map[string]int64)
-	}
-	if st.reqCacheMisses == nil {
-		st.reqCacheMisses = make(map[string]int64)
-	}
-	for _, idx := range targets {
-		if idx == "" {
-			continue
-		}
-		if isHit {
-			st.reqCacheHits[idx]++
-		} else {
-			st.reqCacheMisses[idx]++
-		}
-	}
-	st.mu.Unlock()
 }
 
 func computeIndexUncommittedTranslogRound61(s *Server, indexName string, live *indexLiveStats) (ops int64, uncommittedOps int64, sizeBytes int64, uncommittedBytes int64) {
@@ -1648,8 +1649,14 @@ func lookupFieldESTypeRound61(idxSchema *schema.IndexSchema, fieldPath string) s
 			return "double"
 		case schema.DorisBoolean:
 			return "boolean"
+		case schema.DorisVarchar:
+			return "keyword"
 		case schema.DorisString:
 			return "text"
+		default:
+			if strings.HasPrefix(strings.ToUpper(string(fb.DorisType)), "DATE") {
+				return "date"
+			}
 		}
 	}
 	return ""
@@ -4051,6 +4058,17 @@ func (s *Server) handleFieldCapsRound61(w http.ResponseWriter, r *http.Request) 
 				if esTypeOut == "match_only_text" && isES8 {
 					esTypeOut = "text"
 				}
+				if s.hasExplicitTargetESVersion() && esTypeOut == "keyword" && !isMulti && !isRuntime && (dynamicFieldTypesByIdx[idxName][esPath] == "text" || s.isDynamicallyInferredStringFieldWave3R63(idxName, esPath)) {
+					_, explicitRaw := lookupRawPropertyWithMultiFieldR61Search(idxSchema, esPath)
+					if !explicitRaw || s.isDynamicallyInferredStringFieldWave3R63(idxName, esPath) {
+						addCap(idxName, esPath, "text", true, false, baseFlags)
+						addCap(idxName, esPath+".keyword", "keyword", true, true, capEntryFlags{
+							isMultifield: true,
+							isNested:     isNested,
+						})
+						break
+					}
+				}
 				addCap(idxName, esPath, esTypeOut, computeSearchable(fb.ESType), isAggregatableForType(fb.ESType), baseFlags)
 				addFieldMeta(esPath, esTypeOut, fb.Meta)
 				if fb.KeywordCompanion != "" && fb.AliasTarget == "" && !runtimeFieldNames[esPath+".keyword"] {
@@ -4102,6 +4120,16 @@ func (s *Server) handleFieldCapsRound61(w http.ResponseWriter, r *http.Request) 
 					})
 				}
 			default:
+				if s.hasExplicitTargetESVersion() && !isMulti && !isRuntime && dynamicFieldTypesByIdx[idxName][esPath] == "text" {
+					if _, explicitRaw := lookupRawPropertyWithMultiFieldR61Search(idxSchema, esPath); !explicitRaw {
+						addCap(idxName, esPath, "text", true, false, baseFlags)
+						addCap(idxName, esPath+".keyword", "keyword", true, true, capEntryFlags{
+							isMultifield: true,
+							isNested:     isNested,
+						})
+						break
+					}
+				}
 				addCap(idxName, esPath, "keyword", computeSearchable("keyword"), isAggregatableForType("keyword"), baseFlags)
 			}
 		}

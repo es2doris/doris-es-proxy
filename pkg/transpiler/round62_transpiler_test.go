@@ -254,7 +254,7 @@ func TestRound62_F12_DocCountAndIgnoredAggs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BuildSearchPlan F12 failed: %v", err)
 	}
-	if strings.Count(plan.AggsSQL, "$._doc_count") < 6 {
+	if strings.Count(plan.AggsSQL, `$."_doc_count"`) < 6 || !strings.Contains(plan.AggsSQL, "TRY_CAST(json_extract_string(`_source`, '$."+`"_doc_count"`+"') AS BIGINT)") {
 		t.Fatalf("expected _doc_count SUM expression across terms/filter/filters/composite, got:\n%s", plan.AggsSQL)
 	}
 	if strings.Count(plan.AggsSQL, "LATERAL VIEW EXPLODE(`_ignored`)") < 3 {
@@ -266,7 +266,7 @@ func TestRound62_F12_DocCountAndIgnoredAggs(t *testing.T) {
 	schNoSrc.ES8Mode = true
 	trNoSrc := NewTranspiler(schNoSrc, TranspilerOptions{ES8Compat: true})
 	planNoSrc, err := trNoSrc.BuildSearchPlan(mustUnmarshalSearchReqR62(t, `{"size": 0, "aggs": {"t": {"terms": {"field": "k"}}}}`))
-	if err != nil || strings.Contains(planNoSrc.AggsSQL, "$._doc_count") {
+	if err != nil || strings.Contains(planNoSrc.AggsSQL, "_doc_count'") || strings.Contains(planNoSrc.AggsSQL, `"_doc_count"`) {
 		t.Fatalf("expected _source disabled to fall back to COUNT(*), err=%v sql=%s", err, planNoSrc.AggsSQL)
 	}
 }
@@ -491,8 +491,8 @@ func TestRound62_F15_TimeSeriesAndTSID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BuildSearchPlan TSDB failed: %v", err)
 	}
-	if !strings.Contains(planTS.HitsSQL, "`__tsid` ASC") || !strings.Contains(planTS.AggsSQL, "GROUP BY `__tsid`, `__tsid_key`") || !strings.Contains(planTS.AggsSQL, "FROM_BASE64") {
-		t.Fatalf("expected __tsid sort, __tsid/__tsid_key GROUP BY, and FROM_BASE64 binary sort in SQL:\nhits=%s\naggs=%s", planTS.HitsSQL, planTS.AggsSQL)
+	if !strings.Contains(planTS.HitsSQL, "`__tsid` ASC") || !strings.Contains(planTS.AggsSQL, "GROUP BY `__tsid`, `__tsid_key`") || !strings.Contains(planTS.AggsSQL, "TRANSLATE(`__tsid`") {
+		t.Fatalf("expected __tsid sort, __tsid/__tsid_key GROUP BY, and TRANSLATE binary sort in SQL:\nhits=%s\naggs=%s", planTS.HitsSQL, planTS.AggsSQL)
 	}
 
 	// Searching _tsid directly must fail with [_tsid] is not searchable
@@ -784,10 +784,10 @@ func TestRound62_F17_MapperExtrasAndF22RuntimeFields(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BuildSearchPlan scriptless runtime fields failed: %v", err)
 	}
-	if !strings.Contains(rtPlan.HitsSQL, "json_extract_string(`_source`, '$.req_kw')") ||
+	if !strings.Contains(rtPlan.HitsSQL, `json_extract_string(`+"`_source`"+`, '$."req_kw"')`) ||
 		!strings.Contains(rtPlan.HitsSQL, `$."rt.dotted"`) ||
-		!strings.Contains(rtPlan.HitsSQL, "$.rt_comp.sub_kw") ||
-		!strings.Contains(rtPlan.AggsSQL, "$.rt_dbl") {
+		!strings.Contains(rtPlan.HitsSQL, `$."rt_comp"."sub_kw"`) ||
+		!strings.Contains(rtPlan.AggsSQL, `$."rt_dbl"`) {
 		t.Fatalf("expected _source json_extract_string pushdown across runtime queries/sort/aggs:\nhits=%s\naggs=%s", rtPlan.HitsSQL, rtPlan.AggsSQL)
 	}
 }

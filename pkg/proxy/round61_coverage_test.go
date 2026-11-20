@@ -556,8 +556,8 @@ func TestRound61Coverage_DiskUsageSuggestHighlightRuntimeTasksAndParsers(t *test
 				"script": "emit(doc['cnt'].value * 2)"
 			}
 		},
-		"fields": ["*", "_id", "_index", "_routing", "_version", "_seq_no", "_primary_term", "_ignored"],
-		"docvalue_fields": ["tag", "cnt", "ul", "flag", "ts", "ts_ns", "ip_addr"],
+		"fields": ["*", "_id", "_index", "_routing", "_version", "_ignored"],
+		"docvalue_fields": ["_seq_no", "_primary_term", "tag", "cnt", "ul", "flag", "ts", "ts_ns", "ip_addr"],
 		"query": {
 			"intervals": {
 				"title": {

@@ -44,6 +44,7 @@ fuzz:
 	go test -fuzz='^FuzzPainlessEval$$' -fuzztime=5s ./pkg/painless
 	go test -fuzz='^FuzzShredDocument$$' -fuzztime=5s ./pkg/schema
 	go test -fuzz='^FuzzParseBulkNDJSON$$' -fuzztime=5s ./pkg/esast
+	go test -fuzz='^FuzzAnalyze$$' -fuzztime=5s ./pkg/analysis
 
 test-e2e:
 	DORIS_E2E_DSN="$(DORIS_E2E_DSN)" DORIS_E2E_HTTP="$(DORIS_E2E_HTTP)" go test -race -count=1 -v ./e2e -run TestLiveApacheDoris_E2E
@@ -56,7 +57,7 @@ test-sdk-conformance:
 
 test-conformance:
 	bash scripts/fetch-conformance-specs.sh
-	CONFORMANCE_REQUIRE_UPSTREAM=1 CONFORMANCE_MIN_V7_PASSED=1830 CONFORMANCE_MIN_V8_PASSED=3000 go test -race -count=1 -v ./pkg/compliance -run 'TestUpstream|TestSpecSchemaValidatorLiveUpstreamSchema'
+	CONFORMANCE_REQUIRE_UPSTREAM=1 CONFORMANCE_MIN_V7_PASSED=1940 CONFORMANCE_MIN_V8_PASSED=3680 go test -race -count=1 -v ./pkg/compliance -run 'TestUpstream|TestSpecSchemaValidatorLiveUpstreamSchema'
 	go -C e2e/sdkconformance test -race -count=1 -v ./...
 
 lint:

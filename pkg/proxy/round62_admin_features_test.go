@@ -341,7 +341,7 @@ func TestRound62Admin_F4_F5_F7_F25_IndicesFieldCapsSyntheticSourceAndSQLIdent(t 
 
 	// get_mapping expand_wildcards=none & ES8 put_mapping typed error
 	_, _, _, _ = doR62AdminReq(t, h8, http.MethodPut, "/gm_1", `{"mappings":{"properties":{"k":{"type":"keyword"}}}}`, nil)
-	code, _, m, raw := doR62AdminReq(t, h8, http.MethodGet, "/gm_*/_mapping?expand_wildcards=none", "", nil)
+	code, _, m, raw := doR62AdminReq(t, h8, http.MethodGet, "/gm_*/_mapping?expand_wildcards=none&ignore_unavailable=true", "", nil)
 	if code != http.StatusOK || len(m) != 0 {
 		t.Fatalf("expected empty 200 {} on expand_wildcards=none, got %d: %s", code, raw)
 	}

@@ -743,7 +743,14 @@ func TestScriptingNormalizersLimitsQueryGraphAndClusterStats(t *testing.T) {
 		},
 	}
 
-	qGraph, err := AnalyzeForQuery("three what the fudge foo", "syn_search", normCfg, opts)
+	// AnalyzeForQuery enforces index.analyze.max_token_count identically to Analyze!
+	if _, err := AnalyzeForQuery("three what the fudge foo", "syn_search", normCfg, opts); err == nil || err.Error() != wantLimitErr {
+		t.Fatalf("expected AnalyzeForQuery to enforce max_token_count=3, got: %v", err)
+	}
+
+	queryCfg := *normCfg
+	queryCfg.MaxTokenCount = DefaultMaxTokenCount
+	qGraph, err := AnalyzeForQuery("three what the fudge foo", "syn_search", &queryCfg, opts)
 	if err != nil {
 		t.Fatalf("AnalyzeForQuery failed: %v", err)
 	}
@@ -755,9 +762,9 @@ func TestScriptingNormalizersLimitsQueryGraphAndClusterStats(t *testing.T) {
 		t.Fatalf("expected 4 phrase paths (1 x 2 x 2), got %v", phrasePaths)
 	}
 
-	// Mutate synonym set rules dynamically (simulating PUT _synonyms/set1) without recompiling normCfg!
+	// Mutate synonym set rules dynamically (simulating PUT _synonyms/set1) without recompiling queryCfg!
 	currentRules = []string{"hello, salute"}
-	qGraphReloaded, err := AnalyzeForQuery("salute", "syn_search", normCfg, opts)
+	qGraphReloaded, err := AnalyzeForQuery("salute", "syn_search", &queryCfg, opts)
 	if err != nil {
 		t.Fatalf("reloaded AnalyzeForQuery failed: %v", err)
 	}

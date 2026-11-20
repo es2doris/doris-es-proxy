@@ -477,6 +477,11 @@ func evalMathStaticCallRound58(fnName string, args []string, sourceMap, params m
 			return int64(0), true, nil
 		}
 		if iv, isInt := isIntegerValuePainless(v0); isInt {
+			if iv == math.MinInt64 && params != nil {
+				if dt, _ := params["__eval_number_double_target"].(bool); dt {
+					return math.Abs(float64(iv)), true, nil
+				}
+			}
 			if iv < 0 {
 				return -iv, true, nil
 			}

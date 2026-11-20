@@ -50,6 +50,7 @@ var supportedRunnerFeatures = map[string]bool{
 	"is_unset":               true,
 	"is_empty":               true,
 	"exists":                 true,
+	"not_exists":             true,
 	"yaml":                   true,
 	"catch_param":            true,
 	"stash_in_key":           true,
@@ -840,6 +841,8 @@ func (c *runnerContext) execStep(step SpecStep, isTeardown bool) error {
 		return c.execIsUnset(step.Value)
 	case "exists":
 		return c.execExists(step.Value)
+	case "not_exists":
+		return c.execNotExists(step.Value)
 	case "is_empty":
 		return c.execIsEmpty(step.Value)
 	case "length":
@@ -6657,6 +6660,11 @@ func (c *runnerContext) expandStash(v any) any {
 				return sv
 			}
 		}
+		if val != "" && val == strings.TrimSpace(val) {
+			if sv, ok := c.lookupStashPathValue(val); ok {
+				return sv
+			}
+		}
 		return c.expandStashString(val)
 	default:
 		return v
@@ -6732,6 +6740,14 @@ func (c *runnerContext) expandStashString(s string) string {
 	return reStashVar.ReplaceAllStringFunc(s, func(match string) string {
 		if sv, suffix, ok := c.resolveStashMatch(match); ok {
 			return fmt.Sprintf("%v", sv) + suffix
+		}
+		if sv, ok := c.lookupStashPathValue(match); ok && sv != nil {
+			switch sv.(type) {
+			case map[string]any, []any, *OrderedMap, OrderedMap:
+				return match
+			default:
+				return fmt.Sprintf("%v", sv)
+			}
 		}
 		return match
 	})
@@ -7192,6 +7208,9 @@ func (c *runnerContext) resolveTransformValue(rawArg string) (any, bool) {
 		if val, found := c.lookupStashVar(normalizeStashKey(trimmed)); found && val != nil {
 			return val, true
 		}
+		if val, found := c.lookupStashPathValue(trimmed); found && val != nil {
+			return val, true
+		}
 	}
 	return nil, false
 }
@@ -7307,6 +7326,9 @@ func (c *runnerContext) evalTransformExpr(exprStr string) (any, error) {
 			val, found = c.lookupResponsePath(fieldPath)
 			if !found && strings.HasPrefix(rawPath, "$") {
 				val, found = c.lookupStashVar(normalizeStashKey(rawPath))
+				if !found {
+					val, found = c.lookupStashPathValue(rawPath)
+				}
 			}
 			if !found || val == nil {
 				return nil, fmt.Errorf("transform_and_set: response path %q not found in %s", fieldPath, c.lastBodyRaw)
@@ -7418,12 +7440,69 @@ func decodeBase64String(s string) (string, error) {
 	return "", fmt.Errorf("invalid base64 input %q", s)
 }
 
+func (c *runnerContext) currentBodyRoot() (any, bool) {
+	if c == nil {
+		return nil, false
+	}
+	switch c.lastBodyKind {
+	case bodyKindNone:
+		return nil, false
+	case bodyKindEmptyText:
+		return "", true
+	case bodyKindJSONNull:
+		return nil, true
+	default:
+		return c.lastResponse, c.lastResponse != nil
+	}
+}
+
 func (c *runnerContext) lookupStashPathValue(rawKey string) (any, bool) {
 	trimmed := strings.TrimSpace(rawKey)
 	if !strings.HasPrefix(trimmed, "$") ||
-		trimmed == "$body" || strings.HasPrefix(trimmed, "$body.") ||
 		trimmed == "$headers" || strings.HasPrefix(trimmed, "$headers.") {
 		return nil, false
+	}
+	if trimmed == "$body" || trimmed == "${body}" {
+		if sv, ok := c.stash["body"]; ok {
+			return sv, true
+		}
+		return c.currentBodyRoot()
+	}
+	if afterBody, ok := strings.CutPrefix(trimmed, "$body."); ok {
+		segs := splitEscapedPath(afterBody)
+		resolved := make([]string, len(segs))
+		for i, seg := range segs {
+			resolved[i] = c.expandStashString(seg)
+		}
+		if sv, hasBodyStash := c.stash["body"]; hasBodyStash {
+			if v, found := lookupSegments(sv, resolved); found {
+				return v, true
+			}
+		}
+		bodyRoot, hasBody := c.currentBodyRoot()
+		if !hasBody {
+			return nil, false
+		}
+		return lookupSegments(bodyRoot, resolved)
+	}
+	if inner, ok := strings.CutPrefix(trimmed, "${body."); ok {
+		if afterBody, ok2 := strings.CutSuffix(inner, "}"); ok2 && afterBody != "" {
+			segs := splitEscapedPath(afterBody)
+			resolved := make([]string, len(segs))
+			for i, seg := range segs {
+				resolved[i] = c.expandStashString(seg)
+			}
+			if sv, hasBodyStash := c.stash["body"]; hasBodyStash {
+				if v, found := lookupSegments(sv, resolved); found {
+					return v, true
+				}
+			}
+			bodyRoot, hasBody := c.currentBodyRoot()
+			if !hasBody {
+				return nil, false
+			}
+			return lookupSegments(bodyRoot, resolved)
+		}
 	}
 	segs := splitEscapedPath(trimmed)
 	if len(segs) == 0 || !strings.HasPrefix(segs[0], "$") {
@@ -7438,7 +7517,7 @@ func (c *runnerContext) lookupStashPathValue(rawKey string) (any, bool) {
 	}
 	rest := make([]string, len(segs)-1)
 	for i := 1; i < len(segs); i++ {
-		rest[i] = c.expandStashString(segs[i])
+		rest[i-1] = c.expandStashString(segs[i])
 	}
 	return lookupSegments(sv, rest)
 }
@@ -8496,6 +8575,45 @@ func (c *runnerContext) execExists(rawVal any) error {
 	return nil
 }
 
+func (c *runnerContext) execNotExists(rawVal any) error {
+	if seq, ok := rawVal.([]any); ok {
+		for _, item := range seq {
+			if err := c.execNotExists(item); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	fieldPath := ""
+	if rawVal != nil {
+		fieldPath = c.expandStashPath(fmt.Sprintf("%v", rawVal))
+	}
+	if fieldPath == "" || fieldPath == "$body" {
+		if c.lastMethod == http.MethodHead {
+			if c.lastStatus == http.StatusNotFound {
+				return nil
+			}
+			return fmt.Errorf("not_exists %q: expected HEAD HTTP 404, got %d", fieldPath, c.lastStatus)
+		}
+		if c.lastBodyKind == bodyKindNone ||
+			(c.lastBodyKind == bodyKindUnset && c.lastResponse == nil) {
+			return nil
+		}
+		return fmt.Errorf("not_exists %q: response body exists (HTTP %d): %s", fieldPath, c.lastStatus, c.lastBodyRaw)
+	}
+	if strings.Contains(fieldPath, "_arbitrary_key_") {
+		if cands := c.lookupAllResponsePaths(fieldPath); len(cands) > 0 {
+			return fmt.Errorf("not_exists %q failed: path exists with value %v (response: %s)", fieldPath, cands[0], c.lastBodyRaw)
+		}
+		return nil
+	}
+	val, exists := c.lookupResponsePath(fieldPath)
+	if exists {
+		return fmt.Errorf("not_exists %q failed: path exists with value %v (response: %s)", fieldPath, val, c.lastBodyRaw)
+	}
+	return nil
+}
+
 func checkSingleCloseTo(fieldPath string, actual any, expFloat, errFloat float64) error {
 	actFloat, ok := toFloat64(actual)
 	if !ok {
@@ -8562,7 +8680,7 @@ func (c *runnerContext) execCloseTo(rawVal any) error {
 	}
 	if hasField && hasValue && hasError {
 		if _, isMap := ToNative(valueVal).(map[string]any); !isMap {
-			fieldPath := c.expandStashPath(fmt.Sprintf("%v", c.expandStash(fieldVal)))
+			fieldPath := c.expandStashPath(fmt.Sprintf("%v", fieldVal))
 			return c.evalCloseToField(fieldPath, valueVal, errorVal)
 		}
 	}

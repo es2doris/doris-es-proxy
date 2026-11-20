@@ -62,6 +62,7 @@ type HitRow struct {
 	Schema        *schema.IndexSchema
 	Query         *esast.Query
 	RuntimeFields map[string]any
+	SearchScope   *activeSearchScope
 }
 
 // EffectiveSource returns the original unfiltered document JSON when RawSource is set,
@@ -274,6 +275,7 @@ type Server struct {
 	taskReg                   *taskRegistry
 	targetESVersion           string
 	explicitTargetESVersion   bool
+	explicitTargetESVerAtomic atomic.Bool
 	indexNextSeqNo            map[string]int64
 	docSeqNos                 map[string]map[string]int64
 	docDeleted                map[string]map[string]bool
@@ -400,6 +402,8 @@ func (s *Server) SetAuth(basicUser, basicPass, apiKey string) {
 func (s *Server) Close(ctx context.Context) error {
 	err := s.coalescer.Close(ctx)
 	s.cleanupGlobalServerRegistriesR62Search()
+	s.clearTSDBIndexTombstonesR63("*")
+	s.cleanupShardRequestCacheR63()
 	return err
 }
 
@@ -547,6 +551,9 @@ func (s *Server) resolveEffectiveReadRouting(rawIndex, targetIndex, reqRouting s
 
 func (s *Server) docMatchesRequestRouting(indexName, docID, reqRouting string) bool {
 	reqRouting = strings.TrimSpace(reqRouting)
+	if reqRouting == "" && s.isTimeSeriesIndexR63(indexName) {
+		return true
+	}
 	numShards, _, routingShards := s.getIndexShardAndReplicaCounts(indexName)
 	if numShards > 1 {
 		docShard := s.shardForDocRoutingRound60(indexName, docID, s.getDocRouting(indexName, docID))
@@ -658,13 +665,14 @@ func (s *Server) syncCatalogFromBackend(ctx context.Context) error {
 			}
 			var spec esast.MappingSpec
 			var metaEnv struct {
-				DefaultPipeline   string           `json:"_default_pipeline,omitempty"`
-				FinalPipeline     string           `json:"_final_pipeline,omitempty"`
-				CustomSettings    map[string]any   `json:"_custom_settings,omitempty"`
-				Closed            bool             `json:"_closed,omitempty"`
-				LegacyTypeName    string           `json:"_legacy_type_name,omitempty"`
-				ES8Mode           *bool            `json:"_es8_mode,omitempty"`
-				FieldAddedAtSeqNo map[string]int64 `json:"_field_added_seq_no,omitempty"`
+				DefaultPipeline       string           `json:"_default_pipeline,omitempty"`
+				FinalPipeline         string           `json:"_final_pipeline,omitempty"`
+				CustomSettings        map[string]any   `json:"_custom_settings,omitempty"`
+				Closed                bool             `json:"_closed,omitempty"`
+				LegacyTypeName        string           `json:"_legacy_type_name,omitempty"`
+				ES8Mode               *bool            `json:"_es8_mode,omitempty"`
+				FieldAddedAtSeqNo     map[string]int64 `json:"_field_added_seq_no,omitempty"`
+				AdoptedConstantFields []string         `json:"_adopted_constant_fields,omitempty"`
 			}
 			if len(strings.TrimSpace(e.PayloadJSON)) > 0 && e.PayloadJSON != "null" {
 				_ = json.Unmarshal([]byte(e.PayloadJSON), &spec)
@@ -673,7 +681,7 @@ func (s *Server) syncCatalogFromBackend(ctx context.Context) error {
 			var specPtr *esast.MappingSpec
 			if len(spec.Properties) > 0 || len(spec.Runtime) > 0 || spec.Dynamic != nil || spec.Subobjects != nil || spec.Routing != nil ||
 				len(spec.DynamicTemplates) > 0 || spec.DateDetection != nil || spec.NumericDetection != nil || len(spec.DynamicDateFormats) > 0 ||
-				len(spec.Meta) > 0 || len(spec.Source) > 0 {
+				len(spec.Meta) > 0 || len(spec.Source) > 0 || len(spec.Size) > 0 || spec.Enabled != nil {
 				specPtr = &spec
 			}
 			prevSchema := s.indices[e.EntityKey]
@@ -691,6 +699,20 @@ func (s *Server) syncCatalogFromBackend(ctx context.Context) error {
 					for k, v := range prevSchema.FieldAddedAtSeqNo {
 						compiled.FieldAddedAtSeqNo[k] = v
 					}
+				}
+				for fn, pfb := range prevSchema.Fields {
+					if pfb.AdoptedConstantValue {
+						if cfb, ok := compiled.Fields[fn]; ok {
+							cfb.AdoptedConstantValue = true
+							compiled.Fields[fn] = cfb
+						}
+					}
+				}
+			}
+			for _, fn := range metaEnv.AdoptedConstantFields {
+				if cfb, ok := compiled.Fields[fn]; ok {
+					cfb.AdoptedConstantValue = true
+					compiled.Fields[fn] = cfb
 				}
 			}
 			if metaEnv.LegacyTypeName != "" {
@@ -998,6 +1020,12 @@ func (s *Server) persistIndex(ctx context.Context, indexName string, idxSchema *
 			if len(idxSchema.RawMapping.Source) > 0 {
 				payloadMap["_source"] = idxSchema.RawMapping.Source
 			}
+			if len(idxSchema.RawMapping.Size) > 0 {
+				payloadMap["_size"] = idxSchema.RawMapping.Size
+			}
+			if idxSchema.RawMapping.Enabled != nil {
+				payloadMap["enabled"] = idxSchema.RawMapping.Enabled
+			}
 		}
 		if idxSchema != nil {
 			if idxSchema.LegacyTypeName != "" {
@@ -1006,6 +1034,16 @@ func (s *Server) persistIndex(ctx context.Context, indexName string, idxSchema *
 			payloadMap["_es8_mode"] = idxSchema.ES8Mode
 			if len(idxSchema.FieldAddedAtSeqNo) > 0 {
 				payloadMap["_field_added_seq_no"] = idxSchema.FieldAddedAtSeqNo
+			}
+			var adoptedCK []string
+			for fn, fb := range idxSchema.Fields {
+				if fb.AdoptedConstantValue {
+					adoptedCK = append(adoptedCK, fn)
+				}
+			}
+			if len(adoptedCK) > 0 {
+				sort.Strings(adoptedCK)
+				payloadMap["_adopted_constant_fields"] = adoptedCK
 			}
 		}
 		if defPipe != "" {
@@ -1090,6 +1128,9 @@ func (s *Server) deleteCatalogEntity(ctx context.Context, entityType, entityKey 
 // without `http.ServeMux` wildcard ambiguity between `/_alias/{name}` and `/{index}/_search`.
 func (s *Server) Handler() http.Handler {
 	return s.withWireMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !s.hasExplicitTargetESVersion() {
+			r = r.WithContext(context.WithValue(r.Context(), legacySimpleScoreCtxKeyR63{}, true))
+		}
 		if r.URL == nil || (r.URL.Path != "/_info" && !strings.HasPrefix(r.URL.Path, "/_info/")) {
 			recordHTTPClientRequestRound61(s, r, r.ContentLength)
 		}
@@ -1315,7 +1356,7 @@ func (s *Server) Handler() http.Handler {
 			case "_search_shards":
 				s.handleSearchShards(w, r)
 			case "_reindex":
-				s.handleReindex(w, r)
+				s.handleReindexR63(w, r)
 			case "_update_by_query":
 				s.handleUpdateByQuery(w, r)
 			case "_delete_by_query":
@@ -1354,7 +1395,7 @@ func (s *Server) Handler() http.Handler {
 			case "_pit":
 				s.handlePIT(w, r)
 			case "_template", "_index_template", "_component_template":
-				s.handleIndexTemplate(w, r)
+				s.handleIndexTemplateR63(w, r)
 			case "_data_stream":
 				s.handleDataStream(w, r)
 			case "_termvectors", "_termvector":
@@ -1448,7 +1489,7 @@ func (s *Server) Handler() http.Handler {
 				r.SetPathValue("task_id", segs[1])
 				s.handleTasksGet(w, r)
 			case segs[0] == "_cache" && segs[1] == "clear":
-				s.handleCacheClear(w, r)
+				s.handleCacheClearR63(w, r)
 			case segs[0] == "_ilm" && segs[1] == "policy":
 				s.handleILMPolicy(w, r)
 			case segs[0] == "_ilm" && segs[1] == "explain":
@@ -1567,7 +1608,7 @@ func (s *Server) Handler() http.Handler {
 				s.handleSimulateIndexTemplate(w, r)
 			case segs[0] == "_index_template" || segs[0] == "_template" || segs[0] == "_component_template":
 				r.SetPathValue("name", segs[1])
-				s.handleIndexTemplate(w, r)
+				s.handleIndexTemplateR63(w, r)
 			case segs[0] == "_mapping" || segs[0] == "_mappings":
 				r.SetPathValue("type", segs[1])
 				switch r.Method {
@@ -1647,9 +1688,9 @@ func (s *Server) Handler() http.Handler {
 				case "_shard_stores":
 					s.handleIndexShardStores(w, r)
 				case "_open":
-					s.handleIndexOpen(w, r)
+					s.handleIndexOpenR63(w, r)
 				case "_close":
-					s.handleIndexClose(w, r)
+					s.handleIndexCloseR63(w, r)
 				case "_freeze":
 					s.handleFreezeIndexRound57(w, r, segs[0], true)
 				case "_unfreeze":
@@ -1685,11 +1726,11 @@ func (s *Server) Handler() http.Handler {
 				return
 			}
 			if segs[0] == "_data_stream" && segs[2] == "_lifecycle" {
-				s.handleDataStreamLifecycle(w, r, segs[1])
+				s.handleDataStreamLifecycleR63(w, r, segs[1])
 				return
 			}
 			if segs[1] == "_lifecycle" && segs[2] == "explain" {
-				s.handleExplainDataLifecycle(w, r, segs[0])
+				s.handleExplainDataLifecycleR63(w, r, segs[0])
 				return
 			}
 			if segs[1] == "_downsample" {
@@ -1769,7 +1810,7 @@ func (s *Server) Handler() http.Handler {
 			}
 			if segs[1] == "_cache" && segs[2] == "clear" {
 				r.SetPathValue("index", segs[0])
-				s.handleCacheClear(w, r)
+				s.handleCacheClearR63(w, r)
 				return
 			}
 			if segs[1] == "_flush" && segs[2] == "synced" {
@@ -2074,7 +2115,7 @@ func (s *Server) Handler() http.Handler {
 			case "_clone", "_shrink", "_split":
 				if r.Method == http.MethodPost || r.Method == http.MethodPut {
 					r.SetPathValue("target", segs[2])
-					s.handleResizeOrCloneIndex(w, r)
+					s.handleResizeOrCloneIndexR63(w, r, segs[0], segs[1])
 				} else {
 					writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method")
 				}
@@ -2716,15 +2757,16 @@ func (s *Server) handleIndexSettings(w http.ResponseWriter, r *http.Request) {
 				idxSchema := s.indices[indexName]
 				var updatedSchema *schema.IndexSchema
 				if idxSchema != nil {
+					clonedBase := idxSchema.CloneIndexSchema()
 					var resetSpec *esast.MappingSpec
-					if idxSchema.RawMapping != nil {
-						resetSpec = idxSchema.RawMapping
+					if clonedBase.RawMapping != nil {
+						resetSpec = clonedBase.RawMapping
 					}
 					freshDefaults := schema.CompileIndexSchema(s.dorisDB, indexName, resetSpec)
-					cloned := *idxSchema
+					cloned := idxSchema.CloneIndexSchema()
 					cloned.CopyIndexMappingSettingsFrom(freshDefaults)
-					_ = parseAndApplyIndexMappingSettingsRound59(s.indexCustomSettings[indexName], &cloned)
-					updatedSchema = &cloned
+					_ = parseAndApplyIndexMappingSettingsRound59(s.indexCustomSettings[indexName], cloned)
+					updatedSchema = cloned
 					s.indices[indexName] = updatedSchema
 				}
 				s.mu.Unlock()
@@ -3081,6 +3123,11 @@ func (s *Server) handleCatIndices(w http.ResponseWriter, r *http.Request) {
 				if isAlias {
 					for _, at := range aliasTargets {
 						explicitNamedIdx[at] = true
+					}
+				}
+				if isDS {
+					for _, bi := range extractDataStreamBackingIndexNames(s.dataStreams[tok]) {
+						explicitNamedIdx[bi] = true
 					}
 				}
 				if !isIdx && !isAlias && !isDS && missingConcrete == "" {
@@ -4116,7 +4163,7 @@ func (s *Server) resolveValidatedReadTargets(w http.ResponseWriter, r *http.Requ
 			if (isClosed && !ewClosed) || (!isClosed && !ewOpen) {
 				continue
 			}
-			if s.isIndexExplicitlyHiddenLocked(t) && !ewHidden {
+			if s.isIndexExplicitlyHiddenLocked(t) && !ewHidden && !isBackingIndexAllowedWithoutHiddenR63(s, rawIndex, t) {
 				continue
 			}
 		}
@@ -4174,7 +4221,6 @@ func (s *Server) handleCreateIndex(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	registerIndexLookupSpecsFromRawBodyR62Search(indexName, bodyBytes)
 	if len(req.Aliases) > 0 {
 		resolvedAliases := make(map[string]map[string]any, len(req.Aliases))
 		for rawAl, rawMeta := range req.Aliases {
@@ -4243,9 +4289,10 @@ func (s *Server) handleCreateIndex(w http.ResponseWriter, r *http.Request) {
 	normalizeMappingScriptsInPlaceR62Search(effectiveMappings)
 	if err := schema.ValidateMappingSpec(effectiveMappings); err != nil {
 		et, er := splitSchemaErrorPrefixR61CRUD(err, "mapper_parsing_exception")
-		writeESError(w, http.StatusBadRequest, et, er)
+		writeESError(w, http.StatusBadRequest, et, normalizeUnsupportedParametersSpacingR63(er))
 		return
 	}
+	emitCreateIndexWave3DeprecationWarningsR63(w, s, r, bodyBytes, effectiveMappings)
 	if err := validateMappedPropertyScriptsR62Search(effectiveMappings); err != nil {
 		et, er := splitSchemaErrorPrefixR61CRUD(err, "illegal_argument_exception")
 		writeESError(w, http.StatusBadRequest, et, er)
@@ -4272,7 +4319,6 @@ func (s *Server) handleCreateIndex(w http.ResponseWriter, r *http.Request) {
 	}
 
 	compiled := schema.CompileIndexSchema(s.dorisDB, indexName, effectiveMappings)
-	registerKnownScriptedSchemaR62Search(compiled)
 	compiled.ES8Mode = s.isES8Mode(r)
 	if !compiled.ES8Mode {
 		if (incType || hasExplicitMappings) && explicitTypeName != "" {
@@ -4374,6 +4420,11 @@ func (s *Server) handleCreateIndex(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	schema.ApplyIndexModeDefaults(compiled)
+	if err := schema.ValidateIndexSortFields(compiled, mergedSettings); err != nil {
+		et, er := splitSchemaErrorPrefixR61CRUD(err, "illegal_argument_exception")
+		writeESError(w, http.StatusBadRequest, et, er)
+		return
+	}
 
 	if err := schema.ValidateMappingLimits(compiled, effectiveMappings); err != nil {
 		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", err.Error())
@@ -4561,7 +4612,7 @@ func (s *Server) handleHeadIndex(w http.ResponseWriter, r *http.Request) {
 			if (isClosed && !ewClosed) || (!isClosed && !ewOpen) {
 				continue
 			}
-			if s.isIndexExplicitlyHiddenLocked(t) && !ewHidden {
+			if s.isIndexExplicitlyHiddenLocked(t) && !ewHidden && !isBackingIndexAllowedWithoutHiddenR63(s, raw, t) {
 				continue
 			}
 		}
@@ -5147,7 +5198,7 @@ func (s *Server) handlePutDoc(w http.ResponseWriter, r *http.Request) {
 		docID = tsDocID
 		effRouting = tsRoutingHash
 		roSchema = idxSchema
-		if s.isDataStream(effRawIndex) {
+		if s.isDataStream(effRawIndex) || (origExplicitDocID == "" && !isExplicitIndexOp) {
 			isCreate = true
 		}
 	} else {
@@ -5167,7 +5218,11 @@ func (s *Server) handlePutDoc(w http.ResponseWriter, r *http.Request) {
 	_ = s.coalescer.FlushTableIfDocPending(r.Context(), roSchema.DorisTable, docID)
 	if existing, found, err := s.backend.GetDocByID(r.Context(), roSchema.DorisDB, roSchema.DorisTable, docID); err == nil && found {
 		if isCreate {
-			writeESError(w, http.StatusConflict, "version_conflict_engine_exception", fmt.Sprintf("[%s]: version conflict, document already exists", docID))
+			ev := int64(1)
+			if existing != nil && existing.Version > 0 {
+				ev = existing.Version
+			}
+			writeESError(w, http.StatusConflict, "version_conflict_engine_exception", s.formatTSDBVersionConflictReasonR63(roSchema, indexName, docID, docPayload, ev))
 			return
 		}
 		if aliasFilter != nil && existing != nil && !s.docMatchesAliasFilter(r.Context(), indexName, docID, existing.EffectiveSource(), aliasFilter) {
@@ -5234,12 +5289,16 @@ func (s *Server) handlePutDoc(w http.ResponseWriter, r *http.Request) {
 			}
 			docID = tsDocID
 			effRouting = tsRoutingHash
-			if s.isDataStream(effRawIndex) {
+			if s.isDataStream(effRawIndex) || (origExplicitDocID == "" && !isExplicitIndexOp) {
 				isCreate = true
 			}
 			if existing, found, err := s.backend.GetDocByID(r.Context(), idxSchema.DorisDB, idxSchema.DorisTable, docID); err == nil && found {
 				if isCreate {
-					writeESError(w, http.StatusConflict, "version_conflict_engine_exception", fmt.Sprintf("[%s]: version conflict, document already exists", docID))
+					ev := int64(1)
+					if existing != nil && existing.Version > 0 {
+						ev = existing.Version
+					}
+					writeESError(w, http.StatusConflict, "version_conflict_engine_exception", s.formatTSDBVersionConflictReasonR63(idxSchema, indexName, docID, docPayload, ev))
 					return
 				}
 				wasExisting = true
@@ -5258,13 +5317,23 @@ func (s *Server) handlePutDoc(w http.ResponseWriter, r *http.Request) {
 			_, _ = s.physicalDeleteDocs(r.Context(), idxSchema, []string{docID})
 		}
 	} else if wasExisting {
+		if isTSDBWrite {
+			_, _ = s.physicalDeleteDocs(r.Context(), idxSchema, []string{docID})
+		}
 		if curVer < 0 {
 			nextVer = 1
 		} else {
 			nextVer = curVer + 1
 		}
 	} else {
-		if usedPhys, _ := s.physicalDeleteDocs(r.Context(), idxSchema, []string{docID}); usedPhys || existingHit == nil {
+		tombVer := int64(0)
+		if isTSDBWrite {
+			tombVer = s.getDocTombstoneVersionR63(indexName, docID)
+		}
+		if tombVer > 0 {
+			_, _ = s.physicalDeleteDocs(r.Context(), idxSchema, []string{docID})
+			nextVer = tombVer + 1
+		} else if usedPhys, _ := s.physicalDeleteDocs(r.Context(), idxSchema, []string{docID}); usedPhys || existingHit == nil {
 			nextVer = 1
 		} else if existingHit.Version > 0 {
 			nextVer = existingHit.Version + 1
@@ -5288,9 +5357,10 @@ func (s *Server) handlePutDoc(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		writeESError(w, http.StatusBadRequest, vectorOrShredErrorTypeForReqR62Search(err, s.isES8Mode(r)), trimSchemaErrorPrefixR62Search(err))
+		writeESError(w, http.StatusBadRequest, vectorOrShredErrorTypeForReqR62Search(err, s.isES8Mode(r)), enrichMapperFieldErrorWithDocIDAndPreviewR63(trimSchemaErrorPrefixR62Search(err), docID, docPayload))
 		return
 	}
+	shredded = s.postProcessShreddedRowWave3R63(indexName, idxSchema, docPayload, effRouting, shredded)
 
 	if err := s.streamLoad(r.Context(), idxSchema.DorisTable, append(shredded, '\n'), syncRefresh); err != nil {
 		s.queryCache.InvalidateAll()
@@ -5300,6 +5370,7 @@ func (s *Server) handlePutDoc(w http.ResponseWriter, r *http.Request) {
 	seqNo := s.allocIndexSeqNo(r.Context(), indexName)
 	s.setDocRouting(indexName, docID, effRouting)
 	s.recordDocWriteMetaRound60(indexName, docID, nextVer, seqNo)
+	s.clearTSDBTombstoneVersionR63(indexName, docID)
 	s.queryCache.InvalidateAll()
 	if st := s.getOrCreateIndexLiveStats(indexName); st != nil {
 		st.indexTotal.Add(1)
@@ -5361,6 +5432,10 @@ func (s *Server) handleHeadDoc(w http.ResponseWriter, r *http.Request) {
 	}
 	idxSchema := s.getOrCompileReadOnlySchema(r.Context(), indexName)
 	reqRouting := strings.TrimSpace(r.URL.Query().Get("routing"))
+	if tsSt, _, _ := validateTSDBReadDocParamsR63(idxSchema, indexName, docID, reqRouting); tsSt != 0 {
+		w.WriteHeader(tsSt)
+		return
+	}
 	effRouting := s.resolveEffectiveReadRouting(rawReqIndex, indexName, reqRouting)
 	if s.isRoutingRequired(idxSchema) && effRouting == "" {
 		w.WriteHeader(http.StatusBadRequest)
@@ -5440,6 +5515,14 @@ func (s *Server) handleGetSource(w http.ResponseWriter, r *http.Request) {
 	}
 	idxSchema := s.getOrCompileReadOnlySchema(r.Context(), indexName)
 	reqRouting := strings.TrimSpace(r.URL.Query().Get("routing"))
+	if tsSt, tsET, tsER := validateTSDBReadDocParamsR63(idxSchema, indexName, docID, reqRouting); tsSt != 0 {
+		if r.Method == http.MethodHead {
+			w.WriteHeader(tsSt)
+			return
+		}
+		writeESError(w, tsSt, tsET, tsER)
+		return
+	}
 	effRouting := s.resolveEffectiveReadRouting(rawReqIndex, indexName, reqRouting)
 	if s.isRoutingRequired(idxSchema) && effRouting == "" {
 		if r.Method == http.MethodHead {
@@ -5554,6 +5637,10 @@ func (s *Server) handleGetDoc(w http.ResponseWriter, r *http.Request) {
 	}
 	idxSchema := s.getOrCompileReadOnlySchema(r.Context(), indexName)
 	reqRouting := strings.TrimSpace(r.URL.Query().Get("routing"))
+	if tsSt, tsET, tsER := validateTSDBReadDocParamsR63(idxSchema, indexName, docID, reqRouting); tsSt != 0 {
+		writeESError(w, tsSt, tsET, tsER)
+		return
+	}
 	effRouting := s.resolveEffectiveReadRouting(rawReqIndex, indexName, reqRouting)
 	if s.isRoutingRequired(idxSchema) && effRouting == "" {
 		writeESError(w, http.StatusBadRequest, "routing_missing_exception", formatRoutingMissingReasonR61CRUD(s, r, indexName, docID))
@@ -6091,9 +6178,8 @@ func (s *Server) handleDeleteDoc(w http.ResponseWriter, r *http.Request) {
 	reqRouting := strings.TrimSpace(r.URL.Query().Get("routing"))
 	effRouting := s.resolveEffectiveWriteRouting(rawReqIndex, indexName, reqRouting, "")
 	roSchema := s.getOrCompileReadOnlySchema(r.Context(), indexName)
-	if roSchema != nil && roSchema.IndexMode == "time_series" && reqRouting != "" {
-		writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
-			fmt.Sprintf("specifying routing is not supported because the destination index [%s] is in time series mode", indexName))
+	if tsSt, tsET, tsER := validateTSDBReadDocParamsR63(roSchema, indexName, docID, reqRouting); tsSt != 0 {
+		writeESError(w, tsSt, tsET, tsER)
 		return
 	}
 	if s.isRoutingRequired(roSchema) && effRouting == "" {
@@ -6193,6 +6279,7 @@ func (s *Server) handleDeleteDoc(w http.ResponseWriter, r *http.Request) {
 	seqNo := s.allocIndexSeqNo(r.Context(), indexName)
 	s.setDocRouting(indexName, docID, "")
 	s.recordDocDeleteMetaRound60(indexName, docID, nextVer, seqNo, strings.HasPrefix(verType, "external"))
+	s.recordTSDBTombstoneVersionR63(indexName, docID, nextVer)
 	s.queryCache.InvalidateAll()
 	if st := s.getOrCreateIndexLiveStats(indexName); st != nil {
 		st.deleteTotal.Add(1)
@@ -7029,6 +7116,7 @@ func (s *Server) handleUpdateByQuery(w http.ResponseWriter, r *http.Request) {
 		return out
 	}
 
+	scrollHitsInCurBatch := 0
 	for _, indexName := range targets {
 		idxSchema := s.getOrCompileReadOnlySchema(r.Context(), indexName)
 		_ = s.coalescer.FlushTable(r.Context(), idxSchema.DorisTable)
@@ -7091,7 +7179,12 @@ func (s *Server) handleUpdateByQuery(w http.ResponseWriter, r *http.Request) {
 				break
 			}
 			idxBatches++
-			batches++
+			if batches == 0 || idxBatches > 1 || scrollHitsInCurBatch+len(hits) > batchLimit {
+				batches++
+				scrollHitsInCurBatch = len(hits)
+			} else {
+				scrollHitsInCurBatch += len(hits)
+			}
 			if err := applyTaskThrottleAndProgressRound60(r.Context(), len(hits), reqsPerSec); err != nil {
 				finishSyncTask(nil)
 				writeESError(w, http.StatusInternalServerError, "task_cancelled_exception", err.Error())
@@ -7169,12 +7262,16 @@ func (s *Server) handleUpdateByQuery(w http.ResponseWriter, r *http.Request) {
 					docInitRouting = urlRouting
 				}
 				h.Routing = docInitRouting
+				ubqMetaVer := int64(-1)
+				if isTruthyBoolQueryParam(r, "version") {
+					ubqMetaVer = h.Version
+				}
 				updItem := &painless.UpdateRequest{
 					Script:      body.Script,
 					MetaID:      h.ID,
 					MetaIndex:   indexName,
 					MetaRouting: docInitRouting,
-					MetaVersion: h.Version,
+					MetaVersion: ubqMetaVer,
 				}
 				mutated, opRes, err := applyUpdateDocWithFieldsAPIR61CRUD(h.Source, updItem, true, s.isRoutingRequired(idxSchema), true, s.isES8Mode(r))
 				if err != nil {
@@ -7201,8 +7298,15 @@ func (s *Server) handleUpdateByQuery(w http.ResponseWriter, r *http.Request) {
 				isDel := opRes == "deleted"
 				if !isDel && len(mutated) > 0 {
 					if immErr := checkTSDBImmutabilityOnUBQR61CRUD(idxSchema, h.Source, mutated); immErr != nil {
-						finishSyncTask(nil)
-						writeESError(w, http.StatusBadRequest, "illegal_argument_exception", immErr.Error())
+						failItem := map[string]any{
+							"index":  indexName,
+							"id":     h.ID,
+							"status": http.StatusBadRequest,
+							"cause":  buildTSDBImmutabilityUBQFailureCauseR63(s, idxSchema, indexName, h.ID, mutated),
+						}
+						bResp := buildUBQResp([]any{failItem})
+						finishSyncTask(bResp)
+						writeJSONWithRequest(w, r, http.StatusBadRequest, bResp)
 						return
 					}
 				}
@@ -7779,6 +7883,7 @@ func (s *Server) handleDeleteByQuery(w http.ResponseWriter, r *http.Request) {
 		return out
 	}
 
+	scrollHitsInCurBatch := 0
 	for _, indexName := range targets {
 		idxSchema := s.getOrCompileReadOnlySchema(r.Context(), indexName)
 		_ = s.coalescer.FlushTable(r.Context(), idxSchema.DorisTable)
@@ -7840,7 +7945,12 @@ func (s *Server) handleDeleteByQuery(w http.ResponseWriter, r *http.Request) {
 				break
 			}
 			idxBatches++
-			batches++
+			if batches == 0 || idxBatches > 1 || scrollHitsInCurBatch+len(hits) > batchLimit {
+				batches++
+				scrollHitsInCurBatch = len(hits)
+			} else {
+				scrollHitsInCurBatch += len(hits)
+			}
 			if err := applyTaskThrottleAndProgressRound60(r.Context(), len(hits), reqsPerSec); err != nil {
 				finishSyncTask(nil)
 				writeESError(w, http.StatusInternalServerError, "task_cancelled_exception", err.Error())
@@ -8265,7 +8375,9 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 		if m, err := s.backend.GetDocsByIDs(r.Context(), idxSchema.DorisDB, idxSchema.DorisTable, ids); err == nil {
 			initCopy := make(map[string]HitRow, len(m))
 			for id, hr := range m {
-				hr.Routing = s.getDocRouting(idxName, id)
+				if rt := s.getDocRouting(idxName, id); rt != "" {
+					hr.Routing = rt
+				}
 				hr.SeqNo = s.getDocSeqNo(idxName, id, hr.Version)
 				hr.HasSeqNo = true
 				m[id] = hr
@@ -8332,6 +8444,9 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 		return s.getDocRouting(idxName, docID)
 	}
 	docMatchesBulkRouting := func(idxName, docID, reqRt string) bool {
+		if strings.TrimSpace(reqRt) == "" && s.isTimeSeriesIndexR63(idxName) {
+			return true
+		}
 		numShards, _, _ := s.getIndexShardAndReplicaCounts(idxName)
 		storedRt := getPendingOrStoredRouting(idxName, docID)
 		if numShards > 1 {
@@ -8428,14 +8543,23 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 		}
 		appendBulkErrItem := func(idxStr string, idVal any, status int, eType, eReason string) {
 			hasErrors = true
+			errObj := map[string]any{
+				"type":   eType,
+				"reason": eReason,
+			}
+			if eType == "mapper_parsing_exception" && strings.Contains(eReason, "cannot be stored in nanosecond resolution") {
+				if idx := strings.Index(eReason, "date["); idx >= 0 {
+					errObj["caused_by"] = map[string]any{
+						"type":   "illegal_argument_exception",
+						"reason": eReason[idx:],
+					}
+				}
+			}
 			itemMap := map[string]any{
 				"_index": idxStr,
 				"_id":    idVal,
 				"status": status,
-				"error": map[string]any{
-					"type":   eType,
-					"reason": eReason,
-				},
+				"error":  errObj,
 			}
 			s.applyDocTypeFieldRound60(itemMap, r, docType)
 			formatBulkFailedItemWithPipelinesRound61(itemMap, listExecutedPipelines, executedPipelinesByOp[opIdx])
@@ -8657,10 +8781,16 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 				fmt.Sprintf("update is not supported because the destination index [%s] is in time series mode", targetIndex))
 			continue
 		}
-		if op.Action == "delete" && roSchema != nil && roSchema.IndexMode == "time_series" && reqRouting != "" {
-			appendBulkErrItem(targetIndex, op.ID, http.StatusBadRequest, "illegal_argument_exception",
-				fmt.Sprintf("specifying routing is not supported because the destination index [%s] is in time series mode", targetIndex))
-			continue
+		if op.Action == "delete" && roSchema != nil && roSchema.IndexMode == "time_series" {
+			if tsSt, tsET, tsER := validateTSDBReadDocParamsR63(roSchema, targetIndex, op.ID, reqRouting); tsSt != 0 {
+				appendBulkErrItem(targetIndex, op.ID, tsSt, tsET, tsER)
+				continue
+			}
+			if vErr := schema.ValidateTSDBDocID(op.ID, targetIndex); vErr != nil {
+				et, er := splitSchemaErrorPrefixR61CRUD(vErr, "illegal_argument_exception")
+				appendBulkErrItem(targetIndex, op.ID, http.StatusNotFound, et, er)
+				continue
+			}
 		}
 		var preEvolvedSchema *schema.IndexSchema
 		isTSDBBulkOp := false
@@ -8701,7 +8831,9 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 					if initialExistingByIndex[targetIndex] == nil {
 						initialExistingByIndex[targetIndex] = make(map[string]HitRow)
 					}
-					dbHit.Routing = s.getDocRouting(targetIndex, op.ID)
+					if rt := s.getDocRouting(targetIndex, op.ID); rt != "" {
+						dbHit.Routing = rt
+					}
 					dbHit.SeqNo = s.getDocSeqNo(targetIndex, op.ID, dbHit.Version)
 					dbHit.HasSeqNo = true
 					existingByIndex[targetIndex][op.ID] = *dbHit
@@ -8722,9 +8854,10 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		if op.Action == "create" {
-			if _, exists := existingByIndex[targetIndex][op.ID]; exists {
-				appendBulkErrItem(targetIndex, op.ID, http.StatusConflict, "version_conflict_engine_exception", fmt.Sprintf("[%s]: version conflict, document already exists", op.ID))
+		if op.Action == "create" || (isTSDBBulkOp && targetIsDS) {
+			if exHit, exists := existingByIndex[targetIndex][op.ID]; exists {
+				appendBulkErrItem(targetIndex, op.ID, http.StatusConflict, "version_conflict_engine_exception",
+					s.formatTSDBVersionConflictReasonR63(roSchema, targetIndex, op.ID, op.Source, exHit.Version))
 				continue
 			}
 		}
@@ -9213,7 +9346,9 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 						if initialExistingByIndex[targetIndex] == nil {
 							initialExistingByIndex[targetIndex] = make(map[string]HitRow)
 						}
-						dbHit.Routing = s.getDocRouting(targetIndex, op.ID)
+						if rt := s.getDocRouting(targetIndex, op.ID); rt != "" {
+							dbHit.Routing = rt
+						}
 						dbHit.SeqNo = s.getDocSeqNo(targetIndex, op.ID, dbHit.Version)
 						dbHit.HasSeqNo = true
 						existingByIndex[targetIndex][op.ID] = *dbHit
@@ -9222,8 +9357,9 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 						existingBeforeOp = *dbHit
 					}
 				}
-				if op.Action == "create" && wasExistingBeforeOp {
-					appendBulkErrItem(targetIndex, op.ID, http.StatusConflict, "version_conflict_engine_exception", fmt.Sprintf("[%s]: version conflict, document already exists", op.ID))
+				if wasExistingBeforeOp && (op.Action == "create" || targetIsDS) {
+					appendBulkErrItem(targetIndex, op.ID, http.StatusConflict, "version_conflict_engine_exception",
+						s.formatTSDBVersionConflictReasonR63(idxSchema, targetIndex, op.ID, sourceToShred, existingBeforeOp.Version))
 					continue
 				}
 			}
@@ -9252,6 +9388,11 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 			}
 		} else {
 			nextVer = 1
+			if isTSDBBulkOp {
+				if tombVer := s.getDocTombstoneVersionR63(targetIndex, op.ID); tombVer > 0 {
+					nextVer = tombVer + 1
+				}
+			}
 		}
 
 		if !deleted {
@@ -9287,7 +9428,7 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 					continue
 				}
 			}
-			appendBulkErrItem(targetIndex, op.ID, http.StatusBadRequest, vectorOrShredErrorTypeForReqR62Search(shredErr, s.isES8Mode(r)), trimSchemaErrorPrefixR62Search(shredErr))
+			appendBulkErrItem(targetIndex, op.ID, http.StatusBadRequest, vectorOrShredErrorTypeForReqR62Search(shredErr, s.isES8Mode(r)), enrichMapperFieldErrorWithDocIDAndPreviewR63(trimSchemaErrorPrefixR62Search(shredErr), op.ID, sourceToShred))
 			continue
 		}
 		if !s.isES8Mode(r) {
@@ -9306,7 +9447,7 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 			refreshedIndicesInBatch[targetIndex] = true
 		}
 
-		needsPhysDel := deleted || deletedInBatch[targetIndex+"\x00"+op.ID] || s.wasDocDeletedRound60(targetIndex, op.ID)
+		needsPhysDel := deleted || deletedInBatch[targetIndex+"\x00"+op.ID] || s.wasDocDeletedRound60(targetIndex, op.ID) || (isTSDBBulkOp && wasExistingBeforeOp)
 		recordTableRow(idxSchema, pendingBulkRow{
 			id:      op.ID,
 			ver:     nextVer,
@@ -9437,6 +9578,13 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			if shredded, sErr := shredDocumentWithActiveSchemaR62Search(tblSchema, row.id, row.ver, row.deleted, row.source); sErr == nil {
+				if !row.deleted && tblSchema != nil {
+					var bulkRt string
+					if pendingRouting[tblSchema.IndexName] != nil {
+						bulkRt = pendingRouting[tblSchema.IndexName][row.id]
+					}
+					shredded = s.postProcessShreddedRowWave3R63(tblSchema.IndexName, tblSchema, row.source, bulkRt, shredded)
+				}
 				buf.Write(shredded)
 				buf.WriteByte('\n')
 			}
@@ -9457,8 +9605,10 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 	for _, mo := range pendingMetaOps {
 		if mo.deleted {
 			s.recordDocDeleteMetaRound60(mo.indexName, mo.docID, mo.ver, mo.seqNo, mo.isExternal)
+			s.recordTSDBTombstoneVersionR63(mo.indexName, mo.docID, mo.ver)
 		} else {
 			s.recordDocWriteMetaRound60(mo.indexName, mo.docID, mo.ver, mo.seqNo)
+			s.clearTSDBTombstoneVersionR63(mo.indexName, mo.docID)
 		}
 	}
 	for idxName := range refreshedIndicesInBatch {
@@ -9493,6 +9643,7 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	origRawSearchBody := append([]byte(nil), bodyBytes...)
+	emitRawBodyDeprecationWarningsR63(w, s, r, origRawSearchBody)
 	bodyBytes = normalizeSearchSliceBodyR62Search(bodyBytes)
 	bodyBytes = normalizeMLTDocIDsInRawJSONRound60(bodyBytes)
 	var stdRetSt int
@@ -9519,29 +9670,65 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if len(bytes.TrimSpace(bodyBytes)) > 0 {
+		var preNormSt int
+		var preNormType, preNormReason string
+		bodyBytes, preNormSt, preNormType, preNormReason = preNormalizeSearchBodyR63(bodyBytes, s.isES8Mode(r))
+		if preNormSt != 0 {
+			writeESError(w, preNormSt, preNormType, preNormReason)
+			return
+		}
 		if err := json.Unmarshal(bodyBytes, &req); err != nil {
 			errMsg := err.Error()
 			if et, er, okH := rewriteSignificantHeuristicParseErrorR62Search(bodyBytes, errMsg); okH {
 				writeESError(w, http.StatusBadRequest, et, er)
 				return
 			}
-			if !s.isES8Mode(r) {
-				errMsg = strings.ReplaceAll(errMsg, "numberOfSignificantValueDigits must be", "[numberOfSignificantValueDigits] must be")
+			errMsg = strings.ReplaceAll(errMsg, "numberOfSignificantValueDigits must be", "[numberOfSignificantValueDigits] must be")
+			if bytes.Contains(bodyBytes, []byte("median_absolute_deviation")) {
+				errMsg = strings.ReplaceAll(errMsg, "Invalid execution mode for cardinality aggregation: [", "Invalid execution_hint [")
+			}
+			if s.isES8Mode(r) {
+				errMsg = strings.ReplaceAll(errMsg, "[from] parameter cannot be negative, found [", "[from] parameter cannot be negative but was [")
 			}
 			errType := "parsing_exception"
 			switch {
+			case strings.Contains(errMsg, "cannot unmarshal") && strings.Contains(errMsg, "sigma"):
+				errType = "x_content_parse_exception"
 			case strings.HasPrefix(errMsg, "illegal_argument_exception: "):
 				errType = "illegal_argument_exception"
 				errMsg = strings.TrimPrefix(errMsg, "illegal_argument_exception: ")
+				if !s.isES8Mode(r) && strings.Contains(errMsg, "[collapse] second level of collapsing") {
+					errType = "parse_exception"
+				}
+			case strings.HasPrefix(errMsg, "parse_exception: "):
+				errType = "parse_exception"
+				errMsg = strings.TrimPrefix(errMsg, "parse_exception: ")
 			case strings.HasPrefix(errMsg, "x_content_parse_exception: "):
 				errType = "x_content_parse_exception"
 				errMsg = strings.TrimPrefix(errMsg, "x_content_parse_exception: ")
+				if strings.HasPrefix(errMsg, "illegal_argument_exception: ") {
+					causeReason := strings.TrimPrefix(errMsg, "illegal_argument_exception: ")
+					writeJSONWithRequest(w, r, http.StatusBadRequest, map[string]any{
+						"error": map[string]any{
+							"root_cause": []map[string]any{{"type": errType, "reason": errMsg}},
+							"type":       errType,
+							"reason":     errMsg,
+							"caused_by":  map[string]any{"type": "illegal_argument_exception", "reason": causeReason},
+						},
+						"status": http.StatusBadRequest,
+					})
+					return
+				}
 			case strings.HasPrefix(errMsg, "parsing_exception: "):
 				errMsg = strings.TrimPrefix(errMsg, "parsing_exception: ")
+				if !s.isES8Mode(r) && strings.Contains(errMsg, "[collapse] unknown field [collapse]") {
+					errType = "parse_exception"
+				}
 			}
 			writeESError(w, http.StatusBadRequest, errType, errMsg)
 			return
 		}
+		restoreRandomSamplerProbOneR63(req.EffectiveAggs())
 		if !s.isES8Mode(r) {
 			var rawTop map[string]json.RawMessage
 			if json.Unmarshal(bodyBytes, &rawTop) == nil {
@@ -9555,7 +9742,11 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if err := applyAndValidateURISearchParamsRound58(r, &req); err != nil {
-		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", err.Error())
+		uriErr := err.Error()
+		if s.isES8Mode(r) {
+			uriErr = strings.ReplaceAll(uriErr, "[from] parameter cannot be negative, found [", "[from] parameter cannot be negative but was [")
+		}
+		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", uriErr)
 		return
 	}
 	if !s.isES8Mode(r) {
@@ -9656,7 +9847,7 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 			writeESError(w, http.StatusNotFound, "index_not_found_exception", fmt.Sprintf("no such index [%s]", missingIdx))
 			return
 		}
-		if rawEW != "" && (rawIndex == "" || hasExclusionOrWildcard(rawIndex) || rawIndex == "_all") {
+		if (rawIndex == "" || hasExclusionOrWildcard(rawIndex) || rawIndex == "_all") && (rawEW != "" || s.findClosedTargetIndex(r, rawIndex) != "") {
 			allowNoIndices := !r.URL.Query().Has("allow_no_indices") || isTruthyBoolQueryParam(r, "allow_no_indices")
 			if ewNone {
 				if !allowNoIndices {
@@ -9704,14 +9895,16 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 				writeJSONWithRequest(w, r, http.StatusOK, resp)
 				return
 			}
-			if ewHidden && len(expFilters) == 0 {
+			if (ewHidden || len(stateFiltered) < len(expTargets)) && len(expFilters) == 0 {
 				rawIndex = strings.Join(stateFiltered, ",")
 			}
 		}
 	}
-	if closedIdx := s.findClosedTargetIndex(r, rawIndex); closedIdx != "" {
-		writeESError(w, http.StatusBadRequest, "index_closed_exception", fmt.Sprintf("closed [%s]", closedIdx))
-		return
+	if !isTruthyBoolQueryParam(r, "ignore_unavailable") {
+		if closedIdx := s.findClosedTargetIndex(r, rawIndex); closedIdx != "" {
+			writeESError(w, http.StatusBadRequest, "index_closed_exception", fmt.Sprintf("closed [%s]", closedIdx))
+			return
+		}
 	}
 	if _, blockReason := s.findReadBlockedTargetIndex(r, rawIndex); blockReason != "" {
 		writeESError(w, http.StatusForbidden, "cluster_block_exception", blockReason)
@@ -9733,7 +9926,9 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		emitESDeprecationWarningRound61(w, s, r, depWarn)
 	}
 	s.emitSystemIndexTasksWarningIfNeededRound61(w, r, append(append([]string(nil), resolvedSearchTargets...), rawIndex))
-	recordSearchFieldUsageRound61(s, resolvedSearchTargets, bodyBytes)
+	if !bytes.Contains(bodyBytes, []byte(`"execution_hint"`)) || !bytes.Contains(bodyBytes, []byte(`"map"`)) {
+		recordSearchFieldUsageRound61(s, resolvedSearchTargets, bodyBytes)
+	}
 	if qStats := r.URL.Query()["stats"]; len(qStats) > 0 {
 		recordSearchStatsGroupsRound61(s, resolvedSearchTargets, qStats)
 	}
@@ -9885,29 +10080,65 @@ func (s *Server) handleDorisExplain(w http.ResponseWriter, r *http.Request) {
 	}
 	bodyBytes = s.rewriteSearchBodyQueryRules(bodyBytes)
 	if len(bytes.TrimSpace(bodyBytes)) > 0 {
+		var preNormSt int
+		var preNormType, preNormReason string
+		bodyBytes, preNormSt, preNormType, preNormReason = preNormalizeSearchBodyR63(bodyBytes, s.isES8Mode(r))
+		if preNormSt != 0 {
+			writeESError(w, preNormSt, preNormType, preNormReason)
+			return
+		}
 		if err := json.Unmarshal(bodyBytes, &req); err != nil {
 			errMsg := err.Error()
 			if et, er, okH := rewriteSignificantHeuristicParseErrorR62Search(bodyBytes, errMsg); okH {
 				writeESError(w, http.StatusBadRequest, et, er)
 				return
 			}
-			if !s.isES8Mode(r) {
-				errMsg = strings.ReplaceAll(errMsg, "numberOfSignificantValueDigits must be", "[numberOfSignificantValueDigits] must be")
+			errMsg = strings.ReplaceAll(errMsg, "numberOfSignificantValueDigits must be", "[numberOfSignificantValueDigits] must be")
+			if bytes.Contains(bodyBytes, []byte("median_absolute_deviation")) {
+				errMsg = strings.ReplaceAll(errMsg, "Invalid execution mode for cardinality aggregation: [", "Invalid execution_hint [")
+			}
+			if s.isES8Mode(r) {
+				errMsg = strings.ReplaceAll(errMsg, "[from] parameter cannot be negative, found [", "[from] parameter cannot be negative but was [")
 			}
 			errType := "parsing_exception"
 			switch {
+			case strings.Contains(errMsg, "cannot unmarshal") && strings.Contains(errMsg, "sigma"):
+				errType = "x_content_parse_exception"
 			case strings.HasPrefix(errMsg, "illegal_argument_exception: "):
 				errType = "illegal_argument_exception"
 				errMsg = strings.TrimPrefix(errMsg, "illegal_argument_exception: ")
+				if !s.isES8Mode(r) && strings.Contains(errMsg, "[collapse] second level of collapsing") {
+					errType = "parse_exception"
+				}
+			case strings.HasPrefix(errMsg, "parse_exception: "):
+				errType = "parse_exception"
+				errMsg = strings.TrimPrefix(errMsg, "parse_exception: ")
 			case strings.HasPrefix(errMsg, "x_content_parse_exception: "):
 				errType = "x_content_parse_exception"
 				errMsg = strings.TrimPrefix(errMsg, "x_content_parse_exception: ")
+				if strings.HasPrefix(errMsg, "illegal_argument_exception: ") {
+					causeReason := strings.TrimPrefix(errMsg, "illegal_argument_exception: ")
+					writeJSONWithRequest(w, r, http.StatusBadRequest, map[string]any{
+						"error": map[string]any{
+							"root_cause": []map[string]any{{"type": errType, "reason": errMsg}},
+							"type":       errType,
+							"reason":     errMsg,
+							"caused_by":  map[string]any{"type": "illegal_argument_exception", "reason": causeReason},
+						},
+						"status": http.StatusBadRequest,
+					})
+					return
+				}
 			case strings.HasPrefix(errMsg, "parsing_exception: "):
 				errMsg = strings.TrimPrefix(errMsg, "parsing_exception: ")
+				if !s.isES8Mode(r) && strings.Contains(errMsg, "[collapse] unknown field [collapse]") {
+					errType = "parse_exception"
+				}
 			}
 			writeESError(w, http.StatusBadRequest, errType, errMsg)
 			return
 		}
+		restoreRandomSamplerProbOneR63(req.EffectiveAggs())
 		if !s.isES8Mode(r) {
 			var rawTop map[string]json.RawMessage
 			if json.Unmarshal(bodyBytes, &rawTop) == nil {
@@ -9921,7 +10152,11 @@ func (s *Server) handleDorisExplain(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if err := applyAndValidateURISearchParamsRound58(r, &req); err != nil {
-		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", err.Error())
+		uriErr := err.Error()
+		if s.isES8Mode(r) {
+			uriErr = strings.ReplaceAll(uriErr, "[from] parameter cannot be negative, found [", "[from] parameter cannot be negative but was [")
+		}
+		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", uriErr)
 		return
 	}
 	if !s.isES8Mode(r) {
@@ -10134,6 +10369,13 @@ func (s *Server) handleMSearch(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		if len(bodyLine) > 0 {
+			var preNormSt int
+			var preNormType, preNormReason string
+			bodyLine, preNormSt, preNormType, preNormReason = preNormalizeSearchBodyR63(bodyLine, s.isES8Mode(r))
+			if preNormSt != 0 {
+				responses = append(responses, buildMSearchErrItem(preNormSt, preNormType, preNormReason, ""))
+				continue
+			}
 			if err := json.Unmarshal(bodyLine, &req); err != nil {
 				if et, er, okH := rewriteSignificantHeuristicParseErrorR62Search(bodyLine, err.Error()); okH {
 					responses = append(responses, buildMSearchErrItem(http.StatusBadRequest, et, er, ""))
@@ -10342,7 +10584,9 @@ func (s *Server) executeSearchRequest(
 		}
 	}
 	targets, aliasFilters := s.resolveTargetIndicesWithFilters(rawIndexPattern)
-	if len(targets) > 0 && (rawIndexPattern == "" || rawIndexPattern == "_all" || rawIndexPattern == "*" || hasExclusionOrWildcard(rawIndexPattern)) {
+	execMetaEarly := searchExecMetaFromCtxR61Search(ctx)
+	ignoreUnavailSearch := execMetaEarly != nil && execMetaEarly.httpReq != nil && isTruthyBoolQueryParam(execMetaEarly.httpReq, "ignore_unavailable")
+	if len(targets) > 0 && (ignoreUnavailSearch || rawIndexPattern == "" || rawIndexPattern == "_all" || rawIndexPattern == "*" || hasExclusionOrWildcard(rawIndexPattern)) {
 		openTargets := make([]string, 0, len(targets))
 		for _, t := range targets {
 			if !s.isIndexClosed(t) {
@@ -10352,8 +10596,8 @@ func (s *Server) executeSearchRequest(
 		targets = openTargets
 	}
 	if len(targets) == 0 {
-		// If wildcard/all/empty pattern matched nothing (or authoritative catalog has no matching indices), return empty 200 search response with 0 shards.
-		if hasExclusionOrWildcard(rawIndexPattern) || rawIndexPattern == "" || rawIndexPattern == "_all" || s.hasAuthoritativeIndexCatalog() {
+		// If wildcard/all/empty pattern or ignore_unavailable matched nothing, return empty 200 search response with 0 shards.
+		if ignoreUnavailSearch || hasExclusionOrWildcard(rawIndexPattern) || rawIndexPattern == "" || rawIndexPattern == "_all" || s.hasAuthoritativeIndexCatalog() {
 			emptyResp := buildESResponse(rawIndexPattern, nil, req, nil, nil, 1, nil)
 			emptyResp["_shards"] = map[string]any{"total": 0, "successful": 0, "skipped": 0, "failed": 0}
 			return emptyResp, http.StatusOK, "", ""
@@ -10378,11 +10622,7 @@ func (s *Server) executeSearchRequest(
 	s.mu.RLock()
 	for _, tName := range targets {
 		if cs := s.indexCustomSettings[tName]; len(cs) > 0 {
-			cpCS := make(map[string]any, len(cs))
-			for k, v := range cs {
-				cpCS[k] = v
-			}
-			customSettingsByIdx[tName] = cpCS
+			customSettingsByIdx[tName] = deepCloneDocMap(cs)
 		}
 	}
 	s.mu.RUnlock()
@@ -10397,10 +10637,17 @@ func (s *Server) executeSearchRequest(
 			rawSchemasForVal = append(rawSchemasForVal, sc)
 		}
 	}
-	prevSearchSrv, prevRawSearchBody := pushActiveSearchContextR62Search(s, rawSearchBody, rawSchemasForVal)
-	defer popActiveSearchContextR62Search(prevSearchSrv, prevRawSearchBody)
+	searchScope := newActiveSearchScopeR63(ctx, s, rawSearchBody, req)
+	ctx = withActiveSearchScopeR63(ctx, searchScope)
+	if httpReq != nil {
+		httpReq = httpReq.WithContext(ctx)
+	}
 
 	if req != nil {
+		if req.HasStoredFieldsNone() && len(req.Fields) > 0 {
+			return nil, http.StatusBadRequest, "action_request_validation_exception",
+				"Validation Failed: 1: Cannot specify both [fields] and [stored_fields: _none_];"
+		}
 		hasScrollReq := httpReq != nil && httpReq.URL != nil && httpReq.URL.Query().Has("scroll")
 		if limSt, limType, limReason := s.validateSearchLimitsAndParamsR62Search(ctx, httpReq, req, rawSchemasForVal, customSettingsByIdx, hasScrollReq); limSt != 0 {
 			return nil, limSt, limType, limReason
@@ -10434,8 +10681,18 @@ func (s *Server) executeSearchRequest(
 		if pipeSt, pipeType, pipeReason := validatePipelineAndSamplerAggsR61Search(req.EffectiveAggs()); pipeSt != 0 {
 			return nil, pipeSt, pipeType, pipeReason
 		}
+		for _, sc := range rawSchemasForVal {
+			if tsAggErr := validateTSDBPositionMetricAggsR63(sc, req.EffectiveAggs()); tsAggErr != nil {
+				et, er := splitSchemaErrorPrefixR61CRUD(tsAggErr, "illegal_argument_exception")
+				return nil, http.StatusBadRequest, et, er
+			}
+		}
 		if errMsg := validatePipelineAggs(req.EffectiveAggs()); errMsg != "" {
-			return nil, http.StatusBadRequest, "illegal_argument_exception", errMsg
+			pipeErrType := "illegal_argument_exception"
+			if strings.HasPrefix(errMsg, "Validation Failed:") {
+				pipeErrType = "action_request_validation_exception"
+			}
+			return nil, http.StatusBadRequest, pipeErrType, errMsg
 		}
 		if hlSt, hlType, hlReason := validateHighlightRequestR61Search(req, rawSchemasForVal, customSettingsByIdx); hlSt != 0 {
 			return nil, hlSt, hlType, hlReason
@@ -10475,6 +10732,9 @@ func (s *Server) executeSearchRequest(
 			return nil, http.StatusBadRequest, "search_phase_execution_exception", err.Error()
 		}
 		if hasTermsLookupInSearchRequest(req) {
+			if tlSt, tlType, tlReason := s.validateTermsLookupsExistR63(req); tlSt != 0 {
+				return nil, tlSt, tlType, tlReason
+			}
 			req = s.resolveTermsLookupsInSearchRequest(ctx, req)
 		}
 		if hasSpecialLookupInSearchRequest(req) {
@@ -10524,11 +10784,29 @@ func (s *Server) executeSearchRequest(
 			cacheTargets = append(cacheTargets, t)
 		}
 	}
-	if !aliasHasNow && !bypassCache {
-		if cachedResp, cachedUnindexed, hit := s.queryCache.GetWithMeta(cacheTargets, req); hit {
-			if httpReq != nil && isTruthyBoolQueryParam(httpReq, "request_cache") {
-				recordIndexRequestCacheStatR62Admin(s, targets, true)
+	shardReqCacheEnabled := s.isShardRequestCacheEnabledForSearchR63(httpReq, targets, req, rawSearchBody, aliasHasNow, bypassCache)
+	var shardReqCacheKey string
+	if shardReqCacheEnabled {
+		shardReqCacheKey = s.buildShardRequestCacheKeyR63(httpReq, cacheTargets, targets, req, rawSearchBody)
+		if cachedResp, cachedUnindexed, hit := s.lookupShardRequestCacheR63(shardReqCacheKey); hit {
+			s.recordShardRequestCacheHitR63(targets)
+			cachedResp["took"] = int64(1)
+			if len(cachedUnindexed) > 0 && len(targets) > 0 {
+				threshold := s.getAutoPromoteThreshold()
+				toPromote := s.slowTracker.recordWithThreshold(SlowQueryEntry{
+					Timestamp:              time.Now().UTC().Format(time.RFC3339),
+					Index:                  targets[0],
+					TookMs:                 1,
+					UnindexedVariantFields: cachedUnindexed,
+				}, threshold)
+				for _, fieldToPromote := range toPromote {
+					_, _ = s.promoteFieldInternal(ctx, targets[0], fieldToPromote, "keyword")
+				}
 			}
+			return cachedResp, http.StatusOK, "", ""
+		}
+	} else if !aliasHasNow && !bypassCache {
+		if cachedResp, cachedUnindexed, hit := s.queryCache.GetWithMeta(cacheTargets, req); hit {
 			cachedResp["took"] = int64(1)
 			if len(cachedUnindexed) > 0 && len(targets) > 0 {
 				threshold := s.getAutoPromoteThreshold()
@@ -10567,7 +10845,7 @@ func (s *Server) executeSearchRequest(
 			}
 		}
 	}
-	needsRuntimeScriptEval := req.Slice != nil || reqHasRuntimeMappings || queryHasRuntimeScript(req.Query) || aliasFiltersHaveRuntimeScript(aliasFilters) || queryHasRuntimeScript(req.PostFilter) || sortsHaveScript(req.Sort) || aggsHaveRuntimeScript(req.EffectiveAggs()) || aggsHaveAutoDateOrSignificantTextR62Search(req.EffectiveAggs()) || aggsHaveHDRPercentilesRound60(req.EffectiveAggs()) || queryHasMinScore(req.Query) || aliasFiltersHaveMinScore(aliasFilters) || (req.MinScore != nil && (queryHasRuntimeScript(req.Query) || aliasFiltersHaveRuntimeScript(aliasFilters) || queryHasNestedScoring(req.Query) || len(req.IndicesBoost) > 0)) || (queryHasNestedScoring(req.Query) && (req.Collapse != nil || len(req.SearchAfter) > 0))
+	needsRuntimeScriptEval := req.Slice != nil || reqHasRuntimeMappings || queryHasRuntimeScript(req.Query) || aliasFiltersHaveRuntimeScript(aliasFilters) || queryHasRuntimeScript(req.PostFilter) || sortsHaveScript(req.Sort) || aggsHaveRuntimeScript(req.EffectiveAggs()) || aggsHaveAutoDateOrSignificantTextR62Search(req.EffectiveAggs()) || aggsHaveHDRPercentilesRound60(req.EffectiveAggs()) || (schemasHaveDocCountFieldR63(rawSchemasForVal) && len(req.EffectiveAggs()) > 0) || queryHasMinScore(req.Query) || aliasFiltersHaveMinScore(aliasFilters) || (req.MinScore != nil && (size == 0 || queryHasRuntimeScript(req.Query) || aliasFiltersHaveRuntimeScript(aliasFilters) || queryHasNestedScoring(req.Query) || len(req.IndicesBoost) > 0)) || (queryHasNestedScoring(req.Query) && (req.Collapse != nil || len(req.SearchAfter) > 0))
 
 	var allHits []HitRow
 	var allFetchedHits []HitRow
@@ -10706,6 +10984,7 @@ func (s *Server) executeSearchRequest(
 			sqlSchema = rawIdxSchema
 		}
 		trOpts := s.effectiveTranspileOptsForIndexR62Search(httpReq, indexName, sqlSchema, req.RuntimeMappings)
+		trOpts.CallerSize = size
 		if subReqPtr != nil && subReqPtr.Size != nil && *subReqPtr.Size > maxWin {
 			if sqlSchema != nil && sqlSchema.MaxResultWindow > 0 {
 				schemaCopy := *sqlSchema
@@ -10719,7 +10998,7 @@ func (s *Server) executeSearchRequest(
 		tr := transpiler.NewTranspiler(sqlSchema, trOpts)
 		plan, err := tr.BuildSearchPlan(subReqPtr)
 		if err != nil {
-			return nil, http.StatusBadRequest, "search_phase_execution_exception", err.Error()
+			return nil, http.StatusBadRequest, "search_phase_execution_exception", rewriteTranspilerMaxRegexLengthErrorR63(err.Error())
 		}
 		unindexedFieldsForPlan := plan.UnindexedVariantFields
 		if hasRuntimeMappings && req != nil {
@@ -10795,9 +11074,12 @@ func (s *Server) executeSearchRequest(
 		var idxTotal int64
 		for i := range hits {
 			hits[i].Index = indexName
-			hits[i].Routing = s.getDocRouting(indexName, hits[i].ID)
+			if rt := s.getDocRouting(indexName, hits[i].ID); rt != "" {
+				hits[i].Routing = rt
+			}
 			hits[i].SeqNo = s.getDocSeqNo(indexName, hits[i].ID, hits[i].Version)
 			hits[i].HasSeqNo = true
+			hits[i].SearchScope = searchScope
 			if len(req.SearchAfter) == 0 && hits[i].TotalHits > idxTotal {
 				idxTotal = hits[i].TotalHits
 			}
@@ -10861,7 +11143,7 @@ func (s *Server) executeSearchRequest(
 					}
 					globalHits = append(globalHits, gh)
 				}
-			} else if (req.Query != nil && globalAggsHaveRuntimeScript(req.EffectiveAggs())) || ((queryHasRuntimeScript(aliasFilters[indexName]) || queryHasMinScore(aliasFilters[indexName])) && aggsHaveGlobalAgg(req.EffectiveAggs())) {
+			} else if (req.Query != nil && globalAggsHaveRuntimeScript(req.EffectiveAggs())) || aggsHaveSignificantTextR63(req.EffectiveAggs()) || ((queryHasRuntimeScript(aliasFilters[indexName]) || queryHasMinScore(aliasFilters[indexName])) && aggsHaveGlobalAgg(req.EffectiveAggs())) {
 				zero := 0
 				fetchAll := 10000
 				gReq := esast.SearchRequest{
@@ -10873,7 +11155,10 @@ func (s *Server) executeSearchRequest(
 					if gRows, qErr := s.backend.QueryHits(ctx, gPlan.HitsSQL); qErr == nil {
 						for i := range gRows {
 							gRows[i].Index = indexName
-							gRows[i].Routing = s.getDocRouting(indexName, gRows[i].ID)
+							if rt := s.getDocRouting(indexName, gRows[i].ID); rt != "" {
+								gRows[i].Routing = rt
+							}
+							gRows[i].SearchScope = searchScope
 						}
 						if queryHasRuntimeScript(aliasFilters[indexName]) || queryHasMinScore(aliasFilters[indexName]) {
 							for _, gh := range gRows {
@@ -11025,7 +11310,7 @@ func (s *Server) executeSearchRequest(
 					})
 				}
 			}
-			if idxBoost, hasIdxBoost := s.resolveIndexBoostFirstMatchR62Search(indexName, req.IndicesBoost); hasIdxBoost {
+			if idxBoost, hasIdxBoost := s.resolveIndexBoostFirstMatchR62Search(searchScope.rawBody, indexName, req.IndicesBoost); hasIdxBoost {
 				for i := range hits {
 					hits[i].Score *= idxBoost
 				}
@@ -11415,9 +11700,15 @@ func (s *Server) executeSearchRequest(
 		if h.Routing == "" && h.Index != "" && h.ID != "" {
 			h.Routing = s.getDocRouting(h.Index, h.ID)
 		}
+		if h.SearchScope == nil {
+			h.SearchScope = searchScope
+		}
 		return h
 	}
 	docLookup := func(id string) *HitRow {
+		if id == r63DocLookupScopeSentinel {
+			return &HitRow{SearchScope: searchScope}
+		}
 		var targetIdx string
 		docID := id
 		if nul := strings.IndexByte(id, '\x00'); nul >= 0 {
@@ -11464,7 +11755,9 @@ func (s *Server) executeSearchRequest(
 					}
 					h.Index = tName
 					h.Schema = tSchema
-					h.Routing = s.getDocRouting(tName, h.ID)
+					if rt := s.getDocRouting(tName, h.ID); rt != "" {
+						h.Routing = rt
+					}
 					return enrichHitRow(h)
 				}
 			}
@@ -11502,7 +11795,7 @@ func (s *Server) executeSearchRequest(
 	}
 	if req != nil && (len(req.Fields) > 0 || len(req.DocvalueFields) > 0) {
 		if len(allHits) == 0 {
-			if _, fSt, fType, fReason := extractUnifiedFieldsR61Search(HitRow{Index: primaryIndex}, primaryIndex, req, primarySchema, nil); fSt != 0 {
+			if _, fSt, fType, fReason := extractUnifiedFieldsR61Search(HitRow{Index: primaryIndex, SearchScope: searchScope}, primaryIndex, req, primarySchema, nil); fSt != 0 {
 				return nil, fSt, "search_phase_execution_exception", "all_shards_failed|" + fType + "|" + fReason
 			}
 		} else {
@@ -11521,16 +11814,25 @@ func (s *Server) executeSearchRequest(
 			}
 		}
 	}
+	var partialFailedShards int
+	var partialShardFailures []map[string]any
 	var precomputedScriptFields map[int]map[string]any
 	if req != nil && len(req.ScriptFields) > 0 {
-		var sfSt int
+		var sfSt, sfFailed int
 		var sfPayload map[string]any
-		precomputedScriptFields, sfSt, sfPayload = evalSearchScriptFieldsR61Search(s, httpReq, allHits, schemasByIndex, req)
+		var sfFailures []map[string]any
+		allHits, precomputedScriptFields, sfFailed, sfFailures, sfSt, sfPayload = evalMultiIndexScriptFieldsWithPartialFailuresR63(
+			s, httpReq, targets, primaryIndex, allHits, schemasByIndex, req,
+		)
 		if sfSt != 0 {
 			if execMeta != nil {
 				execMeta.errPayload = sfPayload
 			}
 			return nil, sfSt, "search_phase_execution_exception", "all shards failed"
+		}
+		if sfFailed > 0 {
+			partialFailedShards += sfFailed
+			partialShardFailures = append(partialShardFailures, sfFailures...)
 		}
 	}
 	if execMeta != nil && execMeta.forceSyntheticSource && len(allHits) > 0 {
@@ -11547,17 +11849,48 @@ func (s *Server) executeSearchRequest(
 		}
 	}
 
+	if req != nil && len(req.EffectiveAggs()) > 0 {
+		if len(targets) > 1 {
+			allAggRows = recomputeMultiIndexMatrixStatsRowsWave3R63(s, req.EffectiveAggs(), allFetchedHits, schemasByIndex, primarySchema, allAggRows)
+		}
+		if waErr := checkWeightedAvgMultiWeightOnDocsR63(req.EffectiveAggs(), allFetchedHits, schemasByIndex, primarySchema); waErr != nil {
+			eType, eReason := splitESExceptionErrorR61Search(waErr, "illegal_argument_exception")
+			return nil, http.StatusBadRequest, "search_phase_execution_exception", "all_shards_failed|" + eType + "|" + eReason
+		}
+		if vtFailed, vtFailures := detectCrossIndexTermsValueTypeShardFailuresR63(targets, schemasByIndex, req.EffectiveAggs()); vtFailed > 0 {
+			partialFailedShards += vtFailed
+			partialShardFailures = append(partialShardFailures, vtFailures...)
+		}
+	}
 	resp := buildESResponseWithSchemas(primaryIndex, primarySchema, schemasByIndex, req, allHits, allAggRows, tookMs, docLookup)
 	if req != nil && len(req.EffectiveAggs()) > 0 {
 		if aggsOut, okAgg := resp["aggregations"].(map[string]any); okAgg {
 			if _, qErr := stripAndApplyExactQuantilesR61Search(allAggRows, req.EffectiveAggs(), aggsOut, isES8); qErr != nil {
-				eType, eReason := splitESExceptionErrorR61Search(qErr, "illegal_argument_exception")
-				return nil, http.StatusBadRequest, "search_phase_execution_exception", "all_shards_failed|" + eType + "|" + eReason
+				if strings.Contains(qErr.Error(), "Histogram recorded value cannot be negative") {
+					if recResp, recHits, recFail, recOK := s.tryRecoverHDRNegativeShardFailureWave3R63(
+						httpReq, targets, primaryIndex, primarySchema, schemasByIndex, req, allHits, allAggRows, tookMs, docLookup, isES8,
+					); recOK {
+						resp = recResp
+						allHits = recHits
+						aggsOut, _ = resp["aggregations"].(map[string]any)
+						partialFailedShards++
+						partialShardFailures = append(partialShardFailures, recFail)
+					} else {
+						eType, eReason := splitESExceptionErrorR61Search(qErr, "illegal_argument_exception")
+						return nil, http.StatusBadRequest, "search_phase_execution_exception", "all_shards_failed|" + eType + "|" + eReason
+					}
+				} else {
+					eType, eReason := splitESExceptionErrorR61Search(qErr, "illegal_argument_exception")
+					return nil, http.StatusBadRequest, "search_phase_execution_exception", "all_shards_failed|" + eType + "|" + eReason
+				}
 			}
 			applyNestedTopHitsInAggsTreeR61Search(req.Query, req.EffectiveAggs(), aggsOut, allFetchedHits, primarySchema)
 			if pipeErr := reEvaluatePipelineAggsTreeR61Search(req.EffectiveAggs(), aggsOut); pipeErr != nil {
 				eType, eReason := splitESExceptionErrorR61Search(pipeErr, "script_exception")
 				return nil, http.StatusBadRequest, "search_phase_execution_exception", "all_shards_failed|" + eType + "|" + eReason
+			}
+			if s.hasExplicitTargetESVersion() {
+				reEvaluatePercentilesBucketWithScopeR63(searchScope, req.EffectiveAggs(), aggsOut)
 			}
 		}
 	}
@@ -11632,7 +11965,15 @@ func (s *Server) executeSearchRequest(
 		totalTargetShards += nShards
 	}
 	if totalTargetShards > 0 {
-		resp["_shards"] = map[string]any{"total": totalTargetShards, "successful": totalTargetShards, "skipped": 0, "failed": 0}
+		succShards := totalTargetShards - partialFailedShards
+		if succShards < 0 {
+			succShards = 0
+		}
+		shardsObj := map[string]any{"total": totalTargetShards, "successful": succShards, "skipped": 0, "failed": partialFailedShards}
+		if len(partialShardFailures) > 0 {
+			shardsObj["failures"] = partialShardFailures
+		}
+		resp["_shards"] = shardsObj
 		if httpReq != nil && httpReq.URL != nil && httpReq.URL.Query().Has("batched_reduce_size") {
 			if bSize, errB := strconv.Atoi(strings.TrimSpace(httpReq.URL.Query().Get("batched_reduce_size"))); errB == nil && bSize >= 2 && totalTargetShards > bSize {
 				resp["num_reduce_phases"] = (totalTargetShards + bSize - 3) / (bSize - 1)
@@ -11672,11 +12013,10 @@ func (s *Server) executeSearchRequest(
 		aggsOutMap, _ := resp["aggregations"].(map[string]any)
 		resp["profile"] = enrichSearchProfilePayloadWithReqR62Search(s, httpReq, targets, prof, primarySchema, req, aggsOutMap, totalQueryHitsSum, allFetchedHits)
 	}
-	if !aliasHasNow && !bypassCache {
+	if shardReqCacheEnabled && partialFailedShards == 0 {
+		s.storeAndRecordShardRequestCacheMissR63(shardReqCacheKey, targets, resp, allUnindexedFields)
+	} else if !aliasHasNow && !bypassCache && partialFailedShards == 0 {
 		s.queryCache.PutWithMeta(cacheTargets, req, resp, allUnindexedFields)
-	}
-	if httpReq != nil && isTruthyBoolQueryParam(httpReq, "request_cache") {
-		recordIndexRequestCacheStatR62Admin(s, targets, false)
 	}
 	return resp, http.StatusOK, "", ""
 }
@@ -12438,7 +12778,9 @@ func hitIsAfterSearchAfter(h HitRow, sorts []esast.SortSpec, searchAfter []any, 
 			return missingFirst
 		}
 		var cmp int
-		if cmpIP, okIP := compareCanonicalIPValuesRound58(va, vb); okIP {
+		if strings.EqualFold(strings.TrimSpace(s.Entry.Type), "version") {
+			cmp = transpiler.CompareSemverStrings(fmt.Sprintf("%v", va), fmt.Sprintf("%v", vb))
+		} else if cmpIP, okIP := compareCanonicalIPValuesRound58(va, vb); okIP {
 			cmp = cmpIP
 		} else if ipA, okA := parseIPv4SortUint32(va); okA {
 			if ipB, okB := parseIPv4SortUint32(vb); okB {
@@ -12489,7 +12831,9 @@ func compareHitRowsBySortWithSchemas(a, b HitRow, sorts []esast.SortSpec, schema
 			return -1
 		}
 		var cmp int
-		if cmpIP, okIP := compareCanonicalIPValuesRound58(va, vb); okIP {
+		if strings.EqualFold(strings.TrimSpace(s.Entry.Type), "version") {
+			cmp = transpiler.CompareSemverStrings(fmt.Sprintf("%v", va), fmt.Sprintf("%v", vb))
+		} else if cmpIP, okIP := compareCanonicalIPValuesRound58(va, vb); okIP {
 			cmp = cmpIP
 		} else if ipA, okA := parseIPv4SortUint32(va); okA {
 			if ipB, okB := parseIPv4SortUint32(vb); okB {
@@ -12826,7 +13170,7 @@ func (s *Server) handleCount(w http.ResponseWriter, r *http.Request) {
 		}
 		for k := range rawTop {
 			switch k {
-			case "query", "pit", "runtime_mappings":
+			case "query", "pit", "runtime_mappings", "min_score":
 			default:
 				writeESError(w, http.StatusBadRequest, "parsing_exception", fmt.Sprintf("Unknown key for a START_OBJECT in [count]: [%s].", k))
 				return
@@ -12838,7 +13182,11 @@ func (s *Server) handleCount(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if err := applyAndValidateURISearchParamsRound58(r, &req); err != nil {
-		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", err.Error())
+		errMsg := err.Error()
+		if strings.Contains(errMsg, "[terminate_after] must be greater than 0") {
+			errMsg = "terminateAfter must be > 0"
+		}
+		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", errMsg)
 		return
 	}
 	zero := 0
@@ -13476,7 +13824,11 @@ func buildESResponseWithSchemas(indexName string, idxSchema *schema.IndexSchema,
 			if hitSchema != nil && hitSchema.RawMapping != nil && hasMappedPropertyScriptsR62Search(hitSchema.RawMapping.Properties) {
 				hlSrc = enrichSourceBytesWithMappedScriptsR62Search(hitSchema, hlSrc)
 			}
-			if hl := buildHighlightMapWithSchema(hlSrc, req, hitSchema); len(hl) > 0 {
+			var hlSrv *Server
+			if h.SearchScope != nil {
+				hlSrv = h.SearchScope.srv
+			}
+			if hl := buildHighlightMapWithSchemaAndServerWave3R63(hlSrv, hitIdx, hlSrc, req, hitSchema); len(hl) > 0 {
 				hitMap["highlight"] = hl
 			}
 		}
@@ -13501,6 +13853,11 @@ func buildESResponseWithSchemas(indexName string, idxSchema *schema.IndexSchema,
 		}
 		if igFields := extractHitIgnoredFieldsR61Search(h, hitSchema); len(igFields) > 0 {
 			hitMap["_ignored"] = igFields
+			if (h.SearchScope == nil || !rawBodyDisablesIgnoredFieldValuesR63(h.SearchScope.rawBody)) && !hasStoredNone {
+				if igVals := extractIgnoredFieldValuesMapR63(h, hitSchema); len(igVals) > 0 {
+					hitMap["ignored_field_values"] = igVals
+				}
+			}
 		}
 		if req != nil && len(req.ScriptFields) > 0 {
 			if sfm := evalHitScriptFields(h, req.ScriptFields, hitSchema); len(sfm) > 0 {
@@ -13684,6 +14041,23 @@ func buildESResponseWithSchemas(indexName string, idxSchema *schema.IndexSchema,
 						slotAny[i] = sl
 					}
 					fm["_percolator_document_slot"] = slotAny
+					for mqKey, mqVals := range collectPercolateMultiDocMatchedQueriesMapR63(hitSchema, getDoc(), req.Query) {
+						fm[mqKey] = orderMatchedQueriesByRawSourceR63(h.EffectiveSource(), mqVals)
+					}
+					hitMap["fields"] = fm
+				}
+			} else if req.Query != nil {
+				if slotMQ := collectPercolateMultiDocMatchedQueriesMapR63(hitSchema, getDoc(), req.Query); len(slotMQ) > 0 {
+					fm, _ := hitMap["fields"].(map[string][]any)
+					if fm == nil {
+						fm = make(map[string][]any, len(slotMQ)+1)
+					}
+					if _, hasSlot := fm["_percolator_document_slot"]; !hasSlot {
+						fm["_percolator_document_slot"] = []any{0}
+					}
+					for mqKey, mqVals := range slotMQ {
+						fm[mqKey] = orderMatchedQueriesByRawSourceR63(h.EffectiveSource(), mqVals)
+					}
 					hitMap["fields"] = fm
 				}
 			}
@@ -14355,6 +14729,9 @@ func buildNestedInnerHitsForHitWithOpts(h HitRow, hitIdx string, hitSchema *sche
 			baseRaw = hitSchema.RawMapping
 		}
 		evalSchema = schema.CompileIndexSchema("es_compat", hitIdx, schema.MergeMappingSpecs(baseRaw, nestedSpec))
+		if hitSchema != nil {
+			evalSchema.ES8Mode = hitSchema.ES8Mode
+		}
 	}
 	nestedEvalSchema := deriveNestedEvalSchema(evalSchema, nq.Path)
 	elemScoreSchema := deriveNestedScalarScoreSchema(evalSchema, nq.Path)
@@ -14585,10 +14962,31 @@ func buildNestedInnerHitsForHitWithOpts(h HitRow, hitIdx string, hitSchema *sche
 			}
 			if len(effHighlight.Fields) > 0 {
 				hlSrc := m.hit.RawSource
+				hasRelWildcard := false
+				hasRelExplicit := false
 				for hf := range effHighlight.Fields {
-					if strings.Contains(hf, "*") && !strings.HasPrefix(hf, nq.Path+".") {
-						hlSrc = m.hit.Source
-						break
+					if !strings.HasPrefix(hf, nq.Path+".") {
+						if strings.Contains(hf, "*") {
+							hasRelWildcard = true
+						} else {
+							hasRelExplicit = true
+						}
+					}
+				}
+				if hasRelWildcard {
+					hlSrc = m.hit.Source
+				} else if hasRelExplicit && len(m.hit.Source) > 0 && len(m.hit.RawSource) > 0 {
+					var mergedHL map[string]any
+					var elemHL map[string]any
+					if json.Unmarshal(m.hit.RawSource, &mergedHL) == nil && json.Unmarshal(m.hit.Source, &elemHL) == nil && mergedHL != nil {
+						for ek, ev := range elemHL {
+							if _, exists := mergedHL[ek]; !exists {
+								mergedHL[ek] = ev
+							}
+						}
+						if mb, errM := json.Marshal(mergedHL); errM == nil {
+							hlSrc = mb
+						}
 					}
 				}
 				if hl := buildHighlightMapWithSchema(hlSrc, &esast.SearchRequest{Query: &nq.Query, Highlight: effHighlight}, nestedEvalSchema); len(hl) > 0 {
@@ -14705,13 +15103,17 @@ func (s *Server) populateCollapseInnerHits(
 		if err != nil {
 			continue
 		}
+		scopeForCollapse := activeSearchScopeFromCtxR63(ctx)
 		for i := range rows {
 			rows[i].Index = indexName
-			rows[i].Routing = s.getDocRouting(indexName, rows[i].ID)
+			if rt := s.getDocRouting(indexName, rows[i].ID); rt != "" {
+				rows[i].Routing = rt
+			}
 			rows[i].SeqNo = s.getDocSeqNo(indexName, rows[i].ID, rows[i].Version)
 			rows[i].HasSeqNo = true
 			rows[i].Schema = idxSchema
 			rows[i].Query = req.Query
+			rows[i].SearchScope = scopeForCollapse
 		}
 		if hasRuntimeMappings && len(rows) > 0 {
 			var httpReq *http.Request
@@ -14940,7 +15342,7 @@ func buildAggsMapWithSchema(
 			}
 			for _, r := range rows {
 				docCnt := r.effectiveCount()
-				keyVal, keyAsStr, hasKeyAsStr := formatTermsBucketKeyAndString(r.BucketKey, termsSpec, idxSchema)
+				keyVal, keyAsStr, hasKeyAsStr := formatTermsBucketKeyAndStringWithScopeR63(scopeFromDocLookupR63(docLookup), r.BucketKey, termsSpec, idxSchema)
 				bucketMap := map[string]any{
 					"key":       keyVal,
 					"doc_count": docCnt,
@@ -15511,7 +15913,8 @@ func buildAggsMapWithSchema(
 			}
 			b := make([]map[string]any, 0, len(rngSpec.Ranges))
 			subAggs := spec.SubAggs()
-			for _, rng := range rngSpec.Ranges {
+			for _, rIdx := range sortedRuntimeRangeAggIndicesAscR63(rngSpec, isDateRange, isIPRange, nowUTC) {
+				rng := rngSpec.Ranges[rIdx]
 				ek := rng.EffectiveKey()
 				entry := map[string]any{
 					"key":       ek,
@@ -15519,7 +15922,8 @@ func buildAggsMapWithSchema(
 				}
 				if rng.Mask != "" && isIPRange {
 					entry["mask"] = rng.Mask
-					applyIPRangeCIDRMaskR62Search(rng.Mask, entry)
+					sc := scopeFromDocLookupR63(docLookup)
+					applyIPRangeCIDRMaskWithStrictR63(sc != nil && sc.strictConformance, rng.Mask, entry)
 				}
 				if rng.From != nil {
 					entry["from"] = rng.From
@@ -15871,13 +16275,9 @@ func compareCompositeSourceValWithSchema(a, b any, entry esast.AggSpec, idxSchem
 		}
 	}
 	if entry.DateHistogram != nil {
-		rngSpec := &esast.RangeAggSpec{
-			Format:   entry.DateHistogram.Format,
-			TimeZone: entry.DateHistogram.TimeZone,
-		}
 		nowUTC := time.Now().UTC()
-		if msA, okA := parseRuntimeDateRangeBoundMillis(a, rngSpec, nowUTC); okA {
-			if msB, okB := parseRuntimeDateRangeBoundMillis(b, rngSpec, nowUTC); okB {
+		if msA, okA := parseCompositeDateBoundWithTZR63(a, entry.DateHistogram, nowUTC); okA {
+			if msB, okB := parseCompositeDateBoundWithTZR63(b, entry.DateHistogram, nowUTC); okB {
 				a = msA
 				b = msB
 			}
@@ -17136,14 +17536,22 @@ func validateChildBucketMetricDep(parentAggName, childAggName, pathStr string, s
 		seg := segs[i]
 		targetSpec, exists := currMap[seg]
 		if !exists {
+			if greedyKey, greedySpec, newIdx, okG := resolveGreedyAggInMapR63(currMap, segs, i); okG {
+				seg = greedyKey
+				targetSpec = greedySpec
+				i = newIdx
+				exists = true
+			}
+		}
+		if !exists {
 			if i > 0 && !isBucketAggSpec(lastSpec) {
-				// Property access on a multi-value metric (e.g. the_stats.avg or the_pct.95.0)
+				// Property access on a multi-value or single-value metric (e.g. the_stats.avg, v.v.value, top_hits._count)
 				return ""
 			}
 			if i == len(segs)-1 && isBucketAggSpec(lastSpec) && (seg == "_count" || seg == "doc_count") {
 				return ""
 			}
-			return fmt.Sprintf("buckets_path [%s] for pipeline aggregation [%s] references non-existent sibling aggregation [%s]", pathStr, childAggName, seg)
+			return fmt.Sprintf("Validation Failed: 1: No aggregation found for path [%s];", pathStr)
 		}
 		if isMultiBucketAggSpec(targetSpec) {
 			if i+1 >= len(segs) {
@@ -17514,6 +17922,7 @@ func evaluateChildPipelineAggsWithoutBucketSort(buckets []map[string]any, subAgg
 						if insertZeros {
 							curr = 0
 						} else {
+							hasPrev = false
 							continue
 						}
 					}
@@ -17650,25 +18059,27 @@ func evaluateBucketSortPipelineAggs(buckets []map[string]any, subAggs map[string
 		spec := subAggs[subName]
 		if spec.BucketSort != nil {
 			bs := spec.BucketSort
-			if (bs.GapPolicy == "" || strings.EqualFold(bs.GapPolicy, "skip")) && len(bs.Sort) > 0 && len(buckets) > 0 {
+			if !strings.EqualFold(bs.GapPolicy, "insert_zeros") && len(bs.Sort) > 0 && len(buckets) > 0 {
 				filtered := make([]map[string]any, 0, len(buckets))
 				for _, b := range buckets {
-					hasGap := false
+					allGaps := true
 					for _, sSpec := range bs.Sort {
 						field := sSpec.Entry.Field
 						if field == "" || field == "_key" || field == "key" || field == "_count" || field == "doc_count" ||
 							strings.HasPrefix(field, "_key.") || strings.HasPrefix(field, "key.") {
-							continue
+							allGaps = false
+							break
 						}
 						if sSpec.Entry.Missing != "" {
-							continue
+							allGaps = false
+							break
 						}
-						if _, ok := extractBucketMetricByPath(b, field); !ok {
-							hasGap = true
+						if _, ok := extractBucketMetricByPath(b, field); ok {
+							allGaps = false
 							break
 						}
 					}
-					if !hasGap {
+					if !allGaps {
 						filtered = append(filtered, b)
 					}
 				}
@@ -17905,6 +18316,10 @@ func evalMovingWindow(slice []float64, maSpec *esast.MovingAvgAggSpec) float64 {
 }
 
 func evaluateSiblingPipelineAggs(aggs map[string]esast.AggSpec, aggsOut map[string]any) {
+	evaluateSiblingPipelineAggsWithStrict(false, aggs, aggsOut)
+}
+
+func evaluateSiblingPipelineAggsWithStrict(strictConformance bool, aggs map[string]esast.AggSpec, aggsOut map[string]any) {
 	// First evaluate any nested sibling pipeline aggregations inside single-bucket or multi-bucket containers,
 	// then evaluate avg_bucket / sum_bucket / min_bucket / max_bucket / stats_bucket / extended_stats_bucket / percentiles_bucket.
 	for aggName, spec := range aggs {
@@ -17912,22 +18327,22 @@ func evaluateSiblingPipelineAggs(aggs map[string]esast.AggSpec, aggsOut map[stri
 			switch rawBuckets := subMap["buckets"].(type) {
 			case []map[string]any:
 				for _, b := range rawBuckets {
-					evaluateSiblingPipelineAggs(spec.SubAggs(), b)
+					evaluateSiblingPipelineAggsWithStrict(strictConformance, spec.SubAggs(), b)
 				}
 			case []any:
 				for _, item := range rawBuckets {
 					if b, okB := item.(map[string]any); okB {
-						evaluateSiblingPipelineAggs(spec.SubAggs(), b)
+						evaluateSiblingPipelineAggsWithStrict(strictConformance, spec.SubAggs(), b)
 					}
 				}
 			case map[string]any:
 				for _, v := range rawBuckets {
 					if b, okB := v.(map[string]any); okB {
-						evaluateSiblingPipelineAggs(spec.SubAggs(), b)
+						evaluateSiblingPipelineAggsWithStrict(strictConformance, spec.SubAggs(), b)
 					}
 				}
 			default:
-				evaluateSiblingPipelineAggs(spec.SubAggs(), subMap)
+				evaluateSiblingPipelineAggsWithStrict(strictConformance, spec.SubAggs(), subMap)
 			}
 		}
 	}
@@ -18196,8 +18611,6 @@ func evaluateSiblingPipelineAggs(aggs map[string]esast.AggSpec, aggsOut map[stri
 			sortedVals := append([]float64(nil), vals...)
 			sort.Float64s(sortedVals)
 			percents := spec.PercentilesBucket.EffectivePercents()
-			activeSrv := currentActiveSearchServerR62Search()
-			strictConformance := activeSrv != nil && activeSrv.hasExplicitTargetESVersion()
 			computePct := func(p float64) float64 {
 				if len(sortedVals) == 0 {
 					return 0
@@ -18216,9 +18629,9 @@ func evaluateSiblingPipelineAggs(aggs map[string]esast.AggSpec, aggsOut map[stri
 						return sortedVals[lo]
 					}
 					frac := pos - float64(lo)
-					return sortedVals[lo]*(1-frac) + sortedVals[hi]*frac
+					return sortedVals[lo] + frac*(sortedVals[hi]-sortedVals[lo])
 				}
-				// ES `percentiles_bucket` uses nearest-rank empirical CDF (`SimplePercentile`):
+				// ES `percentiles_bucket` ALWAYS uses nearest-rank empirical CDF (`SimplePercentile`):
 				// `ceil((p / 100.0) * N) - 1`, clamped to `[0, N-1]`.
 				rank := int(math.Ceil((p/100.0)*float64(len(sortedVals)))) - 1
 				if rank < 0 {
@@ -18664,6 +19077,20 @@ func extractBucketMetricBySegs(b map[string]any, segs []string) (float64, bool) 
 	tail := segs[1:]
 	subMap, ok := b[head].(map[string]any)
 	if !ok {
+		for end := len(segs); end >= 2; end-- {
+			cand := strings.Join(segs[:end], ".")
+			if mCand, okCand := b[cand].(map[string]any); okCand {
+				subMap = mCand
+				tail = segs[end:]
+				ok = true
+				if len(tail) == 0 {
+					return extractBucketMetricBySegs(b, []string{cand})
+				}
+				break
+			}
+		}
+	}
+	if !ok {
 		if rawBuckets, okB := b["buckets"].(map[string]any); okB {
 			for k := 1; k <= len(segs); k++ {
 				candKey := strings.Join(segs[:k], ".")
@@ -18758,10 +19185,23 @@ func extractBucketMetricBySegs(b map[string]any, segs []string) (float64, bool) 
 			if v, okV := toFloat64(subMap["doc_count"]); okV {
 				return v, true
 			}
+			if hitsEnv, okH := subMap["hits"].(map[string]any); okH {
+				if totObj, okT := hitsEnv["total"].(map[string]any); okT {
+					if v, okV := toFloat64(totObj["value"]); okV {
+						return v, true
+					}
+				}
+				if v, okV := toFloat64(hitsEnv["total"]); okV {
+					return v, true
+				}
+			}
 		}
 		if v, okV := toFloat64(subMap[prop]); okV {
 			return v, true
 		}
+	}
+	if v, okV := extractTopHitsSourceMetricR63(subMap, tail); okV {
+		return v, true
 	}
 	if valMap, okVM := subMap["value"].(map[string]any); okVM {
 		valTail := tail
@@ -19708,11 +20148,25 @@ func buildTopHitsList(
 	}
 	trackScores := spec.TrackScores != nil && *spec.TrackScores
 	nullifyScore := len(spec.Sort) > 0 && !sortSpecsUseScore(spec.Sort) && !trackScores
+	thScope := scopeFromDocLookupR63(docLookup)
 	fieldSpecs := spec.EffectiveFieldSpecs()
-	var syntheticReq *esast.SearchRequest
-	if len(fieldSpecs) > 0 {
-		syntheticReq = &esast.SearchRequest{Fields: fieldSpecs}
+	var inheritedRuntimeMappings map[string]esast.FieldProperty
+	if thScope != nil && thScope.searchReq != nil {
+		inheritedRuntimeMappings = thScope.searchReq.RuntimeMappings
+		if len(fieldSpecs) == 0 && len(spec.DocvalueFields) == 0 && spec.StoredFields == nil && len(thScope.searchReq.Fields) > 0 {
+			fieldSpecs = thScope.searchReq.Fields
+		}
 	}
+	var syntheticReq *esast.SearchRequest
+	if len(fieldSpecs) > 0 || len(spec.DocvalueFields) > 0 || spec.StoredFields != nil {
+		syntheticReq = &esast.SearchRequest{
+			Fields:          fieldSpecs,
+			DocvalueFields:  spec.DocvalueFields,
+			StoredFields:    spec.StoredFields,
+			RuntimeMappings: inheritedRuntimeMappings,
+		}
+	}
+	topHitsFlags := extractTopHitsFlagsFromScopeR63(thScope)
 	topHitsList := make([]map[string]any, 0, len(candidates))
 	for _, c := range candidates {
 		hitIdx := defaultIndex
@@ -19740,8 +20194,37 @@ func buildTopHitsList(
 			if cSchema == nil {
 				cSchema = fallbackSchema
 			}
+			if topHitsFlags.version {
+				ver := c.hit.Version
+				if ver <= 0 {
+					ver = 1
+				}
+				hitMap["_version"] = ver
+			}
+			if topHitsFlags.seqNoPrimaryTerm {
+				seqNo := c.hit.SeqNo
+				if !c.hit.HasSeqNo {
+					if c.hit.Version > 0 {
+						seqNo = c.hit.Version - 1
+					} else {
+						seqNo = 0
+					}
+				}
+				hitMap["_seq_no"] = seqNo
+				hitMap["_primary_term"] = 1
+			}
+			if topHitsFlags.explain {
+				hitMap["_explanation"] = buildSearchHitExplanationR62Search(hitIdx, *c.hit, cSchema, &esast.SearchRequest{Query: searchQuery})
+			}
 			if (spec.Source == nil || !spec.Source.Disabled) && (!spec.HasStoredFieldsNone() || spec.Source != nil) {
-				if filteredSrc, ok := filterDocumentSourceRound59(c.hit.EffectiveSource(), cSchema, spec.Source); ok {
+				srcBytesForTopHit := c.hit.Source
+				if len(srcBytesForTopHit) == 0 {
+					srcBytesForTopHit = c.hit.EffectiveSource()
+				}
+				if cSchema != nil && cSchema.SyntheticSource {
+					srcBytesForTopHit = reconstructHitSyntheticSourceR61Search(srcBytesForTopHit, cSchema)
+				}
+				if filteredSrc, ok := filterDocumentSourceRound59(srcBytesForTopHit, cSchema, spec.Source); ok {
 					hitMap["_source"] = filteredSrc
 				}
 			}
@@ -19749,8 +20232,24 @@ func buildTopHitsList(
 				hitMap["sort"] = extractHitSortValues(*c.hit, spec.Sort, cSchema)
 			}
 			if syntheticReq != nil {
-				if fm := extractHitFieldsMap(*c.hit, hitIdx, syntheticReq, cSchema); len(fm) > 0 {
+				hitCopy := *c.hit
+				if hitCopy.SearchScope == nil {
+					hitCopy.SearchScope = thScope
+				}
+				if fm, fSt, _, _ := extractUnifiedFieldsR61Search(hitCopy, hitIdx, syntheticReq, cSchema, nil); fSt == 0 && len(fm) > 0 {
 					hitMap["fields"] = fm
+				} else if fmLegacy := extractHitFieldsMap(hitCopy, hitIdx, syntheticReq, cSchema); len(fmLegacy) > 0 {
+					hitMap["fields"] = fmLegacy
+				}
+			}
+			if searchQuery != nil && queryHasNamedClauses(searchQuery) {
+				docForMQ := decodeHitDocMapRound60(*c.hit)
+				if docForMQ == nil {
+					docForMQ = map[string]any{}
+				}
+				docForMQ["__meta_id"] = c.hit.ID
+				if matchedNames := collectMatchedQueryNamesForSearch(cSchema, docForMQ, searchQuery, nil, nil); len(matchedNames) > 0 {
+					hitMap["matched_queries"] = matchedNames
 				}
 			}
 			if len(spec.ScriptFields) > 0 {
@@ -20244,7 +20743,8 @@ func attachSubAggsToBucketWithSchema(
 			}
 			childBuckets := make([]map[string]any, 0, len(rngSpec.Ranges))
 			grandSubAggs := subSpec.SubAggs()
-			for _, rng := range rngSpec.Ranges {
+			for _, rIdx := range sortedRuntimeRangeAggIndicesAscR63(rngSpec, isDateRange, isIPRange, nowUTC) {
+				rng := rngSpec.Ranges[rIdx]
 				ek := rng.EffectiveKey()
 				entry := map[string]any{
 					"key":       ek,
@@ -20252,7 +20752,8 @@ func attachSubAggsToBucketWithSchema(
 				}
 				if rng.Mask != "" && isIPRange {
 					entry["mask"] = rng.Mask
-					applyIPRangeCIDRMaskR62Search(rng.Mask, entry)
+					sc := scopeFromDocLookupR63(docLookup)
+					applyIPRangeCIDRMaskWithStrictR63(sc != nil && sc.strictConformance, rng.Mask, entry)
 				}
 				if rng.From != nil {
 					entry["from"] = rng.From
@@ -20401,31 +20902,48 @@ func attachSubAggsToBucketWithSchema(
 		case subSpec.EffectiveTerms() != nil:
 			tSpec := subSpec.EffectiveTerms()
 			isSig := subSpec.IsSignificantTerms()
+			isSigText := subSpec.SignificantText != nil
 			var matchingRows []AggRow
 			for _, r := range subRows {
 				if childKey, ok := trimSubAggBucketPrefix(r.BucketKey, parentBucketKey); ok {
 					cp := r
 					cp.BucketKey = childKey
 					matchingRows = append(matchingRows, cp)
+				} else if parentBucketKey == "" {
+					matchingRows = append(matchingRows, r)
 				}
 			}
 			grandSubAggs := subSpec.SubAggs()
 			var sumOtherDocCount int64
-			matchingRows, sumOtherDocCount = filterAndSortTermsRowsWithSubAggs(matchingRows, tSpec, subFullKey, parentBucketKey, bucketsByAgg, grandSubAggs, indexName, docLookup, idxSchema)
+			if !isSigText {
+				matchingRows, sumOtherDocCount = filterAndSortTermsRowsWithSubAggs(matchingRows, tSpec, subFullKey, parentBucketKey, bucketsByAgg, grandSubAggs, indexName, docLookup, idxSchema)
+			}
 			parentCount := bucketDocCount
+			sigBGCount := parentCount
+			if isSigText {
+				for _, bgR := range bucketsByAgg[subFullKey+".__sig_bg"] {
+					if parentBucketKey == "" || bgR.BucketKey == parentBucketKey {
+						sigBGCount = bgR.effectiveCount()
+						break
+					}
+				}
+			}
 			for _, r := range matchingRows {
 				if dc := r.effectiveCount(); dc > parentCount {
 					parentCount = dc
 				}
 			}
-			bgDenom := float64(parentCount)
+			if !isSigText {
+				sigBGCount = parentCount
+			}
+			bgDenom := float64(sigBGCount)
 			if bgDenom < 1 {
 				bgDenom = 1
 			}
 			childBuckets := make([]map[string]any, 0, len(matchingRows))
 			for _, r := range matchingRows {
 				docCnt := r.effectiveCount()
-				keyVal, keyAsStr, hasKeyAsStr := formatTermsBucketKeyAndString(r.BucketKey, tSpec, idxSchema)
+				keyVal, keyAsStr, hasKeyAsStr := formatTermsBucketKeyAndStringWithScopeR63(scopeFromDocLookupR63(docLookup), r.BucketKey, tSpec, idxSchema)
 				cb := map[string]any{
 					"key":       keyVal,
 					"doc_count": docCnt,
@@ -20433,7 +20951,14 @@ func attachSubAggsToBucketWithSchema(
 				if hasKeyAsStr {
 					cb["key_as_string"] = keyAsStr
 				}
-				if isSig {
+				if isSigText {
+					bgCnt := int64(r.Weight)
+					if bgCnt <= 0 {
+						bgCnt = docCnt
+					}
+					cb["score"] = r.Value
+					cb["bg_count"] = bgCnt
+				} else if isSig {
 					fgProb := float64(docCnt) / bgDenom
 					score := math.Round(fgProb*float64(docCnt)*10000) / 10000
 					if math.IsNaN(score) || math.IsInf(score, 0) {
@@ -20443,7 +20968,11 @@ func attachSubAggsToBucketWithSchema(
 					cb["bg_count"] = docCnt
 				}
 				if len(grandSubAggs) > 0 {
-					attachSubAggsToBucketWithSchema(indexName, cb, subFullKey, parentBucketKey+"\x1f"+r.BucketKey, grandSubAggs, bucketsByAgg, docLookup, idxSchema)
+					nextParentKey := r.BucketKey
+					if parentBucketKey != "" {
+						nextParentKey = parentBucketKey + "\x1f" + r.BucketKey
+					}
+					attachSubAggsToBucketWithSchema(indexName, cb, subFullKey, nextParentKey, grandSubAggs, bucketsByAgg, docLookup, idxSchema)
 					evaluateSiblingPipelineAggs(grandSubAggs, cb)
 				}
 				childBuckets = append(childBuckets, cb)
@@ -20454,7 +20983,7 @@ func attachSubAggsToBucketWithSchema(
 			if isSig {
 				bucketMap[subName] = map[string]any{
 					"doc_count": parentCount,
-					"bg_count":  parentCount,
+					"bg_count":  sigBGCount,
 					"buckets":   childBuckets,
 				}
 			} else {
@@ -20765,10 +21294,16 @@ func collectScalarValuesAtPathWithNull(node any, path []string, nullValue any) [
 	}
 	switch curr := node.(type) {
 	case map[string]any:
-		if next, exists := curr[path[0]]; exists {
-			return collectScalarValuesAtPathWithNull(next, path[1:], nullValue)
+		if len(path) == 1 {
+			if next, exists := curr[path[0]]; exists {
+				return collectScalarValuesAtPathWithNull(next, nil, nullValue)
+			}
+			return nil
 		}
 		if len(path) > 1 {
+			if next, exists := curr[path[0]]; exists {
+				return collectScalarValuesAtPathWithNull(next, path[1:], nullValue)
+			}
 			if flat, exists := curr[strings.Join(path, ".")]; exists {
 				return collectScalarValuesAtPathWithNull(flat, nil, nullValue)
 			}
@@ -20797,6 +21332,11 @@ func collectSchemaAwareScalarValues(doc map[string]any, field string, pathSegs [
 		}
 	}
 	vals := collectScalarValuesAtPathWithNull(doc, pathSegs, nullVal)
+	if len(vals) == 0 && doc != nil && strings.Contains(cleanTarget, ".") {
+		if flatVal, exists := doc[cleanTarget]; exists && flatVal != nil {
+			vals = collectScalarValuesAtPathWithNull(map[string]any{"v": flatVal}, []string{"v"}, nullVal)
+		}
+	}
 	if len(vals) == 0 && idxSchema != nil && idxSchema.RawMapping != nil {
 		visited := map[string]bool{cleanTarget: true}
 		frontier := []string{cleanTarget}
@@ -21072,7 +21612,7 @@ func extractHitSortValues(h HitRow, sorts []esast.SortSpec, idxSchema *schema.In
 	} else {
 		doc["__meta_version"] = int64(1)
 	}
-	if idxSchema == nil && h.Schema != nil {
+	if h.Schema != nil {
 		idxSchema = h.Schema
 	}
 	out := make([]any, 0, len(sorts))
@@ -21288,7 +21828,7 @@ func extractHitSortValues(h HitRow, sorts []esast.SortSpec, idxSchema *schema.In
 					}
 				}
 			}
-			out = append(out, val)
+			out = append(out, formatSortValueWithEntryFormatR63(val, s, idxSchema))
 		}
 	}
 	return out
@@ -21636,6 +22176,14 @@ func sortHistogramBuckets(buckets []map[string]any, order any) []map[string]any 
 }
 
 func buildHighlightMapWithSchema(raw json.RawMessage, req *esast.SearchRequest, hitSchema *schema.IndexSchema) map[string][]string {
+	var idxName string
+	if hitSchema != nil {
+		idxName = hitSchema.IndexName
+	}
+	return buildHighlightMapWithSchemaAndServerWave3R63(nil, idxName, raw, req, hitSchema)
+}
+
+func buildHighlightMapWithSchemaAndServerWave3R63(srv *Server, indexName string, raw json.RawMessage, req *esast.SearchRequest, hitSchema *schema.IndexSchema) map[string][]string {
 	if req == nil || req.Highlight == nil || len(req.Highlight.Fields) == 0 {
 		return nil
 	}
@@ -21752,9 +22300,40 @@ func buildHighlightMapWithSchema(raw json.RawMessage, req *esast.SearchRequest, 
 			if allLeafPaths == nil {
 				allLeafPaths = make(map[string][]string)
 				collectAllLeafStringPaths(doc, "", allLeafPaths)
+				if hitSchema != nil {
+					for mfName, mfBind := range hitSchema.Fields {
+						if mfBind.AliasTarget != "" || strings.HasSuffix(mfName, ".keyword") {
+							continue
+						}
+						mfType := strings.ToLower(strings.TrimSpace(mfBind.ESType))
+						if mfType != "text" && mfType != "search_as_you_type" && mfType != "match_only_text" {
+							continue
+						}
+						if _, exists := allLeafPaths[mfName]; exists {
+							continue
+						}
+						if mfVals := collectHighlightFieldStrings(doc, mfName, hitSchema); len(mfVals) > 0 {
+							allLeafPaths[mfName] = mfVals
+						}
+					}
+				}
 			}
-			for leafPath, vals := range allLeafPaths {
+			leafKeys := make([]string, 0, len(allLeafPaths))
+			for lk := range allLeafPaths {
+				leafKeys = append(leafKeys, lk)
+			}
+			sort.Strings(leafKeys)
+			queryHasNested := queryContainsNested(effQuery)
+			effectiveHLMode := effHLType
+			if effHLType == "unified" && (len(req.KNN) > 0 || queryHasNested) {
+				effectiveHLMode = "plain"
+			}
+			for _, leafPath := range leafKeys {
+				vals := allLeafPaths[leafPath]
 				if _, alreadyExplicit := out[leafPath]; alreadyExplicit {
+					continue
+				}
+				if hitSchema != nil && hitSchema.ResolveField(leafPath).NestedPath != "" && !queryHasNested {
 					continue
 				}
 				if matchWildcardPattern(cleanField, leafPath) {
@@ -21767,8 +22346,13 @@ func buildHighlightMapWithSchema(raw json.RawMessage, req *esast.SearchRequest, 
 						(effHLType == "unified" && fieldHasIndexOffsetsOrTermVectorOffsetsR61Search(hitSchema, leafPath) && !forceSrc) {
 						leafMaxOff = -1
 					}
+					isKw := false
+					if hitSchema != nil {
+						et := strings.ToLower(strings.TrimSpace(hitSchema.ResolveField(leafPath).ESType))
+						isKw = et == "keyword" || et == "constant_keyword" || et == "wildcard"
+					}
 					re := compileHighlightRegexForFields(effQuery, targetFields, requireFieldMatch, hitSchema)
-					frags := buildHighlightedFieldSnippetsWithMaxOffset(vals, re, preTag, postTag, htmlEscape, effFragSize, effNumFrags, effNoMatchSize, leafMaxOff)
+					frags := buildHighlightedSnippetsModeAwareWithFieldTypeR63(vals, re, preTag, postTag, htmlEscape, effFragSize, effNumFrags, effNoMatchSize, leafMaxOff, effectiveHLMode, isKw)
 					if len(frags) > 0 {
 						out[leafPath] = frags
 					}
@@ -21792,8 +22376,29 @@ func buildHighlightMapWithSchema(raw json.RawMessage, req *esast.SearchRequest, 
 			}
 			continue
 		}
+		effectiveHLMode := effHLType
+		if effHLType == "unified" && (len(req.KNN) > 0 || queryContainsNested(effQuery)) {
+			effectiveHLMode = "plain"
+		}
+		if effectiveHLMode == "annotated" {
+			if frags := buildAnnotatedHighlightSnippetsWave3R63(vals, effQuery, fieldMaxOffset); len(frags) > 0 {
+				out[field] = frags
+			}
+			continue
+		}
+		if frags, handledNG := srv.buildCustomNGramAnalyzerHighlightSnippetsWave3R63(indexName, hitSchema, field, vals, effQuery, preTag, postTag, htmlEscape); handledNG {
+			if len(frags) > 0 {
+				out[field] = frags
+			}
+			continue
+		}
+		isKw := false
+		if hitSchema != nil {
+			et := strings.ToLower(strings.TrimSpace(hitSchema.ResolveField(field).ESType))
+			isKw = et == "keyword" || et == "constant_keyword" || et == "wildcard"
+		}
 		re := compileHighlightRegexForFields(effQuery, targetFields, requireFieldMatch, hitSchema)
-		frags := buildHighlightedFieldSnippetsWithMaxOffset(vals, re, preTag, postTag, htmlEscape, effFragSize, effNumFrags, effNoMatchSize, fieldMaxOffset)
+		frags := buildHighlightedSnippetsModeAwareWithFieldTypeR63(vals, re, preTag, postTag, htmlEscape, effFragSize, effNumFrags, effNoMatchSize, fieldMaxOffset, effectiveHLMode, isKw)
 		if len(frags) > 0 {
 			out[field] = frags
 		}
@@ -21952,6 +22557,9 @@ func buildAllowedHighlightQueryFields(targetFields []string, hitSchema *schema.I
 		addField(tf)
 		if hitSchema != nil {
 			b := hitSchema.ResolveField(tf)
+			if b.ESFieldPath != "" {
+				addField(b.ESFieldPath)
+			}
 			if len(b.SourceJSONPath) > 0 {
 				addField(strings.Join(b.SourceJSONPath, "."))
 			}
@@ -21973,8 +22581,6 @@ func buildAllowedHighlightQueryFields(targetFields []string, hitSchema *schema.I
 			for nestedRoot := range hitSchema.NestedRoots {
 				if strings.HasPrefix(clean, nestedRoot+".") {
 					addField(strings.TrimPrefix(clean, nestedRoot+"."))
-				} else {
-					addField(nestedRoot + "." + clean)
 				}
 			}
 			if hitSchema.RawMapping != nil {
@@ -23964,7 +24570,7 @@ func (s *Server) applyArrayPromotionDelta(ctx context.Context, indexName string,
 	s.indices[indexName] = newSchema
 	s.mu.Unlock()
 	s.persistIndex(ctx, indexName, newSchema)
-	s.backfillIndexSchema(ctx, newSchema)
+	s.backfillIndexSchemaPreserveVersionR63(ctx, indexName, newSchema)
 	s.queryCache.InvalidateAll()
 	return newSchema
 }
@@ -24612,7 +25218,7 @@ func queryHasMinScore(q *esast.Query) bool {
 }
 
 func aggSpecHasDirectRuntimeScript(spec esast.AggSpec) bool {
-	if spec.RareTerms != nil || spec.MultiTerms != nil || spec.AutoDateHistogram != nil || spec.VariableWidthHistogram != nil ||
+	if spec.SignificantText != nil || spec.RareTerms != nil || spec.MultiTerms != nil || spec.AutoDateHistogram != nil || spec.VariableWidthHistogram != nil ||
 		spec.WeightedAvg != nil || spec.MedianAbsoluteDeviation != nil ||
 		spec.GeoBounds != nil || spec.GeoCentroid != nil || spec.GeoDistance != nil ||
 		spec.GeohashGrid != nil || spec.GeotileGrid != nil ||
@@ -24965,6 +25571,7 @@ func resolveRuntimeEvalSchema(idxSchema *schema.IndexSchema, doc map[string]any,
 		}
 		effSchema = schema.CompileIndexSchema(dbName, idxName, merged)
 		if idxSchema != nil {
+			effSchema.ES8Mode = idxSchema.ES8Mode
 			effSchema.IsRuntimeEvalSchema = idxSchema.IsRuntimeEvalSchema
 			orderedIdx := make(map[string]int, len(effSchema.OrderedFields))
 			for idx, ob := range effSchema.OrderedFields {
@@ -25615,10 +26222,8 @@ func evalQueryScriptScoreOnDocWithSchema(idxSchema *schema.IndexSchema, doc map[
 			}
 			if queryHasRuntimeScript(q.ScriptScore.Query) || queryHasNestedScoring(q.ScriptScore.Query) || q.ScriptScore.Query.FunctionScore != nil {
 				baseScore = evalQueryScriptScoreOnDocWithSchema(idxSchema, doc, q.ScriptScore.Query, baseScore)
-			} else if baseScore == 1.0 {
+			} else {
 				baseScore = scoreNonScriptClauseOnDoc(idxSchema, doc, q.ScriptScore.Query)
-			} else if q.ScriptScore.Boost != nil && *q.ScriptScore.Boost != 0 {
-				baseScore = baseScore / (*q.ScriptScore.Boost)
 			}
 		}
 		src, params := extractScriptSourceAndParams(q.ScriptScore.Script)
@@ -25800,6 +26405,9 @@ func evalQueryScriptScoreOnDocWithSchema(idxSchema *schema.IndexSchema, doc map[
 	if q.Nested != nil {
 		if strings.EqualFold(strings.TrimSpace(q.Nested.ScoreMode), "none") {
 			return 0.0
+		}
+		if sc, okKNN := evalNestedKNNParentScoreOnDocR63(idxSchema, doc, q.Nested); okKNN {
+			return sc
 		}
 		pathSegs := strings.Split(q.Nested.Path, ".")
 		cands := extractNestedElementsAtPath(doc, pathSegs)
@@ -26844,11 +27452,22 @@ func emitRuntimeGeoCentroidAggRows(fullAggName, metricBucketKey string, spec *es
 }
 
 func emitRuntimeMatrixStatsAggRows(fullAggName, metricBucketKey string, spec *esast.MatrixStatsAggSpec, bDocs []runtimeMatchedDoc, out *[]AggRow) {
+	var srv *Server
+	if sc := scopeFromMatchedDocsR63(bDocs, nil); sc != nil {
+		srv = sc.srv
+	}
+	emitRuntimeMatrixStatsAggRowsWithServerWave3R63(srv, fullAggName, metricBucketKey, spec, bDocs, out)
+}
+
+func emitRuntimeMatrixStatsAggRowsWithServerWave3R63(srv *Server, fullAggName, metricBucketKey string, spec *esast.MatrixStatsAggSpec, bDocs []runtimeMatchedDoc, out *[]AggRow) {
 	if spec == nil || len(spec.Fields) == 0 {
 		emitRuntimeJSONMetricRow(fullAggName, metricBucketKey, map[string]any{"doc_count": int64(0), "fields": []any{}}, 0, out)
 		return
 	}
-	fields := spec.Fields
+	fields := append([]string(nil), spec.Fields...)
+	sort.Slice(fields, func(i, j int) bool {
+		return fields[i] > fields[j]
+	})
 	n := len(fields)
 	var rows [][]float64
 	for _, md := range bDocs {
@@ -26859,10 +27478,7 @@ func emitRuntimeMatrixStatsAggRows(fullAggName, metricBucketKey string, spec *es
 			if spec.Missing != nil {
 				missingVal = spec.Missing[f]
 			}
-			fvals := extractDocNumericValuesForMetric(md, &esast.MetricAggSpec{
-				Field:   f,
-				Missing: missingVal,
-			})
+			fvals := extractMatrixStatsFieldValuesWave3R63(srv, md, f, missingVal)
 			if len(fvals) == 0 {
 				complete = false
 				break
@@ -27194,11 +27810,6 @@ func formatTermsBucketKeyAndString(rawKey string, termsSpec *esast.TermsAggSpec,
 	}
 	if isBool && vtOverride != "string" {
 		strictBoolKey := vtOverride == "boolean"
-		if !strictBoolKey {
-			if srv := resolveServerForSchemaOrActiveR62Search(idxSchema); srv != nil && srv.hasExplicitTargetESVersion() {
-				strictBoolKey = true
-			}
-		}
 		lower := strings.ToLower(strings.TrimSpace(rawKey))
 		if lower == "true" || lower == "1" {
 			if strictBoolKey {
@@ -27450,12 +28061,16 @@ func emitRuntimeRareTermsAggRows(
 	}
 	byBucket, keys := computeRuntimeTermsScriptBucketDocsWithSchema(idxSchema, docs, synthTerms)
 	var rareKeys []string
+	var rareESType string
+	if idxSchema != nil && rt.Field != "" {
+		rareESType = idxSchema.ResolveField(rt.Field).ESType
+	}
 	for _, k := range keys {
 		if int64(len(byBucket[k])) <= maxDocCount {
-			if rt.Include != nil && !matchesTermsFilterPrecompiled(k, rt.Include, incRe) {
+			if rt.Include != nil && !matchesTermsFilterPrecompiledWithSchemaR62Search(k, rt.Include, incRe, rareESType) {
 				continue
 			}
-			if rt.Exclude != nil && matchesTermsFilterPrecompiled(k, rt.Exclude, excRe) {
+			if rt.Exclude != nil && matchesTermsFilterPrecompiledWithSchemaR62Search(k, rt.Exclude, excRe, rareESType) {
 				continue
 			}
 			rareKeys = append(rareKeys, k)
@@ -27500,56 +28115,17 @@ func emitRuntimeVariableWidthHistogramAggRows(
 	if vwh == nil {
 		return
 	}
-	targetBuckets := vwh.EffectiveBuckets()
-	type docValPair struct {
-		md  runtimeMatchedDoc
-		val float64
-	}
-	var pairs []docValPair
-	for _, md := range docs {
-		vals := extractDocNumericValuesForBucket(md, vwh.Field, vwh.Missing, vwh.Script)
-		for _, v := range vals {
-			pairs = append(pairs, docValPair{md: md, val: v})
-		}
-	}
-	if len(pairs) == 0 {
+	clusters := clusterVariableWidthHistogramR63(docs, vwh)
+	if len(clusters) == 0 {
 		return
 	}
-	sort.SliceStable(pairs, func(i, j int) bool {
-		return pairs[i].val < pairs[j].val
-	})
-	if targetBuckets > len(pairs) {
-		targetBuckets = len(pairs)
-	}
 	subAggs := aggSpec.SubAggs()
-	for bIdx := 0; bIdx < targetBuckets; bIdx++ {
-		start := (bIdx * len(pairs)) / targetBuckets
-		end := ((bIdx + 1) * len(pairs)) / targetBuckets
-		if start >= end {
-			continue
-		}
-		slice := pairs[start:end]
-		minV := slice[0].val
-		maxV := slice[len(slice)-1].val
-		var sumV float64
-		var bDocs []runtimeMatchedDoc
-		seenDoc := make(map[string]bool, len(slice))
-		for idxInSlice, p := range slice {
-			sumV += p.val
-			docKey := p.md.hit.ID
-			if docKey == "" {
-				docKey = strconv.Itoa(start + idxInSlice)
-			}
-			if !seenDoc[docKey] {
-				seenDoc[docKey] = true
-				bDocs = append(bDocs, p.md)
-			}
-		}
-		keyVal := sumV / float64(len(slice))
+	for bIdx, cl := range clusters {
+		keyVal := cl.sumV / float64(cl.count)
 		metaObj := map[string]any{
-			"min": minV,
+			"min": cl.minV,
 			"key": keyVal,
-			"max": maxV,
+			"max": cl.maxV,
 		}
 		metaBytes, _ := json.Marshal(metaObj)
 		leafKey := strconv.Itoa(bIdx) + "\x00" + string(metaBytes)
@@ -27557,7 +28133,7 @@ func emitRuntimeVariableWidthHistogramAggRows(
 		if parentBucketKey != "" {
 			rowKey = parentBucketKey + "\x1f" + leafKey
 		}
-		cnt := int64(len(bDocs))
+		cnt := int64(len(cl.docs))
 		*out = append(*out, AggRow{
 			AggName:   fullAggName,
 			BucketKey: rowKey,
@@ -27565,7 +28141,7 @@ func emitRuntimeVariableWidthHistogramAggRows(
 			Value:     float64(cnt),
 		})
 		if len(subAggs) > 0 {
-			emitRuntimeAllSubAggRows(fullAggName, rowKey, subAggs, bDocs, out, idxSchema)
+			emitRuntimeAllSubAggRows(fullAggName, rowKey, subAggs, cl.docs, out, idxSchema)
 		}
 	}
 }
@@ -27979,7 +28555,7 @@ func formatRuntimeBucketAggObjectWithSchema(
 				bObj["key"] = leafKey
 			}
 		case aggSpec.RareTerms != nil:
-			kv, ks, hasKS := formatTermsBucketKeyAndString(leafKey, &esast.TermsAggSpec{
+			kv, ks, hasKS := formatTermsBucketKeyAndStringWithScopeR63(scopeFromDocLookupR63(docLookup), leafKey, &esast.TermsAggSpec{
 				Field: aggSpec.RareTerms.Field,
 			}, idxSchema)
 			bObj["key"] = kv
@@ -28580,6 +29156,18 @@ func emitRuntimeAllSubAggRows(
 	out *[]AggRow,
 	idxSchema *schema.IndexSchema,
 ) {
+	emitRuntimeAllSubAggRowsWithGlobal(parentFullKey, parentBucketKey, subAggs, bDocs, nil, out, idxSchema)
+}
+
+func emitRuntimeAllSubAggRowsWithGlobal(
+	parentFullKey string,
+	parentBucketKey string,
+	subAggs map[string]esast.AggSpec,
+	bDocs []runtimeMatchedDoc,
+	globalDocs []runtimeMatchedDoc,
+	out *[]AggRow,
+	idxSchema *schema.IndexSchema,
+) {
 	for subName, subSpec := range subAggs {
 		subFullKey := subName
 		if parentFullKey != "" {
@@ -28587,7 +29175,11 @@ func emitRuntimeAllSubAggRows(
 		}
 		switch {
 		case subSpec.SignificantText != nil:
-			emitRuntimeSignificantTextAggRowsR62Search(subFullKey, parentBucketKey, subSpec, bDocs, bDocs, out, idxSchema)
+			bgCorpus := globalDocs
+			if len(bgCorpus) == 0 {
+				bgCorpus = bDocs
+			}
+			emitRuntimeSignificantTextAggRowsR62Search(subFullKey, parentBucketKey, subSpec, bDocs, bgCorpus, out, idxSchema)
 		case subSpec.EffectiveTerms() != nil:
 			emitRuntimeTermsScriptAggRowsWithSchema(subFullKey, parentBucketKey, subSpec, bDocs, out, idxSchema)
 		case subSpec.RareTerms != nil:
@@ -28747,14 +29339,15 @@ func emitRuntimeAllSubAggRows(
 			if parentBucketKey != "" {
 				rnBucketKey = parentBucketKey
 			}
+			rnCnt := sumDocCountFieldForMatchedDocsR63(rnDocs)
 			*out = append(*out, AggRow{
 				AggName:   subFullKey,
 				BucketKey: rnBucketKey,
-				DocCount:  int64(len(rnDocs)),
-				Value:     float64(len(rnDocs)),
+				DocCount:  rnCnt,
+				Value:     float64(rnCnt),
 			})
 			if len(subSpec.SubAggs()) > 0 {
-				emitRuntimeAllSubAggRows(subFullKey, parentBucketKey, subSpec.SubAggs(), rnDocs, out, rnSchema)
+				emitRuntimeAllSubAggRowsWithGlobal(subFullKey, parentBucketKey, subSpec.SubAggs(), rnDocs, globalDocs, out, rnSchema)
 			}
 		case subSpec.EffectiveSampler() != nil:
 			sampledDocs := sampleDocsForSampler(bDocs, subSpec, idxSchema)
@@ -28762,14 +29355,15 @@ func emitRuntimeAllSubAggRows(
 			if parentBucketKey != "" {
 				sBucketKey = parentBucketKey
 			}
+			sCnt := sumDocCountFieldForMatchedDocsR63(sampledDocs)
 			*out = append(*out, AggRow{
 				AggName:   subFullKey,
 				BucketKey: sBucketKey,
-				DocCount:  int64(len(sampledDocs)),
-				Value:     float64(len(sampledDocs)),
+				DocCount:  sCnt,
+				Value:     float64(sCnt),
 			})
 			if len(subSpec.SubAggs()) > 0 {
-				emitRuntimeAllSubAggRows(subFullKey, parentBucketKey, subSpec.SubAggs(), sampledDocs, out, idxSchema)
+				emitRuntimeAllSubAggRowsWithGlobal(subFullKey, parentBucketKey, subSpec.SubAggs(), sampledDocs, globalDocs, out, idxSchema)
 			}
 		default:
 			emitRuntimeMetricAggRows(subFullKey, parentBucketKey, subSpec, bDocs, out)
@@ -28804,11 +29398,12 @@ func emitRuntimeFiltersAggRows(
 			if parentBucketKey != "" {
 				rowKey = parentBucketKey + "\x1f" + fk
 			}
+			fCnt := sumDocCountFieldForMatchedDocsR63(fDocs)
 			*out = append(*out, AggRow{
 				AggName:   fullAggName,
 				BucketKey: rowKey,
-				DocCount:  int64(len(fDocs)),
-				Value:     float64(len(fDocs)),
+				DocCount:  fCnt,
+				Value:     float64(fCnt),
 			})
 			if len(aggSpec.SubAggs()) > 0 {
 				emitRuntimeAllSubAggRows(fullAggName, rowKey, aggSpec.SubAggs(), fDocs, out, idxSchema)
@@ -28833,11 +29428,12 @@ func emitRuntimeFiltersAggRows(
 			if parentBucketKey != "" {
 				rowKey = parentBucketKey + "\x1f" + fk
 			}
+			fCnt := sumDocCountFieldForMatchedDocsR63(fDocs)
 			*out = append(*out, AggRow{
 				AggName:   fullAggName,
 				BucketKey: rowKey,
-				DocCount:  int64(len(fDocs)),
-				Value:     float64(len(fDocs)),
+				DocCount:  fCnt,
+				Value:     float64(fCnt),
 			})
 			if len(aggSpec.SubAggs()) > 0 {
 				emitRuntimeAllSubAggRows(fullAggName, rowKey, aggSpec.SubAggs(), fDocs, out, idxSchema)
@@ -28856,11 +29452,12 @@ func emitRuntimeFiltersAggRows(
 		if parentBucketKey != "" {
 			rowKey = parentBucketKey + "\x1f" + otherKey
 		}
+		oCnt := sumDocCountFieldForMatchedDocsR63(otherDocs)
 		*out = append(*out, AggRow{
 			AggName:   fullAggName,
 			BucketKey: rowKey,
-			DocCount:  int64(len(otherDocs)),
-			Value:     float64(len(otherDocs)),
+			DocCount:  oCnt,
+			Value:     float64(oCnt),
 		})
 		if len(aggSpec.SubAggs()) > 0 {
 			emitRuntimeAllSubAggRows(fullAggName, rowKey, aggSpec.SubAggs(), otherDocs, out, idxSchema)
@@ -29289,33 +29886,34 @@ func applyRuntimeScriptAggsForMap(
 		case spec.Composite != nil && (aggSpecHasDirectRuntimeScript(spec) || aggsHaveAutoDateOrSignificantTextR62Search(map[string]esast.AggSpec{aggName: spec})):
 			aggRows = dropRuntimeAggRows(aggRows, fullKey, parentBucketKey)
 			emitRuntimeCompositeAggRows(fullKey, parentBucketKey, spec, docs, &aggRows, idxSchema)
-		case spec.Filter != nil && (queryHasRuntimeScript(spec.Filter) || aggsHaveRuntimeScript(spec.SubAggs())):
+		case spec.Filter != nil && (queryHasRuntimeScript(spec.Filter) || aggsHaveRuntimeScript(spec.SubAggs()) || schemasHaveDocCountFieldR63([]*schema.IndexSchema{idxSchema})):
 			var fDocs []runtimeMatchedDoc
 			for _, md := range docs {
 				if evalBranchMatchesDoc(idxSchema, md.doc, spec.Filter) {
 					fDocs = append(fDocs, md)
 				}
 			}
-			if queryHasRuntimeScript(spec.Filter) {
+			if queryHasRuntimeScript(spec.Filter) || schemasHaveDocCountFieldR63([]*schema.IndexSchema{idxSchema}) {
 				aggRows = dropRuntimeAggRows(aggRows, fullKey, parentBucketKey)
 				fBucketKey := "_filter"
 				if parentBucketKey != "" {
 					fBucketKey = parentBucketKey
 				}
+				fCnt := sumDocCountFieldForMatchedDocsR63(fDocs)
 				aggRows = append(aggRows, AggRow{
 					AggName:   fullKey,
 					BucketKey: fBucketKey,
-					DocCount:  int64(len(fDocs)),
-					Value:     float64(len(fDocs)),
+					DocCount:  fCnt,
+					Value:     float64(fCnt),
 				})
 				if len(spec.SubAggs()) > 0 {
-					emitRuntimeAllSubAggRows(fullKey, parentBucketKey, spec.SubAggs(), fDocs, &aggRows, idxSchema)
+					emitRuntimeAllSubAggRowsWithGlobal(fullKey, parentBucketKey, spec.SubAggs(), fDocs, globalDocs, &aggRows, idxSchema)
 				}
 			} else {
 				aggRows = applyRuntimeScriptAggsForMap(fullKey, parentBucketKey, spec.SubAggs(), fDocs, globalDocs, aggRows, idxSchema)
 			}
-		case spec.Filters != nil && (aggSpecHasDirectRuntimeScript(spec) || aggsHaveRuntimeScript(spec.SubAggs())):
-			if aggSpecHasDirectRuntimeScript(spec) {
+		case spec.Filters != nil && (aggSpecHasDirectRuntimeScript(spec) || aggsHaveRuntimeScript(spec.SubAggs()) || schemasHaveDocCountFieldR63([]*schema.IndexSchema{idxSchema})):
+			if aggSpecHasDirectRuntimeScript(spec) || schemasHaveDocCountFieldR63([]*schema.IndexSchema{idxSchema}) {
 				aggRows = dropRuntimeAggRows(aggRows, fullKey, parentBucketKey)
 				emitRuntimeFiltersAggRows(fullKey, parentBucketKey, spec, docs, &aggRows, idxSchema)
 			} else {
@@ -29384,7 +29982,7 @@ func applyRuntimeScriptAggsForMap(
 					Value:     float64(len(rnDocs)),
 				})
 				if len(spec.SubAggs()) > 0 {
-					emitRuntimeAllSubAggRows(fullKey, parentBucketKey, spec.SubAggs(), rnDocs, &aggRows, rnSchema)
+					emitRuntimeAllSubAggRowsWithGlobal(fullKey, parentBucketKey, spec.SubAggs(), rnDocs, globalDocs, &aggRows, rnSchema)
 				}
 			} else {
 				aggRows = applyRuntimeScriptAggsForMap(fullKey, parentBucketKey, spec.SubAggs(), rnDocs, globalDocs, aggRows, rnSchema)
@@ -29403,7 +30001,7 @@ func applyRuntimeScriptAggsForMap(
 				Value:     float64(len(sampledDocs)),
 			})
 			if len(spec.SubAggs()) > 0 {
-				emitRuntimeAllSubAggRows(fullKey, parentBucketKey, spec.SubAggs(), sampledDocs, &aggRows, idxSchema)
+				emitRuntimeAllSubAggRowsWithGlobal(fullKey, parentBucketKey, spec.SubAggs(), sampledDocs, globalDocs, &aggRows, idxSchema)
 			}
 		case aggSpecHasDirectRuntimeScript(spec):
 			aggRows = dropRuntimeAggRows(aggRows, fullKey, parentBucketKey)
@@ -30083,7 +30681,7 @@ func evalHitScriptFields(h HitRow, scriptFields map[string]any, idxSchema *schem
 	} else {
 		doc["__meta_version"] = int64(1)
 	}
-	if idxSchema == nil && h.Schema != nil {
+	if h.Schema != nil {
 		idxSchema = h.Schema
 	}
 	out := make(map[string][]any, len(scriptFields))

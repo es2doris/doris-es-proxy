@@ -970,6 +970,15 @@ func unmarshalFieldPropertyRound60Internal(fp *FieldProperty, data []byte, stric
 		}
 		delete(rawMap, "contexts")
 	}
+	var parsedFetchFields []map[string]any
+	if rawFetch, hasFetch := rawMap["fetch_fields"]; hasFetch {
+		ff, err := parseFlexibleLookupFetchFields(rawFetch)
+		if err != nil {
+			return err
+		}
+		parsedFetchFields = ff
+		delete(rawMap, "fetch_fields")
+	}
 	cleaned, err := json.Marshal(rawMap)
 	if err != nil {
 		return err
@@ -987,6 +996,16 @@ func unmarshalFieldPropertyRound60Internal(fp *FieldProperty, data []byte, stric
 			return err
 		}
 	}
+	if rawNV, hasNV := rawMap["null_value"]; hasNV {
+		if num, ok := extractExactLargeIntNumber(rawNV); ok {
+			p.NullValue = num
+		}
+	}
+	if rawVal, hasVal := rawMap["value"]; hasVal {
+		if num, ok := extractExactLargeIntNumber(rawVal); ok {
+			p.Value = num
+		}
+	}
 	if p.OnScriptError != "" {
 		normErrMode, err := ValidateOnScriptError(p.OnScriptError)
 		if err != nil {
@@ -996,6 +1015,7 @@ func unmarshalFieldPropertyRound60Internal(fp *FieldProperty, data []byte, stric
 	}
 	p.Meta = parsedMeta
 	p.Contexts = parsedContexts
+	p.FetchFields = parsedFetchFields
 	p.ExplicitDims = hasDims || hasDim
 	*fp = FieldProperty(p)
 	return nil

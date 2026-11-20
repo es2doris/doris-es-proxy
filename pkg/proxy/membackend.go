@@ -54,20 +54,22 @@ import (
 // transpiled Doris SQL (`WHERE`, `_score`, `ORDER BY`, `LIMIT/OFFSET`, `WITH base_matched AS (...)`,
 // `LATERAL VIEW EXPLODE`, `array_exists`, `array_contains`, and `MATCH_*` predicates).
 type MemoryBackend struct {
-	mu       sync.RWMutex
-	logSQL   bool
-	ddls     []string
-	hitsSQLs []string
-	aggsSQLs []string
-	tables   map[string]map[string]map[string]any // table -> _id -> shredded row map
-	catalog  map[string]CatalogEntry              // entityType+":"+entityKey -> CatalogEntry
+	mu         sync.RWMutex
+	logSQL     bool
+	ddls       []string
+	hitsSQLs   []string
+	aggsSQLs   []string
+	tables     map[string]map[string]map[string]any // table -> _id -> shredded row map
+	stringCols map[string]map[string]bool           // table -> VARCHAR/STRING scalar columns
+	catalog    map[string]CatalogEntry              // entityType+":"+entityKey -> CatalogEntry
 }
 
 func NewMemoryBackend(logSQL bool) *MemoryBackend {
 	return &MemoryBackend{
-		logSQL:  logSQL,
-		tables:  make(map[string]map[string]map[string]any),
-		catalog: make(map[string]CatalogEntry),
+		logSQL:     logSQL,
+		tables:     make(map[string]map[string]map[string]any),
+		stringCols: make(map[string]map[string]bool),
+		catalog:    make(map[string]CatalogEntry),
 	}
 }
 
@@ -123,6 +125,7 @@ func (m *MemoryBackend) ExecDDL(_ context.Context, ddl string) error {
 	}
 
 	upper := strings.ToUpper(ddl)
+	recordDDLStringColumnsR63Mem(m.stringCols, ddl)
 	if strings.HasPrefix(upper, "CREATE TABLE") {
 		tbl := extractTableNameFromDDL(ddl)
 		if tbl != "" && m.tables[tbl] == nil {
@@ -155,6 +158,7 @@ func (m *MemoryBackend) StreamLoad(_ context.Context, table string, ndjson []byt
 		if err := dec.Decode(&row); err != nil {
 			return err
 		}
+		coerceRowStringColumnsR63Mem(row, m.stringCols[table])
 		id := fmt.Sprintf("%v", row["_id"])
 		newVer, _ := toInt64(row["_version"])
 		if existing, ok := m.tables[table][id]; ok {
@@ -390,7 +394,7 @@ func splitHitsWhereBody(whereBody string) (mainWhere, postWhere string) {
 	return strings.Join(parts[:len(parts)-1], " AND "), parts[len(parts)-1]
 }
 
-func (m *MemoryBackend) QueryHits(_ context.Context, sqlStr string) ([]HitRow, error) {
+func (m *MemoryBackend) QueryHits(ctx context.Context, sqlStr string) ([]HitRow, error) {
 	m.mu.Lock()
 	m.hitsSQLs = appendBoundedSQL(m.hitsSQLs, sqlStr)
 	logSQL := m.logSQL
@@ -402,6 +406,10 @@ func (m *MemoryBackend) QueryHits(_ context.Context, sqlStr string) ([]HitRow, e
 
 	m.mu.RLock()
 	defer m.mu.RUnlock()
+
+	if err := checkStrictNereidsSQLTypesR63Mem(sqlStr); err != nil {
+		return nil, err
+	}
 
 	var scoreExpr, totalExpr, collapseCol, collapseSearchAfterWhere, tableName, mainWhere, postWhere, orderByClause string
 	var limit, offset int
@@ -445,13 +453,14 @@ func (m *MemoryBackend) QueryHits(_ context.Context, sqlStr string) ([]HitRow, e
 	}
 	var matchedRows []map[string]any
 	var hits []HitRow
+	evalScore := prepareScoreEvaluatorR63Mem(ctx, tbl, scoreExpr)
 
 	for _, row := range tbl {
 		if isTombstoneRow(row) {
 			continue
 		}
 		if evalWhereExpr(row, mainWhere) && evalWhereExpr(row, postWhere) {
-			score := evalNumericExpr(row, scoreExpr)
+			score := evalScore(row)
 			ver, _ := toInt64(row["_version"])
 			srcStr, _ := row["_source"].(string)
 			rowCopy := make(map[string]any, len(row)+1)
@@ -581,6 +590,10 @@ func (m *MemoryBackend) QueryAggs(_ context.Context, sqlStr string) ([]AggRow, e
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
+	if err := checkStrictNereidsSQLTypesR63Mem(sqlStr); err != nil {
+		return nil, err
+	}
+
 	sub := reCTEBase.FindStringSubmatch(sqlStr)
 	if sub == nil {
 		return nil, fmt.Errorf("unrecognized AggsSQL format: %s", sqlStr)
@@ -606,6 +619,9 @@ func (m *MemoryBackend) QueryAggs(_ context.Context, sqlStr string) ([]AggRow, e
 	var out []AggRow
 	for _, branch := range unionBranches {
 		branch = strings.TrimSpace(branch)
+		if strings.HasPrefix(branch, "(SELECT ") && strings.HasSuffix(branch, ")") {
+			branch = strings.TrimSpace(branch[1 : len(branch)-1])
+		}
 		if strings.Contains(branch, "ROW_NUMBER() OVER (ORDER BY ") {
 			branch = resolveKNNTopKSubqueries(tbl, branch)
 		}
@@ -616,7 +632,7 @@ func (m *MemoryBackend) QueryAggs(_ context.Context, sqlStr string) ([]AggRow, e
 	return out, nil
 }
 
-const docCountAggExprPatR62Mem = `(?:COUNT\(\*\)|COALESCE\(SUM\(COALESCE\(CAST\(json_extract_string\(` + "`_source`" + `, '\$\._doc_count'\) AS BIGINT\), 1\)\), 0\))`
+const docCountAggExprPatR62Mem = `(?:COUNT\(\*\)|COALESCE\(SUM\(COALESCE\((?:TRY_CAST|CAST)\(json_extract_string\(` + "`_source`" + `, '\$\.(?:"_doc_count"|_doc_count)'\) AS BIGINT\), 1\)\), 0\))`
 
 var (
 	reAggArrayExplode           = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, CAST\\((.+?) AS STRING\\) AS `_bucket_key`, CAST\\((?:COUNT\\(\\*\\)|COUNT\\(DISTINCT `_id`\\)) AS DOUBLE\\) AS `_doc_count` FROM `base_matched` LATERAL VIEW EXPLODE\\(`([^`]+)`\\) `_t` AS `_elem` WHERE (?:\\((.+)\\) AND )?`_elem` IS NOT NULL GROUP BY (?:`_elem`|`_bucket_key`) ORDER BY `_doc_count` DESC, `_bucket_key` ASC LIMIT (\\d+)")
@@ -643,7 +659,7 @@ var (
 	reAggMetric                 = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, '(_metric|_stats_[a-z_]+)' AS `_bucket_key`, CAST\\(COALESCE\\((AVG|SUM|MIN|MAX|COUNT|STDDEV_POP)\\((.+?)\\), 0\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched`(?: WHERE (.+))?$")
 	reAggPercentile             = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, '([^']+)' AS `_bucket_key`, CAST\\(COALESCE\\(PERCENTILE_APPROX\\((.+?), ([0-9.]+)\\), 0\\) AS DOUBLE\\) AS `_doc_count` FROM (`base_matched`(?: LATERAL VIEW EXPLODE\\(.+?\\) `_(?:nt|t)` AS `_(?:nel|elem)`)?)(?: WHERE (.+))?$")
 	reAggPercentileRank         = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, '([^']+)' AS `_bucket_key`, CAST\\(COALESCE\\(AVG\\(CASE WHEN (.+?) <= ([0-9.eE+-]+) THEN 100\\.0 ELSE 0\\.0 END\\), 0\\) AS DOUBLE\\) AS `_doc_count` FROM (`base_matched`(?: LATERAL VIEW EXPLODE\\(.+?\\) `_(?:nt|t)` AS `_(?:nel|elem)`)?)(?: WHERE (.+))?$")
-	reAggDateHist               = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, CAST\\(CAST\\(FLOOR\\((?:\\((.+?) \\+ (-?\\d+)\\)|(.+?)) / (\\d+)\\) \\* \\d+(?: - -?\\d+)? AS BIGINT\\) AS STRING\\) AS `_bucket_key`, CAST\\((?:COUNT\\(\\*\\)|COUNT\\(DISTINCT `_id`\\)) AS DOUBLE\\) AS `_doc_count` FROM (`base_matched`(?: LATERAL VIEW EXPLODE\\((?:CASE WHEN .+ END|`[^`]+`)\\) `_t` AS `_elem`)?) WHERE (?:(?:\\((.+)\\) AND )?(?:`[^`]+`|CAST\\([^)]+\\)|`_doc`\\[[^\\]]+\\]) IS NOT NULL|(.+?)) GROUP BY `_bucket_key` ORDER BY CAST\\(`_bucket_key` AS BIGINT\\) ASC")
+	reAggDateHist               = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, CAST\\(CAST\\(FLOOR\\((?:\\((.+?) \\+ (-?\\d+)\\)|(.+?)) / (\\d+)\\) \\* \\d+(?: - -?\\d+)? AS BIGINT\\) AS STRING\\) AS `_bucket_key`, CAST\\((?:COUNT\\(\\*\\)|COUNT\\(DISTINCT `_id`\\)) AS DOUBLE\\) AS `_doc_count` FROM (`base_matched`(?: LATERAL VIEW EXPLODE\\((?:CASE WHEN .+ END|`[^`]+`)\\) `_(?:t|ht|rng_t)` AS `_(?:elem|helem|bidx|off)`)?) WHERE (?:(?:\\((.+)\\) AND )?(?:`[^`]+`|CAST\\([^)]+\\)|`_doc`\\[[^\\]]+\\]) IS NOT NULL|(.+?)) GROUP BY `_bucket_key` ORDER BY CAST\\(`_bucket_key` AS BIGINT\\) ASC")
 	reAggDateHistGeneric        = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, (.+?) AS `_bucket_key`, CAST\\((?:COUNT\\(\\*\\)|COUNT\\(DISTINCT `_id`\\)) AS DOUBLE\\) AS `_doc_count` FROM (.+?) WHERE (.+?) GROUP BY `_bucket_key` ORDER BY CAST\\(`_bucket_key` AS BIGINT\\) ASC")
 	reAggHist                   = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, CAST\\(FLOOR\\(\\((.+?) - ([^)]+)\\) / ([^)]+)\\) \\* [^)]+ \\+ [^)]+ AS STRING\\) AS `_bucket_key`, CAST\\((?:COUNT\\(\\*\\)|COUNT\\(DISTINCT `_id`\\)|COALESCE\\(SUM\\((.+?)\\), 0\\)) AS DOUBLE\\) AS `_doc_count` FROM (`base_matched`(?: LATERAL VIEW EXPLODE\\(.+?\\) `_(?:t|ht|rng_t)` AS `_(?:elem|helem|bidx|off)`)?) WHERE (?:(?:\\((.+)\\) AND )?(?:`[^`]+`|CAST\\([^)]+\\)|`_doc`\\[[^\\]]+\\]) IS NOT NULL|(.+?)) GROUP BY `_bucket_key` ORDER BY CAST\\(`_bucket_key` AS DOUBLE\\) ASC")
 	reAggRawValues              = regexp.MustCompile(`^SELECT '(__raw_vals__(?:''|[^'])*)' AS ` + "`_agg_name`, CONCAT\\('_vals:', (?:IF\\(COUNT\\(.+?\\) <= 50000, )?COALESCE\\(ARRAY_JOIN\\(COLLECT_LIST\\(CAST\\((.+?) AS DOUBLE\\)\\), ','\\), ''\\)(?:, ':OVERFLOW:'\\))?\\) AS `_bucket_key`, CAST\\(COUNT\\(.+?\\) AS DOUBLE\\) AS `_doc_count` FROM (.+)$")
@@ -887,6 +903,10 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 		}})
 	}
 
+	if rows, handled := evalRound63AggBranchR63Mem(baseRows, branch, filterHaving); handled {
+		return rows
+	}
+
 	if rows, handled := evalRound62AggBranchR62Mem(baseRows, branch, filterHaving); handled {
 		return rows
 	}
@@ -895,11 +915,15 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 		aggName, elemExpr, arrCol, extraWhere := m[1], m[2], m[3], m[4]
 		limit, _ := strconv.Atoi(m[5])
 		counts := make(map[string]int64)
+		dedupPerDoc := strings.Contains(branch, "COUNT(DISTINCT `_id`)")
 		for _, row := range baseRows {
 			if extraWhere != "" && !evalWhereExpr(row, extraWhere) {
 				continue
 			}
-			seenInDoc := make(map[string]bool)
+			var seenInDoc map[string]bool
+			if dedupPerDoc {
+				seenInDoc = make(map[string]bool)
+			}
 			for _, elem := range toStringSlice(row[arrCol]) {
 				if elem == "" {
 					continue
@@ -917,8 +941,10 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 						valStr = ""
 					}
 				}
-				if valStr != "" && !seenInDoc[valStr] {
-					seenInDoc[valStr] = true
+				if valStr != "" && (!dedupPerDoc || !seenInDoc[valStr]) {
+					if dedupPerDoc {
+						seenInDoc[valStr] = true
+					}
 					counts[valStr]++
 				}
 			}
@@ -1248,7 +1274,7 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 		missingVal := unquoteSQLLiteral(missingLit)
 		limit, _ := strconv.Atoi(m[5])
 		counts := make(map[string]int64)
-		useDocCnt := strings.Contains(branch, "$._doc_count")
+		useDocCnt := strings.Contains(branch, "$._doc_count") || strings.Contains(branch, `$."_doc_count"`)
 		for _, row := range baseRows {
 			if extraWhere != "" && !evalWhereExpr(row, extraWhere) {
 				continue
@@ -1280,7 +1306,7 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 		}
 		limit, _ := strconv.Atoi(m[4])
 		counts := make(map[string]int64)
-		useDocCnt := strings.Contains(branch, "$._doc_count")
+		useDocCnt := strings.Contains(branch, "$._doc_count") || strings.Contains(branch, `$."_doc_count"`)
 		for _, row := range baseRows {
 			if extraWhere != "" && !evalWhereExpr(row, extraWhere) {
 				continue
@@ -1299,7 +1325,7 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 	if m := reAggFilter.FindStringSubmatch(branch); m != nil {
 		aggName, bKey, filterWhere := m[1], m[2], m[3]
 		var cnt int64
-		useDocCnt := strings.Contains(branch, "$._doc_count")
+		useDocCnt := strings.Contains(branch, "$._doc_count") || strings.Contains(branch, `$."_doc_count"`)
 		for _, row := range baseRows {
 			if filterWhere == "" || evalWhereExpr(row, filterWhere) {
 				cnt += rowDocCountWeightR62Mem(row, useDocCnt)
@@ -3378,11 +3404,17 @@ func evalFulltextMatch(row map[string]any, colExpr, matchOp, queryStr string) bo
 }
 
 func tokenizeWords(s string) []string {
+	runes := []rune(strings.ToLower(s))
+	n := len(runes)
 	var out []string
 	var cur strings.Builder
-	for _, r := range strings.ToLower(s) {
-		if unicode.IsLetter(r) || unicode.IsNumber(r) {
+	isAlnum := func(r rune) bool { return unicode.IsLetter(r) || unicode.IsNumber(r) }
+	for i := 0; i < n; i++ {
+		r := runes[i]
+		if isAlnum(r) {
 			cur.WriteRune(r)
+		} else if r == '_' && cur.Len() > 0 && i+1 < n && isAlnum(runes[i+1]) {
+			cur.WriteByte('_')
 		} else if cur.Len() > 0 {
 			out = append(out, cur.String())
 			cur.Reset()
@@ -3449,11 +3481,11 @@ func evalNumericExpr(row map[string]any, expr string) float64 {
 	}
 
 	if parts := splitTopLevelBinaryMath(expr, '&'); len(parts) >= 2 {
-		acc := int64(math.Trunc(evalNumericExpr(row, parts[0])))
-		for _, p := range parts[1:] {
-			acc &= int64(math.Trunc(evalNumericExpr(row, p)))
+		v, ok := evalBitwiseAndStrictR63Mem(row, parts)
+		if !ok {
+			return math.NaN()
 		}
-		return float64(acc)
+		return v
 	}
 
 	if parts := splitTopLevelBinaryMath(expr, '+'); len(parts) > 1 {
@@ -3691,6 +3723,11 @@ func evalNumericExpr(row map[string]any, expr string) float64 {
 							}
 						}
 					}
+					if isArithmeticSQLExpr(arg) && !hasUnwrappedNullColumnRef(row, arg) && !hasNullArithmeticOperandR63Mem(row, arg) {
+						if fv := evalNumericExpr(row, arg); !math.IsNaN(fv) && !math.IsInf(fv, 0) {
+							return fv
+						}
+					}
 					if i == len(args)-1 {
 						return evalNumericExpr(row, arg)
 					}
@@ -3736,6 +3773,19 @@ func evalNumericExpr(row map[string]any, expr string) float64 {
 
 func resolveColumnValue(row map[string]any, colExpr string) any {
 	colExpr = trimOuterParens(strings.TrimSpace(colExpr))
+	if (strings.HasPrefix(colExpr, "GREATEST(") || strings.HasPrefix(colExpr, "LEAST(")) && strings.HasSuffix(colExpr, ")") {
+		fnLen := len("LEAST")
+		if strings.HasPrefix(colExpr, "GREATEST(") {
+			fnLen = len("GREATEST")
+		}
+		if hasMatchingOuterParens(colExpr, fnLen) {
+			fv := evalNumericExpr(row, colExpr)
+			if !math.IsNaN(fv) && !math.IsInf(fv, 0) {
+				return fv
+			}
+			return nil
+		}
+	}
 	if strings.HasPrefix(colExpr, "CONCAT_WS(") && strings.HasSuffix(colExpr, ")") {
 		vals := evalBucketKeyExprs(row, colExpr)
 		if len(vals) == 1 {
@@ -3993,29 +4043,45 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 			}
 			return bestF
 		}
-		if aSlice, okA := rawResolved.([]any); okA && len(aSlice) > 0 && !strings.HasPrefix(inner, "array_map(_x -> CAST(_x AS ") {
-			allFloat := true
-			var bestF float64
-			hasF := false
+		isNumericMap := strings.HasPrefix(inner, "array_map(_x -> CAST(_x AS LARGEINT), ") ||
+			strings.HasPrefix(inner, "array_map(_x -> CAST(_x AS BIGINT), ") ||
+			strings.HasPrefix(inner, "array_map(_x -> CAST(_x AS DOUBLE), ")
+		if aSlice, okA := rawResolved.([]any); okA && len(aSlice) > 0 && !isNumericMap {
+			var bestAny any
+			hasAny := false
 			for _, el := range aSlice {
-				fv, isF := el.(float64)
-				if !isF {
-					allFloat = false
-					break
+				if el == nil {
+					continue
 				}
-				if !hasF || (!isMax && fv < bestF) || (isMax && fv > bestF) {
-					bestF = fv
-					hasF = true
+				if !hasAny || (!isMax && compareAny(el, bestAny) < 0) || (isMax && compareAny(el, bestAny) > 0) {
+					bestAny = el
+					hasAny = true
 				}
 			}
-			if allFloat && hasF {
-				return bestF
+			if hasAny {
+				return bestAny
 			}
 		}
 		best := elems[0]
 		for _, e := range elems[1:] {
 			var cmp int
-			if ipE, okE := parseIPv4SortUint32(e); okE {
+			if isNumericMap {
+				if biE, okE := memParseExactBigInt(e); okE {
+					if biB, okB := memParseExactBigInt(best); okB {
+						cmp = biE.Cmp(biB)
+					} else {
+						cmp = compareAny(e, best)
+					}
+				} else if fE, okFE := toFloat(e); okFE {
+					if fB, okFB := toFloat(best); okFB {
+						cmp = compareFloats(fE, fB)
+					} else {
+						cmp = compareAny(e, best)
+					}
+				} else {
+					cmp = compareAny(e, best)
+				}
+			} else if ipE, okE := parseIPv4SortUint32(e); okE {
 				if ipBest, okBest := parseIPv4SortUint32(best); okBest {
 					if ipE < ipBest {
 						cmp = -1
@@ -4073,6 +4139,10 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 				return f
 			} else if i == len(args)-1 && (strings.EqualFold(arg, "TRUE") || strings.EqualFold(arg, "FALSE")) {
 				return strings.EqualFold(arg, "TRUE")
+			} else if isArithmeticSQLExpr(arg) && !hasUnwrappedNullColumnRef(row, arg) && !hasNullArithmeticOperandR63Mem(row, arg) {
+				if fv := evalNumericExpr(row, arg); !math.IsNaN(fv) && !math.IsInf(fv, 0) {
+					return fv
+				}
 			}
 		}
 		return nil
@@ -4309,6 +4379,9 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 		if val == nil {
 			return int64(0)
 		}
+		if fSlice, ok := val.([]float64); ok {
+			return int64(len(fSlice))
+		}
 		return int64(len(toStringSlice(val)))
 	}
 	if (strings.HasPrefix(colExpr, "SPLIT_PART(") || strings.HasPrefix(colExpr, "split_part(")) && strings.HasSuffix(colExpr, ")") {
@@ -4321,6 +4394,9 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 			if strVal != nil && err == nil && idx >= 1 {
 				rawStr := fmt.Sprintf("%v", strVal)
 				if delim != "" && !strings.Contains(rawStr, delim) {
+					if idx == 1 {
+						return rawStr
+					}
 					return nil
 				}
 				parts := strings.Split(rawStr, delim)
@@ -4957,11 +5033,14 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 	if trimmedCase := trimOuterParens(colExpr); strings.HasPrefix(trimmedCase, "CASE WHEN ") && strings.HasSuffix(trimmedCase, " END") {
 		return evalCaseWhenValue(row, trimmedCase)
 	}
+	if v, handled := evalColumnFuncR63Mem(row, colExpr); handled {
+		return v
+	}
 	if v, handled := evalColumnFuncR62Mem(row, colExpr); handled {
 		return v
 	}
 	if isArithmeticSQLExpr(colExpr) {
-		if hasUnwrappedNullColumnRef(row, colExpr) {
+		if hasUnwrappedNullColumnRef(row, colExpr) || hasNullArithmeticOperandR63Mem(row, colExpr) {
 			return nil
 		}
 		return evalNumericExpr(row, colExpr)
@@ -5136,7 +5215,7 @@ func isArithmeticSQLExpr(expr string) bool {
 	if strings.EqualFold(trimmed, "PI()") {
 		return true
 	}
-	for _, fn := range []string{"CASE ", "ST_Distance_Sphere(", "GREATEST(", "LEAST(", "POW(", "LOG10(", "LN(", "EXP(", "SQRT(", "SIN(", "COS(", "TAN(", "ASIN(", "ACOS(", "ATAN2(", "ATAN(", "FLOOR(", "CEIL(", "ROUND(", "TRUNCATE(", "ABS(", "UNIX_TIMESTAMP(", "TIMESTAMPDIFF(", "MURMUR_HASH3_32(", "CONV("} {
+	for _, fn := range []string{"CASE ", "ST_Distance_Sphere(", "GREATEST(", "LEAST(", "POW(", "LOG10(", "LN(", "EXP(", "SQRT(", "SIN(", "COS(", "TAN(", "ASIN(", "ACOS(", "ATAN2(", "ATAN(", "FLOOR(", "CEIL(", "ROUND(", "TRUNCATE(", "ABS(", "UNIX_TIMESTAMP(", "TIMESTAMPDIFF(", "MURMUR_HASH3_32("} {
 		if strings.HasPrefix(trimmed, fn) {
 			return true
 		}
@@ -5634,6 +5713,14 @@ func resolveVectorValue(row map[string]any, expr string) []float64 {
 			}
 		}
 	}
+	if strings.HasPrefix(expr, "COALESCE(") && strings.HasSuffix(expr, ")") && hasMatchingOuterParens(expr, len("COALESCE")) {
+		for _, a := range splitTopLevelArgs(expr[len("COALESCE(") : len(expr)-1]) {
+			if vec := resolveVectorValue(row, a); len(vec) > 0 {
+				return vec
+			}
+		}
+		return nil
+	}
 	if strings.HasPrefix(expr, "CAST([") || (strings.HasPrefix(expr, "[") && strings.HasSuffix(expr, "]")) {
 		return parseVectorLiteral(expr)
 	}
@@ -5988,9 +6075,12 @@ func isHex32String(s string) bool {
 }
 
 func compareAny(a, b any) int {
-	if sa, okA := a.(string); okA && isHex32String(sa) {
-		if sb, okB := b.(string); okB && isHex32String(sb) {
-			return strings.Compare(strings.ToUpper(sa), strings.ToUpper(sb))
+	if sa, okA := a.(string); okA {
+		if sb, okB := b.(string); okB {
+			if isHex32String(sa) && isHex32String(sb) {
+				return strings.Compare(strings.ToUpper(sa), strings.ToUpper(sb))
+			}
+			return strings.Compare(sa, sb)
 		}
 	}
 	if ab, aOk := a.(bool); aOk {
@@ -6543,7 +6633,7 @@ func resolveKNNTopKSubqueries(tbl map[string]map[string]any, sqlExpr string) str
 // ----------------------------------------------------------------------------
 
 var (
-	reWrappedOrderedAggSubR62Mem = regexp.MustCompile(`^SELECT ` + "`_agg_name`, `_bucket_key`, `_doc_count` FROM \\(SELECT '((?:''|[^'])+)' AS `_agg_name`, (.+?) AS `_bucket_key`, CAST\\((.+?) AS DOUBLE\\) AS `_doc_count` FROM (.+) GROUP BY (.+?) ORDER BY (.+?) (ASC|DESC) LIMIT (\\d+)\\) `_agg_sub_\\d+`$")
+	reWrappedOrderedAggSubR62Mem = regexp.MustCompile(`^SELECT ` + "`_agg_name`, `_bucket_key`, `_doc_count` FROM \\(SELECT '((?:''|[^'])+)' AS `_agg_name`, (.+?) AS `_bucket_key`, CAST\\((.+?) AS DOUBLE\\) AS `_doc_count`(?:, .+? AS `_ts_ord`)? FROM (.+) GROUP BY (.+?) ORDER BY (.+?) (ASC|DESC) LIMIT (\\d+)\\) `_agg_sub_\\d+`(?: ORDER BY `_ts_ord` (?:ASC|DESC) LIMIT \\d+)?$")
 	reGroupedJoinEmptyAggR62Mem  = regexp.MustCompile(`^SELECT '((?:''|[^'])+)' AS ` + "`_agg_name`, .+ AS `_bucket_key`, CAST\\(0 AS DOUBLE\\) AS `_doc_count` FROM .+ WHERE FALSE GROUP BY `_bucket_key`$")
 	reGroupedJoinCountAggR62Mem  = regexp.MustCompile(`^SELECT '((?:''|[^'])+)' AS ` + "`_agg_name`, (`_(?:jp|jc)_\\d+`\\.`_(?:jp|jc)_bkey_\\d+`) AS `_bucket_key`, CAST\\(COUNT\\(DISTINCT `base_matched`\\.`_id`\\) AS DOUBLE\\) AS `_doc_count` FROM (.+) GROUP BY `_bucket_key`$")
 	reTSTopSubSelectR62Mem       = regexp.MustCompile("^SELECT `__tsid` AS `(_ts_id_\\d+)`, (.+?) AS `(_ts_bkey_\\d+)` FROM `base_matched` WHERE (.+?) GROUP BY `__tsid`, `__tsid_key` ORDER BY (.+?) ASC LIMIT (\\d+)$")
@@ -6588,16 +6678,11 @@ func extractJSONPathRawR62Mem(rawJSON, rawPath string) any {
 	if rawJSON == "" {
 		return nil
 	}
-	clean := strings.TrimSpace(rawPath)
-	if strings.HasPrefix(clean, `$."`) && strings.HasSuffix(clean, `"`) && len(clean) >= 4 {
-		litKey := strings.ReplaceAll(clean[3:len(clean)-1], `\"`, `"`)
-		return extractJSONPathFromStr(rawJSON, []string{litKey})
-	}
-	clean = strings.TrimPrefix(clean, "$.")
-	if clean == "" || clean == "$" {
+	segs := parseDorisJSONPathSegmentsR63Mem(rawPath)
+	if len(segs) == 0 {
 		return nil
 	}
-	return extractJSONPathFromStr(rawJSON, strings.Split(clean, "."))
+	return extractJSONPathFromStr(rawJSON, segs)
 }
 
 func coerceCastArrayOfStringR62Mem(v any) []string {
@@ -6652,9 +6737,10 @@ func resolveRound62AggSubqueriesR62Mem(baseRows []map[string]any, sqlExpr string
 			score float64
 		}
 		var docs []smpDoc
+		evalSmpScore := prepareScoreEvaluatorFromRowSliceR63Mem(baseRows, scoreExpr)
 		for _, r := range baseRows {
 			if evalWhereExpr(r, baseFilter) {
-				sc := evalNumericExpr(r, scoreExpr)
+				sc := evalSmpScore(r)
 				if math.IsNaN(sc) || math.IsInf(sc, 0) {
 					sc = 0
 				}
@@ -6723,6 +6809,7 @@ func resolveRound62AggSubqueriesR62Mem(baseRows []map[string]any, sqlExpr string
 			score float64
 		}
 		var docs []divDoc
+		evalDivScore := prepareScoreEvaluatorFromRowSliceR63Mem(baseRows, scoreExpr)
 		for _, r := range baseRows {
 			if evalWhereExpr(r, baseFilter) {
 				idStr := fmt.Sprintf("%v", r["_id"])
@@ -6731,7 +6818,7 @@ func resolveRound62AggSubqueriesR62Mem(baseRows []map[string]any, sqlExpr string
 				if kv != nil && fmt.Sprintf("%v", kv) != "" {
 					keyStr = fmt.Sprintf("%v", kv)
 				}
-				sc := evalNumericExpr(r, scoreExpr)
+				sc := evalDivScore(r)
 				if math.IsNaN(sc) || math.IsInf(sc, 0) {
 					sc = 0
 				}
@@ -6893,7 +6980,7 @@ func evalRound62AggBranchR62Mem(
 		expanded := expandFromClauseRows(baseRows, fromClause, whereClause)
 
 		isDistinctID := strings.Contains(cntExpr, "COUNT(DISTINCT `_id`)")
-		useDocCnt := !isDistinctID && strings.Contains(cntExpr, "$._doc_count")
+		useDocCnt := !isDistinctID && (strings.Contains(cntExpr, "$._doc_count") || strings.Contains(cntExpr, `$."_doc_count"`))
 
 		type ordBucket struct {
 			key     string
@@ -7344,9 +7431,6 @@ func evalColumnFuncR62Mem(row map[string]any, colExpr string) (any, bool) {
 			u, err := strconv.ParseUint(strings.TrimSpace(fmt.Sprintf("%v", sv)), fromBase, 64)
 			if err != nil {
 				return nil, true
-			}
-			if toBase == 10 && u <= math.MaxInt64 {
-				return int64(u), true
 			}
 			return strings.ToUpper(strconv.FormatUint(u, toBase)), true
 		}

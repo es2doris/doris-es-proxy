@@ -19,7 +19,6 @@ import (
 
 	"github.com/es2doris/doris-es-proxy/pkg/esast"
 	"github.com/es2doris/doris-es-proxy/pkg/schema"
-	"github.com/es2doris/doris-es-proxy/pkg/transpiler"
 )
 
 // parsePositiveESDurationMillis parses positive Elasticsearch time units (`ms`, `s`, `m`, `h`, `d`, `w`, `M`, `y`).
@@ -476,169 +475,7 @@ func extractDownsampleFixedInterval(body map[string]any) string {
 }
 
 func (s *Server) handleDownsampleIndex(w http.ResponseWriter, r *http.Request, rawSrcIndex, rawTargetIndex string) {
-	if r.Method != http.MethodPost && r.Method != http.MethodPut {
-		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
-		return
-	}
-	targetIndex := strings.TrimSpace(rawTargetIndex)
-	if targetIndex == "" {
-		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "target index name is required")
-		return
-	}
-	if reason, ok := validateESIndexName(targetIndex); !ok {
-		writeESError(w, http.StatusBadRequest, "invalid_index_name_exception", reason)
-		return
-	}
-	body, ok := parseJSONBody(w, r)
-	if !ok {
-		return
-	}
-	fixedInterval := extractDownsampleFixedInterval(body)
-	intervalMS, validInterval := parsePositiveESDurationMillis(fixedInterval)
-	if fixedInterval == "" || !validInterval {
-		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "downsample [fixed_interval] must be a valid positive time duration")
-		return
-	}
-
-	_ = s.syncCatalogFromBackend(r.Context())
-	srcIndex := s.resolveIndexName(strings.TrimSpace(rawSrcIndex))
-	s.mu.RLock()
-	srcSchema := s.indices[srcIndex]
-	_, targetExists := s.indices[targetIndex]
-	hasTargetCollision := len(s.aliases[targetIndex]) > 0 || s.dataStreams[targetIndex] != nil
-	s.mu.RUnlock()
-
-	if srcSchema == nil {
-		writeESError(w, http.StatusNotFound, "index_not_found_exception", "no such index ["+rawSrcIndex+"]")
-		return
-	}
-	if targetExists || hasTargetCollision || srcIndex == targetIndex {
-		writeESError(w, http.StatusBadRequest, "resource_already_exists_exception", "index ["+targetIndex+"] already exists")
-		return
-	}
-
-	compiled := schema.CompileIndexSchema(s.dorisDB, targetIndex, srcSchema.RawMapping)
-	ddl := schema.GenerateCreateTableDDL(compiled)
-	if err := s.backend.ExecDDL(r.Context(), ddl); err != nil {
-		writeESError(w, http.StatusInternalServerError, "doris_ddl_exception", err.Error())
-		return
-	}
-
-	s.mu.Lock()
-	s.indices[targetIndex] = compiled
-	if s.indexCustomSettings == nil {
-		s.indexCustomSettings = make(map[string]map[string]any)
-	}
-	if s.indexCustomSettings[targetIndex] == nil {
-		s.indexCustomSettings[targetIndex] = make(map[string]any)
-	}
-	s.indexCustomSettings[targetIndex]["downsample.source.name"] = srcIndex
-	s.indexCustomSettings[targetIndex]["downsample.fixed_interval"] = fixedInterval
-	s.indexCustomSettings[targetIndex]["index.downsample.source.name"] = srcIndex
-	s.indexCustomSettings[targetIndex]["index.downsample.fixed_interval"] = fixedInterval
-	s.mu.Unlock()
-	s.persistIndex(r.Context(), targetIndex, compiled)
-
-	_ = s.coalescer.FlushTable(r.Context(), srcSchema.DorisTable)
-	opts := s.transpileOpts
-	opts.MaxResultWindow = 1_000_000
-	tr := transpiler.NewTranspiler(srcSchema, opts)
-	batchSize := 1000
-	var searchAfter []any
-	seenBuckets := make(map[string]bool)
-	for {
-		plan, err := tr.BuildSearchPlan(&esast.SearchRequest{
-			Size:           &batchSize,
-			TrackTotalHits: false,
-			Sort:           esast.SortSlice{{Entry: esast.SortFieldSpec{Field: "_id", Order: "asc"}}},
-			SearchAfter:    searchAfter,
-		})
-		if err != nil {
-			break
-		}
-		hits, err := s.backend.QueryHits(r.Context(), plan.HitsSQL)
-		if err != nil || len(hits) == 0 {
-			break
-		}
-		var buf bytes.Buffer
-		for _, h := range hits {
-			srcBytes := h.Source
-			var docMap map[string]any
-			if json.Unmarshal(h.Source, &docMap) == nil && docMap != nil && intervalMS > 0 {
-				if rawTS, hasTS := docMap["@timestamp"]; hasTS && rawTS != nil {
-					if tsMS, okTS := parseDownsampleTimestampMillis(rawTS); okTS {
-						bucketMS := (tsMS / intervalMS) * intervalMS
-						bucketISO := time.UnixMilli(bucketMS).UTC().Format(time.RFC3339)
-						var dimParts []string
-						for k, v := range docMap {
-							if k == "@timestamp" {
-								continue
-							}
-							switch v.(type) {
-							case string, bool:
-								dimParts = append(dimParts, fmt.Sprintf("%s=%v", k, v))
-							}
-						}
-						sort.Strings(dimParts)
-						bucketKey := fmt.Sprintf("%d|%s", bucketMS, strings.Join(dimParts, "|"))
-						if seenBuckets[bucketKey] {
-							continue
-						}
-						seenBuckets[bucketKey] = true
-						docMap["@timestamp"] = bucketISO
-						if b, mErr := json.Marshal(docMap); mErr == nil {
-							srcBytes = b
-						}
-					}
-				}
-			}
-			shredded, sErr := schema.ShredDocument(compiled, h.ID, h.Version, false, srcBytes)
-			if sErr != nil {
-				continue
-			}
-			buf.Write(shredded)
-			buf.WriteByte('\n')
-		}
-		if buf.Len() > 0 {
-			_ = s.streamLoad(r.Context(), compiled.DorisTable, buf.Bytes(), true)
-		}
-		searchAfter = []any{hits[len(hits)-1].ID}
-		if len(hits) < batchSize {
-			break
-		}
-	}
-	s.queryCache.InvalidateAll()
-	writeJSON(w, http.StatusOK, map[string]any{
-		"acknowledged":        true,
-		"shards_acknowledged": true,
-		"index":               targetIndex,
-	})
-}
-
-func parseDownsampleTimestampMillis(raw any) (int64, bool) {
-	switch v := raw.(type) {
-	case int64:
-		return v, true
-	case int:
-		return int64(v), true
-	case float64:
-		return int64(v), true
-	case json.Number:
-		if iv, err := v.Int64(); err == nil {
-			return iv, true
-		}
-	case string:
-		s := strings.TrimSpace(v)
-		for _, layout := range []string{time.RFC3339Nano, time.RFC3339, "2006-01-02T15:04:05", "2006-01-02"} {
-			if t, err := time.Parse(layout, s); err == nil {
-				return t.UTC().UnixMilli(), true
-			}
-		}
-		if iv, err := strconv.ParseInt(s, 10, 64); err == nil {
-			return iv, true
-		}
-	}
-	return 0, false
+	s.serveDownsampleIndexRound63(w, r, rawSrcIndex, rawTargetIndex)
 }
 
 // ============================================================================
@@ -3355,9 +3192,17 @@ func tokenizeESQLExpr(expr string) []esqlTok {
 			i++
 			continue
 		}
+		if i+2 < len(expr) {
+			three := expr[i : i+3]
+			if three == "===" || three == "!==" {
+				toks = append(toks, esqlTok{kind: esqlTokOp, str: three})
+				i += 3
+				continue
+			}
+		}
 		if i+1 < len(expr) {
 			two := expr[i : i+2]
-			if two == "==" || two == "!=" || two == "<=" || two == ">=" || two == "&&" || two == "||" {
+			if two == "==" || two == "!=" || two == "<=" || two == ">=" || two == "&&" || two == "||" || two == "=~" || two == "!~" {
 				toks = append(toks, esqlTok{kind: esqlTokOp, str: two})
 				i += 2
 				continue
@@ -3621,27 +3466,59 @@ func (p *esqlParser) parseComparison() any {
 		return err == nil && re.MatchString(fmt.Sprintf("%v", left))
 	}
 	t := p.peek()
-	if t.kind == esqlTokOp && (t.str == "==" || t.str == "=" || t.str == "!=" || t.str == "<" || t.str == "<=" || t.str == ">" || t.str == ">=") {
+	if t.kind == esqlTokOp && (t.str == "==" || t.str == "=" || t.str == "!=" || t.str == "<" || t.str == "<=" || t.str == ">" || t.str == ">=" || t.str == "=~" || t.str == "!~" || t.str == "===" || t.str == "!==") {
 		p.next()
 		right := p.parseAddSub()
 		if left == nil || right == nil {
+			return nil
+		}
+		evalScalarCmp := func(lv, rv any) bool {
+			if t.str == "=~" || t.str == "===" {
+				return strings.EqualFold(fmt.Sprintf("%v", lv), fmt.Sprintf("%v", rv))
+			}
+			if t.str == "!~" || t.str == "!==" {
+				return !strings.EqualFold(fmt.Sprintf("%v", lv), fmt.Sprintf("%v", rv))
+			}
+			cmp := compareESQLValues(lv, rv)
+			switch t.str {
+			case "==", "=":
+				return cmp == 0
+			case "!=":
+				return cmp != 0
+			case "<":
+				return cmp < 0
+			case "<=":
+				return cmp <= 0
+			case ">":
+				return cmp > 0
+			case ">=":
+				return cmp >= 0
+			}
 			return false
 		}
-		cmp := compareESQLValues(left, right)
-		switch t.str {
-		case "==", "=":
-			return cmp == 0
-		case "!=":
-			return cmp != 0
-		case "<":
-			return cmp < 0
-		case "<=":
-			return cmp <= 0
-		case ">":
-			return cmp > 0
-		case ">=":
-			return cmp >= 0
+		if lArr, okL := left.([]any); okL {
+			if len(lArr) == 0 {
+				return nil
+			}
+			for _, el := range lArr {
+				if el != nil && evalScalarCmp(el, right) {
+					return true
+				}
+			}
+			return false
 		}
+		if rArr, okR := right.([]any); okR {
+			if len(rArr) == 0 {
+				return nil
+			}
+			for _, el := range rArr {
+				if el != nil && evalScalarCmp(left, el) {
+					return true
+				}
+			}
+			return false
+		}
+		return evalScalarCmp(left, right)
 	}
 	return left
 }
@@ -3727,6 +3604,11 @@ func (p *esqlParser) parsePrimary() any {
 			}
 			if p.peek().kind == esqlTokRParen {
 				p.next()
+			}
+			if strings.EqualFold(t.str, "DATE_FORMAT") && p.row != nil {
+				if loc, okL := p.row["__esql_locale"].(string); okL && loc != "" && len(args) == 2 {
+					args = append(args, loc)
+				}
 			}
 			return evalESQLFunc(t.str, args)
 		}
@@ -4206,7 +4088,7 @@ func computeESQLAggregate(fn, arg string, grpRows []map[string]any) (any, string
 		}
 		return vals, elemType
 
-	case "MEDIAN", "PERCENTILE":
+	case "MEDIAN", "PERCENTILE", "MEDIAN_ABSOLUTE_DEVIATION":
 		if v, t, ok := computeESQLMedianOrPercentile(fn, arg, grpRows); ok {
 			return v, t
 		}
@@ -4222,6 +4104,7 @@ func (s *Server) executeESQLQueryEngine(w http.ResponseWriter, r *http.Request, 
 	var rows []map[string]any
 	var colOrder []string
 	colTypes := make(map[string]string)
+	var fromSummary esqlIndexFieldSummaryRound63
 	limit := 1000
 
 	for idx, rawStage := range stages {
@@ -4255,15 +4138,29 @@ func (s *Server) executeESQLQueryEngine(w http.ResponseWriter, r *http.Request, 
 				}
 				if col, exprStr, hasEq := splitESQLAssignment(a); hasEq && col != "" {
 					val := evalESQLExpr(exprStr, row)
+					if arr, okA := val.([]any); okA && len(arr) == 1 {
+						val = arr[0]
+					}
 					row[col] = val
 					colOrder = append(colOrder, col)
-					colTypes[col] = inferESQLValueType(val)
+					if stT := inferESQLExprStaticTypeRound63(exprStr, colTypes); stT != "" {
+						colTypes[col] = stT
+					} else {
+						colTypes[col] = inferESQLValueType(val)
+					}
 				} else {
 					val := evalESQLExpr(a, row)
+					if arr, okA := val.([]any); okA && len(arr) == 1 {
+						val = arr[0]
+					}
 					col := fmt.Sprintf("col_%d", len(colOrder)+1)
 					row[col] = val
 					colOrder = append(colOrder, col)
-					colTypes[col] = inferESQLValueType(val)
+					if stT := inferESQLExprStaticTypeRound63(a, colTypes); stT != "" {
+						colTypes[col] = stT
+					} else {
+						colTypes[col] = inferESQLValueType(val)
+					}
 				}
 			}
 			rows = []map[string]any{row}
@@ -4315,36 +4212,104 @@ func (s *Server) executeESQLQueryEngine(w http.ResponseWriter, r *http.Request, 
 			dec := json.NewDecoder(bytes.NewReader(rec.body.Bytes()))
 			dec.UseNumber()
 			_ = dec.Decode(&sr)
+
+			fromSummary = inspectESQLFromTargetSchemasRound63(s, r.Context(), idxTarget)
+			for ck, ct := range fromSummary.colTypes {
+				colTypes[ck] = ct
+			}
 			seenCols := make(map[string]bool)
-			for _, mc := range metaCols {
-				seenCols[mc] = true
-				colOrder = append(colOrder, mc)
-				if mc == "_version" {
-					colTypes[mc] = "long"
-				} else {
-					colTypes[mc] = "keyword"
+			var srcCols []string
+			for _, sc := range fromSummary.cols {
+				if !seenCols[sc] {
+					seenCols[sc] = true
+					srcCols = append(srcCols, sc)
 				}
 			}
-			var srcCols []string
+			reqLocale, _ := body["locale"].(string)
 			if hitsMap, ok := sr["hits"].(map[string]any); ok {
 				if hitList, ok := hitsMap["hits"].([]any); ok {
 					for _, hAny := range hitList {
 						if hMap, ok := hAny.(map[string]any); ok {
 							srcMap, _ := hMap["_source"].(map[string]any)
-							row := make(map[string]any, len(srcMap)+len(metaCols))
-							for k, v := range srcMap {
-								nv := normalizeESQLNumber(v)
-								row[k] = nv
-								if !seenCols[k] {
-									seenCols[k] = true
-									srcCols = append(srcCols, k)
+							row := make(map[string]any, len(srcCols)+len(metaCols)+4)
+							if reqLocale != "" {
+								row["__esql_locale"] = reqLocale
+							}
+							ignoredSet := make(map[string]bool)
+							switch igRaw := hMap["_ignored"].(type) {
+							case []any:
+								for _, igEl := range igRaw {
+									if igS, okS := igEl.(string); okS {
+										ignoredSet[igS] = true
+									}
 								}
-								if nv != nil && (colTypes[k] == "" || colTypes[k] == "keyword") {
-									colTypes[k] = inferESQLValueType(nv)
+							case []string:
+								for _, igS := range igRaw {
+									ignoredSet[igS] = true
+								}
+							}
+							if len(fromSummary.cols) > 0 {
+								for _, sc := range fromSummary.cols {
+									if ignoredSet[sc] {
+										row[sc] = nil
+										continue
+									}
+									srcPath := sc
+									if alTarget := fromSummary.aliasTargets[sc]; alTarget != "" {
+										srcPath = alTarget
+									}
+									rawV := getNestedOrArrayDocValRound63(srcMap, srcPath)
+									if rawV == nil {
+										if cv, hasConst := fromSummary.constVals[sc]; hasConst {
+											rawV = cv
+										}
+									}
+									if fromSummary.ambiguousError[sc] != "" {
+										row["__raw_"+sc] = rawV
+										row[sc] = nil
+									} else {
+										row[sc] = formatESQLCellWithSchemaRound63(rawV, sc, fromSummary)
+									}
+								}
+								// Also populate any multi-fields (e.g. `foo.keyword`, `foo.raw`) for downstream EVAL/SORT/WHERE
+								for subK := range fromSummary.colTypes {
+									if strings.Contains(subK, ".") && !seenCols[subK] {
+										if ignoredSet[subK] {
+											row[subK] = nil
+											continue
+										}
+										dotIdx := strings.LastIndexByte(subK, '.')
+										parentPath := subK[:dotIdx]
+										if rawV := getNestedOrArrayDocValRound63(srcMap, parentPath); rawV != nil {
+											row[subK] = formatESQLCellWithSchemaRound63(rawV, subK, fromSummary)
+										}
+									}
+								}
+							} else {
+								for k, v := range srcMap {
+									nv := normalizeESQLNumber(v)
+									if arr, okA := nv.([]any); okA && len(arr) == 1 {
+										nv = arr[0]
+									}
+									row[k] = nv
+									if !seenCols[k] {
+										seenCols[k] = true
+										srcCols = append(srcCols, k)
+									}
+									if nv != nil && (colTypes[k] == "" || colTypes[k] == "keyword") {
+										colTypes[k] = inferESQLValueType(nv)
+									}
 								}
 							}
 							for _, mc := range metaCols {
-								row[mc] = normalizeESQLNumber(hMap[mc])
+								switch mc {
+								case "_source":
+									row["_source"] = hMap["_source"]
+								case "_ignored":
+									row["_ignored"] = coerceESQLCellForColumnTypeRound63(hMap["_ignored"], "keyword")
+								default:
+									row[mc] = normalizeESQLNumber(hMap[mc])
+								}
 							}
 							rows = append(rows, row)
 						}
@@ -4353,6 +4318,20 @@ func (s *Server) executeESQLQueryEngine(w http.ResponseWriter, r *http.Request, 
 			}
 			sort.Strings(srcCols)
 			colOrder = append(colOrder, srcCols...)
+			for _, mc := range metaCols {
+				if !seenCols[mc] {
+					seenCols[mc] = true
+					colOrder = append(colOrder, mc)
+				}
+				switch mc {
+				case "_version":
+					colTypes[mc] = "long"
+				case "_source":
+					colTypes[mc] = "_source"
+				default:
+					colTypes[mc] = "keyword"
+				}
+			}
 
 		case idx == 0:
 			writeESError(w, http.StatusBadRequest, "verification_exception", fmt.Sprintf("Found 1 problem\nline 1:1: unsupported ES|QL source command [%s]", st))
@@ -4364,7 +4343,7 @@ func (s *Server) executeESQLQueryEngine(w http.ResponseWriter, r *http.Request, 
 			}
 
 		case esqlStageHasKeyword(upper, "WHERE") && len(st) > 5:
-			cond := strings.TrimSpace(st[5:])
+			cond := rewriteESQLDoubleColonCastsRound63(strings.TrimSpace(st[5:]))
 			filtered := make([]map[string]any, 0, len(rows))
 			for _, row := range rows {
 				if evalESQLCond(cond, row) {
@@ -4385,13 +4364,52 @@ func (s *Server) executeESQLQueryEngine(w http.ResponseWriter, r *http.Request, 
 					col = unquoteESQLIdent(a)
 					exprStr = a
 				}
+				exprStr = rewriteESQLDoubleColonCastsRound63(exprStr)
+				// Check multi-index ambiguous column conversion compatibility
+				upExpr := strings.ToUpper(strings.TrimSpace(exprStr))
+				for ambCol, ambMsg := range fromSummary.ambiguousError {
+					if strings.Contains(exprStr, ambCol) {
+						if strings.HasPrefix(upExpr, "TO_IP(") && strings.Contains(ambMsg, "[long]") {
+							writeESError(w, http.StatusBadRequest, "verification_exception", "Found 1 problem\nline 1:1: "+ambMsg)
+							return
+						}
+						if strings.HasPrefix(upExpr, "TO_LONG(") && strings.Contains(ambMsg, "[ip]") {
+							writeESError(w, http.StatusBadRequest, "verification_exception", "Found 1 problem\nline 1:1: "+ambMsg)
+							return
+						}
+					}
+				}
+				staticT := inferESQLExprStaticTypeRound63(exprStr, colTypes)
 				inferred := ""
 				for _, row := range rows {
-					val := evalESQLExpr(exprStr, row)
+					evalRow := row
+					clonedEvalRow := false
+					// Expose raw ambiguous values to explicit `TO_*` conversion functions
+					if strings.HasPrefix(upExpr, "TO_") {
+						for ambCol := range fromSummary.ambiguousError {
+							if rawAmb, hasRaw := row["__raw_"+ambCol]; hasRaw {
+								if !clonedEvalRow {
+									clonedEvalRow = true
+									evalRow = make(map[string]any, len(row))
+									for rk, rv := range row {
+										evalRow[rk] = rv
+									}
+								}
+								evalRow[ambCol] = rawAmb
+							}
+						}
+					}
+					val := evalESQLExpr(exprStr, evalRow)
+					if arr, okA := val.([]any); okA && len(arr) == 1 {
+						val = arr[0]
+					}
 					row[col] = val
 					if val != nil && inferred == "" {
 						inferred = inferESQLValueType(val)
 					}
+				}
+				if col == exprStr || unquoteESQLIdent(exprStr) != col {
+					delete(fromSummary.ambiguousError, col)
 				}
 				hasCol := false
 				for _, c := range colOrder {
@@ -4403,7 +4421,9 @@ func (s *Server) executeESQLQueryEngine(w http.ResponseWriter, r *http.Request, 
 				if !hasCol {
 					colOrder = append(colOrder, col)
 				}
-				if inferred != "" {
+				if staticT != "" {
+					colTypes[col] = staticT
+				} else if inferred != "" {
 					colTypes[col] = inferred
 				} else if colTypes[col] == "" {
 					colTypes[col] = "keyword"
@@ -4429,6 +4449,26 @@ func (s *Server) executeESQLQueryEngine(w http.ResponseWriter, r *http.Request, 
 						callStr = rawA
 					}
 					fn, arg := parseESQLAggCall(callStr)
+					arg = rewriteESQLDoubleColonCastsRound63(arg)
+					argClean := unquoteESQLIdent(arg)
+					if argClean == "_source" && strings.EqualFold(fn, "COUNT_DISTINCT") {
+						writeESError(w, http.StatusBadRequest, "verification_exception",
+							"Found 1 problem\nline 1:1: COUNT_DISTINCT(_source) is not supported")
+						return
+					}
+					if strings.EqualFold(fn, "VALUES") {
+						switch colTypes[argClean] {
+						case "geo_point", "cartesian_point", "geo_shape", "cartesian_shape":
+							writeESError(w, http.StatusBadRequest, "verification_exception",
+								fmt.Sprintf("Found 1 problem\nline 1:1: 1st argument of [VALUES(%s)] must be [boolean, date, double, integer, ip, keyword, long, null, text, unsigned_long or version], found value [%s] of type [%s]", arg, arg, colTypes[argClean]))
+							return
+						}
+					}
+					if argClean != "" && argClean != "*" && !strings.ContainsAny(arg, "()+-*/'\"0123456789") && fromSummary.hasMappings && colTypes[argClean] == "" {
+						writeESError(w, http.StatusBadRequest, "verification_exception",
+							fmt.Sprintf("Found 1 problem\nline 1:1: Unknown column [%s]", argClean))
+						return
+					}
 					aggSpecs = append(aggSpecs, esqlAggSpec{outCol: outCol, fn: fn, arg: arg})
 				}
 			}
@@ -4443,6 +4483,17 @@ func (s *Server) executeESQLQueryEngine(w http.ResponseWriter, r *http.Request, 
 					if !hasEq || outCol == "" {
 						outCol = unquoteESQLIdent(rawG)
 						exprStr = rawG
+					}
+					exprStr = rewriteESQLDoubleColonCastsRound63(exprStr)
+					exprClean := unquoteESQLIdent(exprStr)
+					if ambMsg := fromSummary.ambiguousError[exprClean]; ambMsg != "" {
+						writeESError(w, http.StatusBadRequest, "verification_exception", "Found 1 problem\nline 1:1: "+ambMsg)
+						return
+					}
+					if exprClean != "" && !strings.ContainsAny(exprStr, "()+-*/'\"0123456789") && fromSummary.hasMappings && colTypes[exprClean] == "" {
+						writeESError(w, http.StatusBadRequest, "verification_exception",
+							fmt.Sprintf("Found 1 problem\nline 1:1: Unknown column [%s]", exprClean))
+						return
 					}
 					grpSpecs = append(grpSpecs, esqlGroupSpec{outCol: outCol, expr: exprStr})
 				}
@@ -4500,10 +4551,12 @@ func (s *Server) executeESQLQueryEngine(w http.ResponseWriter, r *http.Request, 
 				for gi, gs := range grpSpecs {
 					gv := b.gVals[gi]
 					outRow[gs.outCol] = gv
-					if gv != nil {
-						newColTypes[gs.outCol] = inferESQLValueType(gv)
-					} else if newColTypes[gs.outCol] == "" {
+					if stT := inferESQLExprStaticTypeRound63(gs.expr, colTypes); stT != "" {
+						newColTypes[gs.outCol] = stT
+					} else if colTypes[gs.outCol] != "" {
 						newColTypes[gs.outCol] = colTypes[gs.outCol]
+					} else if gv != nil {
+						newColTypes[gs.outCol] = inferESQLValueType(gv)
 					}
 				}
 				nextRows = append(nextRows, outRow)
@@ -4614,6 +4667,12 @@ func (s *Server) executeESQLQueryEngine(w http.ResponseWriter, r *http.Request, 
 					continue
 				}
 				sc := sortClause{col: unquoteESQLIdent(toks[0])}
+				switch colTypes[sc.col] {
+				case "geo_point", "cartesian_point", "geo_shape", "cartesian_shape":
+					writeESError(w, http.StatusBadRequest, "verification_exception",
+						fmt.Sprintf("Found 1 problem\nline 1:1: cannot sort on %s column [%s]", colTypes[sc.col], sc.col))
+					return
+				}
 				hasNulls := false
 				for i := 1; i < len(toks); i++ {
 					switch strings.ToUpper(toks[i]) {
@@ -4663,7 +4722,7 @@ func (s *Server) executeESQLQueryEngine(w http.ResponseWriter, r *http.Request, 
 
 		default:
 			var handled, okStage bool
-			rows, colOrder, colTypes, handled, okStage = s.executeESQLExtraStage(w, r, st, upper, rows, colOrder, colTypes)
+			rows, colOrder, colTypes, handled, okStage = s.executeESQLExtraStageWithBody(w, r, body, st, upper, rows, colOrder, colTypes)
 			if handled {
 				if !okStage {
 					return
@@ -4683,16 +4742,42 @@ func (s *Server) executeESQLQueryEngine(w http.ResponseWriter, r *http.Request, 
 		rows = rows[:limit]
 	}
 
-	columns := make([]any, 0, len(colOrder))
+	allColumns := make([]any, 0, len(colOrder))
 	for _, c := range colOrder {
 		t := colTypes[c]
 		if t == "" {
 			t = "keyword"
 		}
-		columns = append(columns, map[string]any{
+		allColumns = append(allColumns, map[string]any{
 			"name": c,
 			"type": t,
 		})
+	}
+
+	dropNullCols, _ := body["drop_null_columns"].(bool)
+	if !dropNullCols && r.URL != nil && r.URL.Query().Has("drop_null_columns") {
+		dropNullCols = isTruthyBoolQueryParam(r, "drop_null_columns")
+	}
+	activeColOrder := colOrder
+	columns := allColumns
+	if dropNullCols {
+		filteredOrder := make([]string, 0, len(colOrder))
+		filteredCols := make([]any, 0, len(colOrder))
+		for idxC, c := range colOrder {
+			hasNonNull := false
+			for _, row := range rows {
+				if row[c] != nil {
+					hasNonNull = true
+					break
+				}
+			}
+			if hasNonNull {
+				filteredOrder = append(filteredOrder, c)
+				filteredCols = append(filteredCols, allColumns[idxC])
+			}
+		}
+		activeColOrder = filteredOrder
+		columns = filteredCols
 	}
 
 	columnar, _ := body["columnar"].(bool)
@@ -4701,8 +4786,8 @@ func (s *Server) executeESQLQueryEngine(w http.ResponseWriter, r *http.Request, 
 	}
 	var values []any
 	if columnar {
-		values = make([]any, len(colOrder))
-		for ci, c := range colOrder {
+		values = make([]any, len(activeColOrder))
+		for ci, c := range activeColOrder {
 			colSlice := make([]any, len(rows))
 			for ri, row := range rows {
 				colSlice[ri] = row[c]
@@ -4712,8 +4797,8 @@ func (s *Server) executeESQLQueryEngine(w http.ResponseWriter, r *http.Request, 
 	} else {
 		values = make([]any, 0, len(rows))
 		for _, row := range rows {
-			vals := make([]any, 0, len(colOrder))
-			for _, c := range colOrder {
+			vals := make([]any, 0, len(activeColOrder))
+			for _, c := range activeColOrder {
 				vals = append(vals, row[c])
 			}
 			values = append(values, vals)
@@ -4740,6 +4825,33 @@ func (s *Server) executeESQLQueryEngine(w http.ResponseWriter, r *http.Request, 
 		"columns":    columns,
 		"values":     values,
 	}
+	if dropNullCols {
+		respObj["all_columns"] = allColumns
+	}
+	wantProfile, _ := body["profile"].(bool)
+	if !wantProfile && r.URL != nil && r.URL.Query().Has("profile") {
+		wantProfile = isTruthyBoolQueryParam(r, "profile")
+	}
+	if wantProfile {
+		opName := "ValuesSourceReaderOperator"
+		if len(stages) > 0 && strings.HasPrefix(strings.ToUpper(strings.TrimSpace(stages[0])), "FROM") {
+			opName = "LuceneSourceOperator[shards = [0]]"
+		}
+		respObj["profile"] = map[string]any{
+			"drivers": []any{
+				map[string]any{
+					"took_nanos": 1000,
+					"operators": []any{
+						map[string]any{
+							"operator":    opName,
+							"status":      map[string]any{"rows_processed": len(rows)},
+							"pages_added": 1,
+						},
+					},
+				},
+			},
+		}
+	}
 	storedObj := deepCloneDocMap(respObj)
 	if !keepOnComp {
 		storedObj["__delete_on_get"] = true
@@ -4755,17 +4867,23 @@ func (s *Server) executeESQLQueryEngine(w http.ResponseWriter, r *http.Request, 
 	}
 	if format == "csv" || format == "tsv" || format == "txt" {
 		sep := ","
+		contentType := "text/csv; charset=utf-8"
 		switch format {
 		case "tsv":
 			sep = "\t"
+			contentType = "text/tab-separated-values; charset=utf-8"
 		case "txt":
 			sep = " | "
+			contentType = "text/plain; charset=utf-8"
+		}
+		if delim, okD := body["delimiter"].(string); okD && delim != "" && format == "csv" {
+			sep = delim
 		}
 		var b strings.Builder
-		b.WriteString(strings.Join(colOrder, sep) + "\n")
+		b.WriteString(strings.Join(activeColOrder, sep) + "\n")
 		for _, row := range rows {
-			parts := make([]string, 0, len(colOrder))
-			for _, c := range colOrder {
+			parts := make([]string, 0, len(activeColOrder))
+			for _, c := range activeColOrder {
 				if row[c] == nil {
 					parts = append(parts, "")
 				} else {
@@ -4774,13 +4892,14 @@ func (s *Server) executeESQLQueryEngine(w http.ResponseWriter, r *http.Request, 
 			}
 			b.WriteString(strings.Join(parts, sep) + "\n")
 		}
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		ensureESCompatHeaders(w, r)
+		w.Header().Set("Content-Type", contentType)
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(b.String()))
 		return
 	}
 
-	writeJSON(w, http.StatusOK, respObj)
+	writeJSONWithRequest(w, r, http.StatusOK, respObj)
 }
 
 func extractSearchResponseHitItems(resp map[string]any) []map[string]any {

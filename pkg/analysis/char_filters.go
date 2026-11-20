@@ -86,32 +86,55 @@ type charStreamBuilder struct {
 	ends       []int
 	baseOffset int
 	origEnd    int
+	exceeded   bool
 }
 
 func newCharStreamBuilder(in charStream) *charStreamBuilder {
+	initCap := len(in.runes)
+	if initCap > MaxCharFilterOutputRunes {
+		initCap = MaxCharFilterOutputRunes
+	}
 	return &charStreamBuilder{
-		runes:      make([]rune, 0, len(in.runes)),
-		starts:     make([]int, 0, len(in.runes)),
-		ends:       make([]int, 0, len(in.runes)),
+		runes:      make([]rune, 0, initCap),
+		starts:     make([]int, 0, initCap),
+		ends:       make([]int, 0, initCap),
 		baseOffset: in.baseOffset,
 		origEnd:    in.origEnd,
 	}
 }
 
 func (b *charStreamBuilder) appendUnchanged(in charStream, idx int) {
+	if b.exceeded {
+		return
+	}
+	if len(b.runes)+1 > MaxCharFilterOutputRunes {
+		b.exceeded = true
+		return
+	}
 	b.runes = append(b.runes, in.runes[idx])
 	b.starts = append(b.starts, in.starts[idx])
 	b.ends = append(b.ends, in.ends[idx])
 }
 
 func (b *charStreamBuilder) appendRangeUnchanged(in charStream, fromIdx, toIdx int) {
-	for i := fromIdx; i < toIdx; i++ {
-		b.appendUnchanged(in, i)
+	if b.exceeded || toIdx <= fromIdx {
+		return
 	}
+	if len(b.runes)+(toIdx-fromIdx) > MaxCharFilterOutputRunes {
+		b.exceeded = true
+		return
+	}
+	b.runes = append(b.runes, in.runes[fromIdx:toIdx]...)
+	b.starts = append(b.starts, in.starts[fromIdx:toIdx]...)
+	b.ends = append(b.ends, in.ends[fromIdx:toIdx]...)
 }
 
 func (b *charStreamBuilder) appendReplacement(rep []rune, origStart, origEnd int) {
-	if len(rep) == 0 {
+	if b.exceeded || len(rep) == 0 {
+		return
+	}
+	if len(b.runes)+len(rep) > MaxCharFilterOutputRunes {
+		b.exceeded = true
 		return
 	}
 	for k, r := range rep {
@@ -132,19 +155,22 @@ func (b *charStreamBuilder) appendReplacement(rep []rune, origStart, origEnd int
 	}
 }
 
-func (b *charStreamBuilder) build() charStream {
+func (b *charStreamBuilder) build() (charStream, error) {
+	if b.exceeded || len(b.runes) > MaxCharFilterOutputRunes {
+		return charStream{}, newIllegalArgError(fmt.Sprintf("char_filter output exceeds maximum allowed length [%d]", MaxCharFilterOutputRunes))
+	}
 	return charStream{
 		runes:      b.runes,
 		starts:     b.starts,
 		ends:       b.ends,
 		baseOffset: b.baseOffset,
 		origEnd:    b.origEnd,
-	}
+	}, nil
 }
 
 type compiledCharFilter struct {
 	name  string
-	apply func(charStream) charStream
+	apply func(charStream) (charStream, error)
 }
 
 var htmlBlockTags = map[string]bool{
@@ -176,7 +202,7 @@ func buildCharFilter(displayName string, typeName string, def map[string]any, op
 		}
 		return &compiledCharFilter{
 			name: displayName,
-			apply: func(in charStream) charStream {
+			apply: func(in charStream) (charStream, error) {
 				return applyHTMLStrip(in, escaped)
 			},
 		}, nil
@@ -199,7 +225,7 @@ func buildCharFilter(displayName string, typeName string, def map[string]any, op
 		}
 		return &compiledCharFilter{
 			name: displayName,
-			apply: func(in charStream) charStream {
+			apply: func(in charStream) (charStream, error) {
 				return applyMappingCharFilter(in, pairs)
 			},
 		}, nil
@@ -222,7 +248,7 @@ func buildCharFilter(displayName string, typeName string, def map[string]any, op
 		}
 		return &compiledCharFilter{
 			name: displayName,
-			apply: func(in charStream) charStream {
+			apply: func(in charStream) (charStream, error) {
 				return applyPatternReplaceCharFilter(in, re, repl)
 			},
 		}, nil
@@ -230,7 +256,10 @@ func buildCharFilter(displayName string, typeName string, def map[string]any, op
 	case "zero_width_spaces":
 		return &compiledCharFilter{
 			name: displayName,
-			apply: func(in charStream) charStream {
+			apply: func(in charStream) (charStream, error) {
+				if len(in.runes) > MaxCharFilterOutputRunes {
+					return charStream{}, newIllegalArgError(fmt.Sprintf("char_filter output exceeds maximum allowed length [%d]", MaxCharFilterOutputRunes))
+				}
 				b := newCharStreamBuilder(in)
 				for i, r := range in.runes {
 					if r == '\u200C' || r == '\u200D' || r == '\u200B' {
@@ -238,10 +267,19 @@ func buildCharFilter(displayName string, typeName string, def map[string]any, op
 					} else {
 						b.appendUnchanged(in, i)
 					}
+					if b.exceeded {
+						break
+					}
 				}
 				return b.build()
 			},
 		}, nil
+
+	case "icu_normalizer":
+		return buildICUNormalizerCharFilter(displayName, def)
+
+	case "kuromoji_iteration_mark", "japanese_iteration_mark":
+		return buildKuromojiIterationMarkCharFilter(displayName, def)
 
 	default:
 		return nil, newIllegalArgError(fmt.Sprintf("Unknown char_filter type [%s] for [%s]", typeName, displayName))
@@ -347,9 +385,12 @@ func unescapeMappingStr(s string) string {
 	return b.String()
 }
 
-func applyMappingCharFilter(in charStream, pairs []mappingPair) charStream {
+func applyMappingCharFilter(in charStream, pairs []mappingPair) (charStream, error) {
+	if len(in.runes) > MaxCharFilterOutputRunes {
+		return charStream{}, newIllegalArgError(fmt.Sprintf("char_filter output exceeds maximum allowed length [%d]", MaxCharFilterOutputRunes))
+	}
 	if len(pairs) == 0 || len(in.runes) == 0 {
-		return in
+		return in, nil
 	}
 	b := newCharStreamBuilder(in)
 	n := len(in.runes)
@@ -368,6 +409,9 @@ func applyMappingCharFilter(in charStream, pairs []mappingPair) charStream {
 			b.appendUnchanged(in, i)
 			i++
 		}
+		if b.exceeded {
+			return b.build()
+		}
 	}
 	return b.build()
 }
@@ -384,58 +428,125 @@ func runesEqual(a, b []rune) bool {
 	return true
 }
 
-func applyHTMLStrip(in charStream, escapedTags map[string]bool) charStream {
+func applyHTMLStrip(in charStream, escapedTags map[string]bool) (charStream, error) {
 	n := len(in.runes)
+	if n > MaxCharFilterOutputRunes {
+		return charStream{}, newIllegalArgError(fmt.Sprintf("char_filter output exceeds maximum allowed length [%d]", MaxCharFilterOutputRunes))
+	}
 	if n == 0 {
-		return in
+		return in, nil
 	}
 	b := newCharStreamBuilder(in)
+	noMoreCommentClose := false
+	nextCommentClose := -1
+	noMoreCDATAClose := false
+	nextCDATAClose := -1
+	noMorePIEnd := false
+	checkedAnyGT := false
+	noMoreRawClose := make(map[string]bool)
+	var visitedPICloseFail []uint8
+	var visitedTagCloseFail []uint8
+
 	for i := 0; i < n; {
 		r := in.runes[i]
 		if r == '<' {
 			// HTML comment <!-- ... -->
 			if hasRunePrefix(in.runes[i:], "<!--") {
-				endIdx := indexRunes(in.runes[i+4:], "-->")
-				if endIdx >= 0 {
-					i += 4 + endIdx + 3
-					continue
+				if !noMoreCommentClose {
+					if nextCommentClose < i+4 {
+						scanFrom := i + 4
+						if nextCommentClose+1 > scanFrom {
+							scanFrom = nextCommentClose + 1
+						}
+						rel := indexRunes(in.runes[scanFrom:], "-->")
+						if rel < 0 {
+							noMoreCommentClose = true
+						} else {
+							nextCommentClose = scanFrom + rel
+						}
+					}
+					if !noMoreCommentClose && nextCommentClose >= i+4 {
+						i = nextCommentClose + 3
+						continue
+					}
 				}
+				b.appendUnchanged(in, i)
+				if b.exceeded {
+					return b.build()
+				}
+				i++
+				continue
 			}
 			// CDATA <![CDATA[ ... ]]>
 			if hasRunePrefixFold(in.runes[i:], "<![cdata[") {
-				endIdx := indexRunes(in.runes[i+9:], "]]>")
-				if endIdx >= 0 {
-					b.appendRangeUnchanged(in, i+9, i+9+endIdx)
-					i += 9 + endIdx + 3
-					continue
+				if !noMoreCDATAClose {
+					if nextCDATAClose < i+9 {
+						scanFrom := i + 9
+						if nextCDATAClose+1 > scanFrom {
+							scanFrom = nextCDATAClose + 1
+						}
+						rel := indexRunes(in.runes[scanFrom:], "]]>")
+						if rel < 0 {
+							noMoreCDATAClose = true
+						} else {
+							nextCDATAClose = scanFrom + rel
+						}
+					}
+					if !noMoreCDATAClose && nextCDATAClose >= i+9 {
+						b.appendRangeUnchanged(in, i+9, nextCDATAClose)
+						if b.exceeded {
+							return b.build()
+						}
+						i = nextCDATAClose + 3
+						continue
+					}
 				}
+				b.appendUnchanged(in, i)
+				if b.exceeded {
+					return b.build()
+				}
+				i++
+				continue
 			}
 			// <!DOCTYPE ...> or <?...?>
-			if i+1 < n && (in.runes[i+1] == '!' || in.runes[i+1] == '?') {
-				endTag := findTagClose(in.runes, i+2)
+			if !noMorePIEnd && i+1 < n && (in.runes[i+1] == '!' || in.runes[i+1] == '?') {
+				endTag := findTagCloseMemo(in.runes, i+2, &visitedPICloseFail)
 				if endTag >= 0 {
 					i = endTag + 1
 					continue
 				}
+				if !checkedAnyGT {
+					checkedAnyGT = true
+					if indexRunes(in.runes[i+2:], ">") < 0 {
+						noMorePIEnd = true
+					}
+				}
 			}
 			// Standard tag <tag ...> or </tag>
-			tagName, isClosing, endTag, ok := parseHTMLTagAt(in.runes, i)
+			tagName, isClosing, endTag, ok := parseHTMLTagAtMemo(in.runes, i, &visitedTagCloseFail)
 			if ok {
 				lowerTag := strings.ToLower(tagName)
 				if escapedTags[lowerTag] {
 					b.appendRangeUnchanged(in, i, endTag+1)
+					if b.exceeded {
+						return b.build()
+					}
 					i = endTag + 1
 					continue
 				}
-				if !isClosing && (lowerTag == "script" || lowerTag == "style") {
-					closeEnd := findClosingRawElement(in.runes, endTag+1, lowerTag)
+				if !isClosing && (lowerTag == "script" || lowerTag == "style") && !noMoreRawClose[lowerTag] {
+					closeEnd := findClosingRawElementMemo(in.runes, endTag+1, lowerTag, &visitedTagCloseFail)
 					if closeEnd >= 0 {
 						i = closeEnd
 						continue
 					}
+					noMoreRawClose[lowerTag] = true
 				}
 				if htmlBlockTags[lowerTag] {
 					b.appendReplacement([]rune{'\n'}, in.starts[i], in.ends[endTag])
+					if b.exceeded {
+						return b.build()
+					}
 				}
 				i = endTag + 1
 				continue
@@ -463,6 +574,9 @@ func applyHTMLStrip(in charStream, escapedTags map[string]bool) charStream {
 				decoded := html.UnescapeString(rawEnt)
 				if decoded != rawEnt {
 					b.appendReplacement([]rune(decoded), in.starts[i], in.ends[semi])
+					if b.exceeded {
+						return b.build()
+					}
 					i = semi + 1
 					continue
 				}
@@ -470,28 +584,41 @@ func applyHTMLStrip(in charStream, escapedTags map[string]bool) charStream {
 		}
 
 		b.appendUnchanged(in, i)
+		if b.exceeded {
+			return b.build()
+		}
 		i++
 	}
 	return b.build()
 }
 
 func hasRunePrefix(runes []rune, prefix string) bool {
-	pr := []rune(prefix)
-	if len(runes) < len(pr) {
-		return false
+	idx := 0
+	for _, p := range prefix {
+		if idx >= len(runes) || runes[idx] != p {
+			return false
+		}
+		idx++
 	}
-	return runesEqual(runes[:len(pr)], pr)
+	return true
 }
 
 func hasRunePrefixFold(runes []rune, prefixLower string) bool {
-	pr := []rune(prefixLower)
-	if len(runes) < len(pr) {
-		return false
-	}
-	for i, p := range pr {
-		if unicode.ToLower(runes[i]) != p {
+	idx := 0
+	for _, p := range prefixLower {
+		if idx >= len(runes) {
 			return false
 		}
+		r := runes[idx]
+		if r >= 'A' && r <= 'Z' {
+			r += 'a' - 'A'
+		} else if r >= utf8.RuneSelf {
+			r = unicode.ToLower(r)
+		}
+		if r != p {
+			return false
+		}
+		idx++
 	}
 	return true
 }
@@ -510,9 +637,42 @@ func indexRunes(haystack []rune, needle string) int {
 	return -1
 }
 
-func findTagClose(runes []rune, start int) int {
+func htmlQuoteMask(quote rune) uint8 {
+	switch quote {
+	case '"':
+		return 1 << 1
+	case '\'':
+		return 1 << 2
+	default:
+		return 1 << 0
+	}
+}
+
+func markHTMLQuotePathFailed(runes []rune, start, stopAt int, visited *[]uint8) {
+	if *visited == nil {
+		*visited = make([]uint8, len(runes))
+	}
+	var quote rune
+	for k := start; k < stopAt && k < len(runes); k++ {
+		(*visited)[k] |= htmlQuoteMask(quote)
+		c := runes[k]
+		if quote != 0 {
+			if c == quote {
+				quote = 0
+			}
+		} else if c == '"' || c == '\'' {
+			quote = c
+		}
+	}
+}
+
+func findTagCloseMemo(runes []rune, start int, visited *[]uint8) int {
 	var quote rune
 	for j := start; j < len(runes); j++ {
+		if *visited != nil && ((*visited)[j]&htmlQuoteMask(quote)) != 0 {
+			markHTMLQuotePathFailed(runes, start, j, visited)
+			return -1
+		}
 		c := runes[j]
 		if quote != 0 {
 			if c == quote {
@@ -528,10 +688,11 @@ func findTagClose(runes []rune, start int) int {
 			return j
 		}
 	}
+	markHTMLQuotePathFailed(runes, start, len(runes), visited)
 	return -1
 }
 
-func parseHTMLTagAt(runes []rune, pos int) (tagName string, isClosing bool, endIdx int, ok bool) {
+func parseHTMLTagAtMemo(runes []rune, pos int, visited *[]uint8) (tagName string, isClosing bool, endIdx int, ok bool) {
 	n := len(runes)
 	if pos+2 >= n || runes[pos] != '<' {
 		return "", false, -1, false
@@ -549,8 +710,13 @@ func parseHTMLTagAt(runes []rune, pos int) (tagName string, isClosing bool, endI
 		j++
 	}
 	tagName = string(runes[nameStart:j])
+	attrStart := j
 	var quote rune
 	for ; j < n; j++ {
+		if *visited != nil && ((*visited)[j]&htmlQuoteMask(quote)) != 0 {
+			markHTMLQuotePathFailed(runes, attrStart, j, visited)
+			return "", false, -1, false
+		}
 		c := runes[j]
 		if quote != 0 {
 			if c == quote {
@@ -563,19 +729,21 @@ func parseHTMLTagAt(runes []rune, pos int) (tagName string, isClosing bool, endI
 			continue
 		}
 		if c == '<' {
+			markHTMLQuotePathFailed(runes, attrStart, j, visited)
 			return "", false, -1, false
 		}
 		if c == '>' {
 			return tagName, isClosing, j, true
 		}
 	}
+	markHTMLQuotePathFailed(runes, attrStart, n, visited)
 	return "", false, -1, false
 }
 
-func findClosingRawElement(runes []rune, start int, lowerTag string) int {
+func findClosingRawElementMemo(runes []rune, start int, lowerTag string, visited *[]uint8) int {
 	for j := start; j < len(runes); j++ {
 		if runes[j] == '<' {
-			tName, isClose, endTag, ok := parseHTMLTagAt(runes, j)
+			tName, isClose, endTag, ok := parseHTMLTagAtMemo(runes, j, visited)
 			if ok && isClose && strings.ToLower(tName) == lowerTag {
 				return endTag + 1
 			}
@@ -589,6 +757,9 @@ func isASCIILetter(r rune) bool {
 }
 
 func compileJavaRegex(pattern string, flagsStr string) (*regexp.Regexp, error) {
+	if len(pattern) > MaxRegexPatternBytes {
+		return nil, newIllegalArgError(fmt.Sprintf("Regex pattern length [%d] exceeds maximum allowed [%d]", len(pattern), MaxRegexPatternBytes))
+	}
 	upperFlags := strings.ToUpper(flagsStr)
 	if strings.Contains(upperFlags, "CANON_EQ") && countConsecutiveCombiningMarks(pattern) >= 3 {
 		return nil, newIllegalArgError("Too complex regex pattern")
@@ -654,11 +825,14 @@ func countConsecutiveCombiningMarks(s string) int {
 	return maxRun
 }
 
-func applyPatternReplaceCharFilter(in charStream, re *regexp.Regexp, repl string) charStream {
+func applyPatternReplaceCharFilter(in charStream, re *regexp.Regexp, repl string) (charStream, error) {
+	if len(in.runes) > MaxCharFilterOutputRunes {
+		return charStream{}, newIllegalArgError(fmt.Sprintf("char_filter output exceeds maximum allowed length [%d]", MaxCharFilterOutputRunes))
+	}
 	s := in.String()
 	matches := re.FindAllStringSubmatchIndex(s, -1)
 	if len(matches) == 0 {
-		return in
+		return in, nil
 	}
 	// Map byte index in s -> rune index in in.runes
 	byteToRune := make([]int, len(s)+1)
@@ -682,6 +856,9 @@ func applyPatternReplaceCharFilter(in charStream, re *regexp.Regexp, repl string
 			continue
 		}
 		b.appendRangeUnchanged(in, prevRune, mStartRune)
+		if b.exceeded {
+			return b.build()
+		}
 		expanded := expandJavaReplacement(s, loc, repl)
 		var origStart, origEnd int
 		if mStartRune < len(in.runes) {
@@ -695,9 +872,15 @@ func applyPatternReplaceCharFilter(in charStream, re *regexp.Regexp, repl string
 			origEnd = origStart
 		}
 		b.appendReplacement([]rune(expanded), origStart, origEnd)
+		if b.exceeded {
+			return b.build()
+		}
 		if mEndRune == mStartRune {
 			if mStartRune < len(in.runes) {
 				b.appendUnchanged(in, mStartRune)
+				if b.exceeded {
+					return b.build()
+				}
 				prevRune = mStartRune + 1
 			} else {
 				prevRune = mStartRune

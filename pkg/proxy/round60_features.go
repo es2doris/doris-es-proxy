@@ -28,7 +28,6 @@ import (
 	"io"
 	"math"
 	"math/bits"
-	"net"
 	"net/http"
 	"runtime"
 	"sort"
@@ -90,16 +89,14 @@ func (s *Server) SetTargetESVersion(ver string) {
 	s.targetESVersion = ver
 	s.explicitTargetESVersion = true
 	s.mu.Unlock()
+	s.explicitTargetESVerAtomic.Store(true)
 }
 
 func (s *Server) hasExplicitTargetESVersion() bool {
 	if s == nil {
 		return false
 	}
-	s.mu.RLock()
-	v := s.explicitTargetESVersion
-	s.mu.RUnlock()
-	return v
+	return s.explicitTargetESVerAtomic.Load()
 }
 
 func (s *Server) getTargetESVersion() string {
@@ -222,14 +219,19 @@ func (s *Server) validateWireAcceptAndCompatHeadersRound60(w http.ResponseWriter
 			if mt == "" {
 				continue
 			}
+			if parseMediaQualityWeightR63(semi[1:]) <= 0 {
+				continue
+			}
 			switch mt {
-			case "*/*", "application/*", "text/*",
-				"application/json", "application/x-ndjson",
-				"application/yaml", "application/cbor", "application/smile",
-				"text/plain", "text/html", "text/yaml":
+			case "*/*", "application/*", "text/*", "image/*",
+				"application/json", "application/x-ndjson", "application/ndjson",
+				"application/vnd.mapbox-vector-tile",
+				"application/yaml", "application/x-yaml", "application/cbor", "application/smile",
+				"text/plain", "text/html", "text/yaml", "text/csv", "text/tab-separated-values":
 				acceptable = true
 			case "application/vnd.elasticsearch+json",
 				"application/vnd.elasticsearch+x-ndjson",
+				"application/vnd.elasticsearch+ndjson",
 				"application/vnd.elasticsearch+yaml",
 				"application/vnd.elasticsearch+cbor",
 				"application/vnd.elasticsearch+smile":
@@ -1124,7 +1126,7 @@ func (s *Server) checkAutoCreateIndexClusterSettingRound60(indexName string) (in
 		if strings.HasPrefix(pat, "-") {
 			if matchWildcardPattern(strings.TrimPrefix(pat, "-"), indexName) {
 				return http.StatusNotFound, "index_not_found_exception",
-					fmt.Sprintf("no such index [%s] and [action.auto_create_index] ([%s]) blocks auto-creation", indexName, rule)
+					fmt.Sprintf("no such index [%s] and [action.auto_create_index] contains [%s] which forbids automatic creation of the index", indexName, pat)
 			}
 			continue
 		}
@@ -1134,7 +1136,7 @@ func (s *Server) checkAutoCreateIndexClusterSettingRound60(indexName string) (in
 		}
 	}
 	return http.StatusNotFound, "index_not_found_exception",
-		fmt.Sprintf("no such index [%s] and [action.auto_create_index] ([%s]) did not match", indexName, rule)
+		fmt.Sprintf("no such index [%s] and [action.auto_create_index] ([%s]) doesn't match", indexName, rule)
 }
 
 // normalizeTemplateBodyIndexPatternsRound60 rewrites `"index_patterns": "test-*"` (single string)
@@ -2137,10 +2139,25 @@ func (s *Server) handleIndexStatsRound60(w http.ResponseWriter, r *http.Request)
 					}
 					shSec := buildStatSectionsMapRound61(metrics, shDocs, shDel, shDocs*256, st, idxOpts)
 					decorateShardStatsEntryRound61(shSec, name, sh, true, shDocs)
+					syncID := getSyncedFlushIDR63Admin(s, name)
+					if syncID != "" {
+						if cm, okC := shSec["commit"].(map[string]any); okC {
+							if ud, okU := cm["user_data"].(map[string]any); okU {
+								ud["sync_id"] = syncID
+							}
+						}
+					}
 					shardReplicas := []any{shSec}
 					for rep := 0; rep < numReplicas; rep++ {
 						repSec := buildStatSectionsMapRound61(metrics, shDocs, shDel, shDocs*256, st, idxOpts)
 						decorateShardStatsEntryRound61(repSec, name, sh, false, shDocs)
+						if syncID != "" {
+							if cm, okC := repSec["commit"].(map[string]any); okC {
+								if ud, okU := cm["user_data"].(map[string]any); okU {
+									ud["sync_id"] = syncID
+								}
+							}
+						}
 						shardReplicas = append(shardReplicas, repSec)
 					}
 					shardsObj[strconv.Itoa(sh)] = shardReplicas
@@ -2330,6 +2347,31 @@ func (s *Server) handleNodesRound60(w http.ResponseWriter, r *http.Request, segs
 		s.serveNodesHotThreadsRound61(w, r, segs[1])
 		return
 	}
+	// Route `usage` (`/_nodes/usage`, `/_nodes/{node_id}/usage`, `/_nodes/usage/{metric}`, `/_nodes/{node_id}/usage/{metric}`):
+	if len(segs) >= 2 && segs[1] == "usage" {
+		if len(segs) >= 4 {
+			writeESError(w, http.StatusNotFound, "invalid_index_name_exception", "no handler found for uri ["+r.URL.Path+"]")
+			return
+		}
+		metricStr := ""
+		if len(segs) == 3 {
+			metricStr = segs[2]
+		}
+		s.serveNodesUsageRound63(w, r, "_all", metricStr)
+		return
+	}
+	if len(segs) >= 3 && segs[2] == "usage" {
+		if len(segs) >= 5 {
+			writeESError(w, http.StatusNotFound, "invalid_index_name_exception", "no handler found for uri ["+r.URL.Path+"]")
+			return
+		}
+		metricStr := ""
+		if len(segs) == 4 {
+			metricStr = segs[3]
+		}
+		s.serveNodesUsageRound63(w, r, segs[1], metricStr)
+		return
+	}
 	// Route `stats`:
 	if len(segs) >= 2 && segs[1] == "stats" {
 		metricStr := ""
@@ -2435,11 +2477,12 @@ func (s *Server) serveNodesInfoRound60(w http.ResponseWriter, r *http.Request, n
 	nodesMap := map[string]any{}
 	totalNodes := 1
 	if localNodeMatchesFilterRound60(nodeFilter) {
+		pubAddr, hostStr, ipStr := resolveSniffPublishAddressR63Wire(r)
 		nodeObj := map[string]any{
 			"name":              "doris-es-proxy",
 			"transport_address": "127.0.0.1:9300",
-			"host":              "localhost",
-			"ip":                "127.0.0.1",
+			"host":              hostStr,
+			"ip":                ipStr,
 			"version":           esVer,
 			"build_flavor":      "default",
 			"build_type":        "docker",
@@ -2460,20 +2503,26 @@ func (s *Server) serveNodesInfoRound60(w http.ResponseWriter, r *http.Request, n
 			flat := isTruthyBoolQueryParam(r, "flat_settings")
 			if flat {
 				nodeObj["settings"] = map[string]any{
-					"cluster.name":       "apache-doris-search-cluster",
-					"node.name":          "doris-es-proxy-node-1",
-					"node.attr.backend":  "doris",
-					"node.attr.testattr": "test",
-					"http.type":          "netty4",
-					"transport.type":     "netty4",
-					"client.type":        "node",
+					"cluster.name":              "apache-doris-search-cluster",
+					"cluster.election.strategy": "supports_voting_only",
+					"node.name":                 "doris-es-proxy-node-1",
+					"node.attr.backend":         "doris",
+					"node.attr.testattr":        "test",
+					"http.type":                 "netty4",
+					"http.type.default":         "netty4",
+					"transport.type":            "netty4",
+					"transport.type.default":    "netty4",
+					"client.type":               "node",
 				}
 			} else {
 				nodeObj["settings"] = map[string]any{
-					"cluster":   map[string]any{"name": "apache-doris-search-cluster"},
+					"cluster": map[string]any{
+						"name":     "apache-doris-search-cluster",
+						"election": map[string]any{"strategy": "supports_voting_only"},
+					},
 					"node":      map[string]any{"name": "doris-es-proxy-node-1", "attr": map[string]any{"backend": "doris", "testattr": "test"}},
-					"http":      map[string]any{"type": "netty4"},
-					"transport": map[string]any{"type": "netty4"},
+					"http":      map[string]any{"type": map[string]any{"default": "netty4"}},
+					"transport": map[string]any{"type": map[string]any{"default": "netty4"}},
 					"client":    map[string]any{"type": "node"},
 				}
 			}
@@ -2513,8 +2562,9 @@ func (s *Server) serveNodesInfoRound60(w http.ResponseWriter, r *http.Request, n
 					"non_heap_max_in_bytes":  int64(0),
 					"direct_max_in_bytes":    int64(0),
 				},
-				"gc_collectors": []string{"G1 Young Generation", "G1 Old Generation"},
-				"memory_pools":  []string{"CodeCache", "Metaspace", "G1 Eden Space", "G1 Old Gen"},
+				"gc_collectors":   []string{"G1 Young Generation", "G1 Old Generation"},
+				"memory_pools":    []string{"CodeCache", "Metaspace", "G1 Eden Space", "G1 Old Gen"},
+				"input_arguments": []string{},
 			}
 		}
 		if selected["thread_pool"] {
@@ -2532,23 +2582,41 @@ func (s *Server) serveNodesInfoRound60(w http.ResponseWriter, r *http.Request, n
 			}
 		}
 		if selected["http"] {
-			pubAddr := "127.0.0.1:9200"
-			if r != nil && strings.TrimSpace(r.Host) != "" {
-				cand := strings.TrimSpace(r.Host)
-				if _, _, splitErr := net.SplitHostPort(cand); splitErr == nil {
-					pubAddr = cand
-				} else {
-					pubAddr = net.JoinHostPort(strings.Trim(cand, "[]"), "9200")
-				}
+			maxBytes := atomic.LoadInt64(&s.maxBodyBytes)
+			if maxBytes <= 0 {
+				maxBytes = DefaultMaxRequestBodyBytes
 			}
 			nodeObj["http"] = map[string]any{
 				"bound_address":               []string{pubAddr},
 				"publish_address":             pubAddr,
-				"max_content_length_in_bytes": s.maxBodyBytes,
+				"max_content_length_in_bytes": maxBytes,
 			}
 		}
 		if selected["plugins"] {
-			nodeObj["plugins"] = []any{}
+			if s.hasExplicitTargetESVersion() && !s.isES8Mode(r) {
+				es7PluginNames := []string{
+					"analysis-icu", "analysis-kuromoji", "analysis-nori", "analysis-phonetic",
+					"analysis-smartcn", "analysis-stempel", "analysis-ukrainian",
+					"ingest-attachment", "ingest-geoip", "ingest-user-agent",
+					"mapper-annotated-text", "mapper-murmur3", "mapper-size", "repository-url",
+				}
+				plugs := make([]any, 0, len(es7PluginNames))
+				for _, pn := range es7PluginNames {
+					plugs = append(plugs, map[string]any{
+						"name":                  pn,
+						"version":               esVer,
+						"elasticsearch_version": esVer,
+						"java_version":          "1.8",
+						"description":           pn + " plugin",
+						"classname":             "org.elasticsearch.plugin." + pn,
+						"extended_plugins":      []any{},
+						"has_native_controller": false,
+					})
+				}
+				nodeObj["plugins"] = plugs
+			} else {
+				nodeObj["plugins"] = []any{}
+			}
 		}
 		if selected["modules"] || selected["plugins"] {
 			modNames := []string{
@@ -2556,6 +2624,7 @@ func (s *Server) serveNodesInfoRound60(w http.ResponseWriter, r *http.Request, n
 				"ingest-attachment", "ingest-common", "ingest-geoip", "ingest-user-agent",
 				"lang-expression", "lang-mustache", "lang-painless",
 				"mapper-extras", "parent-join", "percolator", "rank-eval", "reindex",
+				"transport-netty4",
 			}
 			mods := make([]any, 0, len(modNames))
 			for _, mn := range modNames {
@@ -3421,7 +3490,7 @@ func (s *Server) handleClusterStatsRound60(w http.ResponseWriter, r *http.Reques
 
 	s.mu.RLock()
 	openIndices := make([]string, 0, len(s.indices))
-	schemasByIdx := make(map[string]*schema.IndexSchema, len(s.indices))
+	tablesByIdx := make(map[string]string, len(s.indices))
 	numPipelines := len(s.pipelines)
 	hasYellowReplica := false
 	for idxName, sc := range s.indices {
@@ -3429,7 +3498,9 @@ func (s *Server) handleClusterStatsRound60(w http.ResponseWriter, r *http.Reques
 			continue
 		}
 		openIndices = append(openIndices, idxName)
-		schemasByIdx[idxName] = sc
+		if sc != nil {
+			tablesByIdx[idxName] = sc.DorisTable
+		}
 		if cust := s.indexCustomSettings[idxName]; cust != nil {
 			for _, rk := range []string{"number_of_replicas", "index.number_of_replicas"} {
 				if rv, okR := cust[rk]; okR {
@@ -3449,8 +3520,8 @@ func (s *Server) handleClusterStatsRound60(w http.ResponseWriter, r *http.Reques
 		for _, idxName := range openIndices {
 			dCnt, delCnt, bCnt := s.computeAdjustedLiveDocCountRound61(r.Context(), idxName)
 			if bCnt == 0 && dorisTel != nil && len(dorisTel.Tables) > 0 {
-				if sc := schemasByIdx[idxName]; sc != nil {
-					if td, okT := dorisTel.Tables[sc.DorisTable]; okT {
+				if tbl := tablesByIdx[idxName]; tbl != "" {
+					if td, okT := dorisTel.Tables[tbl]; okT {
 						if td.SizeBytes > 0 {
 							bCnt = td.SizeBytes
 						}

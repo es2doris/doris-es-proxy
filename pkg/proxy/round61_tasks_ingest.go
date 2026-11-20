@@ -438,7 +438,7 @@ func (s *Server) handleCatSnapshotsRound61(w http.ResponseWriter, r *http.Reques
 	}
 	s.mu.RUnlock()
 	defaultCols := []string{"id", "status", "start_epoch", "start_time", "end_epoch", "end_time", "duration", "indices", "successful_shards", "failed_shards", "total_shards"}
-	if repoPat == "" || repoPat == "*" || repoPat == "_all" || strings.Contains(repoPat, ",") || strings.ContainsAny(repoPat, "*?") {
+	if s.isES8Mode(r) || repoPat == "" || repoPat == "*" || repoPat == "_all" || strings.Contains(repoPat, ",") || strings.ContainsAny(repoPat, "*?") {
 		defaultCols = []string{"id", "repository", "status", "start_epoch", "start_time", "end_epoch", "end_time", "duration", "indices", "successful_shards", "failed_shards", "total_shards"}
 	}
 	helpCols := []string{"id", "repository", "status", "start_epoch", "start_time", "end_epoch", "end_time", "duration", "indices", "successful_shards", "failed_shards", "total_shards", "reason"}
@@ -1457,6 +1457,10 @@ func (s *Server) applyWritePipelinesFullRound61(
 		DocID:       docID,
 		Routing:     initialRouting,
 	}
+	savedAtt, savedUA, hookErr := s.collectPipelineHooksForWriteRound63(rawTargetIndex, reqPipeline, defaultPipeline, rawDoc)
+	if hookErr != nil {
+		return res, http.StatusBadRequest, "illegal_argument_exception", cleanIngestErrorReasonRound60(hookErr.Error())
+	}
 	cur, curIdx, curID, curRouting, dropped, execPipes, ingestMeta, err := s.applyEffectiveAndFinalPipelinesWithMetaRound61(
 		rawTargetIndex, docID, reqPipeline, defaultPipeline, initialRouting, rawDoc,
 	)
@@ -1489,7 +1493,7 @@ func (s *Server) applyWritePipelinesFullRound61(
 		}
 		return res, http.StatusBadRequest, et, cleanIngestErrorReasonRound60(err.Error())
 	}
-	res.Doc = cur
+	res.Doc = s.applyPostIngestEnrichmentsRound63(cur, savedAtt, savedUA)
 	if curIdx != "" {
 		res.TargetIndex = curIdx
 	}
@@ -1505,6 +1509,8 @@ func (s *Server) applyWritePipelinesFullRound61(
 		}
 		if vt, ok := ingestMeta["__mutated_version_type"].(string); ok && vt != "" {
 			res.VersionType = vt
+		} else if res.HasVersion && res.Version > 0 {
+			res.VersionType = "external"
 		}
 		if sn, ok := toInt64(ingestMeta["__mutated_if_seq_no"]); ok {
 			res.HasIfSeqNo = true
@@ -1518,19 +1524,22 @@ func (s *Server) applyWritePipelinesFullRound61(
 	if dropped {
 		return res, 0, "", ""
 	}
+	if stR, etR, erR := s.finalizeReroutedDestinationRound63(rawTargetIndex, &res); stR != 0 || res.Dropped {
+		return res, stR, etR, erR
+	}
 	if requireAlias && s != nil {
 		if !s.isAliasOrDataStreamTargetRound61(res.TargetIndex) {
 			return res, http.StatusNotFound, "index_not_found_exception",
 				fmt.Sprintf("no such alias [%s]", res.TargetIndex)
 		}
 	}
-	if s != nil {
+	if s != nil && res.ResolvedWriteIdx == "" {
 		if resolved, _, wErr := s.resolveWriteIndexWithFilter(res.TargetIndex); wErr == nil && resolved != "" {
 			res.ResolvedWriteIdx = resolved
 		} else {
 			res.ResolvedWriteIdx = s.resolveIndexName(res.TargetIndex)
 		}
-	} else {
+	} else if s == nil {
 		res.ResolvedWriteIdx = res.TargetIndex
 	}
 	return res, 0, "", ""
@@ -2751,6 +2760,7 @@ func (s *Server) validateReindexPreflightRound61(
 			}
 		}
 		if len(badRemKeys) > 0 {
+			badRemKeys = orderReindexRemoteUnknownKeysRound63(orderedKeys, badRemKeys, len(rm))
 			return 0, 1, false, waitFC, 0, nil, http.StatusBadRequest, "illegal_argument_exception",
 				"Unsupported fields in [remote]: [" + strings.Join(badRemKeys, ",") + "]"
 		}

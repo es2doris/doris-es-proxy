@@ -28,7 +28,7 @@ import (
 
 type compiledTokenizer struct {
 	name     string
-	tokenize func(cs charStream, startPos int) []Token
+	tokenize func(cs charStream, startPos int, budget *tokenStreamBudget) ([]Token, error)
 }
 
 // IsBuiltInTokenizer reports whether typeName is a built-in Elasticsearch tokenizer.
@@ -37,7 +37,8 @@ func IsBuiltInTokenizer(typeName string) bool {
 	case "standard", "uax_url_email", "letter", "lowercase", "whitespace",
 		"classic", "keyword", "noop", "ngram", "edge_ngram", "edgengram",
 		"pattern", "simple_pattern", "simple_pattern_split",
-		"char_group", "path_hierarchy", "pathhierarchy", "thai":
+		"char_group", "path_hierarchy", "pathhierarchy", "thai",
+		"icu_tokenizer", "kuromoji_tokenizer", "nori_tokenizer", "smartcn_tokenizer", "smartcn_sentence":
 		return true
 	default:
 		return false
@@ -45,6 +46,10 @@ func IsBuiltInTokenizer(typeName string) bool {
 }
 
 func buildTokenizer(displayName string, typeName string, def map[string]any, maxNGramDiff int) (*compiledTokenizer, error) {
+	return buildTokenizerWithOpts(displayName, typeName, def, maxNGramDiff, Options{})
+}
+
+func buildTokenizerWithOpts(displayName string, typeName string, def map[string]any, maxNGramDiff int, opts Options) (*compiledTokenizer, error) {
 	normType := strings.ToLower(strings.TrimSpace(typeName))
 	switch normType {
 	case "standard":
@@ -54,8 +59,8 @@ func buildTokenizer(displayName string, typeName string, def map[string]any, max
 		}
 		return &compiledTokenizer{
 			name: displayName,
-			tokenize: func(cs charStream, startPos int) []Token {
-				return tokenizeStandard(cs, startPos, maxLen, false)
+			tokenize: func(cs charStream, startPos int, budget *tokenStreamBudget) ([]Token, error) {
+				return tokenizeStandard(cs, startPos, maxLen, false, budget)
 			},
 		}, nil
 
@@ -66,8 +71,8 @@ func buildTokenizer(displayName string, typeName string, def map[string]any, max
 		}
 		return &compiledTokenizer{
 			name: displayName,
-			tokenize: func(cs charStream, startPos int) []Token {
-				return tokenizeStandard(cs, startPos, maxLen, true)
+			tokenize: func(cs charStream, startPos int, budget *tokenStreamBudget) ([]Token, error) {
+				return tokenizeStandard(cs, startPos, maxLen, true, budget)
 			},
 		}, nil
 
@@ -78,24 +83,24 @@ func buildTokenizer(displayName string, typeName string, def map[string]any, max
 		}
 		return &compiledTokenizer{
 			name: displayName,
-			tokenize: func(cs charStream, startPos int) []Token {
-				return tokenizeClassic(cs, startPos, maxLen)
+			tokenize: func(cs charStream, startPos int, budget *tokenStreamBudget) ([]Token, error) {
+				return tokenizeClassic(cs, startPos, maxLen, budget)
 			},
 		}, nil
 
 	case "letter":
 		return &compiledTokenizer{
 			name: displayName,
-			tokenize: func(cs charStream, startPos int) []Token {
-				return tokenizePred(cs, startPos, 0, unicode.IsLetter, false)
+			tokenize: func(cs charStream, startPos int, budget *tokenStreamBudget) ([]Token, error) {
+				return tokenizePred(cs, startPos, 0, unicode.IsLetter, false, budget)
 			},
 		}, nil
 
 	case "lowercase":
 		return &compiledTokenizer{
 			name: displayName,
-			tokenize: func(cs charStream, startPos int) []Token {
-				return tokenizePred(cs, startPos, 0, unicode.IsLetter, true)
+			tokenize: func(cs charStream, startPos int, budget *tokenStreamBudget) ([]Token, error) {
+				return tokenizePred(cs, startPos, 0, unicode.IsLetter, true, budget)
 			},
 		}, nil
 
@@ -106,10 +111,10 @@ func buildTokenizer(displayName string, typeName string, def map[string]any, max
 		}
 		return &compiledTokenizer{
 			name: displayName,
-			tokenize: func(cs charStream, startPos int) []Token {
+			tokenize: func(cs charStream, startPos int, budget *tokenStreamBudget) ([]Token, error) {
 				return tokenizePred(cs, startPos, maxLen, func(r rune) bool {
 					return !unicode.IsSpace(r)
-				}, false)
+				}, false, budget)
 			},
 		}, nil
 
@@ -123,20 +128,30 @@ func buildTokenizer(displayName string, typeName string, def map[string]any, max
 		}
 		return &compiledTokenizer{
 			name: displayName,
-			tokenize: func(cs charStream, startPos int) []Token {
+			tokenize: func(cs charStream, startPos int, budget *tokenStreamBudget) ([]Token, error) {
 				if len(cs.runes) == 0 {
-					return nil
+					return nil, nil
+				}
+				if len(cs.runes) > MaxTokenTermBytes {
+					return nil, newIllegalArgError(fmt.Sprintf("token term length exceeds maximum allowed [%d] bytes", MaxTokenTermBytes))
+				}
+				if err := budget.canAddOne(); err != nil {
+					return nil, err
+				}
+				term := cs.String()
+				if err := budget.add(len(term)); err != nil {
+					return nil, err
 				}
 				sOff, eOff := cs.sliceOffsets(0, len(cs.runes))
 				return []Token{{
-					Term:           cs.String(),
+					Term:           term,
 					StartOffset:    sOff,
 					EndOffset:      eOff,
 					Type:           "word",
 					Position:       startPos,
 					PositionLength: 1,
 					TermFrequency:  1,
-				}}
+				}}, nil
 			},
 		}, nil
 
@@ -158,8 +173,8 @@ func buildTokenizer(displayName string, typeName string, def map[string]any, max
 		}
 		return &compiledTokenizer{
 			name: displayName,
-			tokenize: func(cs charStream, startPos int) []Token {
-				return tokenizeNGram(cs, startPos, minGram, maxGram, isEdge, charPred)
+			tokenize: func(cs charStream, startPos int, budget *tokenStreamBudget) ([]Token, error) {
+				return tokenizeNGram(cs, startPos, minGram, maxGram, isEdge, charPred, budget)
 			},
 		}, nil
 
@@ -188,8 +203,8 @@ func buildTokenizer(displayName string, typeName string, def map[string]any, max
 		}
 		return &compiledTokenizer{
 			name: displayName,
-			tokenize: func(cs charStream, startPos int) []Token {
-				return tokenizePattern(cs, startPos, re, group)
+			tokenize: func(cs charStream, startPos int, budget *tokenStreamBudget) ([]Token, error) {
+				return tokenizePattern(cs, startPos, re, group, budget)
 			},
 		}, nil
 
@@ -203,8 +218,8 @@ func buildTokenizer(displayName string, typeName string, def map[string]any, max
 		if pat == "" {
 			return &compiledTokenizer{
 				name: displayName,
-				tokenize: func(cs charStream, startPos int) []Token {
-					return nil
+				tokenize: func(cs charStream, startPos int, budget *tokenStreamBudget) ([]Token, error) {
+					return nil, nil
 				},
 			}, nil
 		}
@@ -214,8 +229,8 @@ func buildTokenizer(displayName string, typeName string, def map[string]any, max
 		}
 		return &compiledTokenizer{
 			name: displayName,
-			tokenize: func(cs charStream, startPos int) []Token {
-				return tokenizePattern(cs, startPos, re, 0)
+			tokenize: func(cs charStream, startPos int, budget *tokenStreamBudget) ([]Token, error) {
+				return tokenizePattern(cs, startPos, re, 0, budget)
 			},
 		}, nil
 
@@ -229,20 +244,30 @@ func buildTokenizer(displayName string, typeName string, def map[string]any, max
 		if pat == "" {
 			return &compiledTokenizer{
 				name: displayName,
-				tokenize: func(cs charStream, startPos int) []Token {
+				tokenize: func(cs charStream, startPos int, budget *tokenStreamBudget) ([]Token, error) {
 					if len(cs.runes) == 0 {
-						return nil
+						return nil, nil
+					}
+					if len(cs.runes) > MaxTokenTermBytes {
+						return nil, newIllegalArgError(fmt.Sprintf("token term length exceeds maximum allowed [%d] bytes", MaxTokenTermBytes))
+					}
+					if err := budget.canAddOne(); err != nil {
+						return nil, err
+					}
+					term := cs.String()
+					if err := budget.add(len(term)); err != nil {
+						return nil, err
 					}
 					sOff, eOff := cs.sliceOffsets(0, len(cs.runes))
 					return []Token{{
-						Term:           cs.String(),
+						Term:           term,
 						StartOffset:    sOff,
 						EndOffset:      eOff,
 						Type:           "word",
 						Position:       startPos,
 						PositionLength: 1,
 						TermFrequency:  1,
-					}}
+					}}, nil
 				},
 			}, nil
 		}
@@ -252,8 +277,8 @@ func buildTokenizer(displayName string, typeName string, def map[string]any, max
 		}
 		return &compiledTokenizer{
 			name: displayName,
-			tokenize: func(cs charStream, startPos int) []Token {
-				return tokenizePattern(cs, startPos, re, -1)
+			tokenize: func(cs charStream, startPos int, budget *tokenStreamBudget) ([]Token, error) {
+				return tokenizePattern(cs, startPos, re, -1, budget)
 			},
 		}, nil
 
@@ -268,10 +293,10 @@ func buildTokenizer(displayName string, typeName string, def map[string]any, max
 		}
 		return &compiledTokenizer{
 			name: displayName,
-			tokenize: func(cs charStream, startPos int) []Token {
+			tokenize: func(cs charStream, startPos int, budget *tokenStreamBudget) ([]Token, error) {
 				return tokenizePred(cs, startPos, maxLen, func(r rune) bool {
 					return !splitPred(r)
-				}, false)
+				}, false, budget)
 			},
 		}, nil
 
@@ -317,18 +342,21 @@ func buildTokenizer(displayName string, typeName string, def map[string]any, max
 		}
 		return &compiledTokenizer{
 			name: displayName,
-			tokenize: func(cs charStream, startPos int) []Token {
-				return tokenizePathHierarchy(cs, startPos, delim, repl, reverse, skip)
+			tokenize: func(cs charStream, startPos int, budget *tokenStreamBudget) ([]Token, error) {
+				return tokenizePathHierarchy(cs, startPos, delim, repl, reverse, skip, budget)
 			},
 		}, nil
 
 	case "thai":
 		return &compiledTokenizer{
 			name: displayName,
-			tokenize: func(cs charStream, startPos int) []Token {
-				return tokenizeThai(cs, startPos)
+			tokenize: func(cs charStream, startPos int, budget *tokenStreamBudget) ([]Token, error) {
+				return tokenizeThai(cs, startPos, budget)
 			},
 		}, nil
+
+	case "icu_tokenizer", "kuromoji_tokenizer", "nori_tokenizer", "smartcn_tokenizer", "smartcn_sentence":
+		return buildPluginTokenizer(displayName, normType, def, opts)
 
 	default:
 		return nil, newIllegalArgError(fmt.Sprintf("Unknown tokenizer type [%s] for [%s]", typeName, displayName))
@@ -395,6 +423,9 @@ func parseMinMaxGram(def map[string]any, defaultMin, defaultMax int) (int, int, 
 			}
 			maxGram = n
 		}
+	}
+	if maxGram > MaxAllowedGramSize {
+		return 0, 0, newIllegalArgError(fmt.Sprintf("max_gram [%d] must be <= %d", maxGram, MaxAllowedGramSize))
 	}
 	if maxGram < minGram {
 		return 0, 0, newIllegalArgError(fmt.Sprintf("min_gram [%d] cannot be greater than max_gram [%d]", minGram, maxGram))
@@ -527,7 +558,7 @@ func parseCharGroupSplitPred(def map[string]any) (func(rune) bool, error) {
 	}, nil
 }
 
-func tokenizePred(cs charStream, startPos int, maxLen int, keep func(rune) bool, lower bool) []Token {
+func tokenizePred(cs charStream, startPos int, maxLen int, keep func(rune) bool, lower bool, budget *tokenStreamBudget) ([]Token, error) {
 	var out []Token
 	pos := startPos
 	n := len(cs.runes)
@@ -545,6 +576,12 @@ func tokenizePred(cs charStream, startPos int, maxLen int, keep func(rune) bool,
 			i++
 		}
 		seg := cs.runes[start:i]
+		if len(seg) > MaxTokenTermBytes {
+			return nil, newIllegalArgError(fmt.Sprintf("token term length exceeds maximum allowed [%d] bytes", MaxTokenTermBytes))
+		}
+		if err := budget.canAddOne(); err != nil {
+			return nil, err
+		}
 		var term string
 		if lower {
 			var sb strings.Builder
@@ -555,6 +592,9 @@ func tokenizePred(cs charStream, startPos int, maxLen int, keep func(rune) bool,
 			term = sb.String()
 		} else {
 			term = string(seg)
+		}
+		if err := budget.add(len(term)); err != nil {
+			return nil, err
 		}
 		sOff, eOff := cs.sliceOffsets(start, i)
 		out = append(out, Token{
@@ -568,16 +608,16 @@ func tokenizePred(cs charStream, startPos int, maxLen int, keep func(rune) bool,
 		})
 		pos++
 	}
-	return out
+	return out, nil
 }
 
-func tokenizeNGram(cs charStream, startPos int, minGram, maxGram int, isEdge bool, charPred func(rune) bool) []Token {
+func tokenizeNGram(cs charStream, startPos int, minGram, maxGram int, isEdge bool, charPred func(rune) bool, budget *tokenStreamBudget) ([]Token, error) {
 	var out []Token
 	pos := startPos
-	emitRun := func(runStart, runEnd int) {
+	emitRun := func(runStart, runEnd int) error {
 		runLen := runEnd - runStart
 		if runLen < minGram {
-			return
+			return nil
 		}
 		if isEdge {
 			limit := maxGram
@@ -585,9 +625,16 @@ func tokenizeNGram(cs charStream, startPos int, minGram, maxGram int, isEdge boo
 				limit = runLen
 			}
 			for sz := minGram; sz <= limit; sz++ {
+				if err := budget.canAddOne(); err != nil {
+					return err
+				}
+				term := string(cs.runes[runStart : runStart+sz])
+				if err := budget.add(len(term)); err != nil {
+					return err
+				}
 				sOff, eOff := cs.sliceOffsets(runStart, runStart+sz)
 				out = append(out, Token{
-					Term:           string(cs.runes[runStart : runStart+sz]),
+					Term:           term,
 					StartOffset:    sOff,
 					EndOffset:      eOff,
 					Type:           "word",
@@ -597,13 +644,20 @@ func tokenizeNGram(cs charStream, startPos int, minGram, maxGram int, isEdge boo
 				})
 				pos++
 			}
-			return
+			return nil
 		}
 		for s := runStart; s < runEnd; s++ {
 			for sz := minGram; sz <= maxGram && s+sz <= runEnd; sz++ {
+				if err := budget.canAddOne(); err != nil {
+					return err
+				}
+				term := string(cs.runes[s : s+sz])
+				if err := budget.add(len(term)); err != nil {
+					return err
+				}
 				sOff, eOff := cs.sliceOffsets(s, s+sz)
 				out = append(out, Token{
-					Term:           string(cs.runes[s : s+sz]),
+					Term:           term,
 					StartOffset:    sOff,
 					EndOffset:      eOff,
 					Type:           "word",
@@ -614,11 +668,14 @@ func tokenizeNGram(cs charStream, startPos int, minGram, maxGram int, isEdge boo
 				pos++
 			}
 		}
+		return nil
 	}
 
 	if charPred == nil {
-		emitRun(0, len(cs.runes))
-		return out
+		if err := emitRun(0, len(cs.runes)); err != nil {
+			return nil, err
+		}
+		return out, nil
 	}
 	n := len(cs.runes)
 	for i := 0; i < n; {
@@ -630,15 +687,17 @@ func tokenizeNGram(cs charStream, startPos int, minGram, maxGram int, isEdge boo
 		for i < n && charPred(cs.runes[i]) {
 			i++
 		}
-		emitRun(start, i)
+		if err := emitRun(start, i); err != nil {
+			return nil, err
+		}
 	}
-	return out
+	return out, nil
 }
 
-func tokenizePattern(cs charStream, startPos int, re *regexp.Regexp, group int) []Token {
+func tokenizePattern(cs charStream, startPos int, re *regexp.Regexp, group int, budget *tokenStreamBudget) ([]Token, error) {
 	s := cs.String()
 	if len(cs.runes) == 0 {
-		return nil
+		return nil, nil
 	}
 	byteToRune := make([]int, len(s)+1)
 	bOff := 0
@@ -655,6 +714,31 @@ func tokenizePattern(cs charStream, startPos int, re *regexp.Regexp, group int) 
 	pos := startPos
 	matches := re.FindAllStringSubmatchIndex(s, -1)
 
+	emitSpan := func(rStart, rEnd int) error {
+		if rEnd-rStart > MaxTokenTermBytes {
+			return newIllegalArgError(fmt.Sprintf("token term length exceeds maximum allowed [%d] bytes", MaxTokenTermBytes))
+		}
+		if err := budget.canAddOne(); err != nil {
+			return err
+		}
+		term := string(cs.runes[rStart:rEnd])
+		if err := budget.add(len(term)); err != nil {
+			return err
+		}
+		sOff, eOff := cs.sliceOffsets(rStart, rEnd)
+		out = append(out, Token{
+			Term:           term,
+			StartOffset:    sOff,
+			EndOffset:      eOff,
+			Type:           "word",
+			Position:       pos,
+			PositionLength: 1,
+			TermFrequency:  1,
+		})
+		pos++
+		return nil
+	}
+
 	if group < 0 {
 		// Split mode: emit non-empty segments between matches.
 		prevRune := 0
@@ -662,35 +746,20 @@ func tokenizePattern(cs charStream, startPos int, re *regexp.Regexp, group int) 
 			mStart := byteToRune[loc[0]]
 			mEnd := byteToRune[loc[1]]
 			if mStart > prevRune {
-				sOff, eOff := cs.sliceOffsets(prevRune, mStart)
-				out = append(out, Token{
-					Term:           string(cs.runes[prevRune:mStart]),
-					StartOffset:    sOff,
-					EndOffset:      eOff,
-					Type:           "word",
-					Position:       pos,
-					PositionLength: 1,
-					TermFrequency:  1,
-				})
-				pos++
+				if err := emitSpan(prevRune, mStart); err != nil {
+					return nil, err
+				}
 			}
 			if mEnd > prevRune {
 				prevRune = mEnd
 			}
 		}
 		if prevRune < len(cs.runes) {
-			sOff, eOff := cs.sliceOffsets(prevRune, len(cs.runes))
-			out = append(out, Token{
-				Term:           string(cs.runes[prevRune:]),
-				StartOffset:    sOff,
-				EndOffset:      eOff,
-				Type:           "word",
-				Position:       pos,
-				PositionLength: 1,
-				TermFrequency:  1,
-			})
+			if err := emitSpan(prevRune, len(cs.runes)); err != nil {
+				return nil, err
+			}
 		}
-		return out
+		return out, nil
 	}
 
 	// Capture mode: emit matched group for each regex match.
@@ -704,33 +773,88 @@ func tokenizePattern(cs charStream, startPos int, re *regexp.Regexp, group int) 
 		}
 		rStart := byteToRune[gStartB]
 		rEnd := byteToRune[gEndB]
+		if err := emitSpan(rStart, rEnd); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+func formatPathHierarchySpan(runes []rune, delim, repl rune) string {
+	if delim == repl {
+		return string(runes)
+	}
+	var sb strings.Builder
+	sb.Grow(len(runes))
+	for _, r := range runes {
+		if r == delim {
+			sb.WriteRune(repl)
+		} else {
+			sb.WriteRune(r)
+		}
+	}
+	return sb.String()
+}
+
+func tokenizePathHierarchy(cs charStream, startPos int, delim, repl rune, reverse bool, skip int, budget *tokenStreamBudget) ([]Token, error) {
+	n := len(cs.runes)
+	if n == 0 {
+		return nil, nil
+	}
+
+	var out []Token
+	emitSpan := func(rStart, rEnd int) error {
+		if rEnd-rStart > MaxTokenTermBytes {
+			return newIllegalArgError(fmt.Sprintf("token term length exceeds maximum allowed [%d] bytes", MaxTokenTermBytes))
+		}
+		if err := budget.canAddOne(); err != nil {
+			return err
+		}
+		term := formatPathHierarchySpan(cs.runes[rStart:rEnd], delim, repl)
+		if err := budget.add(len(term)); err != nil {
+			return err
+		}
 		sOff, eOff := cs.sliceOffsets(rStart, rEnd)
 		out = append(out, Token{
-			Term:           string(cs.runes[rStart:rEnd]),
+			Term:           term,
 			StartOffset:    sOff,
 			EndOffset:      eOff,
 			Type:           "word",
-			Position:       pos,
+			Position:       startPos,
 			PositionLength: 1,
 			TermFrequency:  1,
 		})
-		pos++
-	}
-	return out
-}
-
-func tokenizePathHierarchy(cs charStream, startPos int, delim, repl rune, reverse bool, skip int) []Token {
-	n := len(cs.runes)
-	if n == 0 {
 		return nil
 	}
-	replaced := make([]rune, n)
-	for i, r := range cs.runes {
-		if r == delim {
-			replaced[i] = repl
-		} else {
-			replaced[i] = r
+
+	if !reverse && skip == 0 {
+		i := 0
+		if cs.runes[0] == delim {
+			i = 1
 		}
+		lastEmittedEnd := -1
+		for ; i <= n; i++ {
+			if i == n || cs.runes[i] == delim {
+				if i > 0 {
+					if err := emitSpan(0, i); err != nil {
+						return nil, err
+					}
+					lastEmittedEnd = i
+				}
+			}
+		}
+		if n > 1 && cs.runes[n-1] == delim && lastEmittedEnd != n {
+			if err := emitSpan(0, n); err != nil {
+				return nil, err
+			}
+			lastEmittedEnd = n
+		}
+		if lastEmittedEnd < 0 {
+			if err := emitSpan(0, n); err != nil {
+				return nil, err
+			}
+		}
+		return out, nil
 	}
 
 	var spans [][2]int
@@ -754,11 +878,10 @@ func tokenizePathHierarchy(cs charStream, startPos int, delim, repl rune, revers
 		}
 		if skip > 0 {
 			if skip >= len(spans) {
-				return nil
+				return nil, nil
 			}
-			newStart := 0
-			// Notice in Lucene PathHierarchyTokenizer: when skip > 0, skipped prefix is trimmed!
-			newStart = spans[skip-1][1]
+			// In Lucene PathHierarchyTokenizer: when skip > 0, skipped prefix is trimmed!
+			newStart := spans[skip-1][1]
 			spans = spans[skip:]
 			for k := range spans {
 				spans[k][0] = newStart
@@ -775,7 +898,7 @@ func tokenizePathHierarchy(cs charStream, startPos int, delim, repl rune, revers
 				}
 			}
 			if skipped < skip {
-				return nil
+				return nil, nil
 			}
 		}
 		for j := end - 1; j >= 0; j-- {
@@ -790,20 +913,13 @@ func tokenizePathHierarchy(cs charStream, startPos int, delim, repl rune, revers
 		}
 	}
 
-	out := make([]Token, 0, len(spans))
+	out = make([]Token, 0, min(len(spans), 1024))
 	for _, sp := range spans {
-		sOff, eOff := cs.sliceOffsets(sp[0], sp[1])
-		out = append(out, Token{
-			Term:           string(replaced[sp[0]:sp[1]]),
-			StartOffset:    sOff,
-			EndOffset:      eOff,
-			Type:           "word",
-			Position:       startPos,
-			PositionLength: 1,
-			TermFrequency:  1,
-		})
+		if err := emitSpan(sp[0], sp[1]); err != nil {
+			return nil, err
+		}
 	}
-	return out
+	return out, nil
 }
 
 // Standard & UAX URL Email Tokenizers
@@ -813,20 +929,70 @@ var (
 	urlAtRegex   = regexp.MustCompile(`^(?i)(?:https?|ftp|file)://[^\s<>"]+|^(?i)www\.[A-Za-z0-9.\-]+\.[A-Za-z]{2,}[^\s<>"]*`)
 )
 
-func tokenizeStandard(cs charStream, startPos int, maxLen int, withURLEmail bool) []Token {
+func hasEmailCandidatePrefix(runes []rune) bool {
+	for k, r := range runes {
+		if r == '@' {
+			return k > 0
+		}
+		if !isASCIILetter(r) && (r < '0' || r > '9') && r != '.' && r != '_' && r != '%' && r != '+' && r != '-' {
+			return false
+		}
+	}
+	return false
+}
+
+func hasURLCandidatePrefix(runes []rune) bool {
+	if len(runes) < 6 {
+		return false
+	}
+	switch runes[0] {
+	case 'w', 'W':
+		return (runes[1] == 'w' || runes[1] == 'W') &&
+			(runes[2] == 'w' || runes[2] == 'W') &&
+			runes[3] == '.'
+	case 'h', 'H':
+		return hasRunePrefixFold(runes, "http://") || hasRunePrefixFold(runes, "https://")
+	case 'f', 'F':
+		return hasRunePrefixFold(runes, "ftp://") || hasRunePrefixFold(runes, "file://")
+	default:
+		return false
+	}
+}
+
+func nonSpaceLookaheadEnd(runes []rune, start, maxEnd int) int {
+	for k := start; k < maxEnd; k++ {
+		if unicode.IsSpace(runes[k]) {
+			return k
+		}
+	}
+	return maxEnd
+}
+
+func tokenizeStandard(cs charStream, startPos int, maxLen int, withURLEmail bool, budget *tokenStreamBudget) ([]Token, error) {
 	var out []Token
 	pos := startPos
 	n := len(cs.runes)
+	lookWin := max(min(maxLen, MaxTokenTermBytes)*4, 4096)
 
-	emitChunked := func(fromIdx, toIdx int, tokType string) {
+	emitChunked := func(fromIdx, toIdx int, tokType string) error {
 		for s := fromIdx; s < toIdx; s += maxLen {
 			e := s + maxLen
 			if e > toIdx {
 				e = toIdx
 			}
+			if e-s > MaxTokenTermBytes {
+				return newIllegalArgError(fmt.Sprintf("token term length exceeds maximum allowed [%d] bytes", MaxTokenTermBytes))
+			}
+			if err := budget.canAddOne(); err != nil {
+				return err
+			}
+			term := string(cs.runes[s:e])
+			if err := budget.add(len(term)); err != nil {
+				return err
+			}
 			sOff, eOff := cs.sliceOffsets(s, e)
 			out = append(out, Token{
-				Term:           string(cs.runes[s:e]),
+				Term:           term,
 				StartOffset:    sOff,
 				EndOffset:      eOff,
 				Type:           tokType,
@@ -836,6 +1002,7 @@ func tokenizeStandard(cs charStream, startPos int, maxLen int, withURLEmail bool
 			})
 			pos++
 		}
+		return nil
 	}
 
 	i := 0
@@ -843,22 +1010,36 @@ func tokenizeStandard(cs charStream, startPos int, maxLen int, withURLEmail bool
 		r := cs.runes[i]
 
 		if withURLEmail && (isASCIILetter(r) || (r >= '0' && r <= '9')) {
-			rem := string(cs.runes[i:])
-			if m := urlAtRegex.FindString(rem); m != "" {
-				trimmed := strings.TrimRight(m, ".,;:!?)']\"")
-				mRunes := utf8.RuneCountInString(trimmed)
-				if mRunes > 0 {
-					emitChunked(i, i+mRunes, "<URL>")
-					i += mRunes
-					continue
+			end := nonSpaceLookaheadEnd(cs.runes, i, min(n, i+lookWin))
+			cand := cs.runes[i:end]
+			mayURL := hasURLCandidatePrefix(cand)
+			mayEmail := hasEmailCandidatePrefix(cand)
+			if mayURL || mayEmail {
+				rem := string(cand)
+				if mayURL {
+					if m := urlAtRegex.FindString(rem); m != "" {
+						trimmed := strings.TrimRight(m, ".,;:!?)']\"")
+						mRunes := utf8.RuneCountInString(trimmed)
+						if mRunes > 0 {
+							if err := emitChunked(i, i+mRunes, "<URL>"); err != nil {
+								return nil, err
+							}
+							i += mRunes
+							continue
+						}
+					}
 				}
-			}
-			if m := emailAtRegex.FindString(rem); m != "" {
-				mRunes := utf8.RuneCountInString(m)
-				if mRunes > 0 {
-					emitChunked(i, i+mRunes, "<EMAIL>")
-					i += mRunes
-					continue
+				if mayEmail {
+					if m := emailAtRegex.FindString(rem); m != "" {
+						mRunes := utf8.RuneCountInString(m)
+						if mRunes > 0 {
+							if err := emitChunked(i, i+mRunes, "<EMAIL>"); err != nil {
+								return nil, err
+							}
+							i += mRunes
+							continue
+						}
+					}
 				}
 			}
 		}
@@ -868,7 +1049,9 @@ func tokenizeStandard(cs charStream, startPos int, maxLen int, withURLEmail bool
 			for end < n && isCombiningMark(cs.runes[end]) {
 				end++
 			}
-			emitChunked(i, end, "<IDEOGRAPHIC>")
+			if err := emitChunked(i, end, "<IDEOGRAPHIC>"); err != nil {
+				return nil, err
+			}
 			i = end
 			continue
 		}
@@ -878,7 +1061,9 @@ func tokenizeStandard(cs charStream, startPos int, maxLen int, withURLEmail bool
 			for end < n && (isCombiningMark(cs.runes[end]) || cs.runes[end] == '\u3099' || cs.runes[end] == '\u309A') {
 				end++
 			}
-			emitChunked(i, end, "<HIRAGANA>")
+			if err := emitChunked(i, end, "<HIRAGANA>"); err != nil {
+				return nil, err
+			}
 			i = end
 			continue
 		}
@@ -888,7 +1073,9 @@ func tokenizeStandard(cs charStream, startPos int, maxLen int, withURLEmail bool
 			for end < n && (isKatakanaRune(cs.runes[end]) || cs.runes[end] == '\u30FC' || isCombiningMark(cs.runes[end])) {
 				end++
 			}
-			emitChunked(i, end, "<KATAKANA>")
+			if err := emitChunked(i, end, "<KATAKANA>"); err != nil {
+				return nil, err
+			}
 			i = end
 			continue
 		}
@@ -898,7 +1085,9 @@ func tokenizeStandard(cs charStream, startPos int, maxLen int, withURLEmail bool
 			for end < n && (unicode.Is(unicode.Hangul, cs.runes[end]) || isCombiningMark(cs.runes[end])) {
 				end++
 			}
-			emitChunked(i, end, "<HANGUL>")
+			if err := emitChunked(i, end, "<HANGUL>"); err != nil {
+				return nil, err
+			}
 			i = end
 			continue
 		}
@@ -908,7 +1097,9 @@ func tokenizeStandard(cs charStream, startPos int, maxLen int, withURLEmail bool
 			for end < n && (isSoutheastAsianLetter(cs.runes[end]) || isCombiningMark(cs.runes[end])) {
 				end++
 			}
-			emitChunked(i, end, "<SOUTHEAST_ASIAN>")
+			if err := emitChunked(i, end, "<SOUTHEAST_ASIAN>"); err != nil {
+				return nil, err
+			}
 			i = end
 			continue
 		}
@@ -927,14 +1118,16 @@ func tokenizeStandard(cs charStream, startPos int, maxLen int, withURLEmail bool
 				}
 				break
 			}
-			emitChunked(i, end, "<EMOJI>")
+			if err := emitChunked(i, end, "<EMOJI>"); err != nil {
+				return nil, err
+			}
 			i = end
 			continue
 		}
 
 		if isStandardWordStart(cs.runes, i) {
 			start := i
-			hasLetter := isWordLetter(r)
+			hasLetter := isWordLetter(r) || r == '_'
 			hasDigit := unicode.IsDigit(r)
 			i++
 			for i < n {
@@ -987,13 +1180,22 @@ func tokenizeStandard(cs charStream, startPos int, maxLen int, withURLEmail bool
 			if hasDigit && !hasLetter {
 				tokType = "<NUM>"
 			}
-			emitChunked(start, i, tokType)
+			if err := emitChunked(start, i, tokType); err != nil {
+				return nil, err
+			}
+			continue
+		}
+
+		if r == '_' {
+			for i < n && cs.runes[i] == '_' {
+				i++
+			}
 			continue
 		}
 
 		i++
 	}
-	return out
+	return out, nil
 }
 
 func isCJKIdeograph(r rune) bool {
@@ -1039,8 +1241,13 @@ func isStandardWordStart(runes []rune, idx int) bool {
 	if isWordLetter(r) || unicode.IsDigit(r) {
 		return true
 	}
-	if r == '_' && idx+1 < len(runes) && (isWordLetter(runes[idx+1]) || unicode.IsDigit(runes[idx+1])) {
-		return true
+	if r == '_' {
+		for k := idx + 1; k < len(runes); k++ {
+			if runes[k] == '_' {
+				continue
+			}
+			return isWordLetter(runes[k]) || unicode.IsDigit(runes[k])
+		}
 	}
 	return false
 }
@@ -1049,20 +1256,31 @@ func isStandardWordStart(runes []rune, idx int) bool {
 
 var acronymAtRegex = regexp.MustCompile(`^(?:[A-Za-z]\.){2,}`)
 
-func tokenizeClassic(cs charStream, startPos int, maxLen int) []Token {
+func tokenizeClassic(cs charStream, startPos int, maxLen int, budget *tokenStreamBudget) ([]Token, error) {
 	var out []Token
 	pos := startPos
 	n := len(cs.runes)
+	lookWin := max(min(maxLen, MaxTokenTermBytes)*4, 4096)
 
-	emit := func(fromIdx, toIdx int, tokType string) {
+	emit := func(fromIdx, toIdx int, tokType string) error {
 		for s := fromIdx; s < toIdx; s += maxLen {
 			e := s + maxLen
 			if e > toIdx {
 				e = toIdx
 			}
+			if e-s > MaxTokenTermBytes {
+				return newIllegalArgError(fmt.Sprintf("token term length exceeds maximum allowed [%d] bytes", MaxTokenTermBytes))
+			}
+			if err := budget.canAddOne(); err != nil {
+				return err
+			}
+			term := string(cs.runes[s:e])
+			if err := budget.add(len(term)); err != nil {
+				return err
+			}
 			sOff, eOff := cs.sliceOffsets(s, e)
 			out = append(out, Token{
-				Term:           string(cs.runes[s:e]),
+				Term:           term,
 				StartOffset:    sOff,
 				EndOffset:      eOff,
 				Type:           tokType,
@@ -1072,12 +1290,15 @@ func tokenizeClassic(cs charStream, startPos int, maxLen int) []Token {
 			})
 			pos++
 		}
+		return nil
 	}
 
 	for i := 0; i < n; {
 		r := cs.runes[i]
 		if isCJKIdeograph(r) {
-			emit(i, i+1, "<CJ>")
+			if err := emit(i, i+1, "<CJ>"); err != nil {
+				return nil, err
+			}
 			i++
 			continue
 		}
@@ -1085,18 +1306,32 @@ func tokenizeClassic(cs charStream, startPos int, maxLen int) []Token {
 			i++
 			continue
 		}
-		rem := string(cs.runes[i:])
-		if m := emailAtRegex.FindString(rem); m != "" {
-			mRunes := utf8.RuneCountInString(m)
-			emit(i, i+mRunes, "<EMAIL>")
-			i += mRunes
-			continue
-		}
-		if m := acronymAtRegex.FindString(rem); m != "" {
-			mRunes := utf8.RuneCountInString(m)
-			emit(i, i+mRunes, "<ACRONYM>")
-			i += mRunes
-			continue
+		end := nonSpaceLookaheadEnd(cs.runes, i, min(n, i+lookWin))
+		cand := cs.runes[i:end]
+		mayEmail := hasEmailCandidatePrefix(cand)
+		mayAcronym := isASCIILetter(r) && len(cand) >= 4 && cand[1] == '.'
+		if mayEmail || mayAcronym {
+			rem := string(cand)
+			if mayEmail {
+				if m := emailAtRegex.FindString(rem); m != "" {
+					mRunes := utf8.RuneCountInString(m)
+					if err := emit(i, i+mRunes, "<EMAIL>"); err != nil {
+						return nil, err
+					}
+					i += mRunes
+					continue
+				}
+			}
+			if mayAcronym {
+				if m := acronymAtRegex.FindString(rem); m != "" {
+					mRunes := utf8.RuneCountInString(m)
+					if err := emit(i, i+mRunes, "<ACRONYM>"); err != nil {
+						return nil, err
+					}
+					i += mRunes
+					continue
+				}
+			}
 		}
 
 		start := i
@@ -1147,9 +1382,11 @@ func tokenizeClassic(cs charStream, startPos int, maxLen int) []Token {
 		case hasDigit && !hasLetter:
 			tokType = "<NUM>"
 		}
-		emit(start, i, tokType)
+		if err := emit(start, i, tokType); err != nil {
+			return nil, err
+		}
 	}
-	return out
+	return out, nil
 }
 
 // Thai Tokenizer: longest-match dictionary + orthographic Thai cluster segmentation for Thai script,
@@ -1181,7 +1418,7 @@ var thaiDictRunes = func() [][]rune {
 	return out
 }()
 
-func tokenizeThai(cs charStream, startPos int) []Token {
+func tokenizeThai(cs charStream, startPos int, budget *tokenStreamBudget) ([]Token, error) {
 	var out []Token
 	pos := startPos
 	n := len(cs.runes)
@@ -1195,9 +1432,19 @@ func tokenizeThai(cs charStream, startPos int) []Token {
 			segs := segmentThaiRun(cs.runes[i:runEnd])
 			cur := i
 			for _, segLen := range segs {
+				if segLen > MaxTokenTermBytes {
+					return nil, newIllegalArgError(fmt.Sprintf("token term length exceeds maximum allowed [%d] bytes", MaxTokenTermBytes))
+				}
+				if err := budget.canAddOne(); err != nil {
+					return nil, err
+				}
+				term := string(cs.runes[cur : cur+segLen])
+				if err := budget.add(len(term)); err != nil {
+					return nil, err
+				}
 				sOff, eOff := cs.sliceOffsets(cur, cur+segLen)
 				out = append(out, Token{
-					Term:           string(cs.runes[cur : cur+segLen]),
+					Term:           term,
 					StartOffset:    sOff,
 					EndOffset:      eOff,
 					Type:           "<SOUTHEAST_ASIAN>",
@@ -1223,14 +1470,17 @@ func tokenizeThai(cs charStream, startPos int) []Token {
 			baseOffset: cs.baseOffset,
 			origEnd:    cs.origEnd,
 		}
-		subToks := tokenizeStandard(sub, pos, 255, false)
+		subToks, err := tokenizeStandard(sub, pos, 255, false, budget)
+		if err != nil {
+			return nil, err
+		}
 		out = append(out, subToks...)
 		if len(subToks) > 0 {
 			pos = subToks[len(subToks)-1].Position + 1
 		}
 		i = nonThaiEnd
 	}
-	return out
+	return out, nil
 }
 
 func isThaiWordRune(r rune) bool {

@@ -68,18 +68,45 @@ type sdkOrderDoc struct {
 
 // --- elastic/elasticsearch-specification schema.json Wire Validator (via compliance.SpecSchemaValidator) ---
 
+const minValidatedEndpointsTarget = 125
+
 var targetValidatedEndpoints = []string{
 	"info",
+	"ping",
+	"exists",
+	"get_source",
+	"search_shards",
+	"search_mvt",
 	"cluster.health",
 	"cluster.stats",
+	"cluster.state",
+	"cluster.allocation_explain",
+	"cluster.reroute",
+	"cluster.pending_tasks",
 	"cluster.put_settings",
 	"cluster.get_settings",
 	"cluster.put_component_template",
+	"cluster.get_component_template",
+	"cluster.exists_component_template",
 	"cluster.delete_component_template",
+	"nodes.info",
 	"nodes.stats",
+	"nodes.usage",
+	"nodes.hot_threads",
+	"tasks.list",
+	"tasks.get",
+	"tasks.cancel",
 	"indices.create",
+	"indices.get",
+	"indices.exists",
 	"indices.delete",
 	"indices.refresh",
+	"indices.flush",
+	"indices.stats",
+	"indices.recovery",
+	"indices.shrink",
+	"indices.split",
+	"indices.clone",
 	"indices.put_settings",
 	"indices.get_settings",
 	"indices.put_mapping",
@@ -87,12 +114,19 @@ var targetValidatedEndpoints = []string{
 	"indices.get_field_mapping",
 	"indices.put_alias",
 	"indices.get_alias",
+	"indices.exists_alias",
+	"indices.delete_alias",
 	"indices.update_aliases",
 	"indices.put_index_template",
 	"indices.get_index_template",
+	"indices.exists_index_template",
 	"indices.delete_index_template",
 	"indices.simulate_index_template",
 	"indices.simulate_template",
+	"indices.put_template",
+	"indices.get_template",
+	"indices.exists_template",
+	"indices.delete_template",
 	"indices.create_data_stream",
 	"indices.get_data_stream",
 	"indices.data_streams_stats",
@@ -146,12 +180,41 @@ var targetValidatedEndpoints = []string{
 	"explain",
 	"reindex",
 	"ingest.put_pipeline",
+	"ingest.get_pipeline",
+	"ingest.delete_pipeline",
+	"ingest.processor_grok",
 	"ingest.simulate",
+	"ilm.put_lifecycle",
+	"ilm.get_lifecycle",
+	"ilm.delete_lifecycle",
+	"ilm.get_status",
+	"ilm.explain_lifecycle",
+	"snapshot.create_repository",
+	"snapshot.get_repository",
+	"snapshot.verify_repository",
+	"snapshot.create",
+	"snapshot.get",
+	"snapshot.restore",
+	"snapshot.delete",
+	"snapshot.delete_repository",
 	"cat.health",
 	"cat.indices",
 	"cat.aliases",
 	"cat.count",
 	"cat.segments",
+	"cat.nodes",
+	"cat.shards",
+	"cat.fielddata",
+	"cat.templates",
+	"cat.thread_pool",
+	"cat.tasks",
+	"cat.recovery",
+	"cat.master",
+	"cat.plugins",
+	"cat.repositories",
+	"cat.pending_tasks",
+	"cat.nodeattrs",
+	"cat.component_templates",
 }
 
 // --- Wire-Conformance Recording Transport ---
@@ -226,7 +289,9 @@ func (wt *wireConformanceTransport) RoundTrip(req *http.Request) (*http.Response
 	}
 
 	// 3. Upstream elastic/elasticsearch-specification schema.json validation via compliance.SpecSchemaValidator
-	if wt.validator != nil && req.Method != http.MethodHead && isJSONBody {
+	// Covers JSON, HEAD (`exists`, `indices.exists`, `indices.exists_alias`, `ping`), text/plain (`nodes.hot_threads`, `cat.*`),
+	// and binary (`application/vnd.mapbox-vector-tile` `search_mvt`) responses.
+	if wt.validator != nil {
 		if epName := wt.validator.MatchEndpoint(req.Method, req.URL.Path, targetValidatedEndpoints...); epName != "" {
 			if err := wt.validator.ValidateHTTPResponse(epName, resp.StatusCode, trimmed); err != nil {
 				wt.recordViolationf("%s %s -> endpoint %q (HTTP %d) failed schema.json validation: %v",
@@ -259,6 +324,12 @@ func TestOfficialElasticGoSDKv8_Conformance(t *testing.T) {
 
 	// Load compiled upstream schema.json via unified compliance.SpecSchemaValidator when available on disk
 	schemaPath := filepath.Join("..", "..", ".cache", "es-specification", "output", "schema", "schema.json")
+	if cacheDir := strings.TrimSpace(os.Getenv("CONFORMANCE_CACHE_DIR")); cacheDir != "" {
+		cand := filepath.Join(cacheDir, "es-specification", "output", "schema", "schema.json")
+		if _, err := os.Stat(cand); err == nil {
+			schemaPath = cand
+		}
+	}
 	var validator *compliance.SpecSchemaValidator
 	if _, statErr := os.Stat(schemaPath); statErr == nil {
 		var err error
@@ -1975,6 +2046,8 @@ func TestOfficialElasticGoSDKv8_Conformance(t *testing.T) {
 		wireTransport.assertNoViolations(t, "Round62_08_TypedKnn_IfSeqNo409_ErrorSchemas_And_BulkIndexerOnFailure")
 	})
 
+	runRound63SDKConformanceSubtests(t, ctx, targetURL, idx, aliasName, esClient, wireTransport)
+
 	ubqBody := `{"query":{"term":{"category":"storage"}},"script":{"source":"ctx._source.quantity = ctx._source.quantity + params.bump","lang":"painless","params":{"bump":6}}}`
 	ubqRes, err := esClient.UpdateByQuery(
 		[]string{idx},
@@ -2039,13 +2112,19 @@ func TestOfficialElasticGoSDKv8_Conformance(t *testing.T) {
 	if totalHTTP < 20 {
 		t.Fatalf("expected >= 20 recorded SDK HTTP responses, got %d", totalHTTP)
 	}
+	if len(targetValidatedEndpoints) < minValidatedEndpointsTarget {
+		t.Fatalf("expected targetValidatedEndpoints ratchet >= %d, got %d", minValidatedEndpointsTarget, len(targetValidatedEndpoints))
+	}
 	if validator != nil {
 		for _, epName := range targetValidatedEndpoints {
 			if validatedSnapshot[epName] < 1 {
 				t.Fatalf("expected endpoint %q to be validated against schema.json at least once, counts=%v", epName, validatedSnapshot)
 			}
 		}
+		if len(validatedSnapshot) < minValidatedEndpointsTarget {
+			t.Fatalf("expected >= %d distinct schema.json-validated endpoints, got %d", minValidatedEndpointsTarget, len(validatedSnapshot))
+		}
 	}
-	t.Logf("Official Go SDK v8 conformance passed (%d HTTP responses verified; schema-validated endpoints=%v)",
-		totalHTTP, validatedSnapshot)
+	t.Logf("Official Go SDK v8 conformance passed (%d HTTP responses verified; %d distinct schema-validated endpoints=%v)",
+		totalHTTP, len(validatedSnapshot), validatedSnapshot)
 }

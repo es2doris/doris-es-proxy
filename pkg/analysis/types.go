@@ -21,6 +21,8 @@
 package analysis
 
 import (
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 )
@@ -28,12 +30,32 @@ import (
 const (
 	// DefaultMaxTokenCount is the default for index.analyze.max_token_count.
 	DefaultMaxTokenCount = 10000
+	// MaxAllowedTokenCount is the hard upper bound for index.analyze.max_token_count.
+	MaxAllowedTokenCount = 100000
 	// DefaultMaxNGramDiff is the default for index.max_ngram_diff.
 	DefaultMaxNGramDiff = 1
+	// MaxAllowedNGramDiff is the hard upper bound for index.max_ngram_diff.
+	MaxAllowedNGramDiff = 100
 	// DefaultMaxShingleDiff is the default for index.max_shingle_diff.
 	DefaultMaxShingleDiff = 3
+	// MaxAllowedShingleDiff is the hard upper bound for index.max_shingle_diff.
+	MaxAllowedShingleDiff = 100
+	// MaxAllowedGramSize is the hard upper bound for max_gram on ngram and edge_ngram components.
+	MaxAllowedGramSize = 1024
 	// DefaultPositionIncrementGap is the default position gap across multi-valued text inputs.
 	DefaultPositionIncrementGap = 100
+	// MaxPositionIncrementGap is the hard upper bound for position_increment_gap.
+	MaxPositionIncrementGap = 1000000
+	// MaxCharFilterOutputRunes caps character filter output length to 1 MiRunes.
+	MaxCharFilterOutputRunes = 1048576
+	// MaxFilterChainLength caps the number of char_filters or token filters in a pipeline.
+	MaxFilterChainLength = 64
+	// MaxTokenTermBytes is Lucene's IndexWriter.MAX_TERM_LENGTH (32,766 UTF-8 bytes).
+	MaxTokenTermBytes = 32766
+	// MaxRegexPatternBytes caps user-supplied regex pattern byte length.
+	MaxRegexPatternBytes = 4096
+	// DefaultMaxStreamBytes caps cumulative token bytes in a single stream stage to 32 MiB.
+	DefaultMaxStreamBytes int64 = 32 << 20
 )
 
 // AnalysisError represents an Elasticsearch-compatible error with a wire type and HTTP status.
@@ -205,6 +227,19 @@ func (r AnalyzeResponse) MarshalJSON() ([]byte, error) {
 	})
 }
 
+// PayloadBase64 returns the standard Base64 encoding of a hex-encoded TokenOut.Payload
+// (matching Elasticsearch `_termvectors` payload wire encoding, e.g. `PEFMUEhBTlVNPg==` for `<ALPHANUM>`).
+func (t TokenOut) PayloadBase64() string {
+	if t.Payload == "" {
+		return ""
+	}
+	raw, err := hex.DecodeString(t.Payload)
+	if err != nil {
+		return ""
+	}
+	return base64.StdEncoding.EncodeToString(raw)
+}
+
 // QueryToken represents a positioned token produced by query-time analysis.
 type QueryToken struct {
 	Term           string
@@ -214,6 +249,16 @@ type QueryToken struct {
 	EndOffset      int
 	Type           string
 	Keyword        bool
+	Payload        []byte
+}
+
+// PayloadBase64 returns the standard Base64 encoding of Payload when present
+// (matching Elasticsearch `_termvectors` payload wire encoding).
+func (qt QueryToken) PayloadBase64() string {
+	if len(qt.Payload) == 0 {
+		return ""
+	}
+	return base64.StdEncoding.EncodeToString(qt.Payload)
 }
 
 // QueryPosition groups tokens starting at the same position.

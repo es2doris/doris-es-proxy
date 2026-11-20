@@ -21,6 +21,7 @@ import (
 	"github.com/es2doris/doris-es-proxy/pkg/esast"
 	"github.com/es2doris/doris-es-proxy/pkg/painless"
 	"github.com/es2doris/doris-es-proxy/pkg/schema"
+	"github.com/es2doris/doris-es-proxy/pkg/transpiler"
 )
 
 // ============================================================================
@@ -1344,7 +1345,7 @@ func classifyRenderedTemplateJSONError(trimmed string, err error) error {
 	if strings.Contains(errMsg, "unexpected end of JSON input") || strings.Contains(errMsg, "EOF") {
 		return &mustacheTemplateError{
 			errType: "json_e_o_f_exception",
-			reason:  "Unexpected end of input: " + errMsg,
+			reason:  fmt.Sprintf("[1:%d] Unexpected end-of-input: expected close marker for Object", len(trimmed)+1),
 		}
 	}
 	return &mustacheTemplateError{
@@ -1743,6 +1744,9 @@ func (s *Server) resolveTemplateSourceAndParams(r *http.Request, pathID string, 
 		tplSource = body["inline"]
 	}
 	tplID, _ := body["id"].(string)
+	if tplID == "" && body["id"] != nil {
+		tplID = strings.TrimSpace(fmt.Sprintf("%v", body["id"]))
+	}
 	if tplID == "" {
 		tplID, _ = body["file"].(string)
 	}
@@ -1808,6 +1812,7 @@ func (s *Server) handleRenderSearchTemplate(w http.ResponseWriter, r *http.Reque
 	renderedJSON, err := renderMustacheSearchTemplate(tplSource, params)
 	if err != nil {
 		et, er := mustacheErrTypeAndReason(err)
+		et = mustacheErrTypeForServerRound63(s, r, et)
 		writeESError(w, http.StatusBadRequest, et, er)
 		return
 	}
@@ -2074,6 +2079,7 @@ func (s *Server) handleSearchTemplate(w http.ResponseWriter, r *http.Request) {
 	renderedJSON, err := renderMustacheSearchTemplate(tplSource, params)
 	if err != nil {
 		et, er := mustacheErrTypeAndReason(err)
+		et = mustacheErrTypeForServerRound63(s, r, et)
 		writeESError(w, http.StatusBadRequest, et, er)
 		return
 	}
@@ -2092,6 +2098,14 @@ func (s *Server) handleSearchTemplate(w http.ResponseWriter, r *http.Request) {
 	if clonedReq.URL != nil {
 		q := clonedReq.URL.Query()
 		qChanged := false
+		if q.Has("source") {
+			q.Del("source")
+			qChanged = true
+		}
+		if q.Has("source_content_type") {
+			q.Del("source_content_type")
+			qChanged = true
+		}
 		for _, qKey := range []string{"typed_keys", "rest_total_hits_as_int", "explain", "version", "seq_no_primary_term"} {
 			if rawVal, hasVal := body[qKey]; hasVal && !q.Has(qKey) {
 				q.Set(qKey, fmt.Sprintf("%v", rawVal))
@@ -2213,6 +2227,7 @@ func (s *Server) handleMSearchTemplate(w http.ResponseWriter, r *http.Request) {
 		renderedJSON, err := renderMustacheSearchTemplate(tplSource, params)
 		if err != nil {
 			et, er := mustacheErrTypeAndReason(err)
+			et = mustacheErrTypeForServerRound63(s, r, et)
 			perItemErrors[idx] = map[string]any{
 				"status": http.StatusBadRequest,
 				"error": map[string]any{
@@ -2726,6 +2741,13 @@ func (s *Server) computeSingleTermVectorResponseWithRequestRound61(
 	if bOff, ok := parseOptionalBoolAny(bodyMap["offsets"]); ok {
 		includeOffsets = bOff
 	}
+	includePayloads := true
+	if r != nil && r.URL != nil && r.URL.Query().Has("payloads") {
+		includePayloads = isTruthyBoolQueryParam(r, "payloads")
+	}
+	if bPay, ok := parseOptionalBoolAny(bodyMap["payloads"]); ok {
+		includePayloads = bPay
+	}
 
 	termVectors := make(map[string]any)
 	if found && docMap != nil {
@@ -2738,12 +2760,11 @@ func (s *Server) computeSingleTermVectorResponseWithRequestRound61(
 			if len(strs) == 0 {
 				continue
 			}
-			joined := strings.Join(strs, " ")
-			occs := tokenizeTermVectorStringWithAnalyzer(joined, perFieldAnalyzer[field])
+			occs := s.analyzeTermVectorTokensRound63(indexName, field, perFieldAnalyzer[field], strs)
 			if len(occs) == 0 {
 				continue
 			}
-			byTerm := make(map[string][]termTokenOccurrence)
+			byTerm := make(map[string][]termTokenOccurrenceRound63)
 			var uniqueTerms []string
 			for _, occ := range occs {
 				if _, seen := byTerm[occ.term]; !seen {
@@ -2803,16 +2824,28 @@ func (s *Server) computeSingleTermVectorResponseWithRequestRound61(
 					tEntry["doc_freq"] = 1
 					tEntry["ttf"] = tf
 				}
-				if includePositions || includeOffsets {
+				hasAnyPayload := false
+				if includePayloads {
+					for _, o := range tOccs {
+						if o.payloadB64 != "" {
+							hasAnyPayload = true
+							break
+						}
+					}
+				}
+				if includePositions || includeOffsets || hasAnyPayload {
 					tokensArr := make([]map[string]any, 0, len(tOccs))
 					for _, o := range tOccs {
-						tokObj := make(map[string]any, 3)
+						tokObj := make(map[string]any, 4)
 						if includePositions {
 							tokObj["position"] = o.position
 						}
 						if includeOffsets {
 							tokObj["start_offset"] = o.startOffset
 							tokObj["end_offset"] = o.endOffset
+						}
+						if includePayloads && o.payloadB64 != "" {
+							tokObj["payload"] = o.payloadB64
 						}
 						tokensArr = append(tokensArr, tokObj)
 					}
@@ -3070,7 +3103,7 @@ func (s *Server) handleMTermVectors(w http.ResponseWriter, r *http.Request) {
 		)
 		if errType != "" {
 			errItem := map[string]any{
-				"_index": idx,
+				"_index": resolveConcreteTermVectorIndexRound63(s, idx),
 				"error": map[string]any{
 					"root_cause": []map[string]any{{"type": errType, "reason": errReason}},
 					"type":       errType,
@@ -3396,35 +3429,7 @@ func (s *Server) handleRankEval(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleMVT(w http.ResponseWriter, r *http.Request) {
-	rawIndex := strings.TrimSpace(r.PathValue("index"))
-	field := strings.TrimSpace(r.PathValue("field"))
-	zoomStr := strings.TrimSpace(r.PathValue("zoom"))
-	xStr := strings.TrimSpace(r.PathValue("x"))
-	yStr := strings.TrimSpace(r.PathValue("y"))
-
-	zoom, errZ := strconv.Atoi(zoomStr)
-	x, errX := strconv.Atoi(xStr)
-	y, errY := strconv.Atoi(yStr)
-	if errZ != nil || errX != nil || errY != nil || zoom < 0 || zoom > 29 {
-		writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
-			fmt.Sprintf("invalid vector tile coordinates [%s/%s/%s]", zoomStr, xStr, yStr))
-		return
-	}
-	maxCoord := 1 << zoom
-	if x < 0 || x >= maxCoord || y < 0 || y >= maxCoord {
-		writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
-			fmt.Sprintf("tile coordinates [%d/%d/%d] out of range [0..%d]", zoom, x, y, maxCoord-1))
-		return
-	}
-	if field == "" {
-		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "field is required for _mvt")
-		return
-	}
-	if _, _, ok := s.resolveValidatedReadTargets(w, r, rawIndex); !ok {
-		return
-	}
-	w.Header().Set("Content-Type", "application/vnd.mapbox-vector-tile")
-	w.WriteHeader(http.StatusOK)
+	s.serveMVTRound63(w, r)
 }
 
 // ============================================================================
@@ -3464,6 +3469,7 @@ func (s *Server) handleCatAllocation(w http.ResponseWriter, r *http.Request) {
 		unassignedShards += p * rep
 	}
 	isES8 := s.isES8Mode(r)
+	structuredOut := isCatStructuredOutputRound63(r)
 	const gbBytes = int64(1024 * 1024 * 1024)
 	nodeRow := map[string]any{
 		"shards":       strconv.Itoa(assignedPrimaries),
@@ -3478,7 +3484,11 @@ func (s *Server) handleCatAllocation(w http.ResponseWriter, r *http.Request) {
 	}
 	if isES8 {
 		nodeRow["shards.undesired"] = "0"
-		nodeRow["write_load.forecast"] = "0.0"
+		if structuredOut {
+			nodeRow["write_load.forecast"] = 0.0
+		} else {
+			nodeRow["write_load.forecast"] = "0.0"
+		}
 		nodeRow["disk.indices.forecast"] = formatCatBytesValueRound61(0, byteUnit, byteDiv)
 		nodeRow["node.role"] = "cdfhilmrstw"
 	}
@@ -3511,7 +3521,11 @@ func (s *Server) handleCatAllocation(w http.ResponseWriter, r *http.Request) {
 			}
 			if isES8 {
 				unassignedRow["shards.undesired"] = ""
-				unassignedRow["write_load.forecast"] = ""
+				if structuredOut {
+					unassignedRow["write_load.forecast"] = nil
+				} else {
+					unassignedRow["write_load.forecast"] = ""
+				}
 				unassignedRow["disk.indices.forecast"] = ""
 				unassignedRow["node.role"] = ""
 			}
@@ -4387,54 +4401,15 @@ func (s *Server) handleILMStop(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleILMMoveToStep(w http.ResponseWriter, r *http.Request) {
-	if r == nil || r.Method != http.MethodPost {
-		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method")
-		return
-	}
-	rawIndex := strings.TrimSpace(r.PathValue("index"))
-	if rawIndex == "" {
-		writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: index is missing;")
-		return
-	}
-	if _, _, ok := s.resolveValidatedReadTargets(w, r, rawIndex); !ok {
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
+	s.serveILMMoveToStepRound63(w, r)
 }
 
 func (s *Server) handleILMRemovePolicy(w http.ResponseWriter, r *http.Request) {
-	if r == nil || r.Method != http.MethodPost {
-		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method")
-		return
-	}
-	rawIndex := strings.TrimSpace(r.PathValue("index"))
-	if rawIndex == "" {
-		writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: index is missing;")
-		return
-	}
-	if _, _, ok := s.resolveValidatedReadTargets(w, r, rawIndex); !ok {
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"has_failures":   false,
-		"failed_indexes": []any{},
-	})
+	s.serveILMRemovePolicyRound63(w, r)
 }
 
 func (s *Server) handleILMRetry(w http.ResponseWriter, r *http.Request) {
-	if r == nil || r.Method != http.MethodPost {
-		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method")
-		return
-	}
-	rawIndex := strings.TrimSpace(r.PathValue("index"))
-	if rawIndex == "" {
-		writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: index is missing;")
-		return
-	}
-	if _, _, ok := s.resolveValidatedReadTargets(w, r, rawIndex); !ok {
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
+	s.serveILMRetryRound63(w, r)
 }
 
 func (s *Server) handleMigrateToDataStream(w http.ResponseWriter, r *http.Request) {
@@ -4749,6 +4724,11 @@ func extractDirectQueryClauseName(q *esast.Query) string {
 	if q.Wrapper != nil && q.Wrapper.Name != "" {
 		return q.Wrapper.Name
 	}
+	for _, te := range q.Term {
+		if te.Name != "" {
+			return te.Name
+		}
+	}
 	return ""
 }
 
@@ -4770,8 +4750,7 @@ func collectMatchedQueryNamesForSearch(idxSchema *schema.IndexSchema, docMap map
 		addNames(collectMatchedQueryNames(idxSchema, docMap, postFilter))
 	}
 	for i := range knns {
-		kq := esast.Query{KNN: &knns[i]}
-		if evalBranchMatchesDoc(idxSchema, docMap, &kq) {
+		if evalTopLevelKNNMatchesDocR63(idxSchema, docMap, &knns[i]) {
 			if knns[i].Name != "" {
 				addNames([]string{knns[i].Name})
 			}
@@ -4782,6 +4761,54 @@ func collectMatchedQueryNamesForSearch(idxSchema *schema.IndexSchema, docMap map
 	}
 	sort.Strings(out)
 	return out
+}
+
+func evalTopLevelKNNMatchesDocR63(idxSchema *schema.IndexSchema, docMap map[string]any, kq *esast.KNNQuery) bool {
+	if kq == nil || docMap == nil {
+		return false
+	}
+	for i := range kq.Filter {
+		if !evalBranchMatchesDoc(idxSchema, docMap, &kq.Filter[i]) {
+			return false
+		}
+	}
+	var b schema.FieldBinding
+	if idxSchema != nil {
+		b = idxSchema.ResolveField(kq.Field)
+	}
+	vecMetric := b.VectorMetric
+	vecElemType := b.VectorElementType
+	vecDims := b.VectorDims
+	if (vecMetric == "" || vecElemType == "" || vecDims == 0) && idxSchema != nil {
+		if fp, okRaw := lookupRawPropertyWithMultiFieldR61Search(idxSchema, kq.Field); okRaw {
+			if vecMetric == "" {
+				vecMetric = fp.Similarity
+			}
+			if vecElemType == "" {
+				vecElemType = fp.ElementType
+			}
+			if vecDims == 0 {
+				vecDims = fp.Dims
+			}
+		}
+	}
+	qVec := resolveKNNQueryVectorR61Search(kq, vecElemType, vecDims)
+	if len(qVec) == 0 {
+		return false
+	}
+	cands := []map[string]any{docMap}
+	relField := kq.Field
+	if b.NestedPath != "" {
+		pathSegs := strings.Split(b.NestedPath, ".")
+		nestedElems := extractNestedElementsAtPath(docMap, pathSegs)
+		cands = make([]map[string]any, 0, len(nestedElems))
+		for _, ne := range nestedElems {
+			cands = append(cands, ne.obj)
+		}
+		relField = strings.TrimPrefix(kq.Field, b.NestedPath+".")
+	}
+	_, matched, _ := transpiler.EvaluateNestedKNNParentScore(cands, relField, qVec, vecMetric, vecElemType, kq.Similarity, 1.0)
+	return matched
 }
 
 func collectMatchedQueryNames(idxSchema *schema.IndexSchema, docMap map[string]any, q *esast.Query) []string {
@@ -5135,6 +5162,28 @@ func buildJoinInnerHitsEnvelope(hits []HitRow, spec *esast.InnerHitsSpec, idxSch
 			"_score":  scoreVal,
 			"_source": filteredSrc,
 		}
+		if idxSchema != nil && !idxSchema.ES8Mode {
+			hitObj["_type"] = effectiveIndexLegacyTypeR61CRUD(idxSchema)
+		}
+		if spec != nil && spec.Version {
+			ver := h.Version
+			if ver <= 0 {
+				ver = 1
+			}
+			hitObj["_version"] = ver
+		}
+		if spec != nil && spec.SeqNoPrimaryTerm {
+			seqNo := h.SeqNo
+			if !h.HasSeqNo {
+				if h.Version > 0 {
+					seqNo = h.Version - 1
+				} else {
+					seqNo = 0
+				}
+			}
+			hitObj["_seq_no"] = seqNo
+			hitObj["_primary_term"] = int64(1)
+		}
 		if spec != nil && (len(spec.Fields) > 0 || len(spec.DocvalueFields) > 0) {
 			if fMap := extractHitFieldsMap(h, idxName, &esast.SearchRequest{Fields: spec.EffectiveFieldSpecs()}, idxSchema); len(fMap) > 0 {
 				hitObj["fields"] = fMap
@@ -5162,10 +5211,23 @@ func hitMapToHitRow(hm map[string]any) HitRow {
 	if sc, ok := toFloat(hm["_score"]); ok {
 		scVal = sc
 	}
+	var ver int64
+	if v, okV := toInt64(hm["_version"]); okV {
+		ver = v
+	}
+	var seqNo int64
+	hasSeqNo := false
+	if sn, okS := toInt64(hm["_seq_no"]); okS {
+		seqNo = sn
+		hasSeqNo = true
+	}
 	return HitRow{
-		ID:     idStr,
-		Score:  scVal,
-		Source: rawBytes,
+		ID:       idStr,
+		Score:    scVal,
+		Version:  ver,
+		SeqNo:    seqNo,
+		HasSeqNo: hasSeqNo,
+		Source:   rawBytes,
 	}
 }
 
@@ -5198,66 +5260,11 @@ func (s *Server) preResolveSpecialQueriesInQuery(ctx context.Context, targets []
 		cp.Pinned = &pCopy
 	}
 
-	// F9: MoreLikeThis document lookup by _id
+	// F9: MoreLikeThis pre-evaluation across targets (supporting multi-doc `like`, `unlike`, `include`)
 	if cp.MoreLikeThis != nil {
-		mlt := *cp.MoreLikeThis
-		resolveItems := func(raw any) any {
-			items := normalizeMLTItems(raw)
-			if len(items) == 0 {
-				return raw
-			}
-			out := make([]any, 0, len(items))
-			for _, item := range items {
-				m, ok := item.(map[string]any)
-				if !ok {
-					out = append(out, item)
-					continue
-				}
-				if _, hasDoc := m["doc"]; hasDoc {
-					out = append(out, m)
-					continue
-				}
-				if _, hasSrc := m["_source"]; hasSrc {
-					out = append(out, m)
-					continue
-				}
-				id, _ := m["_id"].(string)
-				if id == "" {
-					out = append(out, m)
-					continue
-				}
-				idx, _ := m["_index"].(string)
-				if idx == "" {
-					idx = defaultIdx
-				}
-				cloned := make(map[string]any, len(m)+1)
-				for k, v := range m {
-					cloned[k] = v
-				}
-				if idx != "" && s.backend != nil {
-					resolvedIdx, _, _ := s.resolveReadDocIndexWithFilter(idx)
-					if resolvedIdx == "" {
-						resolvedIdx = idx
-					}
-					roSchema := s.getOrCompileReadOnlySchema(ctx, resolvedIdx)
-					_ = s.coalescer.FlushTable(ctx, roSchema.DorisTable)
-					if existing, found, err := s.backend.GetDocByID(ctx, roSchema.DorisDB, roSchema.DorisTable, id); err == nil && found && existing != nil {
-						var docMap map[string]any
-						if json.Unmarshal(existing.Source, &docMap) == nil && docMap != nil {
-							cloned["doc"] = docMap
-						}
-					}
-				}
-				if _, hasResolvedDoc := cloned["doc"]; !hasResolvedDoc {
-					cloned["doc"] = map[string]any{}
-				}
-				out = append(out, cloned)
-			}
-			return out
+		if resolvedMLT, mltErr := s.preResolveMoreLikeThisQueryRound63(ctx, targets, cp.MoreLikeThis); mltErr == nil && resolvedMLT != nil {
+			return resolvedMLT, nil
 		}
-		mlt.Like = resolveItems(mlt.Like)
-		mlt.Unlike = resolveItems(mlt.Unlike)
-		cp.MoreLikeThis = &mlt
 	}
 
 	// F7 / F11: Percolate validation + lookup by document `_id` (`index` + `id`)
@@ -5328,6 +5335,11 @@ func (s *Server) preResolveSpecialQueriesInQuery(ctx context.Context, targets []
 			if perc.Document == nil {
 				perc.Document = map[string]any{}
 			}
+		}
+		if multiTargetQ, handled, pErr := s.preResolveMultiTargetPercolateRound63(ctx, targets, &perc); pErr != nil {
+			return nil, pErr
+		} else if handled && multiTargetQ != nil {
+			return multiTargetQ, nil
 		}
 		cp.Percolate = &perc
 	}
@@ -5409,9 +5421,11 @@ func (s *Server) preResolveSpecialQueriesInQuery(ctx context.Context, targets []
 			_ = s.coalescer.FlushTable(ctx, sch.DorisTable)
 			trackScoresTrue := true
 			resp, _, errType, _ := s.executeSearchRequest(ctx, t, &esast.SearchRequest{
-				Size:        &sz,
-				Query:       innerQ,
-				TrackScores: &trackScoresTrue,
+				Size:             &sz,
+				Query:            innerQ,
+				TrackScores:      &trackScoresTrue,
+				Version:          hc.InnerHits != nil && hc.InnerHits.Version,
+				SeqNoPrimaryTerm: hc.InnerHits != nil && hc.InnerHits.SeqNoPrimaryTerm,
 			})
 			if errType != "" {
 				continue
@@ -5565,9 +5579,11 @@ func (s *Server) preResolveSpecialQueriesInQuery(ctx context.Context, targets []
 			_ = s.coalescer.FlushTable(ctx, sch.DorisTable)
 			trackScoresTrue := true
 			resp, _, errType, _ := s.executeSearchRequest(ctx, t, &esast.SearchRequest{
-				Size:        &sz,
-				Query:       innerQ,
-				TrackScores: &trackScoresTrue,
+				Size:             &sz,
+				Query:            innerQ,
+				TrackScores:      &trackScoresTrue,
+				Version:          hp.InnerHits != nil && hp.InnerHits.Version,
+				SeqNoPrimaryTerm: hp.InnerHits != nil && hp.InnerHits.SeqNoPrimaryTerm,
 			})
 			if errType != "" {
 				continue
@@ -6060,7 +6076,7 @@ func queryHasPercolateMultiDocs(q *esast.Query) bool {
 	if q == nil {
 		return false
 	}
-	if q.Percolate != nil && len(q.Percolate.Documents) > 0 {
+	if q.Percolate != nil {
 		return true
 	}
 	if q.Bool != nil {
@@ -6116,7 +6132,7 @@ func collectPercolateMatchedSlots(idxSchema *schema.IndexSchema, docMap map[stri
 		if cur == nil {
 			return
 		}
-		if cur.Percolate != nil && len(cur.Percolate.Documents) > 0 {
+		if cur.Percolate != nil && (len(cur.Percolate.Documents) > 0 || storedPercolatorQueryHasNamesRound63(docMap, cur.Percolate.Field)) {
 			ok, _, slots := evalPercolateQueryOnDoc(idxSchema, docMap, cur.Percolate)
 			if ok {
 				for _, sl := range slots {

@@ -279,6 +279,8 @@ func TypedAggKeyPrefix(agg *esast.AggSpec, idxSchema *schema.IndexSchema) string
 		}
 	case agg.SignificantText != nil:
 		return "significant_text"
+	case agg.CountedTerms != nil:
+		return "sterms"
 	case agg.Terms != nil:
 		if agg.Terms.Script != nil && agg.Terms.Field == "" {
 			return "sterms"
@@ -880,7 +882,13 @@ func FormatESDateWithNamedOrJavaPattern(epochMillis int64, epochNanos int64, for
 			}
 			oh := absOff / 3600
 			om := (absOff % 3600) / 60
-			if runLen >= 4 {
+			if runLen >= 5 {
+				if off == 0 {
+					sb.WriteString("Z")
+				} else {
+					fmt.Fprintf(&sb, "%s%02d:%02d", sign, oh, om)
+				}
+			} else if runLen == 4 {
 				if off == 0 {
 					sb.WriteString("GMT")
 				} else {
@@ -1378,7 +1386,7 @@ func TokenizeByAnalyzerWithPositions(s string, analyzer string) []AnalyzedToken 
 			out = append(out, AnalyzedToken{Term: string(cur), Position: pos})
 		}
 		return out
-	case "stop", "english":
+	case "stop":
 		var out []AnalyzedToken
 		var cur []rune
 		pos := 0
@@ -1403,6 +1411,9 @@ func TokenizeByAnalyzerWithPositions(s string, analyzer string) []AnalyzedToken 
 		flush()
 		return out
 	default:
+		if builtInToks, ok := analyzeTokensWithBuiltinGraphR63(s, analyzer); ok {
+			return builtInToks
+		}
 		toks := tokenizeStandardUAX29(s)
 		if len(toks) == 0 {
 			return nil
@@ -1521,9 +1532,10 @@ func hasInternalUnderscoreToken(tokens []string) bool {
 // IntervalsSpan represents a matched token interval `[Start, End]` (0-based inclusive token positions)
 // and its intervening `Gaps` count for Elasticsearch `intervals` queries (`interval.start`, `interval.end`, `interval.gaps`).
 type IntervalsSpan struct {
-	Start int
-	End   int
-	Gaps  int
+	Start  int
+	End    int
+	Gaps   int
+	Branch int
 }
 
 // RuleHasIntervalsScript reports whether `rule` or any of its nested sub-rules/filters contains a `filter.script`.
@@ -1649,11 +1661,14 @@ func minimizeIntervalsSpans(spans []IntervalsSpan) []IntervalsSpan {
 		if spans[i].End != spans[j].End {
 			return spans[i].End < spans[j].End
 		}
+		if spans[i].Branch != spans[j].Branch {
+			return spans[i].Branch < spans[j].Branch
+		}
 		return spans[i].Gaps < spans[j].Gaps
 	})
 	var dedup []IntervalsSpan
 	for _, s := range spans {
-		if len(dedup) > 0 && dedup[len(dedup)-1].Start == s.Start && dedup[len(dedup)-1].End == s.End {
+		if len(dedup) > 0 && dedup[len(dedup)-1].Start == s.Start && dedup[len(dedup)-1].End == s.End && dedup[len(dedup)-1].Branch == s.Branch {
 			continue
 		}
 		dedup = append(dedup, s)
@@ -1662,7 +1677,7 @@ func minimizeIntervalsSpans(spans []IntervalsSpan) []IntervalsSpan {
 	for i, a := range dedup {
 		dominated := false
 		for j, b := range dedup {
-			if i == j {
+			if i == j || a.Branch != b.Branch {
 				continue
 			}
 			if b.Start >= a.Start && b.End <= a.End && (b.Start > a.Start || b.End < a.End) {
@@ -1705,20 +1720,23 @@ func combineSubIntervals(subLists [][]IntervalsSpan, ordered bool, maxGaps *int)
 			if ordered {
 				minStart := picked[0].Start
 				maxEnd := picked[0].End
-				gaps := 0
+				interGaps := 0
+				totalGaps := picked[0].Gaps
 				for k := 1; k < len(picked); k++ {
 					if picked[k].Start <= picked[k-1].End {
 						return
 					}
-					gaps += picked[k].Start - picked[k-1].End - 1
+					g := picked[k].Start - picked[k-1].End - 1
+					interGaps += g
+					totalGaps += g + picked[k].Gaps
 					if picked[k].End > maxEnd {
 						maxEnd = picked[k].End
 					}
 				}
-				if maxGaps != nil && *maxGaps >= 0 && gaps > *maxGaps {
+				if maxGaps != nil && *maxGaps >= 0 && interGaps > *maxGaps {
 					return
 				}
-				results = append(results, IntervalsSpan{Start: minStart, End: maxEnd, Gaps: gaps})
+				results = append(results, IntervalsSpan{Start: minStart, End: maxEnd, Gaps: totalGaps})
 				return
 			}
 			ord := make([]IntervalsSpan, len(picked))
@@ -1731,19 +1749,23 @@ func combineSubIntervals(subLists [][]IntervalsSpan, ordered bool, maxGaps *int)
 			})
 			minStart := ord[0].Start
 			curMaxEnd := ord[0].End
-			gaps := 0
+			interGaps := 0
+			totalGaps := ord[0].Gaps
 			for k := 1; k < len(ord); k++ {
 				if ord[k].Start > curMaxEnd {
-					gaps += ord[k].Start - curMaxEnd - 1
+					g := ord[k].Start - curMaxEnd - 1
+					interGaps += g
+					totalGaps += g
 				}
+				totalGaps += ord[k].Gaps
 				if ord[k].End > curMaxEnd {
 					curMaxEnd = ord[k].End
 				}
 			}
-			if maxGaps != nil && *maxGaps >= 0 && gaps > *maxGaps {
+			if maxGaps != nil && *maxGaps >= 0 && interGaps > *maxGaps {
 				return
 			}
-			results = append(results, IntervalsSpan{Start: minStart, End: curMaxEnd, Gaps: gaps})
+			results = append(results, IntervalsSpan{Start: minStart, End: curMaxEnd, Gaps: totalGaps})
 			return
 		}
 		for _, cand := range subLists[idx] {
@@ -1984,6 +2006,19 @@ func EvaluateIntervalsRule(
 			if len(r.AllOf.Intervals) == 0 {
 				return nil, nil
 			}
+			if rewritten, ok := expandRewrittenAllOfIntervalsR63(r.AllOf); ok {
+				var out []IntervalsSpan
+				for bIdx := range rewritten {
+					br := rewritten[bIdx]
+					subRule := esast.IntervalsRule{AllOf: &br}
+					sl, err := evalRule(&subRule)
+					if err != nil {
+						return nil, err
+					}
+					out = append(out, tagIntervalsBranchR63(minimizeIntervalsSpans(sl), bIdx+1)...)
+				}
+				return out, nil
+			}
 			subLists := make([][]IntervalsSpan, len(r.AllOf.Intervals))
 			for i := range r.AllOf.Intervals {
 				sl, err := evalRule(&r.AllOf.Intervals[i])
@@ -2002,7 +2037,7 @@ func EvaluateIntervalsRule(
 				if err != nil {
 					return nil, err
 				}
-				all = append(all, sl...)
+				all = append(all, tagIntervalsBranchR63(sl, i+1)...)
 			}
 			spans := dedupIntervalsSpansKeepNonMinimal(all)
 			return applyFilter(spans, r.AnyOf.Filter)

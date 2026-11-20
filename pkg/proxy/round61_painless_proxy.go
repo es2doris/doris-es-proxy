@@ -309,6 +309,7 @@ func PrepareDocForRuntimeScriptRound61(idxSchema *schema.IndexSchema, doc map[st
 	if len(disabledFA) > 0 {
 		cp["__disabled_fields_api"] = disabledFA
 	}
+	enrichRuntimeScriptDocBindingsR63(idxSchema, doc, cp, ftMap)
 	return cp
 }
 
@@ -1273,7 +1274,7 @@ func EvalUpdateScriptWithFieldsAPIRound61(
 	}
 	params["_ctx_id"] = origID
 	params["_ctx_index"] = indexName
-	if version > 0 {
+	if version != 0 {
 		params["_ctx_version"] = version
 	} else {
 		params["_ctx_version"] = int64(1)
@@ -1297,7 +1298,7 @@ func EvalUpdateScriptWithFieldsAPIRound61(
 	if err != nil {
 		return "", err
 	}
-	if op == "" {
+	if op == "" || (!docExisted && op == "create") {
 		op = "index"
 	}
 	mutatedRouting := ""

@@ -813,7 +813,7 @@ func TestRound61ServerCRUD_F12_F14_DenseVectorAutoDimsAndTSDBWriteSearchGuards(t
 
 	// TSDB UBQ dimension / @timestamp immutability -> 400
 	code, _, _, raw = doReqR61CRUDTest(t, h, http.MethodPost, "/ts_metrics/_update_by_query", `{"script":{"source":"ctx._source.host = 'h2'"}}`, nil)
-	if code != http.StatusBadRequest || !strings.Contains(raw, "time_series_dimension") {
+	if code != http.StatusBadRequest || (!strings.Contains(raw, "time_series_dimension") && !strings.Contains(raw, "time_series mode")) {
 		t.Fatalf("expected 400 mutating TSDB dimension in UBQ, got %d: %s", code, raw)
 	}
 }

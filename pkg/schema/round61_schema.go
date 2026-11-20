@@ -45,7 +45,7 @@ func SupportsDocValuesQueriesInES8(b FieldBinding) bool {
 	case "byte", "short", "integer", "long", "unsigned_long",
 		"half_float", "float", "double", "scaled_float",
 		"date", "date_nanos",
-		"keyword", "constant_keyword", "wildcard", "version", "flattened",
+		"keyword", "constant_keyword", "counted_keyword", "wildcard", "version", "flattened", "murmur3", "aggregate_metric_double",
 		"boolean", "ip",
 		"geo_point", "point", "geo_shape", "shape",
 		"integer_range", "long_range", "float_range", "double_range", "date_range", "ip_range":
@@ -612,8 +612,15 @@ func validateSyntheticSourceProperties(props map[string]esast.FieldProperty, pre
 			return err
 		}
 		for fk, fprop := range prop.Fields {
-			if err := validateSingleSyntheticSourceProp(fullPath+"."+fk, fprop); err != nil {
-				return err
+			subFull := fullPath + "." + fk
+			sfType := strings.ToLower(strings.TrimSpace(fprop.Type))
+			switch fprop.SyntheticSourceKeep {
+			case "", "none", "all", "arrays":
+			default:
+				return fmt.Errorf("mapper_parsing_exception: Invalid [synthetic_source_keep] value [%s] for field [%s]", fprop.SyntheticSourceKeep, subFull)
+			}
+			if fprop.SyntheticSourceKeep != "" && sfType != "text" && sfType != "annotated-text" && sfType != "annotated_text" {
+				return fmt.Errorf("mapper_parsing_exception: [synthetic_source_keep] is not supported for [%s] field [%s]", sfType, subFull)
 			}
 		}
 		if len(prop.Properties) > 0 {
@@ -635,7 +642,7 @@ func hasSyntheticCapableSubfield(fields map[string]esast.FieldProperty) bool {
 			continue
 		}
 		switch ft {
-		case "keyword", "constant_keyword", "wildcard", "version", "ip", "date", "date_nanos",
+		case "keyword", "constant_keyword", "counted_keyword", "wildcard", "version", "ip", "date", "date_nanos",
 			"boolean", "byte", "short", "integer", "long", "unsigned_long", "half_float", "float", "double", "scaled_float":
 			return true
 		case "text":
@@ -666,7 +673,7 @@ func validateSingleSyntheticSourceProp(fullPath string, prop esast.FieldProperty
 			return nil
 		}
 		return fmt.Errorf("illegal_argument_exception: Field [%s] of type [%s] doesn't support synthetic source", fullPath, prop.Type)
-	case "percolator", "token_count", "rank_feature", "rank_features", "search_as_you_type", "sparse_vector", "completion":
+	case "percolator", "token_count", "rank_feature", "rank_features", "search_as_you_type", "sparse_vector", "completion", "counted_keyword", "aggregate_metric_double":
 		return nil
 	case "flattened":
 		if prop.DocValues != nil && !*prop.DocValues && (prop.Store == nil || !*prop.Store) {
@@ -1272,7 +1279,7 @@ func canonicalizeSingleSyntheticRange(item any, b FieldBinding, esType string) (
 			loVal = formatCanonicalESIP(loAddr)
 			loKey = ipSortHexKey(loAddr)
 		} else {
-			loVal = "::"
+			loVal = nil
 			loKey = ipSortHexKey(netip.IPv6Unspecified())
 		}
 		if hasHi {
@@ -1280,7 +1287,7 @@ func canonicalizeSingleSyntheticRange(item any, b FieldBinding, esType string) (
 			hiKey = ipSortHexKey(hiAddr)
 		} else {
 			maxIPv6 := netip.AddrFrom16([16]byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff})
-			hiVal = formatCanonicalESIP(maxIPv6)
+			hiVal = nil
 			hiKey = ipSortHexKey(maxIPv6)
 		}
 		return canonicalRangePair{
@@ -1387,6 +1394,12 @@ func ValidateTSDBFieldParams(fullPath, fType string, prop esast.FieldProperty) e
 	}
 	if prop.TimeSeriesMetric != "" {
 		tsm := strings.ToLower(strings.TrimSpace(prop.TimeSeriesMetric))
+		if fType == "aggregate_metric_double" {
+			if tsm != "gauge" {
+				return esWireError(fmt.Sprintf("mapper_parsing_exception: Unknown value [%s] for field [time_series_metric] - accepted values are [gauge]", prop.TimeSeriesMetric))
+			}
+			return nil
+		}
 		switch tsm {
 		case "counter":
 			switch fType {
@@ -1753,6 +1766,16 @@ func ComputeTSDBIdentityWithRoutingHash(idx *IndexSchema, doc map[string]any, se
 		}
 		return rPairs[i].canon < rPairs[j].canon
 	})
+	if len(rPairs) > 1 {
+		dedupRP := rPairs[:0]
+		for i, rp := range rPairs {
+			if i > 0 && rp.name == rPairs[i-1].name && rp.canon == rPairs[i-1].canon {
+				continue
+			}
+			dedupRP = append(dedupRP, rp)
+		}
+		rPairs = dedupRP
+	}
 	routingPairs := make([]string, len(rPairs))
 	for i, rp := range rPairs {
 		routingPairs[i] = rp.name + "=" + rp.canon
@@ -1946,6 +1969,17 @@ func extractTSDBRoutingPairs(idx *IndexSchema, doc map[string]any, routingPath [
 			if subMap, isMap := val.(map[string]any); isMap {
 				if err := walk(subMap, full); err != nil {
 					return err
+				}
+				continue
+			}
+			if arr, isArr := val.([]any); isArr && !matchesAnyTSDBRoutingPath(routingPath, full) {
+				for _, elem := range arr {
+					if subMap, okM := elem.(map[string]any); okM {
+						expSub := expandDottedKeysForSyntheticObject(idx, subMap, full)
+						if err := walk(expSub, full); err != nil {
+							return err
+						}
+					}
 				}
 				continue
 			}

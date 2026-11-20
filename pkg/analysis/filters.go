@@ -30,18 +30,67 @@ import (
 	"unicode/utf16"
 )
 
+const maxFilterNestingDepth = 16
+
 type filterBuildContext struct {
-	cfg            *IndexAnalysisConfig
-	opts           Options
-	precedingChars []*compiledCharFilter
-	chainTokenizer *compiledTokenizer
-	precedingFilts []*compiledTokenFilter
+	cfg               *IndexAnalysisConfig
+	opts              Options
+	precedingChars    []*compiledCharFilter
+	chainTokenizer    *compiledTokenizer
+	precedingFilts    []*compiledTokenFilter
+	visitingFilters   map[string]bool
+	visitingAnalyzers map[string]bool
+	depth             int
+}
+
+func (bctx filterBuildContext) enterFilter(name string) (filterBuildContext, error) {
+	if bctx.depth >= maxFilterNestingDepth {
+		label := name
+		if label == "" {
+			label = "inline"
+		}
+		return bctx, newIllegalArgError(fmt.Sprintf("Token filter [%s] exceeds maximum nesting depth [%d]", label, maxFilterNestingDepth))
+	}
+	next := bctx
+	next.depth = bctx.depth + 1
+	if name != "" && !strings.HasPrefix(name, "__anonymous__") {
+		if bctx.visitingFilters[name] {
+			return bctx, newIllegalArgError(fmt.Sprintf("Cycle detected in token filter [%s]", name))
+		}
+		vf := make(map[string]bool, len(bctx.visitingFilters)+1)
+		for k, v := range bctx.visitingFilters {
+			vf[k] = v
+		}
+		vf[name] = true
+		next.visitingFilters = vf
+	}
+	return next, nil
+}
+
+func (bctx filterBuildContext) enterAnalyzer(name string) (filterBuildContext, error) {
+	if bctx.depth >= maxFilterNestingDepth {
+		return bctx, newIllegalArgError(fmt.Sprintf("Analyzer [%s] exceeds maximum nesting depth [%d]", name, maxFilterNestingDepth))
+	}
+	next := bctx
+	next.depth = bctx.depth + 1
+	if name != "" {
+		if bctx.visitingAnalyzers[name] {
+			return bctx, newIllegalArgError(fmt.Sprintf("Cycle detected in analyzer [%s]", name))
+		}
+		va := make(map[string]bool, len(bctx.visitingAnalyzers)+1)
+		for k, v := range bctx.visitingAnalyzers {
+			va[k] = v
+		}
+		va[name] = true
+		next.visitingAnalyzers = va
+	}
+	return next, nil
 }
 
 type compiledTokenFilter struct {
 	name  string
 	typ   string
-	apply func([]Token) ([]Token, error)
+	apply func([]Token, *tokenStreamBudget) ([]Token, error)
 }
 
 // isNormalizerAllowedFilterType reports whether typeName implements Lucene/ES NormalizingTokenFilterFactory.
@@ -52,7 +101,9 @@ func isNormalizerAllowedFilterType(typeName string) bool {
 		"elision", "german_normalization", "hindi_normalization", "indic_normalization",
 		"persian_normalization", "scandinavian_folding", "scandinavian_normalization",
 		"serbian_normalization", "sorani_normalization",
-		"pattern_replace", "trim", "truncate":
+		"pattern_replace", "trim", "truncate",
+		"icu_normalizer", "icu_folding", "icu_transform",
+		"hiragana_uppercase", "katakana_uppercase":
 		return true
 	default:
 		return false
@@ -83,7 +134,15 @@ func IsBuiltInTokenFilter(name string) bool {
 		"pattern_capture", "pattern_replace",
 		"fingerprint", "min_hash",
 		"delimited_payload", "type_as_payload", "delimited_term_freq",
-		"condition", "predicate_token_filter", "multiplexer":
+		"condition", "predicate_token_filter", "multiplexer",
+		"phonetic",
+		"icu_normalizer", "icu_folding", "icu_collation", "icu_transform",
+		"kuromoji_baseform", "kuromoji_part_of_speech", "kuromoji_readingform",
+		"kuromoji_stemmer", "kuromoji_number", "kuromoji_completion",
+		"ja_stop", "hiragana_uppercase", "katakana_uppercase",
+		"nori_part_of_speech", "nori_readingform", "nori_number",
+		"smartcn_stop", "smartcn_word",
+		"polish_stem", "polish_stop":
 		return true
 	default:
 		return false
@@ -132,23 +191,36 @@ func buildTokenFilter(displayName string, typeName string, def map[string]any, i
 				preserveOrig = b
 			}
 		}
-		return simpleTokenFilter(displayName, normType, func(tokens []Token) []Token {
-			out := make([]Token, 0, len(tokens))
-			for _, tok := range tokens {
-				folded, changed := foldASCII(tok.Term)
-				if !changed {
-					out = append(out, tok)
-					continue
+		return &compiledTokenFilter{
+			name: displayName,
+			typ:  normType,
+			apply: func(tokens []Token, budget *tokenStreamBudget) ([]Token, error) {
+				out := make([]Token, 0, len(tokens))
+				for _, tok := range tokens {
+					folded, changed := foldASCII(tok.Term)
+					if !changed {
+						if err := budget.addToken(tok); err != nil {
+							return nil, err
+						}
+						out = append(out, tok)
+						continue
+					}
+					mod := tok.clone()
+					mod.Term = folded
+					if err := budget.addToken(mod); err != nil {
+						return nil, err
+					}
+					out = append(out, mod)
+					if preserveOrig {
+						if err := budget.addToken(tok); err != nil {
+							return nil, err
+						}
+						out = append(out, tok)
+					}
 				}
-				mod := tok.clone()
-				mod.Term = folded
-				out = append(out, mod)
-				if preserveOrig {
-					out = append(out, tok)
-				}
-			}
-			return out
-		}), nil
+				return out, nil
+			},
+		}, nil
 
 	case "decimal_digit":
 		return simpleTokenFilter(displayName, normType, func(tokens []Token) []Token {
@@ -657,15 +729,26 @@ func buildTokenFilter(displayName string, typeName string, def map[string]any, i
 		}), nil
 
 	case "keyword_repeat":
-		return simpleTokenFilter(displayName, normType, func(tokens []Token) []Token {
-			out := make([]Token, 0, len(tokens)*2)
-			for _, tok := range tokens {
-				kwCopy := tok.clone()
-				kwCopy.Keyword = true
-				out = append(out, kwCopy, tok)
-			}
-			return out
-		}), nil
+		return &compiledTokenFilter{
+			name: displayName,
+			typ:  normType,
+			apply: func(tokens []Token, budget *tokenStreamBudget) ([]Token, error) {
+				out := make([]Token, 0, min(len(tokens)*2, 1024))
+				for _, tok := range tokens {
+					kwCopy := tok.clone()
+					kwCopy.Keyword = true
+					if err := budget.addToken(kwCopy); err != nil {
+						return nil, err
+					}
+					out = append(out, kwCopy)
+					if err := budget.addToken(tok); err != nil {
+						return nil, err
+					}
+					out = append(out, tok)
+				}
+				return out, nil
+			},
+		}, nil
 
 	case "pattern_capture":
 		if def == nil {
@@ -696,34 +779,13 @@ func buildTokenFilter(displayName string, typeName string, def map[string]any, i
 			}
 			compiledPats = append(compiledPats, re)
 		}
-		return simpleTokenFilter(displayName, normType, func(tokens []Token) []Token {
-			var out []Token
-			for _, tok := range tokens {
-				seen := make(map[string]bool)
-				var emitted []Token
-				if preserveOrig {
-					seen[tok.Term] = true
-					emitted = append(emitted, tok)
-				}
-				for _, re := range compiledPats {
-					allSub := re.FindAllStringSubmatch(tok.Term, -1)
-					for _, sub := range allSub {
-						for g := 1; g < len(sub); g++ {
-							capStr := sub[g]
-							if capStr == "" || seen[capStr] {
-								continue
-							}
-							seen[capStr] = true
-							cp := tok.clone()
-							cp.Term = capStr
-							emitted = append(emitted, cp)
-						}
-					}
-				}
-				out = append(out, emitted...)
-			}
-			return out
-		}), nil
+		return &compiledTokenFilter{
+			name: displayName,
+			typ:  normType,
+			apply: func(tokens []Token, budget *tokenStreamBudget) ([]Token, error) {
+				return applyPatternCapture(tokens, compiledPats, preserveOrig, budget)
+			},
+		}, nil
 
 	case "pattern_replace":
 		if def == nil {
@@ -747,38 +809,60 @@ func buildTokenFilter(displayName string, typeName string, def map[string]any, i
 		if err != nil {
 			return nil, err
 		}
-		return simpleTokenFilter(displayName, normType, func(tokens []Token) []Token {
-			for i := range tokens {
-				s := tokens[i].Term
-				matches := re.FindAllStringSubmatchIndex(s, -1)
-				if len(matches) == 0 {
-					continue
-				}
-				if !replaceAll {
-					matches = matches[:1]
-				}
-				var sb strings.Builder
-				prev := 0
-				for _, loc := range matches {
-					if loc[0] < prev {
+		return &compiledTokenFilter{
+			name: displayName,
+			typ:  normType,
+			apply: func(tokens []Token, budget *tokenStreamBudget) ([]Token, error) {
+				for i := range tokens {
+					s := tokens[i].Term
+					matches := re.FindAllStringSubmatchIndex(s, -1)
+					if len(matches) == 0 {
+						if err := budget.addToken(tokens[i]); err != nil {
+							return nil, err
+						}
 						continue
 					}
-					sb.WriteString(s[prev:loc[0]])
-					sb.WriteString(expandJavaReplacement(s, loc, repl))
-					if loc[1] == loc[0] {
-						if loc[0] < len(s) {
-							sb.WriteByte(s[loc[0]])
-							prev = loc[0] + 1
+					if !replaceAll {
+						matches = matches[:1]
+					}
+					var sb strings.Builder
+					prev := 0
+					for _, loc := range matches {
+						if loc[0] < prev {
+							continue
 						}
-					} else {
-						prev = loc[1]
+						prefix := s[prev:loc[0]]
+						expanded := expandJavaReplacement(s, loc, repl)
+						if sb.Len()+len(prefix)+len(expanded) > MaxTokenTermBytes {
+							return nil, newIllegalArgError(fmt.Sprintf("token term length exceeds maximum allowed [%d] bytes", MaxTokenTermBytes))
+						}
+						sb.WriteString(prefix)
+						sb.WriteString(expanded)
+						if loc[1] == loc[0] {
+							if loc[0] < len(s) {
+								if sb.Len()+1 > MaxTokenTermBytes {
+									return nil, newIllegalArgError(fmt.Sprintf("token term length exceeds maximum allowed [%d] bytes", MaxTokenTermBytes))
+								}
+								sb.WriteByte(s[loc[0]])
+								prev = loc[0] + 1
+							}
+						} else {
+							prev = loc[1]
+						}
+					}
+					tail := s[prev:]
+					if sb.Len()+len(tail) > MaxTokenTermBytes {
+						return nil, newIllegalArgError(fmt.Sprintf("token term length exceeds maximum allowed [%d] bytes", MaxTokenTermBytes))
+					}
+					sb.WriteString(tail)
+					tokens[i].Term = sb.String()
+					if err := budget.addToken(tokens[i]); err != nil {
+						return nil, err
 					}
 				}
-				sb.WriteString(s[prev:])
-				tokens[i].Term = sb.String()
-			}
-			return tokens
-		}), nil
+				return tokens, nil
+			},
+		}, nil
 
 	case "fingerprint":
 		sep := " "
@@ -844,6 +928,11 @@ func buildTokenFilter(displayName string, typeName string, def map[string]any, i
 		}), nil
 
 	case "min_hash":
+		const (
+			maxMinHashCount       = 64
+			maxMinHashBucketCount = 16384
+			maxMinHashSetSize     = 64
+		)
 		hashCount := 1
 		bucketCount := 512
 		hashSetSize := 1
@@ -851,22 +940,22 @@ func buildTokenFilter(displayName string, typeName string, def map[string]any, i
 		if def != nil {
 			if raw, ok := def["hash_count"]; ok {
 				n, valid := extractInt(raw)
-				if !valid || n < 1 {
-					return nil, newIllegalArgError("hash_count in min_hash must be >= 1")
+				if !valid || n < 1 || n > maxMinHashCount {
+					return nil, newIllegalArgError(fmt.Sprintf("hash_count in min_hash must be between 1 and %d", maxMinHashCount))
 				}
 				hashCount = n
 			}
 			if raw, ok := def["bucket_count"]; ok {
 				n, valid := extractInt(raw)
-				if !valid || n < 1 {
-					return nil, newIllegalArgError("bucket_count in min_hash must be >= 1")
+				if !valid || n < 1 || n > maxMinHashBucketCount {
+					return nil, newIllegalArgError(fmt.Sprintf("bucket_count in min_hash must be between 1 and %d", maxMinHashBucketCount))
 				}
 				bucketCount = n
 			}
 			if raw, ok := def["hash_set_size"]; ok {
 				n, valid := extractInt(raw)
-				if !valid || n < 1 {
-					return nil, newIllegalArgError("hash_set_size in min_hash must be >= 1")
+				if !valid || n < 1 || n > maxMinHashSetSize {
+					return nil, newIllegalArgError(fmt.Sprintf("hash_set_size in min_hash must be between 1 and %d", maxMinHashSetSize))
 				}
 				hashSetSize = n
 			}
@@ -882,9 +971,13 @@ func buildTokenFilter(displayName string, typeName string, def map[string]any, i
 		if explicitRotation != nil {
 			withRotation = *explicitRotation
 		}
-		return simpleTokenFilter(displayName, normType, func(tokens []Token) []Token {
-			return applyMinHashFilter(tokens, hashCount, bucketCount, hashSetSize, withRotation)
-		}), nil
+		return &compiledTokenFilter{
+			name: displayName,
+			typ:  normType,
+			apply: func(tokens []Token, budget *tokenStreamBudget) ([]Token, error) {
+				return applyMinHashFilter(tokens, hashCount, bucketCount, hashSetSize, withRotation, budget)
+			},
+		}, nil
 
 	case "delimited_payload_filter":
 		return nil, newIllegalArgError("[delimited_payload_filter] is not supported for new indices, use [delimited_payload] instead")
@@ -911,11 +1004,14 @@ func buildTokenFilter(displayName string, typeName string, def map[string]any, i
 		return &compiledTokenFilter{
 			name: displayName,
 			typ:  normType,
-			apply: func(tokens []Token) ([]Token, error) {
+			apply: func(tokens []Token, budget *tokenStreamBudget) ([]Token, error) {
 				delimStr := string(delim)
 				for i := range tokens {
 					idx := strings.LastIndex(tokens[i].Term, delimStr)
 					if idx < 0 {
+						if err := budget.addToken(tokens[i]); err != nil {
+							return nil, err
+						}
 						continue
 					}
 					payStr := tokens[i].Term[idx+len(delimStr):]
@@ -938,6 +1034,9 @@ func buildTokenFilter(displayName string, typeName string, def map[string]any, i
 						var buf [4]byte
 						binary.BigEndian.PutUint32(buf[:], math.Float32bits(float32(fv)))
 						tokens[i].Payload = buf[:]
+					}
+					if err := budget.addToken(tokens[i]); err != nil {
+						return nil, err
 					}
 				}
 				return tokens, nil
@@ -974,11 +1073,14 @@ func buildTokenFilter(displayName string, typeName string, def map[string]any, i
 		return &compiledTokenFilter{
 			name: displayName,
 			typ:  normType,
-			apply: func(tokens []Token) ([]Token, error) {
+			apply: func(tokens []Token, budget *tokenStreamBudget) ([]Token, error) {
 				delimStr := string(delim)
 				for i := range tokens {
 					idx := strings.LastIndex(tokens[i].Term, delimStr)
 					if idx < 0 {
+						if err := budget.addToken(tokens[i]); err != nil {
+							return nil, err
+						}
 						continue
 					}
 					tfStr := tokens[i].Term[idx+len(delimStr):]
@@ -991,6 +1093,9 @@ func buildTokenFilter(displayName string, typeName string, def map[string]any, i
 					}
 					tokens[i].Term = tokens[i].Term[:idx]
 					tokens[i].TermFrequency = tf
+					if err := budget.addToken(tokens[i]); err != nil {
+						return nil, err
+					}
 				}
 				return tokens, nil
 			},
@@ -1008,6 +1113,9 @@ func buildTokenFilter(displayName string, typeName string, def map[string]any, i
 		if len(subSpecs) == 0 {
 			return nil, newIllegalArgError("condition filter requires non-empty [filter]")
 		}
+		if len(subSpecs) > MaxFilterChainLength {
+			return nil, newIllegalArgError(fmt.Sprintf("condition filter chain length [%d] exceeds maximum allowed [%d]", len(subSpecs), MaxFilterChainLength))
+		}
 		subFilters := make([]*compiledTokenFilter, 0, len(subSpecs))
 		for _, spec := range subSpecs {
 			cf, err := resolveTokenFilterStep(spec, bctx)
@@ -1023,7 +1131,7 @@ func buildTokenFilter(displayName string, typeName string, def map[string]any, i
 		return &compiledTokenFilter{
 			name: displayName,
 			typ:  normType,
-			apply: func(tokens []Token) ([]Token, error) {
+			apply: func(tokens []Token, budget *tokenStreamBudget) ([]Token, error) {
 				var out []Token
 				prevPos := -1
 				for _, tok := range tokens {
@@ -1050,20 +1158,49 @@ func buildTokenFilter(displayName string, typeName string, def map[string]any, i
 					if err != nil {
 						return nil, err
 					}
+					if len(ctx.Term) > MaxTokenTermBytes {
+						return nil, newIllegalArgError(fmt.Sprintf("token term length [%d] exceeds maximum allowed [%d] bytes", len(ctx.Term), MaxTokenTermBytes))
+					}
 					cur := tok.clone()
 					cur.Term = ctx.Term
 					if !matched {
+						if err := budget.addToken(cur); err != nil {
+							return nil, err
+						}
 						out = append(out, cur)
 						continue
 					}
 					subToks := []Token{cur}
-					for _, sf := range subFilters {
-						subToks, err = sf.apply(subToks)
+					for sfIdx, sf := range subFilters {
+						var subBudget *tokenStreamBudget
+						if budget != nil {
+							remBytes := budget.maxBytes - budget.usedBytes
+							if remBytes < 0 {
+								remBytes = 0
+							}
+							subMaxToks := budget.maxTokens
+							if sfIdx == len(subFilters)-1 {
+								subMaxToks = budget.maxTokens - budget.curTokens
+								if subMaxToks < 0 {
+									subMaxToks = 0
+								}
+							}
+							subBudget = &tokenStreamBudget{
+								maxTokens: subMaxToks,
+								maxBytes:  remBytes,
+							}
+						}
+						subToks, err = sf.apply(subToks, subBudget)
 						if err != nil {
 							return nil, err
 						}
 					}
-					out = append(out, subToks...)
+					for _, st := range subToks {
+						if err := budget.addToken(st); err != nil {
+							return nil, err
+						}
+						out = append(out, st)
+					}
 				}
 				return out, nil
 			},
@@ -1084,7 +1221,7 @@ func buildTokenFilter(displayName string, typeName string, def map[string]any, i
 		return &compiledTokenFilter{
 			name: displayName,
 			typ:  normType,
-			apply: func(tokens []Token) ([]Token, error) {
+			apply: func(tokens []Token, budget *tokenStreamBudget) ([]Token, error) {
 				out := make([]Token, 0, len(tokens))
 				prevPos := -1
 				for _, tok := range tokens {
@@ -1111,9 +1248,15 @@ func buildTokenFilter(displayName string, typeName string, def map[string]any, i
 					if err != nil {
 						return nil, err
 					}
+					if len(ctx.Term) > MaxTokenTermBytes {
+						return nil, newIllegalArgError(fmt.Sprintf("token term length [%d] exceeds maximum allowed [%d] bytes", len(ctx.Term), MaxTokenTermBytes))
+					}
 					if keep {
 						cur := tok.clone()
 						cur.Term = ctx.Term
+						if err := budget.addToken(cur); err != nil {
+							return nil, err
+						}
 						out = append(out, cur)
 					}
 				}
@@ -1129,6 +1272,9 @@ func buildTokenFilter(displayName string, typeName string, def map[string]any, i
 		if len(rawChains) == 0 {
 			return nil, newIllegalArgError("multiplexer filter requires non-empty [filters]")
 		}
+		if len(rawChains) > MaxFilterChainLength {
+			return nil, newIllegalArgError(fmt.Sprintf("multiplexer branch count [%d] exceeds maximum allowed [%d]", len(rawChains), MaxFilterChainLength))
+		}
 		preserveOrig := true
 		if raw, ok := def["preserve_original"]; ok {
 			b, valid := extractBool(raw)
@@ -1140,7 +1286,11 @@ func buildTokenFilter(displayName string, typeName string, def map[string]any, i
 		chains := make([][]*compiledTokenFilter, 0, len(rawChains))
 		for _, chainStr := range rawChains {
 			var chain []*compiledTokenFilter
-			for _, part := range strings.Split(chainStr, ",") {
+			parts := strings.Split(chainStr, ",")
+			if len(parts) > MaxFilterChainLength {
+				return nil, newIllegalArgError(fmt.Sprintf("multiplexer chain length [%d] exceeds maximum allowed [%d]", len(parts), MaxFilterChainLength))
+			}
+			for _, part := range parts {
 				fname := strings.TrimSpace(part)
 				if fname == "" {
 					continue
@@ -1156,19 +1306,34 @@ func buildTokenFilter(displayName string, typeName string, def map[string]any, i
 		return &compiledTokenFilter{
 			name: displayName,
 			typ:  normType,
-			apply: func(tokens []Token) ([]Token, error) {
+			apply: func(tokens []Token, budget *tokenStreamBudget) ([]Token, error) {
 				var out []Token
 				for _, tok := range tokens {
 					seenAtPos := make(map[string]bool)
 					if preserveOrig {
 						seenAtPos[tok.Term] = true
-						out = append(out, tok.clone())
+						cp := tok.clone()
+						if err := budget.addToken(cp); err != nil {
+							return nil, err
+						}
+						out = append(out, cp)
 					}
 					for _, chain := range chains {
 						branch := []Token{tok.clone()}
 						var err error
 						for _, cf := range chain {
-							branch, err = cf.apply(branch)
+							var subBudget *tokenStreamBudget
+							if budget != nil {
+								remBytes := budget.maxBytes - budget.usedBytes
+								if remBytes < 0 {
+									remBytes = 0
+								}
+								subBudget = &tokenStreamBudget{
+									maxTokens: budget.maxTokens,
+									maxBytes:  remBytes,
+								}
+							}
+							branch, err = cf.apply(branch, subBudget)
 							if err != nil {
 								return nil, err
 							}
@@ -1179,6 +1344,9 @@ func buildTokenFilter(displayName string, typeName string, def map[string]any, i
 									continue
 								}
 								seenAtPos[bt.Term] = true
+							}
+							if err := budget.addToken(bt); err != nil {
+								return nil, err
 							}
 							out = append(out, bt)
 						}
@@ -1194,17 +1362,67 @@ func buildTokenFilter(displayName string, typeName string, def map[string]any, i
 		"common_grams", "dictionary_decompounder", "hyphenation_decompounder":
 		return buildCompoundTokenFilter(displayName, normType, def, bctx)
 
+	case "phonetic",
+		"icu_normalizer", "icu_folding", "icu_collation", "icu_transform",
+		"kuromoji_baseform", "kuromoji_part_of_speech", "kuromoji_readingform",
+		"kuromoji_stemmer", "kuromoji_number", "kuromoji_completion",
+		"ja_stop", "hiragana_uppercase", "katakana_uppercase",
+		"nori_part_of_speech", "nori_readingform", "nori_number",
+		"smartcn_stop", "smartcn_word",
+		"polish_stem", "polish_stop":
+		return buildPluginTokenFilter(displayName, normType, def, isPreconfigured, bctx)
+
 	default:
 		return nil, newIllegalArgError(fmt.Sprintf("Unknown token filter type [%s] for [%s]", typeName, displayName))
 	}
+}
+
+func applyPatternCapture(tokens []Token, compiledPats []*regexp.Regexp, preserveOrig bool, budget *tokenStreamBudget) ([]Token, error) {
+	var out []Token
+	for _, tok := range tokens {
+		seen := make(map[string]bool)
+		if preserveOrig {
+			seen[tok.Term] = true
+			if err := budget.addToken(tok); err != nil {
+				return nil, err
+			}
+			out = append(out, tok)
+		}
+		for _, re := range compiledPats {
+			allSub := re.FindAllStringSubmatch(tok.Term, -1)
+			for _, sub := range allSub {
+				for g := 1; g < len(sub); g++ {
+					capStr := sub[g]
+					if capStr == "" || seen[capStr] {
+						continue
+					}
+					if err := budget.canAddOne(); err != nil {
+						return nil, err
+					}
+					seen[capStr] = true
+					cp := tok.clone()
+					cp.Term = capStr
+					if err := budget.addToken(cp); err != nil {
+						return nil, err
+					}
+					out = append(out, cp)
+				}
+			}
+		}
+	}
+	return out, nil
 }
 
 func simpleTokenFilter(name, typ string, fn func([]Token) []Token) *compiledTokenFilter {
 	return &compiledTokenFilter{
 		name: name,
 		typ:  typ,
-		apply: func(tokens []Token) ([]Token, error) {
-			return fn(tokens), nil
+		apply: func(tokens []Token, budget *tokenStreamBudget) ([]Token, error) {
+			res := fn(tokens)
+			if err := budget.addSlice(res); err != nil {
+				return nil, err
+			}
+			return res, nil
 		},
 	}
 }
@@ -1277,9 +1495,9 @@ func (a hashPair128) less(b hashPair128) bool {
 	return a.h1 < b.h1
 }
 
-func applyMinHashFilter(tokens []Token, hashCount, bucketCount, hashSetSize int, withRotation bool) []Token {
+func applyMinHashFilter(tokens []Token, hashCount, bucketCount, hashSetSize int, withRotation bool, budget *tokenStreamBudget) ([]Token, error) {
 	if len(tokens) == 0 {
-		return nil
+		return nil, nil
 	}
 	maxEnd := tokens[len(tokens)-1].EndOffset
 	var out []Token
@@ -1323,11 +1541,18 @@ func applyMinHashFilter(tokens []Token, hashCount, bucketCount, hashSetSize int,
 
 		for b := 0; b < bucketCount; b++ {
 			for _, pair := range buckets[b] {
+				if err := budget.canAddOne(); err != nil {
+					return nil, err
+				}
 				var raw [16]byte
 				binary.BigEndian.PutUint64(raw[0:8], pair.h2)
 				binary.BigEndian.PutUint64(raw[8:16], pair.h1)
+				term := hex.EncodeToString(raw[:])
+				if err := budget.add(len(term)); err != nil {
+					return nil, err
+				}
 				out = append(out, Token{
-					Term:           hex.EncodeToString(raw[:]),
+					Term:           term,
 					StartOffset:    0,
 					EndOffset:      maxEnd,
 					Type:           "MIN_HASH",
@@ -1338,7 +1563,7 @@ func applyMinHashFilter(tokens []Token, hashCount, bucketCount, hashSetSize int,
 			}
 		}
 	}
-	return out
+	return out, nil
 }
 
 func insertMinHashSet(cur []hashPair128, cand hashPair128, maxSize int) []hashPair128 {

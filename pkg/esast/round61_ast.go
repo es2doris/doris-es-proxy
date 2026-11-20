@@ -298,6 +298,27 @@ func parseFlexibleRangesArrayOrMap(rawRanges json.RawMessage) ([]RangeAggBucket,
 		return buckets, false, nil
 	}
 	if trimmed[0] == '{' {
+		var rawObj map[string]json.RawMessage
+		if err := json.Unmarshal(trimmed, &rawObj); err != nil {
+			return nil, false, err
+		}
+		if len(rawObj) > 0 {
+			hasNestedObj := false
+			for _, rv := range rawObj {
+				rt := bytes.TrimSpace(rv)
+				if len(rt) > 0 && rt[0] == '{' {
+					hasNestedObj = true
+					break
+				}
+			}
+			if !hasNestedObj {
+				var single RangeAggBucket
+				if err := json.Unmarshal(trimmed, &single); err != nil {
+					return nil, false, err
+				}
+				return []RangeAggBucket{single}, false, nil
+			}
+		}
 		dec := json.NewDecoder(bytes.NewReader(trimmed))
 		tok, err := dec.Token()
 		if err != nil || tok != json.Delim('{') {

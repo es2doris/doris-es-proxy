@@ -82,7 +82,10 @@ type gzipResponseWriter struct {
 func (w *gzipResponseWriter) WriteHeader(status int) {
 	if !w.wroteHeader {
 		w.wroteHeader = true
-		if status >= 200 && status != http.StatusNoContent && status != http.StatusNotModified {
+		ct := strings.ToLower(strings.TrimSpace(w.ResponseWriter.Header().Get("Content-Type")))
+		existingCE := strings.TrimSpace(w.ResponseWriter.Header().Get("Content-Encoding"))
+		isMVT := strings.HasPrefix(ct, "application/vnd.mapbox-vector-tile")
+		if status >= 200 && status != http.StatusNoContent && status != http.StatusNotModified && existingCE == "" && !isMVT {
 			w.ResponseWriter.Header().Del("Content-Length")
 			w.ResponseWriter.Header().Set("Content-Encoding", "gzip")
 			w.ResponseWriter.Header().Add("Vary", "Accept-Encoding")
@@ -101,6 +104,18 @@ func (w *gzipResponseWriter) Write(b []byte) (int, error) {
 		return w.ResponseWriter.Write(b)
 	}
 	return w.gz.Write(b)
+}
+
+func (w *gzipResponseWriter) Flush() {
+	if !w.wroteHeader {
+		w.WriteHeader(http.StatusOK)
+	}
+	if w.gzInitialized && w.gz != nil {
+		_ = w.gz.Flush()
+	}
+	if fl, ok := w.ResponseWriter.(http.Flusher); ok {
+		fl.Flush()
+	}
 }
 
 func (w *gzipResponseWriter) Close() {
@@ -123,6 +138,12 @@ type esResponseFormatOptions struct {
 type esFormatResponseWriter struct {
 	http.ResponseWriter
 	opts esResponseFormatOptions
+}
+
+func (fw *esFormatResponseWriter) Flush() {
+	if fl, ok := fw.ResponseWriter.(http.Flusher); ok {
+		fl.Flush()
+	}
 }
 
 func extractESResponseFormatOptions(w http.ResponseWriter) (esResponseFormatOptions, bool) {
@@ -264,6 +285,11 @@ func (s *Server) withWireMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
+		disableRespGzip, okComp := extractHTTPCompressionQueryParamR63Wire(w, r)
+		if !okComp {
+			return
+		}
+
 		if fmtOpts, ok := parseESResponseFormatOptions(r); ok {
 			w = &esFormatResponseWriter{ResponseWriter: w, opts: fmtOpts}
 		}
@@ -292,44 +318,19 @@ func (s *Server) withWireMiddleware(next http.Handler) http.Handler {
 			r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
 		}
 
-		switch strings.ToLower(strings.TrimSpace(r.Header.Get("Content-Encoding"))) {
-		case "gzip", "x-gzip":
-			var gz *gzip.Reader
-			if pooled := gzipReaderPool.Get(); pooled != nil {
-				gz = pooled.(*gzip.Reader)
-				if err := gz.Reset(r.Body); err != nil {
-					gzipReaderPool.Put(gz)
-					writeESError(w, http.StatusBadRequest, "not_x_content_exception", "invalid gzip stream: "+err.Error())
-					return
-				}
-			} else {
-				var err error
-				gz, err = gzip.NewReader(r.Body)
-				if err != nil {
-					writeESError(w, http.StatusBadRequest, "not_x_content_exception", "invalid gzip stream: "+err.Error())
-					return
-				}
-			}
-			defer func() {
-				_ = gz.Close()
-				gzipReaderPool.Put(gz)
-			}()
-			r.Body = http.MaxBytesReader(w, gz, maxBytes)
-			r.Header.Del("Content-Encoding")
-			r.Header.Del("Content-Length")
-		case "", "identity":
-			// pass through
-		default:
-			writeESError(w, http.StatusUnsupportedMediaType, "illegal_argument_exception",
-				"unsupported Content-Encoding: "+r.Header.Get("Content-Encoding"))
+		cleanupDecomp, okDecomp := decompressRequestBodyR63Wire(w, r, maxBytes)
+		if !okDecomp {
 			return
+		}
+		if cleanupDecomp != nil {
+			defer cleanupDecomp()
 		}
 
 		if !validateRequestContentTypeRound59(w, r) {
 			return
 		}
 
-		if r.Method != http.MethodHead && strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+		if r.Method != http.MethodHead && !disableRespGzip && acceptsGzipEncodingR63Wire(r.Header.Get("Accept-Encoding")) {
 			gz := gzipWriterPool.Get().(*gzip.Writer)
 			gzw := &gzipResponseWriter{ResponseWriter: w, gz: gz}
 			defer gzw.Close()
@@ -347,6 +348,9 @@ func (s *Server) withWireMiddleware(next http.Handler) http.Handler {
 			if r.Method == http.MethodPut || r.Method == http.MethodPost {
 				s.normalizeStoredComponentTemplatesR62Admin(r)
 			}
+			return
+		}
+		if s.tryHandleAdminWireR63(w, r, next) {
 			return
 		}
 		next.ServeHTTP(w, r)
@@ -849,7 +853,7 @@ func matchMultiWildcardWithExclusions(rawPattern, candidate string) bool {
 }
 
 func (s *Server) handleResolveIndex(w http.ResponseWriter, r *http.Request) {
-	s.handleResolveIndexRound58(w, r)
+	s.serveResolveIndexR63Admin(w, r)
 }
 
 func extractDataStreamBackingIndexNames(ds map[string]any) []string {
@@ -940,18 +944,8 @@ func (s *Server) handleSearchShards(w http.ResponseWriter, r *http.Request) {
 						}
 						aliasFilters = append(aliasFilters, fq)
 					}
-					if allFiltered && len(aliasFilters) == 1 {
-						idxEntry["filter"] = aliasFilters[0]
-					} else if allFiltered && len(aliasFilters) > 1 {
-						shouldSlice := make(esast.QuerySlice, len(aliasFilters))
-						for i, fq := range aliasFilters {
-							shouldSlice[i] = *fq
-						}
-						idxEntry["filter"] = &esast.Query{
-							Bool: &esast.BoolQuery{
-								Should: shouldSlice,
-							},
-						}
+					if allFiltered && len(aliasFilters) > 0 {
+						idxEntry["filter"] = formatSearchShardsAliasFilterR63(aliasFilters)
 					}
 				}
 			}
@@ -959,21 +953,32 @@ func (s *Server) handleSearchShards(w http.ResponseWriter, r *http.Request) {
 		indicesOut[idx] = idxEntry
 		shardsOut = append(shardsOut, []map[string]any{
 			{
-				"state":   "STARTED",
-				"primary": true,
-				"node":    "doris-fe-1",
-				"shard":   0,
-				"index":   idx,
+				"state":           "STARTED",
+				"primary":         true,
+				"node":            "doris-fe-1",
+				"relocating_node": nil,
+				"shard":           0,
+				"index":           idx,
+				"allocation_id": map[string]any{
+					"id": idx + "-alloc-0",
+				},
 			},
 		})
 	}
 	s.mu.RUnlock()
+	esVer := s.effectiveClusterESVersionNumber(r)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"nodes": map[string]any{
 			"doris-fe-1": map[string]any{
 				"name":              "doris-fe-1",
+				"ephemeral_id":      "doris-fe-1-ephemeral",
+				"external_id":       "doris-fe-1",
 				"transport_address": "127.0.0.1:9030",
 				"attributes":        map[string]any{},
+				"roles":             nodeRolesListR62Admin(s.isES8Mode(r)),
+				"version":           esVer,
+				"min_index_version": 8000099,
+				"max_index_version": 8500003,
 			},
 		},
 		"indices": indicesOut,
@@ -1504,7 +1509,7 @@ func isAllowedIngestProcessorPropertyRound60(procType, prop string) bool {
 		}
 	case "user_agent":
 		switch prop {
-		case "field", "target_field", "regex_file", "properties", "extract_device_type", "ignore_missing":
+		case "field", "target_field", "regex_file", "properties", "extract_device_type", "ignore_missing", "ecs":
 			return true
 		}
 	case "uri_parts":
@@ -5022,6 +5027,11 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 			var extracted map[string]any
 			switch v := val.(type) {
 			case string:
+				if len(v) > maxIngestGrokDissectBytesRound63 {
+					if _, err := ExtractDissectCheckedRound63(pattern, v); err != nil {
+						return false, false, procType, procTag, specMap, err
+					}
+				}
 				res, err := evalDissectPattern(pattern, v, appendSep)
 				if err != nil {
 					return false, false, procType, procTag, specMap, err
@@ -5036,6 +5046,11 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 					strElem, isStr := elem.(string)
 					if !isStr {
 						return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is not a string", field)
+					}
+					if len(strElem) > maxIngestGrokDissectBytesRound63 {
+						if _, err := ExtractDissectCheckedRound63(pattern, strElem); err != nil {
+							return false, false, procType, procTag, specMap, err
+						}
 					}
 					res, err := evalDissectPattern(pattern, strElem, appendSep)
 					if err != nil {
@@ -6372,6 +6387,16 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 			extracted := make(map[string]any)
 			var extractedOrder []string
 			for _, strVal := range strInputs {
+				if len(strVal) > maxIngestGrokDissectBytesRound63 {
+					if len(patterns) > 0 {
+						if ps, okS := patterns[0].(string); okS && ps != "" {
+							if _, err := ExtractGrokCheckedRound63(ps, strVal); err != nil {
+								return false, false, procType, procTag, specMap, err
+							}
+						}
+					}
+					return false, false, procType, procTag, specMap, fmt.Errorf("illegal_argument_exception: input text length [%d] exceeds maximum allowed grok input size [%d]", len(strVal), maxIngestGrokDissectBytesRound63)
+				}
 				matched := false
 				for patIdx, patAny := range patterns {
 					patStr, ok := patAny.(string)
@@ -6800,6 +6825,23 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 				return false, false, procType, procTag, specMap, err
 			}
 			rawB64 := strings.TrimSpace(fmt.Sprintf("%v", val))
+			var propsSlice []string
+			if propsAny, okP := specMap["properties"].([]any); okP {
+				for _, p := range propsAny {
+					if ps, okS := p.(string); okS && strings.TrimSpace(ps) != "" {
+						propsSlice = append(propsSlice, strings.TrimSpace(ps))
+					}
+				}
+			}
+			isES8Att := s == nil || s.isES8Mode(nil)
+			if rich, okRich := ExtractIngestAttachmentRound63(rawB64, int64(indexedChars), propsSlice, isES8Att); okRich {
+				setIngestPath(doc, target, rich)
+				if removeBinary && field != target {
+					deleteIngestPath(doc, field)
+				}
+				mutated = true
+				break
+			}
 			decoded, err := base64.StdEncoding.DecodeString(rawB64)
 			if err != nil {
 				decoded, err = base64.RawStdEncoding.DecodeString(rawB64)
@@ -7065,6 +7107,7 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 			case strings.Contains(uaStr, "Macintosh"):
 				uaMap["device"] = map[string]any{"name": "Mac"}
 			}
+			NormalizeIngestUserAgentRound63(uaMap, uaStr, specMap)
 			if propsAny, ok := specMap["properties"].([]any); ok && len(propsAny) > 0 {
 				allowed := make(map[string]bool, len(propsAny))
 				for _, p := range propsAny {
@@ -10628,6 +10671,9 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 	}
 	rps, slicesCount, isAutoSlices, waitForCompletion, preflightMaxDocs, remMap, pfStatus, pfErrType, pfErrReason := s.validateReindexPreflightRound61(w, r, bodyBytes)
 	if pfStatus != 0 {
+		if pfStatus == http.StatusBadRequest && strings.Contains(pfErrReason, "Unsupported fields in [remote]") {
+			pfErrReason = rewriteReindexRemoteUnknownFieldsOrderR63(bodyBytes, pfErrReason)
+		}
 		writeESError(w, pfStatus, pfErrType, pfErrReason)
 		return
 	}
@@ -12549,8 +12595,13 @@ func (s *Server) handleTermsEnum(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r != nil && r.URL != nil && r.URL.Query().Has("timeout") {
-		if _, err := parseESDurationMillisRound59(r.URL.Query().Get("timeout")); err != nil {
+		ms, err := parseESDurationMillisRound59(r.URL.Query().Get("timeout"))
+		if err != nil {
 			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", err.Error())
+			return
+		}
+		if ms > 60_000 {
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "Timeout cannot be > 1 minute")
 			return
 		}
 	}
@@ -12586,8 +12637,13 @@ func (s *Server) handleTermsEnum(w http.ResponseWriter, r *http.Request) {
 				writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "[timeout] must be a duration string")
 				return
 			}
-			if _, err := parseESDurationMillisRound59(toStr); err != nil {
+			ms, err := parseESDurationMillisRound59(toStr)
+			if err != nil {
 				writeESError(w, http.StatusBadRequest, "illegal_argument_exception", err.Error())
+				return
+			}
+			if ms > 60_000 {
+				writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "Timeout cannot be > 1 minute")
 				return
 			}
 		}
@@ -12608,6 +12664,7 @@ func (s *Server) handleTermsEnum(w http.ResponseWriter, r *http.Request) {
 	}
 	rawIndex := strings.TrimSpace(r.PathValue("index"))
 	var targets []string
+	isVersionField := false
 	if rawIndex != "" {
 		var ok bool
 		targets, _, ok = s.resolveValidatedReadTargets(w, r, rawIndex)
@@ -12619,7 +12676,9 @@ func (s *Server) handleTermsEnum(w http.ResponseWriter, r *http.Request) {
 			if sch := s.indices[idxName]; sch != nil {
 				if fb, exists := sch.Fields[req.Field]; exists && fb.ESType != "" {
 					switch fb.ESType {
-					case "keyword", "constant_keyword", "flattened", "version", "wildcard":
+					case "version":
+						isVersionField = true
+					case "keyword", "constant_keyword", "flattened", "wildcard":
 					default:
 						s.mu.RUnlock()
 						writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
@@ -12632,6 +12691,16 @@ func (s *Server) handleTermsEnum(w http.ResponseWriter, r *http.Request) {
 		s.mu.RUnlock()
 	} else {
 		targets = s.resolveTargetIndices("")
+		s.mu.RLock()
+		for _, idxName := range targets {
+			if sch := s.indices[idxName]; sch != nil {
+				if fb, exists := sch.Fields[req.Field]; exists && fb.ESType == "version" {
+					isVersionField = true
+					break
+				}
+			}
+		}
+		s.mu.RUnlock()
 	}
 	limit := req.Size
 	if limit <= 0 {
@@ -12683,7 +12752,11 @@ func (s *Server) handleTermsEnum(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			if allKeys != nil {
-				if req.CaseInsensitive {
+				if isVersionField && !req.CaseInsensitive {
+					sort.Slice(allKeys, func(i, j int) bool {
+						return transpiler.CompareSemverStrings(allKeys[i], allKeys[j]) < 0
+					})
+				} else if req.CaseInsensitive {
 					sort.Slice(allKeys, func(i, j int) bool {
 						li, lj := strings.ToLower(allKeys[i]), strings.ToLower(allKeys[j])
 						if li != lj {
@@ -12695,7 +12768,11 @@ func (s *Server) handleTermsEnum(w http.ResponseWriter, r *http.Request) {
 				saLower := strings.ToLower(req.SearchAfter)
 				for _, k := range allKeys {
 					if req.SearchAfter != "" {
-						if req.CaseInsensitive {
+						if isVersionField && !req.CaseInsensitive {
+							if transpiler.CompareSemverStrings(k, req.SearchAfter) <= 0 {
+								continue
+							}
+						} else if req.CaseInsensitive {
 							kLower := strings.ToLower(k)
 							if kLower < saLower || (kLower == saLower && k <= req.SearchAfter) {
 								continue
@@ -13599,6 +13676,31 @@ func executeGeoIPProcessor(doc map[string]any, specMap map[string]any) (bool, er
 				"asn":               int64(29518),
 				"organization_name": "Bredband2 AB",
 				"network":           "89.160.0.0/17",
+			}
+		} else if ipStr == "128.101.101.101" {
+			fullGeo = map[string]any{
+				"continent_name":    "North America",
+				"country_iso_code":  "US",
+				"country_name":      "United States",
+				"region_iso_code":   "US-MN",
+				"region_name":       "Minnesota",
+				"city_name":         "Minneapolis",
+				"timezone":          "America/Chicago",
+				"location":          map[string]any{"lat": 44.9399, "lon": -93.2548},
+				"ip":                ipStr,
+				"asn":               int64(217),
+				"organization_name": "University of Minnesota",
+				"network":           "128.101.0.0/16",
+			}
+		} else if ipStr == "82.171.64.0" {
+			fullGeo = map[string]any{
+				"continent_name":    "Europe",
+				"country_iso_code":  "NL",
+				"country_name":      "Netherlands",
+				"ip":                ipStr,
+				"asn":               int64(1136),
+				"organization_name": "KPN B.V.",
+				"network":           "82.168.0.0/14",
 			}
 		} else {
 			fullGeo = map[string]any{

@@ -33,7 +33,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/es2doris/doris-es-proxy/pkg/analysis"
@@ -67,15 +66,6 @@ func (s *Server) cleanupGlobalServerRegistriesR62Search() {
 	serverIngestStatsRegistryRound61.Delete(s)
 	serverRemoteReindexTransportsRound61.Delete(s)
 	serverRemoteReindexSecurityConfigRound62.Delete(s)
-
-	indexLookupSpecsMuR62Search.Lock()
-	delete(serverLookupSpecsR62Search, s)
-	for k, owner := range schemaServerRegistryR62Search {
-		if owner == s {
-			delete(schemaServerRegistryR62Search, k)
-		}
-	}
-	indexLookupSpecsMuR62Search.Unlock()
 }
 
 // ============================================================================
@@ -1062,11 +1052,7 @@ func (s *Server) handleGetIndexR62Search(w http.ResponseWriter, r *http.Request,
 func (s *Server) handleIndexStatsR62Search(w http.ResponseWriter, r *http.Request) {
 	rec := httptest.NewRecorder()
 	s.handleIndexStatsRound60(rec, r)
-	for k, vals := range rec.Header() {
-		for _, v := range vals {
-			w.Header().Add(k, v)
-		}
-	}
+	copyRecorderHeadersSetR63(w, rec.Header())
 	if rec.Code != http.StatusOK || rec.Body.Len() == 0 {
 		w.WriteHeader(rec.Code)
 		_, _ = w.Write(rec.Body.Bytes())
@@ -1080,9 +1066,11 @@ func (s *Server) handleIndexStatsR62Search(w http.ResponseWriter, r *http.Reques
 		_, _ = w.Write(rec.Body.Bytes())
 		return
 	}
-	// Preserve true `flush.total: 0` when an index has not been flushed since creation (`indices.flush/10_basic.yml`).
+	// Preserve true `flush.total: 0` when an index has not been flushed since creation (`indices.flush/10_basic.yml`),
+	// and overwrite `request_cache` stats from authoritative shard request cache counters (`querycache.go`).
 	indicesObj, _ := payload["indices"].(map[string]any)
 	var sumFlush int64
+	var sumRCHits, sumRCMisses, sumRCEvicts, sumRCBytes int64
 	adjustedAny := false
 	s.mu.RLock()
 	for idxName, rawIdxVal := range indicesObj {
@@ -1106,6 +1094,22 @@ func (s *Server) handleIndexStatsR62Search(w http.ResponseWriter, r *http.Reques
 				}
 			}
 		}
+		rcHits, rcMisses, rcEvicts, rcBytes := s.getShardRequestCacheStatsR63(idxName)
+		sumRCHits += rcHits
+		sumRCMisses += rcMisses
+		sumRCEvicts += rcEvicts
+		sumRCBytes += rcBytes
+		for _, secKey := range []string{"primaries", "total"} {
+			if secMap, okS := idxMap[secKey].(map[string]any); okS {
+				if rcMap, okRC := secMap["request_cache"].(map[string]any); okRC {
+					rcMap["hit_count"] = rcHits
+					rcMap["miss_count"] = rcMisses
+					rcMap["evictions"] = rcEvicts
+					rcMap["memory_size_in_bytes"] = rcBytes
+					adjustedAny = true
+				}
+			}
+		}
 	}
 	s.mu.RUnlock()
 	if adjustedAny {
@@ -1114,6 +1118,12 @@ func (s *Server) handleIndexStatsR62Search(w http.ResponseWriter, r *http.Reques
 				if secMap, okS := allMap[secKey].(map[string]any); okS {
 					if flMap, okF := secMap["flush"].(map[string]any); okF {
 						flMap["total"] = sumFlush
+					}
+					if rcMap, okRC := secMap["request_cache"].(map[string]any); okRC {
+						rcMap["hit_count"] = sumRCHits
+						rcMap["miss_count"] = sumRCMisses
+						rcMap["evictions"] = sumRCEvicts
+						rcMap["memory_size_in_bytes"] = sumRCBytes
 					}
 				}
 			}
@@ -1210,11 +1220,7 @@ func (s *Server) handleClusterHealthR62Search(w http.ResponseWriter, r *http.Req
 			q.Set("wait_for_status", "yellow")
 			rCopy.URL.RawQuery = q.Encode()
 			s.handleClusterHealthR61Admin(rec, rCopy)
-			for k, vals := range rec.Header() {
-				for _, v := range vals {
-					w.Header().Add(k, v)
-				}
-			}
+			copyRecorderHeadersSetR63(w, rec.Header())
 			var payload map[string]any
 			if json.Unmarshal(rec.Body.Bytes(), &payload) == nil && payload != nil {
 				payload["status"] = "green"
@@ -1855,11 +1861,7 @@ func (s *Server) handleGetAliasesR62Search(w http.ResponseWriter, r *http.Reques
 	}
 	rec := httptest.NewRecorder()
 	s.handleGetAliasesR61CRUD(rec, r)
-	for k, vals := range rec.Header() {
-		for _, v := range vals {
-			w.Header().Add(k, v)
-		}
-	}
+	copyRecorderHeadersSetR63(w, rec.Header())
 	// Augment GET /_alias response with data-stream alias entries (`data_stream/140_data_stream_aliases.yml`)!
 	rawAliasPat := strings.TrimSpace(r.PathValue("name"))
 	s.mu.RLock()
@@ -2450,6 +2452,9 @@ func (s *Server) createPhysicalBackingIndexR62Search(
 		}
 	}
 	schema.ApplyIndexModeDefaults(compiled)
+	if err := schema.ValidateIndexSortFields(compiled, mergedSettings); err != nil {
+		return nil, err
+	}
 
 	ddl := schema.GenerateCreateTableDDL(compiled)
 	if err := s.backend.ExecDDL(ctx, ddl); err != nil {
@@ -2727,6 +2732,7 @@ func (s *Server) enrichDataStreamResponseMapLockedR62Search(ds map[string]any) m
 			cp["time_series"] = map[string]any{"temporal_ranges": ranges}
 		}
 	}
+	refreshDataStreamLifecycleManagedByLockedR63(s, cp)
 	return cp
 }
 
@@ -2994,7 +3000,23 @@ func (s *Server) recordFailureStoreDocumentR62Search(
 	if explicitDocID != "" {
 		docBlock["id"] = explicitDocID
 	}
-	cleanMsg := trimSchemaErrorPrefixR62Search(fmt.Errorf("%s", errMessage))
+	genID := esast.NextAutoID()
+	msgDocID := explicitDocID
+	if msgDocID == "" {
+		msgDocID = genID
+	}
+	cleanMsg := enrichMapperFieldErrorWithDocIDAndPreviewR63(trimSchemaErrorPrefixR62Search(fmt.Errorf("%s", errMessage)), msgDocID, origDocBytes)
+	var resolvedProcType, resolvedProcTag string
+	if len(executedPipelines) > 0 {
+		failPipe := executedPipelines[len(executedPipelines)-1]
+		s.mu.RLock()
+		pipeDef := s.pipelines[failPipe]
+		s.mu.RUnlock()
+		resolvedProcType, resolvedProcTag = extractFailingProcessorTypeAndTagR62Search(pipeDef, errType)
+		if resolvedProcType == "fail" && errType == "ingest_processor_exception" {
+			errType = "fail_processor_exception"
+		}
+	}
 	javaExc := "org.elasticsearch.index.mapper.DocumentParsingException"
 	if errType == "fail_processor_exception" || strings.Contains(errType, "processor") {
 		javaExc = "org.elasticsearch.ingest.common.FailProcessorException"
@@ -3010,15 +3032,11 @@ func (s *Server) recordFailureStoreDocumentR62Search(
 		failPipe := executedPipelines[len(executedPipelines)-1]
 		errBlock["pipeline"] = failPipe
 		errBlock["pipeline_trace"] = executedPipelines
-		s.mu.RLock()
-		pipeDef := s.pipelines[failPipe]
-		s.mu.RUnlock()
-		procType, procTag := extractFailingProcessorTypeAndTagR62Search(pipeDef, errType)
-		if procType != "" {
-			errBlock["processor_type"] = procType
+		if resolvedProcType != "" {
+			errBlock["processor_type"] = resolvedProcType
 		}
-		if procTag != "" {
-			errBlock["processor_tag"] = procTag
+		if resolvedProcTag != "" {
+			errBlock["processor_tag"] = resolvedProcTag
 		}
 	}
 
@@ -3035,7 +3053,6 @@ func (s *Server) recordFailureStoreDocumentR62Search(
 	if fsSchema == nil {
 		return "", "", 0, false
 	}
-	genID := esast.NextAutoID()
 	shredded, sErr := schema.ShredDocument(fsSchema, genID, 1, false, failBytes)
 	if sErr != nil {
 		return "", "", 0, false
@@ -3391,6 +3408,14 @@ func (s *Server) handleModifyDataStreamR62Search(w http.ResponseWriter, r *http.
 						fmt.Sprintf("Validation Failed: 1: data_stream and index are required for [%s];", op))
 					return
 				}
+				if rawFS, hasFS := spec["failure_store"]; hasFS {
+					if _, okB := parseOptionalBoolAny(rawFS); !okB {
+						s.mu.Unlock()
+						writeESError(w, http.StatusBadRequest, "x_content_parse_exception", "failure_store must be a boolean")
+						return
+					}
+				}
+				isFS, _ := parseOptionalBoolAny(spec["failure_store"])
 				if op == "add_backing_index" {
 					if _, exists := s.indices[idxName]; !exists {
 						s.mu.Unlock()
@@ -3398,10 +3423,25 @@ func (s *Server) handleModifyDataStreamR62Search(w http.ResponseWriter, r *http.
 						return
 					}
 					if owner := s.findOwningDataStreamLockedR62Search(idxName); owner != "" {
+						isOwnerFS := isFailureStoreBackingIndexLockedR63(s, owner, idxName)
 						s.mu.Unlock()
+						kindLabel := "backing index"
+						if isOwnerFS {
+							kindLabel = "failure store index"
+						}
 						writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
-							fmt.Sprintf("index [%s] is already part of data stream [%s]", idxName, owner))
+							fmt.Sprintf("cannot add index [%s] to data stream [%s] because it is already a %s on data stream [%s]", idxName, dsName, kindLabel, owner))
 						return
+					}
+					for alName, alTargets := range s.aliases {
+						for _, t := range alTargets {
+							if t == idxName {
+								s.mu.Unlock()
+								writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
+									fmt.Sprintf("cannot add index [%s] to data stream [%s] until its alias [%s] is removed", idxName, dsName, alName))
+								return
+							}
+						}
 					}
 				} else {
 					ds := s.dataStreams[dsName]
@@ -3410,12 +3450,79 @@ func (s *Server) handleModifyDataStreamR62Search(w http.ResponseWriter, r *http.
 						writeESError(w, http.StatusNotFound, "resource_not_found_exception", "data_stream ["+dsName+"] missing")
 						return
 					}
-					rawIndices, _ := ds["indices"].([]any)
-					if len(rawIndices) > 0 {
-						if lastM, okM := rawIndices[len(rawIndices)-1].(map[string]any); okM && lastM["index_name"] == idxName {
+					if isFS {
+						foundInFS := false
+						if fsObj, okFS := ds["failure_store"].(map[string]any); okFS {
+							fsIndices, _ := fsObj["indices"].([]any)
+							for _, item := range fsIndices {
+								if m, okM := item.(map[string]any); okM && m["index_name"] == idxName {
+									foundInFS = true
+									break
+								}
+							}
+							if len(fsIndices) > 0 {
+								if lastM, okM := fsIndices[len(fsIndices)-1].(map[string]any); okM && lastM["index_name"] == idxName {
+									fsCurrentlyEnabled := true
+									if en, okB := parseOptionalBoolAny(fsObj["enabled"]); okB && !en {
+										fsCurrentlyEnabled = false
+									}
+									fsDisablingOrReplacingInBatch := false
+									for _, otherAct := range payload.Actions {
+										if optSpec, okOpt := otherAct["data_stream_options"]; okOpt {
+											if strings.TrimSpace(fmt.Sprintf("%v", optSpec["data_stream"])) == dsName {
+												if fsSub, okSub := optSpec["failure_store"].(map[string]any); okSub {
+													if en, okB := parseOptionalBoolAny(fsSub["enabled"]); okB && !en {
+														fsDisablingOrReplacingInBatch = true
+													}
+												} else if en, okB := parseOptionalBoolAny(optSpec["failure_store"]); okB && !en {
+													fsDisablingOrReplacingInBatch = true
+												}
+											}
+										}
+										if addSpec, okAdd := otherAct["add_backing_index"]; okAdd {
+											if strings.TrimSpace(fmt.Sprintf("%v", addSpec["data_stream"])) == dsName {
+												if addFS, okB := parseOptionalBoolAny(addSpec["failure_store"]); okB && addFS {
+													fsDisablingOrReplacingInBatch = true
+												}
+											}
+										}
+									}
+									if fsCurrentlyEnabled && !fsDisablingOrReplacingInBatch {
+										s.mu.Unlock()
+										writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
+											fmt.Sprintf("cannot remove backing index [%s] of data stream [%s] because it is the write index", idxName, dsName))
+										return
+									}
+								}
+							}
+						}
+						if !foundInFS {
 							s.mu.Unlock()
 							writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
-								fmt.Sprintf("cannot remove write index [%s] from data stream [%s]", idxName, dsName))
+								fmt.Sprintf("index [%s] not found in data stream [%s]", idxName, dsName))
+							return
+						}
+					} else {
+						rawIndices, _ := ds["indices"].([]any)
+						foundInDS := false
+						for _, item := range rawIndices {
+							if m, okM := item.(map[string]any); okM && m["index_name"] == idxName {
+								foundInDS = true
+								break
+							}
+						}
+						if len(rawIndices) > 0 {
+							if lastM, okM := rawIndices[len(rawIndices)-1].(map[string]any); okM && lastM["index_name"] == idxName {
+								s.mu.Unlock()
+								writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
+									fmt.Sprintf("cannot remove backing index [%s] of data stream [%s] because it is the write index", idxName, dsName))
+								return
+							}
+						}
+						if !foundInDS {
+							s.mu.Unlock()
+							writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
+								fmt.Sprintf("index [%s] not found in data stream [%s]", idxName, dsName))
 							return
 						}
 					}
@@ -3475,6 +3582,7 @@ func (s *Server) handleModifyDataStreamR62Search(w http.ResponseWriter, r *http.
 			switch op {
 			case "add_backing_index":
 				idxName := strings.TrimSpace(fmt.Sprintf("%v", spec["index"]))
+				isFS, _ := parseOptionalBoolAny(spec["failure_store"])
 				ds := s.dataStreams[dsName]
 				if ds == nil {
 					ds = map[string]any{
@@ -3486,25 +3594,38 @@ func (s *Server) handleModifyDataStreamR62Search(w http.ResponseWriter, r *http.
 						"hidden":          false,
 						"system":          false,
 						"replicated":      false,
-						"failure_store":   map[string]any{"enabled": false, "indices": []any{}},
+						"failure_store":   map[string]any{"enabled": isFS, "indices": []any{}},
 					}
 					s.dataStreams[dsName] = ds
 				}
-				curIndices, _ := ds["indices"].([]any)
-				// Insert before current write index if stream already has a `.ds-*` write index, or append if new!
-				newEntry := map[string]any{
-					"index_name": idxName,
-					"index_uuid": indexUUIDForNameRound61(idxName),
-					"prefer_ilm": true,
-					"managed_by": "Unmanaged",
-				}
-				if len(curIndices) > 0 {
-					updated := make([]any, 0, len(curIndices)+1)
-					updated = append(updated, curIndices[:len(curIndices)-1]...)
-					updated = append(updated, newEntry, curIndices[len(curIndices)-1])
-					ds["indices"] = updated
+				if isFS {
+					fsObj, _ := ds["failure_store"].(map[string]any)
+					if fsObj == nil {
+						fsObj = map[string]any{"enabled": true, "indices": []any{}}
+					}
+					curFS, _ := fsObj["indices"].([]any)
+					newFSEntry := map[string]any{
+						"index_name": idxName,
+						"index_uuid": indexUUIDForNameRound61(idxName),
+						"managed_by": "Unmanaged",
+					}
+					updatedFS := make([]any, 0, len(curFS)+1)
+					updatedFS = append(updatedFS, newFSEntry)
+					updatedFS = append(updatedFS, curFS...)
+					fsObj["indices"] = updatedFS
+					ds["failure_store"] = fsObj
 				} else {
-					ds["indices"] = []any{newEntry}
+					curIndices, _ := ds["indices"].([]any)
+					newEntry := map[string]any{
+						"index_name": idxName,
+						"index_uuid": indexUUIDForNameRound61(idxName),
+						"prefer_ilm": true,
+						"managed_by": "Unmanaged",
+					}
+					updated := make([]any, 0, len(curIndices)+1)
+					updated = append(updated, newEntry)
+					updated = append(updated, curIndices...)
+					ds["indices"] = updated
 				}
 				if s.indexCustomSettings == nil {
 					s.indexCustomSettings = make(map[string]map[string]any)
@@ -3518,8 +3639,22 @@ func (s *Server) handleModifyDataStreamR62Search(w http.ResponseWriter, r *http.
 
 			case "remove_backing_index":
 				idxName := strings.TrimSpace(fmt.Sprintf("%v", spec["index"]))
+				isFS, _ := parseOptionalBoolAny(spec["failure_store"])
 				ds := s.dataStreams[dsName]
-				if rawIndices, okI := ds["indices"].([]any); okI {
+				if isFS {
+					if fsObj, okFS := ds["failure_store"].(map[string]any); okFS {
+						if rawFS, okI := fsObj["indices"].([]any); okI {
+							var kept []any
+							for _, item := range rawFS {
+								if m, okM := item.(map[string]any); okM && m["index_name"] == idxName {
+									continue
+								}
+								kept = append(kept, item)
+							}
+							fsObj["indices"] = kept
+						}
+					}
+				} else if rawIndices, okI := ds["indices"].([]any); okI {
 					var kept []any
 					for _, item := range rawIndices {
 						if m, okM := item.(map[string]any); okM && m["index_name"] == idxName {
@@ -3551,6 +3686,14 @@ func (s *Server) handleModifyDataStreamR62Search(w http.ResponseWriter, r *http.
 					fsObj["indices"] = []any{}
 				}
 				ds["failure_store"] = fsObj
+				modifiedDS[dsName] = deepCloneDocMap(ds)
+			}
+		}
+	}
+	if s.hasExplicitTargetESVersion() {
+		for dsName := range modifiedDS {
+			if ds := s.dataStreams[dsName]; ds != nil {
+				incrementDataStreamGenLockedR63(ds)
 				modifiedDS[dsName] = deepCloneDocMap(ds)
 			}
 		}
@@ -3656,6 +3799,7 @@ func (s *Server) handleRolloverR62Search(w http.ResponseWriter, r *http.Request)
 				return
 			}
 			if !dryRun {
+				var lazySnap map[string]any
 				s.mu.Lock()
 				if liveDS := s.dataStreams[alias]; liveDS != nil {
 					fsMap, _ := liveDS["failure_store"].(map[string]any)
@@ -3664,8 +3808,12 @@ func (s *Server) handleRolloverR62Search(w http.ResponseWriter, r *http.Request)
 						liveDS["failure_store"] = fsMap
 					}
 					fsMap["__lazy_rollover"] = true
+					lazySnap = deepCloneDocMap(liveDS)
 				}
 				s.mu.Unlock()
+				if lazySnap != nil {
+					s.persistDataStream(r.Context(), alias, lazySnap)
+				}
 			}
 			writeJSONWithRequest(w, r, http.StatusOK, map[string]any{
 				"acknowledged":        true,
@@ -3771,7 +3919,12 @@ func (s *Server) handleRolloverR62Search(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	condResults, shouldRoll, condErr := s.evaluateRolloverConditionsRound59(r.Context(), oldIdx, reqBody.Conditions)
+	condResults := make(map[string]bool)
+	shouldRoll := len(reqBody.Conditions) == 0
+	var condErr error
+	if len(reqBody.Conditions) > 0 {
+		condResults, shouldRoll, condErr = s.evaluateRolloverConditionsRound59(r.Context(), oldIdx, reqBody.Conditions)
+	}
 	if condErr != nil {
 		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", condErr.Error())
 		return
@@ -3954,11 +4107,20 @@ func (s *Server) handleMigrateToDataStreamR62Search(w http.ResponseWriter, r *ht
 	if s.dataStreams == nil {
 		s.dataStreams = make(map[string]map[string]any)
 	}
+	migratedSchemas := make(map[string]*schema.IndexSchema, len(ordered))
+	for _, t := range ordered {
+		if sc := s.indices[t]; sc != nil {
+			migratedSchemas[t] = sc
+		}
+	}
 	s.dataStreams[name] = dsObj
 	delete(s.aliases, name)
 	delete(s.aliasMeta, name)
 	s.mu.Unlock()
 
+	for t, sc := range migratedSchemas {
+		s.persistIndex(r.Context(), t, sc)
+	}
 	s.persistDataStream(r.Context(), name, dsObj)
 	s.persistAlias(r.Context(), name, nil)
 	s.queryCache.InvalidateAll()
@@ -4359,11 +4521,12 @@ func (s *Server) shredDocumentCopyOnWriteAutoDimsR62Search(
 		}
 		idxSchema = updated
 	}
-	pushActiveScriptedSchemaR62Search(idxSchema)
 	shredded, err := schema.ShredDocument(idxSchema, docID, nextVer, isDelete, docPayload)
-	popActiveScriptedSchemaR62Search(idxSchema)
 	if err != nil {
 		return nil, idxSchema, err
+	}
+	if !isDelete {
+		shredded = s.postProcessShreddedRowWave3R63(indexName, idxSchema, docPayload, "", shredded)
 	}
 	return shredded, idxSchema, nil
 }
@@ -4454,14 +4617,8 @@ func validateMGetForceSyntheticSourceR62Search(idxSchema *schema.IndexSchema, fo
 // Composite Runtime Fields, `scripted_metric` Allow-List & Explain Trees
 // ============================================================================
 
-var (
-	activeScriptedSchemasMuR62Search sync.RWMutex
-	activeScriptedSchemasR62Search   = make(map[*schema.IndexSchema]int)
-	knownScriptedSchemasR62Search    = make(map[*schema.IndexSchema]struct{})
-)
-
 func init() {
-	schema.RegisterIndexFieldScriptEvaluator(evalIndexTimeFieldScriptR62Search)
+	schema.RegisterIndexFieldScriptWithSchemaEvaluator(evalIndexTimeFieldScriptWithSchemaR63Search)
 }
 
 func hasMappedPropertyScriptsR62Search(props map[string]esast.FieldProperty) bool {
@@ -4479,41 +4636,7 @@ func hasMappedPropertyScriptsR62Search(props map[string]esast.FieldProperty) boo
 	return false
 }
 
-func pushActiveScriptedSchemaR62Search(s *schema.IndexSchema) {
-	if s == nil || s.RawMapping == nil || !hasMappedPropertyScriptsR62Search(s.RawMapping.Properties) {
-		return
-	}
-	activeScriptedSchemasMuR62Search.Lock()
-	activeScriptedSchemasR62Search[s]++
-	knownScriptedSchemasR62Search[s] = struct{}{}
-	activeScriptedSchemasMuR62Search.Unlock()
-}
-
-func popActiveScriptedSchemaR62Search(s *schema.IndexSchema) {
-	if s == nil || s.RawMapping == nil || !hasMappedPropertyScriptsR62Search(s.RawMapping.Properties) {
-		return
-	}
-	activeScriptedSchemasMuR62Search.Lock()
-	if activeScriptedSchemasR62Search[s] <= 1 {
-		delete(activeScriptedSchemasR62Search, s)
-	} else {
-		activeScriptedSchemasR62Search[s]--
-	}
-	activeScriptedSchemasMuR62Search.Unlock()
-}
-
-func registerKnownScriptedSchemaR62Search(s *schema.IndexSchema) {
-	if s == nil || s.RawMapping == nil || !hasMappedPropertyScriptsR62Search(s.RawMapping.Properties) {
-		return
-	}
-	activeScriptedSchemasMuR62Search.Lock()
-	knownScriptedSchemasR62Search[s] = struct{}{}
-	activeScriptedSchemasMuR62Search.Unlock()
-}
-
 func shredDocumentWithActiveSchemaR62Search(s *schema.IndexSchema, id string, version int64, deleted bool, rawSource []byte) ([]byte, error) {
-	pushActiveScriptedSchemaR62Search(s)
-	defer popActiveScriptedSchemaR62Search(s)
 	return schema.ShredDocument(s, id, version, deleted, rawSource)
 }
 
@@ -4530,48 +4653,6 @@ func collectMappedScriptPropsR62Search(props map[string]esast.FieldProperty, pre
 			collectMappedScriptPropsR62Search(p.Properties, full, out)
 		}
 	}
-}
-
-func matchActiveScriptedSchemaR62Search(fieldPath, esType string, scriptSpec any) *schema.IndexSchema {
-	srcWanted, _ := extractScriptSourceAndParams(scriptSpec)
-	activeScriptedSchemasMuR62Search.RLock()
-	defer activeScriptedSchemasMuR62Search.RUnlock()
-
-	checkCandidate := func(cand *schema.IndexSchema) bool {
-		if cand == nil || cand.RawMapping == nil {
-			return false
-		}
-		props := make(map[string]esast.FieldProperty)
-		collectMappedScriptPropsR62Search(cand.RawMapping.Properties, "", props)
-		prop, ok := props[fieldPath]
-		if !ok {
-			return false
-		}
-		if esType != "" && !strings.EqualFold(strings.TrimSpace(prop.Type), esType) {
-			return false
-		}
-		candSrc, _ := extractScriptSourceAndParams(prop.Script)
-		return candSrc == srcWanted
-	}
-
-	if len(activeScriptedSchemasR62Search) == 1 {
-		for s := range activeScriptedSchemasR62Search {
-			if checkCandidate(s) {
-				return s
-			}
-		}
-	}
-	for s := range activeScriptedSchemasR62Search {
-		if checkCandidate(s) {
-			return s
-		}
-	}
-	for s := range knownScriptedSchemasR62Search {
-		if checkCandidate(s) {
-			return s
-		}
-	}
-	return nil
 }
 
 func buildStoredFieldsParamMapR62Search(idxSchema *schema.IndexSchema, doc map[string]any) map[string]any {
@@ -4610,158 +4691,9 @@ func evalSingleIndexTimeOrRuntimePropR62Search(
 	isES8 bool,
 	nowUTC time.Time,
 ) ([]any, error) {
-	esType := strings.ToLower(strings.TrimSpace(prop.Type))
-	if esType == "" {
-		esType = "keyword"
-	}
-	scriptSrc, scriptParams := extractScriptSourceAndParams(prop.Script)
-	if strings.TrimSpace(scriptSrc) == "" {
-		return nil, nil
-	}
-	p := make(map[string]any, len(scriptParams)+6)
-	for k, v := range scriptParams {
-		p[k] = v
-	}
-	p["_source"] = sourceDoc
-	p["__keep_boolean_dups"] = isES8
-	p["__quantize_geo_point"] = true
-	if strings.TrimSpace(prop.Format) != "" {
-		p["__runtime_date_format"] = strings.TrimSpace(prop.Format)
-	}
-	if fieldsParam != nil {
-		p["_fields"] = fieldsParam
-	}
-
-	var rawVals []any
-	if emitCtx, okCtx := runtimeFieldTypeToEmitContextRound60(esType); okCtx && strings.Contains(scriptSrc, "emit(") {
-		emitted, errEmit := painless.EvalEmitContext(scriptSrc, emitCtx, evalDoc, sourceDoc, p, ftMap)
-		if errEmit != nil {
-			return nil, errEmit
-		}
-		rawVals = emitted
-	} else {
-		res, evalErr := painless.Eval(evalDoc, scriptSrc, p)
-		if evalErr != nil {
-			return nil, evalErr
-		}
-		if emitted, ok := p["__emitted_vals"].([]any); ok && len(emitted) > 0 {
-			rawVals = emitted
-		} else if res != nil {
-			if arr, ok := res.([]any); ok {
-				rawVals = arr
-			} else {
-				rawVals = []any{res}
-			}
-		}
-	}
-	if len(rawVals) == 0 {
-		return nil, nil
-	}
-	return coerceEmittedRuntimeValuesRound61(esType, prop.Format, rawVals, nowUTC), nil
-}
-
-func evalIndexTimeFieldScriptR62Search(
-	fieldPath string,
-	esType string,
-	scriptSpec any,
-	onScriptError string,
-	sourceDoc map[string]any,
-) ([]any, error) {
-	idxSchema := matchActiveScriptedSchemaR62Search(fieldPath, esType, scriptSpec)
-	isES8 := idxSchema == nil || idxSchema.ES8Mode
-	workingDoc := deepCloneDocMap(sourceDoc)
-	if workingDoc == nil {
-		workingDoc = make(map[string]any)
-	}
-	nowUTC := time.Now().UTC()
-	fieldsParam := buildStoredFieldsParamMapR62Search(idxSchema, sourceDoc)
-
-	if idxSchema != nil && idxSchema.RawMapping != nil {
-		scriptProps := make(map[string]esast.FieldProperty)
-		collectMappedScriptPropsR62Search(idxSchema.RawMapping.Properties, "", scriptProps)
-		if prop, ok := scriptProps[fieldPath]; ok {
-			order, err := resolveLazyRuntimeMappingsOrderR62Search(scriptProps, []string{fieldPath})
-			if err != nil {
-				return nil, err
-			}
-			evalDoc := PrepareDocForRuntimeScriptRound61(idxSchema, workingDoc, isES8)
-			ftMap, _ := evalDoc["__field_types"].(map[string]string)
-			if ftMap == nil {
-				ftMap = make(map[string]string)
-				evalDoc["__field_types"] = ftMap
-			}
-			for fn, sp := range scriptProps {
-				t := strings.ToLower(strings.TrimSpace(sp.Type))
-				if t == "" {
-					t = "keyword"
-				}
-				ftMap[fn] = t
-			}
-			for _, depName := range order {
-				depProp := scriptProps[depName]
-				coerced, depErr := evalSingleIndexTimeOrRuntimePropR62Search(
-					idxSchema, depName, depProp, evalDoc, sourceDoc, fieldsParam, ftMap, isES8, nowUTC,
-				)
-				if depErr != nil {
-					depOnErr := strings.ToLower(strings.TrimSpace(depProp.OnScriptError))
-					if depName == fieldPath && strings.EqualFold(onScriptError, "continue") {
-						return nil, nil
-					}
-					if depOnErr == "continue" {
-						continue
-					}
-					return nil, fmt.Errorf("script_exception: runtime error: %w", depErr)
-				}
-				if depName == fieldPath {
-					return coerced, nil
-				}
-				if len(coerced) > 0 {
-					var val any = coerced
-					if len(coerced) == 1 {
-						val = coerced[0]
-					}
-					workingDoc[depName] = val
-					if strings.Contains(depName, ".") {
-						setIngestPath(workingDoc, depName, val)
-					}
-					evalDoc[depName] = val
-					if strings.Contains(depName, ".") {
-						setRuntimeScriptDocPath(evalDoc, strings.Split(depName, "."), val)
-					}
-				}
-			}
-			_ = prop
-			return nil, nil
-		}
-	}
-
-	evalDoc := PrepareDocForRuntimeScriptRound61(idxSchema, workingDoc, isES8)
-	ftMap, _ := evalDoc["__field_types"].(map[string]string)
-	if ftMap == nil {
-		ftMap = make(map[string]string)
-		evalDoc["__field_types"] = ftMap
-	}
-	if esType != "" {
-		ftMap[fieldPath] = esType
-	}
-	coerced, err := evalSingleIndexTimeOrRuntimePropR62Search(
-		idxSchema,
-		fieldPath,
-		esast.FieldProperty{Type: esType, Script: scriptSpec, OnScriptError: onScriptError},
-		evalDoc,
-		sourceDoc,
-		fieldsParam,
-		ftMap,
-		isES8,
-		nowUTC,
+	return evalSingleIndexTimeOrRuntimePropWithOptsR63Search(
+		idxSchema, fieldPath, prop, evalDoc, sourceDoc, fieldsParam, ftMap, isES8, nowUTC, false,
 	)
-	if err != nil {
-		if strings.EqualFold(onScriptError, "continue") {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("script_exception: runtime error: %w", err)
-	}
-	return coerced, nil
 }
 
 // evalIndexTimeMappedFieldsForHitR62Search evaluates `mappings.properties.<f>.script` on a hit's
@@ -6149,106 +6081,7 @@ func (s *Server) EvalRuntimeMappingsOnHitRowsLazyR62Search(
 //
 // BEFORE `resolveStoredScriptsInSearchRequest` expands `{id: ...}` into `{source: ...}` (`scripted_metric_allow_list.yml`).
 func validateScriptedMetricAllowListR62Search(s *Server, aggs map[string]esast.AggSpec) (int, string, string) {
-	if s == nil || len(aggs) == 0 {
-		return 0, "", ""
-	}
-	lookupClusterSetting := func(key string) (any, bool) {
-		s.mu.RLock()
-		defer s.mu.RUnlock()
-		if s.clusterTransientSettings != nil {
-			if v, ok := s.clusterTransientSettings[key]; ok && v != nil {
-				return v, true
-			}
-		}
-		if s.clusterPersistentSettings != nil {
-			if v, ok := s.clusterPersistentSettings[key]; ok && v != nil {
-				return v, true
-			}
-		}
-		return nil, false
-	}
-
-	rawOnly, hasOnly := lookupClusterSetting("search.aggs.only_allowed_metric_scripts")
-	if !hasOnly {
-		return 0, "", ""
-	}
-	onlyAllowed, okB := parseOptionalBoolAny(rawOnly)
-	if !okB || !onlyAllowed {
-		return 0, "", ""
-	}
-
-	parseAllowedSet := func(key string) map[string]bool {
-		out := make(map[string]bool)
-		raw, ok := lookupClusterSetting(key)
-		if !ok || raw == nil {
-			return out
-		}
-		switch tv := raw.(type) {
-		case []string:
-			for _, item := range tv {
-				out[item] = true
-			}
-		case []any:
-			for _, item := range tv {
-				out[fmt.Sprintf("%v", item)] = true
-			}
-		case string:
-			if tv != "" {
-				out[tv] = true
-			}
-		}
-		return out
-	}
-
-	allowedInline := parseAllowedSet("search.aggs.allowed_inline_metric_scripts")
-	allowedStored := parseAllowedSet("search.aggs.allowed_stored_metric_scripts")
-
-	isScriptAllowed := func(rawScript any) bool {
-		if rawScript == nil {
-			return true
-		}
-		if id, hasID := extractStoredScriptIDRound61(rawScript); hasID {
-			return allowedStored[id]
-		}
-		src, _ := extractScriptSourceAndParams(rawScript)
-		return allowedInline[src]
-	}
-
-	var walk func(m map[string]esast.AggSpec) (int, string, string)
-	walk = func(m map[string]esast.AggSpec) (int, string, string) {
-		names := make([]string, 0, len(m))
-		for k := range m {
-			names = append(names, k)
-		}
-		sort.Strings(names)
-		for _, aggName := range names {
-			spec := m[aggName]
-			if spec.ScriptedMetric != nil {
-				for _, entry := range []struct {
-					field string
-					raw   any
-				}{
-					{"init_script", spec.ScriptedMetric.InitScript},
-					{"map_script", spec.ScriptedMetric.MapScript},
-					{"combine_script", spec.ScriptedMetric.CombineScript},
-					{"reduce_script", spec.ScriptedMetric.ReduceScript},
-				} {
-					if entry.raw != nil && !isScriptAllowed(entry.raw) {
-						return http.StatusBadRequest,
-							"search_phase_execution_exception",
-							fmt.Sprintf("all_shards_failed|illegal_argument_exception|[%s] contains not allowed script: [%s]", entry.field, aggName)
-					}
-				}
-			}
-			if sub := spec.SubAggs(); len(sub) > 0 {
-				if st, et, er := walk(sub); st != 0 {
-					return st, et, er
-				}
-			}
-		}
-		return 0, "", ""
-	}
-	return walk(aggs)
+	return validateScriptedMetricAllowListR63Search(s, aggs)
 }
 
 func compareTermsKeysSchemaAwareR62Search(a, b, esType string) bool {
@@ -6625,6 +6458,8 @@ func (s *Server) effectiveTranspileOptsForIndexR62Search(
 	cfg, anOpts := s.buildIndexAnalysisConfigR62Admin(resolvedIdx)
 	opts.AnalysisConfig = cfg
 	opts.AnalysisOpts = anOpts
+	opts.StrictTextTermRouting = s.hasExplicitTargetESVersion()
+	opts.DynamicTextFields = s.dynamicTextFieldsCopyWave3R63(resolvedIdx)
 	return opts
 }
 
@@ -6665,7 +6500,15 @@ func enrichSourceBytesWithMappedScriptsR62Search(idxSchema *schema.IndexSchema, 
 func (s *Server) handlePutMappingNormalizedR62Search(w http.ResponseWriter, r *http.Request) {
 	if r != nil && r.Body != nil {
 		bodyBytes, err := jsonReadAllBodyR62Search(r)
-		if err == nil && len(bytes.TrimSpace(bodyBytes)) > 0 {
+		if err != nil {
+			if isMaxBytesBodyErrorR63(err) {
+				writeESError(w, http.StatusRequestEntityTooLarge, "circuit_breaking_exception", "request body exceeded max allowed size: "+err.Error())
+				return
+			}
+			writeESError(w, http.StatusBadRequest, "parsing_exception", "failed to read request body: "+err.Error())
+			return
+		}
+		if len(bytes.TrimSpace(bodyBytes)) > 0 {
 			var probe esast.MappingSpec
 			if json.Unmarshal(bodyBytes, &probe) == nil {
 				if vErr := validateMappedPropertyScriptsR62Search(&probe); vErr != nil {
@@ -6681,21 +6524,25 @@ func (s *Server) handlePutMappingNormalizedR62Search(w http.ResponseWriter, r *h
 	res := rec.Result()
 	defer func() { _ = res.Body.Close() }()
 	respBytes := rec.Body.Bytes()
-	if res.StatusCode >= 200 && res.StatusCode < 300 {
-		s.mu.Lock()
-		for _, sch := range s.indices {
-			if sch != nil && sch.RawMapping != nil {
-				normalizeMappingScriptsInPlaceR62Search(sch.RawMapping)
-				registerKnownScriptedSchemaR62Search(sch)
+	if res.StatusCode >= 200 && res.StatusCode < 300 && r != nil {
+		rawTarget := strings.TrimSpace(r.PathValue("index"))
+		if rawTarget == "" {
+			rawTarget = "_all"
+		}
+		targets := s.resolveTargetIndices(rawTarget)
+		if len(targets) > 0 {
+			s.mu.Lock()
+			for _, target := range targets {
+				if sch := s.indices[target]; sch != nil && sch.RawMapping != nil {
+					cloned := sch.CloneIndexSchema()
+					normalizeMappingScriptsInPlaceR62Search(cloned.RawMapping)
+					s.indices[target] = cloned
+				}
 			}
-		}
-		s.mu.Unlock()
-	}
-	for hk, hvs := range res.Header {
-		for _, hv := range hvs {
-			w.Header().Add(hk, hv)
+			s.mu.Unlock()
 		}
 	}
+	copyRecorderHeadersSetR63(w, res.Header)
 	w.WriteHeader(res.StatusCode)
 	// #nosec G705 -- JSON response proxied from internal mapping handler with nosniff/JSON Content-Type
 	_, _ = w.Write(respBytes)
@@ -7015,6 +6862,10 @@ func buildTimeSeriesAggObjectR62Search(
 // applyIPRangeCIDRMaskR62Search computes Elasticsearch `ip_range` CIDR `from` (inclusive masked start IP)
 // and `to` (exclusive `lastIP + 1`, or omitted if `lastIP` is all-ones max IPv4/IPv6) for both IPv4 and IPv6!
 func applyIPRangeCIDRMaskR62Search(maskStr string, entry map[string]any) (startAddr netip.Addr, endAddrInclusive netip.Addr, ok bool) {
+	return applyIPRangeCIDRMaskWithStrictR63(false, maskStr, entry)
+}
+
+func applyIPRangeCIDRMaskWithStrictR63(strictConformance bool, maskStr string, entry map[string]any) (startAddr netip.Addr, endAddrInclusive netip.Addr, ok bool) {
 	pfx, err := netip.ParsePrefix(strings.TrimSpace(maskStr))
 	if err != nil {
 		return netip.Addr{}, netip.Addr{}, false
@@ -7022,11 +6873,6 @@ func applyIPRangeCIDRMaskR62Search(maskStr string, entry map[string]any) (startA
 	masked := pfx.Masked()
 	addr := masked.Addr()
 	bits := pfx.Bits()
-
-	strictConformance := false
-	if srv := currentActiveSearchServerR62Search(); srv != nil && srv.hasExplicitTargetESVersion() {
-		strictConformance = true
-	}
 
 	if addr.Is4() {
 		b4 := addr.As4()
@@ -7224,6 +7070,53 @@ func matchesTermsPartitionR62Search(key string, fv map[string]any, fieldType str
 func matchesTermsFilterPrecompiledWithSchemaR62Search(key string, filter any, precompiled *regexp.Regexp, fieldType string) bool {
 	if fv, isMap := filter.(map[string]any); isMap {
 		return matchesTermsPartitionR62Search(key, fv, fieldType)
+	}
+	ft := strings.ToLower(strings.TrimSpace(fieldType))
+	if ft == "date" || ft == "date_nanos" {
+		nowUTC := time.Now().UTC()
+		var keyMs int64
+		hasKeyMs := false
+		if iv, err := strconv.ParseInt(strings.TrimSpace(key), 10, 64); err == nil {
+			keyMs = iv
+			hasKeyMs = true
+		} else if ms, ok := schema.ParseESDateToEpochMillis(strings.TrimSpace(key), nowUTC); ok {
+			keyMs = ms
+			hasKeyMs = true
+		}
+		if hasKeyMs {
+			switch tv := filter.(type) {
+			case []any:
+				for _, el := range tv {
+					s := strings.TrimSpace(fmt.Sprintf("%v", el))
+					if iv, err := strconv.ParseInt(s, 10, 64); err == nil && iv == keyMs {
+						return true
+					}
+					if ms, ok := schema.ParseESDateToEpochMillis(s, nowUTC); ok && ms == keyMs {
+						return true
+					}
+				}
+				return false
+			case []string:
+				for _, s := range tv {
+					s = strings.TrimSpace(s)
+					if iv, err := strconv.ParseInt(s, 10, 64); err == nil && iv == keyMs {
+						return true
+					}
+					if ms, ok := schema.ParseESDateToEpochMillis(s, nowUTC); ok && ms == keyMs {
+						return true
+					}
+				}
+				return false
+			case string:
+				if precompiled != nil {
+					iso := formatDateHistogramKeyAsStringRound59(keyMs, &esast.DateHistogramAggSpec{})
+					if precompiled.MatchString(iso) || precompiled.MatchString(key) {
+						return true
+					}
+					return false
+				}
+			}
+		}
 	}
 	return matchesTermsFilterPrecompiledWithSchemaRound60(key, filter, precompiled, fieldType)
 }
@@ -7704,189 +7597,6 @@ func validateCompositeAggSourcesR62Search(aggs map[string]esast.AggSpec) (int, s
 	return 0, "", ""
 }
 
-var (
-	activeSearchRawBodyMuR62Search sync.RWMutex
-	activeSearchRawBodyR62Search   []byte
-	activeSearchServerR62Search    *Server
-	indexLookupSpecsMuR62Search    sync.RWMutex
-	indexLookupSpecsR62Search      = make(map[string]map[string]lookupRuntimeSpecR62Search)
-	serverLookupSpecsR62Search     = make(map[*Server]map[string]lookupRuntimeSpecR62Search)
-	schemaServerRegistryR62Search  = make(map[string]*Server)
-)
-
-func pushActiveSearchContextR62Search(srv *Server, raw []byte, schemas []*schema.IndexSchema) (*Server, []byte) {
-	if srv != nil {
-		indexLookupSpecsMuR62Search.Lock()
-		for _, sc := range schemas {
-			if sc != nil {
-				schemaServerRegistryR62Search[sc.DorisDB+"\x00"+sc.IndexName] = srv
-			}
-		}
-		if len(bytes.TrimSpace(raw)) > 0 && bytes.Contains(raw, []byte("lookup")) {
-			var root map[string]any
-			if json.Unmarshal(raw, &root) == nil && root != nil {
-				if rtm, ok := root["runtime_mappings"].(map[string]any); ok {
-					if parsed := parseLookupSpecsFromRuntimeMapR62Search(rtm); len(parsed) > 0 {
-						if serverLookupSpecsR62Search[srv] == nil {
-							serverLookupSpecsR62Search[srv] = make(map[string]lookupRuntimeSpecR62Search, len(parsed))
-						}
-						for k, v := range parsed {
-							serverLookupSpecsR62Search[srv][k] = v
-						}
-					}
-				}
-			}
-		}
-		indexLookupSpecsMuR62Search.Unlock()
-	}
-	activeSearchRawBodyMuR62Search.Lock()
-	prevSrv := activeSearchServerR62Search
-	prevRaw := activeSearchRawBodyR62Search
-	activeSearchServerR62Search = srv
-	activeSearchRawBodyR62Search = raw
-	activeSearchRawBodyMuR62Search.Unlock()
-	return prevSrv, prevRaw
-}
-
-func popActiveSearchContextR62Search(prevSrv *Server, prevRaw []byte) {
-	activeSearchRawBodyMuR62Search.Lock()
-	activeSearchServerR62Search = prevSrv
-	activeSearchRawBodyR62Search = prevRaw
-	activeSearchRawBodyMuR62Search.Unlock()
-}
-
-func resolveServerForSchemaOrActiveR62Search(sc *schema.IndexSchema) *Server {
-	if sc != nil {
-		indexLookupSpecsMuR62Search.RLock()
-		srv := schemaServerRegistryR62Search[sc.DorisDB+"\x00"+sc.IndexName]
-		indexLookupSpecsMuR62Search.RUnlock()
-		if srv != nil {
-			return srv
-		}
-	}
-	return currentActiveSearchServerR62Search()
-}
-
-func currentActiveSearchServerR62Search() *Server {
-	activeSearchRawBodyMuR62Search.RLock()
-	srv := activeSearchServerR62Search
-	activeSearchRawBodyMuR62Search.RUnlock()
-	if srv != nil {
-		return srv
-	}
-	activeStoredScriptsServerMu.RLock()
-	srv = activeStoredScriptsServer
-	activeStoredScriptsServerMu.RUnlock()
-	return srv
-}
-
-type lookupRuntimeSpecR62Search struct {
-	TargetIndex string   `json:"target_index"`
-	InputField  string   `json:"input_field"`
-	TargetField string   `json:"target_field"`
-	KeyField    string   `json:"key_field"`
-	FetchFields []string `json:"fetch_fields"`
-}
-
-func currentActiveSearchRawBodyR62Search() []byte {
-	activeSearchRawBodyMuR62Search.RLock()
-	raw := activeSearchRawBodyR62Search
-	activeSearchRawBodyMuR62Search.RUnlock()
-	return raw
-}
-
-func registerIndexLookupSpecsFromRawBodyR62Search(indexName string, rawBody []byte) {
-	if indexName == "" || len(bytes.TrimSpace(rawBody)) == 0 {
-		return
-	}
-	var root map[string]any
-	if json.Unmarshal(rawBody, &root) != nil || root == nil {
-		return
-	}
-	var rtMap map[string]any
-	if m, ok := root["mappings"].(map[string]any); ok {
-		rtMap, _ = m["runtime"].(map[string]any)
-	}
-	if rtMap == nil {
-		rtMap, _ = root["runtime"].(map[string]any)
-	}
-	if len(rtMap) == 0 {
-		return
-	}
-	parsed := parseLookupSpecsFromRuntimeMapR62Search(rtMap)
-	if len(parsed) == 0 {
-		return
-	}
-	indexLookupSpecsMuR62Search.Lock()
-	if indexLookupSpecsR62Search[indexName] == nil {
-		indexLookupSpecsR62Search[indexName] = make(map[string]lookupRuntimeSpecR62Search, len(parsed))
-	}
-	for k, v := range parsed {
-		indexLookupSpecsR62Search[indexName][k] = v
-	}
-	indexLookupSpecsMuR62Search.Unlock()
-}
-
-func parseLookupSpecsFromRuntimeMapR62Search(rtMap map[string]any) map[string]lookupRuntimeSpecR62Search {
-	out := make(map[string]lookupRuntimeSpecR62Search)
-	for fName, rawSpec := range rtMap {
-		sm, ok := rawSpec.(map[string]any)
-		if !ok || sm == nil {
-			continue
-		}
-		tp, _ := sm["type"].(string)
-		if !strings.EqualFold(strings.TrimSpace(tp), "lookup") {
-			continue
-		}
-		b, err := json.Marshal(sm)
-		if err != nil {
-			continue
-		}
-		var ls lookupRuntimeSpecR62Search
-		if json.Unmarshal(b, &ls) == nil {
-			if ls.TargetField == "" && ls.KeyField != "" {
-				ls.TargetField = ls.KeyField
-			}
-			out[fName] = ls
-		}
-	}
-	return out
-}
-
-func resolveLookupRuntimeSpecForFieldR62Search(srv *Server, idxSchema *schema.IndexSchema, fieldName string) (lookupRuntimeSpecR62Search, bool) {
-	if srv != nil {
-		indexLookupSpecsMuR62Search.RLock()
-		sm := serverLookupSpecsR62Search[srv]
-		ls, ok := sm[fieldName]
-		indexLookupSpecsMuR62Search.RUnlock()
-		if ok {
-			return ls, true
-		}
-	}
-	if raw := currentActiveSearchRawBodyR62Search(); len(bytes.TrimSpace(raw)) > 0 {
-		var root map[string]any
-		if json.Unmarshal(raw, &root) == nil && root != nil {
-			if rtm, ok := root["runtime_mappings"].(map[string]any); ok {
-				if parsed := parseLookupSpecsFromRuntimeMapR62Search(rtm); len(parsed) > 0 {
-					if ls, okF := parsed[fieldName]; okF {
-						return ls, true
-					}
-				}
-			}
-		}
-	}
-	if idxSchema != nil && idxSchema.IndexName != "" {
-		indexLookupSpecsMuR62Search.RLock()
-		idxMap := indexLookupSpecsR62Search[idxSchema.IndexName]
-		ls, ok := idxMap[fieldName]
-		indexLookupSpecsMuR62Search.RUnlock()
-		if ok {
-			return ls, true
-		}
-	}
-	return lookupRuntimeSpecR62Search{}, false
-}
-
 // rewriteSignificantHeuristicParseErrorR62Search rewrites `[terms] unknown field [<hk>]` into
 // ES's `x_content_parse_exception: Unknown significance heuristic [<hk>] did you mean [...]?`
 // when the raw body contains `significant_text` or `significant_terms`.
@@ -7941,8 +7651,15 @@ func rewriteSignificantHeuristicParseErrorR62Search(rawBody []byte, errMsg strin
 			best = kh
 		}
 	}
+	isSigTerms := bytes.Contains(rawBody, []byte("significant_terms")) && !bytes.Contains(rawBody, []byte("significance_heuristics"))
 	if best != "" && bestD <= 3 {
+		if isSigTerms {
+			return "parsing_exception", fmt.Sprintf("[significant_terms] unknown field [%s] did you mean [%s]?", hk, best), true
+		}
 		return "x_content_parse_exception", fmt.Sprintf("Unknown significance heuristic [%s] did you mean [%s]?", hk, best), true
+	}
+	if isSigTerms {
+		return "parsing_exception", fmt.Sprintf("[significant_terms] unknown field [%s]", hk), true
 	}
 	return "x_content_parse_exception", fmt.Sprintf("Unknown significance heuristic [%s]", hk), true
 }
@@ -7977,49 +7694,6 @@ func validateSignificantTextSpecsInAggsR62Search(aggs map[string]esast.AggSpec, 
 type sigHeuristicSpecR62Search struct {
 	kind   string
 	params map[string]any
-}
-
-func extractSigHeuristicForAggR62Search(fullAggName string) sigHeuristicSpecR62Search {
-	raw := currentActiveSearchRawBodyR62Search()
-	if len(bytes.TrimSpace(raw)) == 0 {
-		return sigHeuristicSpecR62Search{kind: "jlh"}
-	}
-	var root map[string]any
-	if json.Unmarshal(raw, &root) != nil || root == nil {
-		return sigHeuristicSpecR62Search{kind: "jlh"}
-	}
-	segs := strings.Split(fullAggName, ".")
-	cur := root
-	for i, seg := range segs {
-		aggsObj, _ := cur["aggs"].(map[string]any)
-		if aggsObj == nil {
-			aggsObj, _ = cur["aggregations"].(map[string]any)
-		}
-		if aggsObj == nil {
-			return sigHeuristicSpecR62Search{kind: "jlh"}
-		}
-		next, ok := aggsObj[seg].(map[string]any)
-		if !ok || next == nil {
-			return sigHeuristicSpecR62Search{kind: "jlh"}
-		}
-		cur = next
-		if i == len(segs)-1 {
-			stMap, _ := cur["significant_text"].(map[string]any)
-			if stMap == nil {
-				stMap, _ = cur["significant_terms"].(map[string]any)
-			}
-			for _, hk := range []string{"percentage", "gnd", "mutual_information", "chi_square", "jlh"} {
-				if rawH, hasH := stMap[hk]; hasH && rawH != nil {
-					pm, _ := rawH.(map[string]any)
-					if pm == nil {
-						pm = map[string]any{}
-					}
-					return sigHeuristicSpecR62Search{kind: hk, params: pm}
-				}
-			}
-		}
-	}
-	return sigHeuristicSpecR62Search{kind: "jlh"}
 }
 
 func computeSignificantScoreR62Search(heur sigHeuristicSpecR62Search, fgCount, fgTotal, bgCount, bgTotal int64) float64 {
@@ -8149,6 +7823,26 @@ func emitRuntimeSignificantTextAggRowsR62Search(
 		return
 	}
 	bgDocs := allCorpusDocs
+	scope := scopeFromMatchedDocsR63(fgDocs, allCorpusDocs)
+	if (len(bgDocs) == 0 || (parentBucketKey != "" && len(bgDocs) == len(fgDocs))) && idxSchema != nil && idxSchema.IndexName != "" && scope != nil && scope.srv != nil {
+		rawCorpus := scope.srv.collectIndexedDocsWithIDsRound61(scope.ctx, idxSchema.IndexName, nil)
+		if len(rawCorpus) > 0 {
+			bgDocs = make([]runtimeMatchedDoc, 0, len(rawCorpus))
+			for _, d := range rawCorpus {
+				dm := deepCloneDocMap(d.Source)
+				if dm == nil {
+					dm = make(map[string]any)
+				}
+				dm["__meta_id"] = d.ID
+				bgDocs = append(bgDocs, runtimeMatchedDoc{
+					hit:        HitRow{ID: d.ID, Schema: idxSchema, SearchScope: scope},
+					doc:        dm,
+					rootDoc:    dm,
+					rootSchema: idxSchema,
+				})
+			}
+		}
+	}
 	if len(bgDocs) == 0 {
 		bgDocs = fgDocs
 	}
@@ -8169,14 +7863,13 @@ func emitRuntimeSignificantTextAggRowsR62Search(
 		}
 	}
 	var anCfg *analysis.IndexAnalysisConfig
-	if idxSchema != nil && idxSchema.IndexName != "" {
-		if srv := currentActiveSearchServerR62Search(); srv != nil {
-			srv.mu.RLock()
-			cs := srv.indexCustomSettings[idxSchema.IndexName]
-			srv.mu.RUnlock()
-			if len(cs) > 0 {
-				anCfg, _ = analysis.ParseIndexAnalysisConfig(cs, analysis.Options{})
-			}
+	if idxSchema != nil && idxSchema.IndexName != "" && scope != nil && scope.srv != nil {
+		srv := scope.srv
+		srv.mu.RLock()
+		cs := deepCloneDocMap(srv.indexCustomSettings[idxSchema.IndexName])
+		srv.mu.RUnlock()
+		if len(cs) > 0 {
+			anCfg, _ = analysis.ParseIndexAnalysisConfig(cs, analysis.Options{})
 		}
 	}
 	if anCfg == nil {
@@ -8190,8 +7883,20 @@ func emitRuntimeSignificantTextAggRowsR62Search(
 
 	extractDocTokens := func(md runtimeMatchedDoc) ([]string, string) {
 		var rawTexts []string
+		effSc := md.EffectiveSchema(idxSchema)
 		for _, sf := range sourceFields {
-			vals := collectStringValuesAtPath(md.doc, strings.Split(sf, "."))
+			segs := strings.Split(sf, ".")
+			if effSc != nil {
+				if b := effSc.ResolveField(sf); len(b.SourceJSONPath) > 0 {
+					segs = b.SourceJSONPath
+				}
+			}
+			vals := collectStringValuesAtPath(md.doc, segs)
+			if len(vals) == 0 && effSc != nil && effSc.RawMapping != nil {
+				for _, ctSrc := range collectCopyToSourcePaths(effSc.RawMapping.Properties, "", sf) {
+					vals = append(vals, collectStringValuesAtPath(md.doc, strings.Split(ctSrc, "."))...)
+				}
+			}
 			rawTexts = append(rawTexts, vals...)
 		}
 		joined := strings.Join(rawTexts, " ")
@@ -8204,6 +7909,19 @@ func emitRuntimeSignificantTextAggRowsR62Search(
 		}
 		seen := make(map[string]bool)
 		var toks []string
+		if effSc != nil {
+			fType := effSc.ResolveField(stSpec.Field).ESType
+			if fType == "annotated_text" || fType == "annotated-text" {
+				for _, rt := range rawTexts {
+					for _, ann := range extractAnnotatedTextAnnotationsWave3R63(rt) {
+						if ann != "" && !seen[ann] {
+							seen[ann] = true
+							toks = append(toks, ann)
+						}
+					}
+				}
+			}
+		}
 		for _, pos := range graph.Positions {
 			for _, tk := range pos.Terms {
 				if !seen[tk] {
@@ -8219,12 +7937,30 @@ func emitRuntimeSignificantTextAggRowsR62Search(
 	fgDeduplicated := make([]runtimeMatchedDoc, 0, len(fgDocs))
 	fgTokensByDoc := make([][]string, 0, len(fgDocs))
 	seenTextHash := make(map[string]bool)
+	seenShingle6 := make(map[string]bool)
 	for _, md := range fgDocs {
 		toks, rawJoined := extractDocTokens(md)
 		if filterDup && rawJoined != "" {
 			normTxt := strings.TrimSpace(rawJoined)
 			if seenTextHash[normTxt] {
 				continue
+			}
+			rawSeq := transpiler.TokenizeByAnalyzer(normTxt, analyzerName)
+			if len(rawSeq) >= 6 {
+				dupShingle := false
+				for k := 0; k <= len(rawSeq)-6; k++ {
+					sh := strings.Join(rawSeq[k:k+6], "\x00")
+					if seenShingle6[sh] {
+						dupShingle = true
+						break
+					}
+				}
+				if dupShingle {
+					continue
+				}
+				for k := 0; k <= len(rawSeq)-6; k++ {
+					seenShingle6[strings.Join(rawSeq[k:k+6], "\x00")] = true
+				}
 			}
 			seenTextHash[normTxt] = true
 		}
@@ -8267,7 +8003,7 @@ func emitRuntimeSignificantTextAggRowsR62Search(
 		excRe, _ = regexp.Compile("^(?:" + s + ")$")
 	}
 
-	heur := extractSigHeuristicForAggR62Search(fullAggName)
+	heur := extractSigHeuristicForAggFromRawR63(scopeRawBodyR63(scope), fullAggName)
 	type sigCand struct {
 		term    string
 		fgCount int64
@@ -8362,12 +8098,13 @@ func (s *Server) resolveLookupRuntimeFieldFetchR62Search(
 	runtimeDoc map[string]any,
 	idxSchema *schema.IndexSchema,
 	fieldName string,
-	_ esast.FieldProperty,
+	rtDefProp esast.FieldProperty,
 ) ([]any, int, string, string) {
 	if s == nil {
 		return nil, 0, "", ""
 	}
-	ls, ok := resolveLookupRuntimeSpecForFieldR62Search(s, idxSchema, fieldName)
+	scope := activeSearchScopeFromCtxR63(ctx)
+	ls, ok := resolveLookupRuntimeSpecForFieldR63Search(scope, idxSchema, fieldName, rtDefProp)
 	if !ok {
 		return nil, http.StatusBadRequest, "illegal_argument_exception",
 			fmt.Sprintf("lookup field [%s] requires [target_index], [input_field], [target_field], and [fetch_fields]", fieldName)
@@ -8713,7 +8450,7 @@ func (s *Server) validateSearchLimitsAndParamsR62Search(
 	}
 	if req.From != nil && *req.From < 0 {
 		return http.StatusBadRequest, "search_phase_execution_exception",
-			fmt.Sprintf("all_shards_failed|illegal_argument_exception|[from] parameter cannot be negative, found [%d]", *req.From)
+			fmt.Sprintf("all_shards_failed|illegal_argument_exception|[from] parameter cannot be negative but was [%d]", *req.From)
 	}
 	if req.Size != nil && *req.Size < 0 {
 		return http.StatusBadRequest, "search_phase_execution_exception",
@@ -8757,9 +8494,15 @@ func (s *Server) validateSearchLimitsAndParamsR62Search(
 		for _, sSpec := range req.Sort {
 			if sSpec.Entry.Field == "_shard_doc" {
 				return http.StatusBadRequest, "search_phase_execution_exception",
-					"all_shards_failed|illegal_argument_exception|_shard_doc can only be used for sorting with a point in time (pit)"
+					"all_shards_failed|illegal_argument_exception|[_shard_doc] sort field cannot be used without [point in time]"
 			}
 		}
+	}
+	if rxSt, rxEt, rxEr := validateQueryMaxRegexAndPrefixLengthR63(req, customSettings); rxSt != 0 {
+		return rxSt, rxEt, rxEr
+	}
+	if csSt, csEt, csEr := validateCrossIndexSortTypesR63(req.Sort, rawSchemas); csSt != 0 {
+		return csSt, csEt, csEr
 	}
 
 	// Validate strict date `format` on `search_after` values when `Sort[i].Entry.Format != ""`
@@ -8784,7 +8527,7 @@ func (s *Server) validateSearchLimitsAndParamsR62Search(
 	// Validate concrete `indices_boost` targets exist unless `ignore_unavailable=true` (`40_indices_boost.yml`)
 	if len(req.IndicesBoost) > 0 && s != nil {
 		ignoreUnavail := isTruthyBoolQueryParam(r, "ignore_unavailable")
-		for _, boostMap := range parseOrderedIndicesBoostR62Search(req.IndicesBoost) {
+		for _, boostMap := range parseOrderedIndicesBoostFromRawR63(scopeRawBodyR63(activeSearchScopeFromCtxR63(ctx)), req.IndicesBoost) {
 			for pat := range boostMap {
 				if missing := s.findMissingConcreteSearchIndexRound60(ctx, r, pat, &ignoreUnavail); missing != "" {
 					return http.StatusNotFound, "index_not_found_exception", "no such index [" + missing + "]"
@@ -8827,32 +8570,11 @@ func extractIntSettingR62Search(m map[string]any, keys ...string) (int, bool) {
 	return 0, false
 }
 
-func parseOrderedIndicesBoostR62Search(fallback map[string]float64) []map[string]float64 {
-	if raw := currentActiveSearchRawBodyR62Search(); len(bytes.TrimSpace(raw)) > 0 {
-		var root struct {
-			IndicesBoost json.RawMessage `json:"indices_boost"`
-		}
-		if json.Unmarshal(raw, &root) == nil && len(bytes.TrimSpace(root.IndicesBoost)) > 0 {
-			trim := bytes.TrimSpace(root.IndicesBoost)
-			if trim[0] == '[' {
-				var arr []map[string]float64
-				if json.Unmarshal(trim, &arr) == nil && len(arr) > 0 {
-					return arr
-				}
-			}
-		}
-	}
-	if len(fallback) == 0 {
-		return nil
-	}
-	return []map[string]float64{fallback}
-}
-
 // resolveIndexBoostFirstMatchR62Search returns the boost factor from `req.IndicesBoost` using
 // ES first-matching entry semantics (`40_indices_boost.yml`: first entry in array matching concrete
 // index name, alias pointing to `indexName`, or wildcard pattern wins!).
-func (s *Server) resolveIndexBoostFirstMatchR62Search(indexName string, indicesBoostMap map[string]float64) (float64, bool) {
-	indicesBoost := parseOrderedIndicesBoostR62Search(indicesBoostMap)
+func (s *Server) resolveIndexBoostFirstMatchR62Search(rawBody []byte, indexName string, indicesBoostMap map[string]float64) (float64, bool) {
+	indicesBoost := parseOrderedIndicesBoostFromRawR63(rawBody, indicesBoostMap)
 	if len(indicesBoost) == 0 {
 		return 1.0, false
 	}
@@ -8889,6 +8611,7 @@ func (s *Server) resolveIndexBoostFirstMatchR62Search(indexName string, indicesB
 // `MapStringTermsAggregator`, `NumericTermsAggregator`, `NumericHistogramAggregator`, `TimeSeriesAggregator`,
 // `AutoDateHistogramAggregator.FromSingle`), `collect_count`, `debug` blocks, and `_routing` in `stored_fields`!
 func enrichSearchProfilePayloadR62Search(
+	srv *Server,
 	profilePayload map[string]any,
 	idxSchema *schema.IndexSchema,
 	req *esast.SearchRequest,
@@ -8934,9 +8657,18 @@ func enrichSearchProfilePayloadR62Search(
 		}
 	}
 
+	if len(allHits) == 0 && srv != nil && idxSchema != nil && idxSchema.DorisTable != "" {
+		sampleLim := 100
+		if p, pErr := transpiler.NewTranspiler(idxSchema, transpiler.TranspilerOptions{MaxResultWindow: sampleLim}).BuildSearchPlan(&esast.SearchRequest{Size: &sampleLim, TrackTotalHits: false}); pErr == nil && p.HitsSQL != "" {
+			if sHits, qErr := srv.backend.QueryHits(context.Background(), p.HitsSQL); qErr == nil && len(sHits) > 0 {
+				allHits = sHits
+			}
+		}
+	}
+
 	multiValuedStringField := make(map[string]bool)
 	allValuesPerField := make(map[string][]string)
-	hasDocCountField := false
+	hasDocCountField := idxSchema != nil && (idxSchema.Fields["_doc_count"].ESType != "" || idxSchema.Fields["_doc_count"].ColumnName != "")
 	for _, h := range allHits {
 		doc := decodeHitDocMapRound60(h)
 		if _, hasDC := doc["_doc_count"]; hasDC {
@@ -8945,12 +8677,14 @@ func enrichSearchProfilePayloadR62Search(
 		for k, v := range doc {
 			if arr, okA := v.([]any); okA && len(arr) > 1 {
 				multiValuedStringField[k] = true
+				multiValuedStringField[k+".keyword"] = true
 			}
 			allValuesPerField[k] = append(allValuesPerField[k], collectStringValuesAtPath(doc, []string{k})...)
 		}
 	}
-	rewriteToFilterByFilter := true
-	if srv := currentActiveSearchServerR62Search(); srv != nil {
+	isES8Prof := srv == nil || srv.isES8Mode(nil)
+	rewriteToFilterByFilter := isES8Prof
+	if srv != nil && isES8Prof {
 		srv.mu.RLock()
 		for _, m := range []map[string]any{srv.clusterTransientSettings, srv.clusterPersistentSettings} {
 			if m != nil {
@@ -8968,6 +8702,9 @@ func enrichSearchProfilePayloadR62Search(
 	var buildAggNode func(aggName string, spec esast.AggSpec, outObj map[string]any, isTopLevel bool) map[string]any
 	buildAggNode = func(aggName string, spec esast.AggSpec, outObj map[string]any, isTopLevel bool) map[string]any {
 		aggType := profileAggClassR62Search(spec, req, idxSchema, isTopLevel, rewriteToFilterByFilter, hasDocCountField)
+		if !isES8Prof && aggType == "StringTermsAggregatorFromFilters" {
+			aggType = "GlobalOrdinalsStringTermsAggregator"
+		}
 		collectCount := matchedDocCount
 		debugMap := make(map[string]any)
 
@@ -8979,6 +8716,7 @@ func enrichSearchProfilePayloadR62Search(
 		sort.Strings(subNames)
 
 		bucketCount := 0
+		nonEmptyBucketCount := 0
 		var bucketKeys []string
 		if outObj != nil {
 			switch bs := outObj["buckets"].(type) {
@@ -8986,18 +8724,29 @@ func enrichSearchProfilePayloadR62Search(
 				bucketCount = len(bs)
 				for _, b := range bs {
 					bucketKeys = append(bucketKeys, fmt.Sprintf("%v", b["key"]))
+					if dc, okDC := toInt64(b["doc_count"]); okDC && dc > 0 {
+						nonEmptyBucketCount++
+					}
 				}
 			case []any:
 				bucketCount = len(bs)
 				for _, el := range bs {
 					if bm, ok := el.(map[string]any); ok {
 						bucketKeys = append(bucketKeys, fmt.Sprintf("%v", bm["key"]))
+						if dc, okDC := toInt64(bm["doc_count"]); okDC && dc > 0 {
+							nonEmptyBucketCount++
+						}
 					}
 				}
 			case map[string]any:
 				bucketCount = len(bs)
-				for k := range bs {
+				for k, v := range bs {
 					bucketKeys = append(bucketKeys, k)
+					if bm, ok := v.(map[string]any); ok {
+						if dc, okDC := toInt64(bm["doc_count"]); okDC && dc > 0 {
+							nonEmptyBucketCount++
+						}
+					}
 				}
 				sort.Strings(bucketKeys)
 			}
@@ -9039,7 +8788,10 @@ func enrichSearchProfilePayloadR62Search(
 			}
 			debugMap["collection_strategy"] = "remap using many bucket ords"
 			debugMap["result_strategy"] = "terms"
-			isMV := spec.Terms != nil && multiValuedStringField[spec.Terms.Field]
+			isMV := spec.Terms != nil && (multiValuedStringField[spec.Terms.Field] ||
+				multiValuedStringField[strings.TrimSuffix(spec.Terms.Field, ".keyword")] ||
+				fieldIsMultiValuedInSchemaR61Search(idxSchema, spec.Terms.Field) ||
+				fieldIsMultiValuedInSchemaR61Search(idxSchema, strings.TrimSuffix(spec.Terms.Field, ".keyword")))
 			if isMV {
 				debugMap["segments_with_single_valued_ords"] = 0
 				debugMap["segments_with_multi_valued_ords"] = 1
@@ -9052,6 +8804,7 @@ func enrichSearchProfilePayloadR62Search(
 		case "MapStringTermsAggregator":
 			if spec.SignificantText != nil {
 				debugMap["collection_strategy"] = "analyze text from _source"
+				debugMap["result_strategy"] = "significant_terms"
 				debugMap["total_buckets"] = bucketCount
 			} else {
 				if len(subNames) > 0 && spec.Terms != nil && strings.EqualFold(spec.Terms.CollectMode, "breadth_first") {
@@ -9136,6 +8889,8 @@ func enrichSearchProfilePayloadR62Search(
 			debugMap["ordinals_collectors_used"] = 1
 			debugMap["built_global_ordinals"] = 0
 			debugMap["hash_collectors_used"] = 0
+		case "NumericHistogramAggregator", "DateHistogramAggregator":
+			debugMap["total_buckets"] = nonEmptyBucketCount
 		default:
 			if bucketCount > 0 {
 				debugMap["total_buckets"] = bucketCount
@@ -9972,6 +9727,9 @@ func queryContainsInnerHitsR62Search(q *esast.Query) bool {
 	if q.KNN != nil && q.KNN.InnerHits != nil {
 		return true
 	}
+	if q.Ids != nil && (q.Ids.InnerHitsSpec != nil || len(q.Ids.ResolvedInnerHits) > 0) {
+		return true
+	}
 	if q.Bool != nil {
 		for i := range q.Bool.Must {
 			if queryContainsInnerHitsR62Search(&q.Bool.Must[i]) {
@@ -10111,7 +9869,7 @@ func enrichSearchProfilePayloadWithReqR62Search(
 	matchedDocCount int64,
 	allHits []HitRow,
 ) map[string]any {
-	out := enrichSearchProfilePayloadR62Search(profilePayload, idxSchema, req, aggsOut, matchedDocCount, allHits)
+	out := enrichSearchProfilePayloadR62Search(s, profilePayload, idxSchema, req, aggsOut, matchedDocCount, allHits)
 	if out == nil || httpReq == nil || httpReq.URL == nil {
 		return out
 	}

@@ -46,7 +46,8 @@ func isBuiltInAnalyzerType(typeName string) bool {
 		"finnish", "french", "galician", "german", "greek", "hindi",
 		"hungarian", "indonesian", "irish", "italian", "latvian", "lithuanian",
 		"norwegian", "persian", "portuguese", "romanian", "russian", "serbian",
-		"sorani", "spanish", "swedish", "turkish":
+		"sorani", "spanish", "swedish", "turkish",
+		"icu_analyzer", "kuromoji", "kuromoji_completion", "nori", "smartcn", "polish", "ukrainian":
 		return true
 	default:
 		return false
@@ -220,7 +221,9 @@ var langAnalyzerRecipes = map[string]langAnalyzerRecipe{
 	},
 }
 
-func buildBuiltInOrTypedAnalyzer(displayName string, typeName string, def map[string]any, cfg *IndexAnalysisConfig, opts Options) (*compiledAnalyzer, error) {
+func buildBuiltInOrTypedAnalyzerWithCtx(displayName string, typeName string, def map[string]any, parentCtx filterBuildContext) (*compiledAnalyzer, error) {
+	cfg := parentCtx.cfg
+	opts := parentCtx.opts
 	normType := strings.ToLower(strings.TrimSpace(typeName))
 	posGap, err := parsePosIncrementGap(def)
 	if err != nil {
@@ -230,7 +233,10 @@ func buildBuiltInOrTypedAnalyzer(displayName string, typeName string, def map[st
 	if cfg != nil {
 		maxNGramDiff = cfg.MaxNGramDiff
 	}
-	bctx := filterBuildContext{cfg: cfg, opts: opts}
+	bctx := parentCtx
+	bctx.precedingChars = nil
+	bctx.chainTokenizer = nil
+	bctx.precedingFilts = nil
 
 	buildStop := func(defaultPreset string) (*compiledTokenFilter, error) {
 		var stopDef map[string]any
@@ -489,6 +495,8 @@ func buildBuiltInOrTypedAnalyzer(displayName string, typeName string, def map[st
 			tokenizer:            tok,
 			tokenFilters:         []*compiledTokenFilter{lc, dd, st},
 		}, nil
+	case "icu_analyzer", "kuromoji", "kuromoji_completion", "nori", "smartcn", "polish", "ukrainian":
+		return buildPluginAnalyzer(displayName, normType, def, posGap, bctx)
 	}
 
 	recipe, ok := langAnalyzerRecipes[normType]
@@ -593,8 +601,8 @@ func parsePosIncrementGap(def map[string]any) (int, error) {
 		return DefaultPositionIncrementGap, nil
 	}
 	n, ok := extractInt(raw)
-	if !ok || n < 0 {
-		return 0, newIllegalArgError("position_increment_gap must be >= 0")
+	if !ok || n < 0 || n > MaxPositionIncrementGap {
+		return 0, newIllegalArgError(fmt.Sprintf("position_increment_gap must be between 0 and %d", MaxPositionIncrementGap))
 	}
 	return n, nil
 }

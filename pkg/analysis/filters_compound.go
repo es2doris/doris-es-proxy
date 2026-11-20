@@ -56,9 +56,13 @@ func buildCompoundTokenFilter(displayName string, normType string, def map[strin
 				preserveOrig = b
 			}
 		}
-		return simpleTokenFilter(displayName, normType, func(tokens []Token) []Token {
-			return applyNGramTokenFilter(tokens, minGram, maxGram, isEdge, preserveOrig)
-		}), nil
+		return &compiledTokenFilter{
+			name: displayName,
+			typ:  normType,
+			apply: func(tokens []Token, budget *tokenStreamBudget) ([]Token, error) {
+				return applyNGramFilter(tokens, minGram, maxGram, isEdge, preserveOrig, budget)
+			},
+		}, nil
 
 	case "shingle":
 		minSize := 2
@@ -116,9 +120,13 @@ func buildCompoundTokenFilter(displayName string, normType string, def map[strin
 				maxShingleDiff, maxSize-minSize,
 			))
 		}
-		return simpleTokenFilter(displayName, normType, func(tokens []Token) []Token {
-			return applyShingleFilter(tokens, minSize, maxSize, outputUnigrams, outputUnigramsIfNoShingles, sep, filler)
-		}), nil
+		return &compiledTokenFilter{
+			name: displayName,
+			typ:  normType,
+			apply: func(tokens []Token, budget *tokenStreamBudget) ([]Token, error) {
+				return applyShingleFilter(tokens, minSize, maxSize, outputUnigrams, outputUnigramsIfNoShingles, sep, filler, budget)
+			},
+		}, nil
 
 	case "word_delimiter", "word_delimiter_graph":
 		isGraph := normType == "word_delimiter_graph"
@@ -126,9 +134,13 @@ func buildCompoundTokenFilter(displayName string, normType string, def map[strin
 		if err != nil {
 			return nil, err
 		}
-		return simpleTokenFilter(displayName, normType, func(tokens []Token) []Token {
-			return applyWordDelimiterFilter(tokens, opts)
-		}), nil
+		return &compiledTokenFilter{
+			name: displayName,
+			typ:  normType,
+			apply: func(tokens []Token, budget *tokenStreamBudget) ([]Token, error) {
+				return applyWordDelimiterFilter(tokens, opts, budget)
+			},
+		}, nil
 
 	case "common_grams":
 		if def == nil {
@@ -159,9 +171,13 @@ func buildCompoundTokenFilter(displayName string, normType string, def map[strin
 		if err != nil {
 			return nil, err
 		}
-		return simpleTokenFilter(displayName, normType, func(tokens []Token) []Token {
-			return applyCommonGrams(tokens, commonSet, ignoreCase, queryMode)
-		}), nil
+		return &compiledTokenFilter{
+			name: displayName,
+			typ:  normType,
+			apply: func(tokens []Token, budget *tokenStreamBudget) ([]Token, error) {
+				return applyCommonGrams(tokens, commonSet, ignoreCase, queryMode, budget)
+			},
+		}, nil
 
 	case "dictionary_decompounder", "hyphenation_decompounder":
 		if def == nil && normType == "dictionary_decompounder" {
@@ -226,9 +242,13 @@ func buildCompoundTokenFilter(displayName string, normType string, def map[strin
 		for _, w := range words {
 			dict[strings.ToLower(strings.TrimSpace(w))] = true
 		}
-		return simpleTokenFilter(displayName, normType, func(tokens []Token) []Token {
-			return applyDecompounder(tokens, dict, minWord, minSub, maxSub, onlyLongest)
-		}), nil
+		return &compiledTokenFilter{
+			name: displayName,
+			typ:  normType,
+			apply: func(tokens []Token, budget *tokenStreamBudget) ([]Token, error) {
+				return applyDecompounder(tokens, dict, minWord, minSub, maxSub, onlyLongest, budget)
+			},
+		}, nil
 
 	case "synonym", "synonym_graph":
 		isGraph := normType == "synonym_graph"
@@ -244,14 +264,18 @@ func buildCompoundTokenFilter(displayName string, normType string, def map[strin
 
 // NGram & EdgeNGram Token Filters
 
-func applyNGramTokenFilter(tokens []Token, minGram, maxGram int, isEdge bool, preserveOrig bool) []Token {
+func applyNGramFilter(tokens []Token, minGram, maxGram int, isEdge bool, preserveOrig bool, budget *tokenStreamBudget) ([]Token, error) {
 	var out []Token
 	for _, tok := range tokens {
 		rs := []rune(tok.Term)
 		n := len(rs)
 		if n < minGram {
 			if preserveOrig {
-				out = append(out, tok.clone())
+				cp := tok.clone()
+				if err := budget.addToken(cp); err != nil {
+					return nil, err
+				}
+				out = append(out, cp)
 			}
 			continue
 		}
@@ -261,38 +285,58 @@ func applyNGramTokenFilter(tokens []Token, minGram, maxGram int, isEdge bool, pr
 				limit = n
 			}
 			for sz := minGram; sz <= limit; sz++ {
+				if err := budget.canAddOne(); err != nil {
+					return nil, err
+				}
 				cp := tok.clone()
 				cp.Term = string(rs[:sz])
+				if err := budget.addToken(cp); err != nil {
+					return nil, err
+				}
 				out = append(out, cp)
 			}
 			if preserveOrig && n > maxGram {
-				out = append(out, tok.clone())
+				cp := tok.clone()
+				if err := budget.addToken(cp); err != nil {
+					return nil, err
+				}
+				out = append(out, cp)
 			}
 			continue
 		}
 		emittedOrig := false
 		for s := 0; s < n; s++ {
 			for sz := minGram; sz <= maxGram && s+sz <= n; sz++ {
+				if err := budget.canAddOne(); err != nil {
+					return nil, err
+				}
 				if s == 0 && sz == n {
 					emittedOrig = true
 				}
 				cp := tok.clone()
 				cp.Term = string(rs[s : s+sz])
+				if err := budget.addToken(cp); err != nil {
+					return nil, err
+				}
 				out = append(out, cp)
 			}
 		}
 		if preserveOrig && !emittedOrig {
-			out = append(out, tok.clone())
+			cp := tok.clone()
+			if err := budget.addToken(cp); err != nil {
+				return nil, err
+			}
+			out = append(out, cp)
 		}
 	}
-	return out
+	return out, nil
 }
 
 // Shingle Token Filter
 
-func applyShingleFilter(tokens []Token, minSize, maxSize int, outputUnigrams, outputUnigramsIfNoShingles bool, sep, filler string) []Token {
+func applyShingleFilter(tokens []Token, minSize, maxSize int, outputUnigrams, outputUnigramsIfNoShingles bool, sep, filler string, budget *tokenStreamBudget) ([]Token, error) {
 	if len(tokens) == 0 {
-		return nil
+		return nil, nil
 	}
 	type slot struct {
 		term     string
@@ -305,6 +349,9 @@ func applyShingleFilter(tokens []Token, minSize, maxSize int, outputUnigrams, ou
 	for i, tok := range tokens {
 		if i > 0 {
 			gap := tok.Position - tokens[i-1].Position - 1
+			if gap > maxSize {
+				gap = maxSize
+			}
 			for g := 0; g < gap; g++ {
 				slots = append(slots, slot{
 					term:     filler,
@@ -314,7 +361,11 @@ func applyShingleFilter(tokens []Token, minSize, maxSize int, outputUnigrams, ou
 				})
 			}
 		} else if tok.Position > 0 {
-			for g := 0; g < tok.Position; g++ {
+			gap := tok.Position
+			if gap > maxSize {
+				gap = maxSize
+			}
+			for g := 0; g < gap; g++ {
 				slots = append(slots, slot{
 					term:     filler,
 					startOff: tok.StartOffset,
@@ -339,6 +390,9 @@ func applyShingleFilter(tokens []Token, minSize, maxSize int, outputUnigrams, ou
 			u := slots[i].orig.clone()
 			u.Position = i
 			u.PositionLength = 1
+			if err := budget.addToken(u); err != nil {
+				return nil, err
+			}
 			out = append(out, u)
 		}
 		for sz := minSize; sz <= maxSize && i+sz <= len(slots); sz++ {
@@ -347,9 +401,14 @@ func applyShingleFilter(tokens []Token, minSize, maxSize int, outputUnigrams, ou
 			parts := make([]string, sz)
 			startOff := -1
 			endOff := 0
+			termBytes := (sz - 1) * len(sep)
 			for k := 0; k < sz; k++ {
 				sl := slots[i+k]
 				parts[k] = sl.term
+				termBytes += len(sl.term)
+				if termBytes > MaxTokenTermBytes {
+					return nil, newIllegalArgError(fmt.Sprintf("token term length [%d] exceeds maximum allowed [%d] bytes", termBytes, MaxTokenTermBytes))
+				}
 				if !sl.isFiller {
 					if !hasReal {
 						startOff = sl.startOff
@@ -361,8 +420,11 @@ func applyShingleFilter(tokens []Token, minSize, maxSize int, outputUnigrams, ou
 			if !hasReal {
 				continue
 			}
+			if err := budget.canAddOne(); err != nil {
+				return nil, err
+			}
 			shingleCount++
-			out = append(out, Token{
+			shTok := Token{
 				Term:           strings.Join(parts, sep),
 				StartOffset:    startOff,
 				EndOffset:      endOff,
@@ -370,16 +432,24 @@ func applyShingleFilter(tokens []Token, minSize, maxSize int, outputUnigrams, ou
 				Position:       i,
 				PositionLength: sz,
 				TermFrequency:  1,
-			})
+			}
+			if err := budget.addToken(shTok); err != nil {
+				return nil, err
+			}
+			out = append(out, shTok)
 		}
 	}
 
 	if shingleCount == 0 && !outputUnigrams && outputUnigramsIfNoShingles {
 		for _, tok := range tokens {
-			out = append(out, tok.clone())
+			cp := tok.clone()
+			if err := budget.addToken(cp); err != nil {
+				return nil, err
+			}
+			out = append(out, cp)
 		}
 	}
-	return out
+	return out, nil
 }
 
 // WordDelimiter & WordDelimiterGraph Token Filters
@@ -532,7 +602,7 @@ type wdSubword struct {
 	isDigit bool
 }
 
-func applyWordDelimiterFilter(tokens []Token, o wordDelimiterOpts) []Token {
+func applyWordDelimiterFilter(tokens []Token, o wordDelimiterOpts, budget *tokenStreamBudget) ([]Token, error) {
 	var out []Token
 	posDelta := 0
 
@@ -541,6 +611,9 @@ func applyWordDelimiterFilter(tokens []Token, o wordDelimiterOpts) []Token {
 		if tok.Keyword || o.protectedWords[tok.Term] {
 			cp := tok.clone()
 			cp.Position = basePos
+			if err := budget.addToken(cp); err != nil {
+				return nil, err
+			}
 			out = append(out, cp)
 			continue
 		}
@@ -555,6 +628,9 @@ func applyWordDelimiterFilter(tokens []Token, o wordDelimiterOpts) []Token {
 			if o.preserveOriginal {
 				cp := tok.clone()
 				cp.Position = basePos
+				if err := budget.addToken(cp); err != nil {
+					return nil, err
+				}
 				out = append(out, cp)
 			}
 			continue
@@ -566,6 +642,9 @@ func applyWordDelimiterFilter(tokens []Token, o wordDelimiterOpts) []Token {
 			if keep {
 				cp := tok.clone()
 				cp.Position = basePos
+				if err := budget.addToken(cp); err != nil {
+					return nil, err
+				}
 				out = append(out, cp)
 			}
 			continue
@@ -592,6 +671,14 @@ func applyWordDelimiterFilter(tokens []Token, o wordDelimiterOpts) []Token {
 		}
 
 		var tokEmitted []Token
+		emitToTok := func(em Token) error {
+			if err := budget.addToken(em); err != nil {
+				return err
+			}
+			tokEmitted = append(tokEmitted, em)
+			return nil
+		}
+
 		if o.preserveOriginal {
 			origCopy := tok.clone()
 			origCopy.Position = basePos
@@ -600,12 +687,17 @@ func applyWordDelimiterFilter(tokens []Token, o wordDelimiterOpts) []Token {
 			} else {
 				origCopy.PositionLength = 1
 			}
-			tokEmitted = append(tokEmitted, origCopy)
+			if err := emitToTok(origCopy); err != nil {
+				return nil, err
+			}
 		}
 
 		if o.catenateAll && len(subs) >= 2 {
 			var sb strings.Builder
 			for _, sw := range subs {
+				if sb.Len()+len(sw.text) > MaxTokenTermBytes {
+					return nil, newIllegalArgError(fmt.Sprintf("token term length exceeds maximum allowed [%d] bytes", MaxTokenTermBytes))
+				}
 				sb.WriteString(sw.text)
 			}
 			sOff, eOff := subOff(subs[0].rStart, subs[len(subs)-1].rEnd)
@@ -613,7 +705,7 @@ func applyWordDelimiterFilter(tokens []Token, o wordDelimiterOpts) []Token {
 			if o.isGraph {
 				pl = spanLen
 			}
-			tokEmitted = append(tokEmitted, Token{
+			if err := emitToTok(Token{
 				Term:           sb.String(),
 				StartOffset:    sOff,
 				EndOffset:      eOff,
@@ -621,13 +713,15 @@ func applyWordDelimiterFilter(tokens []Token, o wordDelimiterOpts) []Token {
 				Position:       basePos,
 				PositionLength: pl,
 				TermFrequency:  1,
-			})
+			}); err != nil {
+				return nil, err
+			}
 		}
 
 		// Emit individual parts & word/number run catenations
 		for idx, kp := range keptParts {
 			sOff, eOff := subOff(kp.rStart, kp.rEnd)
-			tokEmitted = append(tokEmitted, Token{
+			if err := emitToTok(Token{
 				Term:           kp.text,
 				StartOffset:    sOff,
 				EndOffset:      eOff,
@@ -635,7 +729,9 @@ func applyWordDelimiterFilter(tokens []Token, o wordDelimiterOpts) []Token {
 				Position:       basePos + idx,
 				PositionLength: 1,
 				TermFrequency:  1,
-			})
+			}); err != nil {
+				return nil, err
+			}
 		}
 
 		if o.catenateWords || o.catenateNumbers {
@@ -657,12 +753,15 @@ func applyWordDelimiterFilter(tokens []Token, o wordDelimiterOpts) []Token {
 						sj++
 					}
 					if sj-si >= 2 {
-						var sb strings.Builder
-						for k := si; k < sj; k++ {
-							sb.WriteString(subs[k].text)
-						}
 						// Avoid duplicate if catenateAll already emitted full span
 						if !o.catenateAll || si != 0 || sj != len(subs) {
+							var sb strings.Builder
+							for k := si; k < sj; k++ {
+								if sb.Len()+len(subs[k].text) > MaxTokenTermBytes {
+									return nil, newIllegalArgError(fmt.Sprintf("token term length exceeds maximum allowed [%d] bytes", MaxTokenTermBytes))
+								}
+								sb.WriteString(subs[k].text)
+							}
 							sOff, eOff := subOff(subs[si].rStart, subs[sj-1].rEnd)
 							startP := basePos + partPosIdx[si]
 							pl := 1
@@ -672,7 +771,7 @@ func applyWordDelimiterFilter(tokens []Token, o wordDelimiterOpts) []Token {
 									pl = endP - startP
 								}
 							}
-							tokEmitted = append(tokEmitted, Token{
+							if err := emitToTok(Token{
 								Term:           sb.String(),
 								StartOffset:    sOff,
 								EndOffset:      eOff,
@@ -680,7 +779,9 @@ func applyWordDelimiterFilter(tokens []Token, o wordDelimiterOpts) []Token {
 								Position:       startP,
 								PositionLength: pl,
 								TermFrequency:  1,
-							})
+							}); err != nil {
+								return nil, err
+							}
 						}
 					}
 					si = sj
@@ -704,7 +805,7 @@ func applyWordDelimiterFilter(tokens []Token, o wordDelimiterOpts) []Token {
 			posDelta += len(keptParts) - 1
 		}
 	}
-	return out
+	return out, nil
 }
 
 func splitWordDelimiterSubwords(rs []rune, o wordDelimiterOpts) []wdSubword {
@@ -765,9 +866,9 @@ func splitWordDelimiterSubwords(rs []rune, o wordDelimiterOpts) []wdSubword {
 
 // CommonGrams Token Filter
 
-func applyCommonGrams(tokens []Token, commonSet map[string]bool, ignoreCase bool, queryMode bool) []Token {
+func applyCommonGrams(tokens []Token, commonSet map[string]bool, ignoreCase bool, queryMode bool, budget *tokenStreamBudget) ([]Token, error) {
 	if len(tokens) == 0 {
-		return nil
+		return nil, nil
 	}
 	isCommon := func(term string) bool {
 		if ignoreCase {
@@ -779,9 +880,16 @@ func applyCommonGrams(tokens []Token, commonSet map[string]bool, ignoreCase bool
 	if !queryMode {
 		var out []Token
 		for i, tok := range tokens {
-			out = append(out, tok.clone())
+			cp := tok.clone()
+			if err := budget.addToken(cp); err != nil {
+				return nil, err
+			}
+			out = append(out, cp)
 			if i+1 < len(tokens) && tokens[i+1].Position == tok.Position+1 && (isCommon(tok.Term) || isCommon(tokens[i+1].Term)) {
-				out = append(out, Token{
+				if len(tok.Term)+1+len(tokens[i+1].Term) > MaxTokenTermBytes {
+					return nil, newIllegalArgError(fmt.Sprintf("token term length exceeds maximum allowed [%d] bytes", MaxTokenTermBytes))
+				}
+				gram := Token{
 					Term:           tok.Term + "_" + tokens[i+1].Term,
 					StartOffset:    tok.StartOffset,
 					EndOffset:      tokens[i+1].EndOffset,
@@ -789,22 +897,33 @@ func applyCommonGrams(tokens []Token, commonSet map[string]bool, ignoreCase bool
 					Position:       tok.Position,
 					PositionLength: 1,
 					TermFrequency:  1,
-				})
+				}
+				if err := budget.addToken(gram); err != nil {
+					return nil, err
+				}
+				out = append(out, gram)
 			}
 		}
-		return out
+		return out, nil
 	}
 
 	// query_mode: true (CommonGramsQueryFilter)
 	if len(tokens) == 1 {
-		return []Token{tokens[0].clone()}
+		cp := tokens[0].clone()
+		if err := budget.addToken(cp); err != nil {
+			return nil, err
+		}
+		return []Token{cp}, nil
 	}
 	var out []Token
 	pos := 0
 	consumed := make([]bool, len(tokens))
 	for i := 0; i < len(tokens); i++ {
 		if i+1 < len(tokens) && tokens[i+1].Position == tokens[i].Position+1 && (isCommon(tokens[i].Term) || isCommon(tokens[i+1].Term)) {
-			out = append(out, Token{
+			if len(tokens[i].Term)+1+len(tokens[i+1].Term) > MaxTokenTermBytes {
+				return nil, newIllegalArgError(fmt.Sprintf("token term length exceeds maximum allowed [%d] bytes", MaxTokenTermBytes))
+			}
+			gram := Token{
 				Term:           tokens[i].Term + "_" + tokens[i+1].Term,
 				StartOffset:    tokens[i].StartOffset,
 				EndOffset:      tokens[i+1].EndOffset,
@@ -812,26 +931,37 @@ func applyCommonGrams(tokens []Token, commonSet map[string]bool, ignoreCase bool
 				Position:       pos,
 				PositionLength: 1,
 				TermFrequency:  1,
-			})
+			}
+			if err := budget.addToken(gram); err != nil {
+				return nil, err
+			}
+			out = append(out, gram)
 			pos++
 			consumed[i] = true
 			consumed[i+1] = true
 		} else if !consumed[i] && !isCommon(tokens[i].Term) {
 			cp := tokens[i].clone()
 			cp.Position = pos
+			if err := budget.addToken(cp); err != nil {
+				return nil, err
+			}
 			out = append(out, cp)
 			pos++
 		}
 	}
-	return out
+	return out, nil
 }
 
 // Decompounder Filter
 
-func applyDecompounder(tokens []Token, dict map[string]bool, minWord, minSub, maxSub int, onlyLongest bool) []Token {
+func applyDecompounder(tokens []Token, dict map[string]bool, minWord, minSub, maxSub int, onlyLongest bool, budget *tokenStreamBudget) ([]Token, error) {
 	var out []Token
 	for _, tok := range tokens {
-		out = append(out, tok.clone())
+		orig := tok.clone()
+		if err := budget.addToken(orig); err != nil {
+			return nil, err
+		}
+		out = append(out, orig)
 		rs := []rune(tok.Term)
 		n := len(rs)
 		if n < minWord || len(dict) == 0 {
@@ -853,20 +983,32 @@ func applyDecompounder(tokens []Token, dict map[string]bool, minWord, minSub, ma
 					if onlyLongest {
 						longestEnd = end
 					} else {
+						if err := budget.canAddOne(); err != nil {
+							return nil, err
+						}
 						cp := tok.clone()
 						cp.Term = string(rs[i:end])
+						if err := budget.addToken(cp); err != nil {
+							return nil, err
+						}
 						out = append(out, cp)
 					}
 				}
 			}
 			if onlyLongest && longestEnd > i {
+				if err := budget.canAddOne(); err != nil {
+					return nil, err
+				}
 				cp := tok.clone()
 				cp.Term = string(rs[i:longestEnd])
+				if err := budget.addToken(cp); err != nil {
+					return nil, err
+				}
 				out = append(out, cp)
 			}
 		}
 	}
-	return out
+	return out, nil
 }
 
 // Synonym, SynonymGraph & FlattenGraph Filters
@@ -942,7 +1084,7 @@ func buildSynonymTokenFilter(displayName, normType string, isGraph bool, def map
 	return &compiledTokenFilter{
 		name: displayName,
 		typ:  normType,
-		apply: func(tokens []Token) ([]Token, error) {
+		apply: func(tokens []Token, budget *tokenStreamBudget) ([]Token, error) {
 			entries := staticCompiled
 			if strings.TrimSpace(synSet) != "" {
 				var rawLines []string
@@ -964,31 +1106,32 @@ func buildSynonymTokenFilter(displayName, normType string, isGraph bool, def map
 				}
 			}
 			if len(entries) == 0 || len(tokens) == 0 {
+				if err := budget.addSlice(tokens); err != nil {
+					return nil, err
+				}
 				return tokens, nil
 			}
-			if isGraph {
-				return applySynonymGraph(tokens, entries), nil
-			}
-			return applySynonymFlat(tokens, entries), nil
+			return applySynonymFilter(tokens, entries, isGraph, budget)
 		},
 	}, nil
 }
 
 func buildSynonymPhraseAnalyzer(def map[string]any, bctx filterBuildContext) (func(string) ([]string, error), error) {
+	maxTok := effectiveMaxTokenCount(bctx.cfg)
 	if anName, ok := def["analyzer"].(string); ok && strings.TrimSpace(anName) != "" {
+		trimmedAn := strings.TrimSpace(anName)
+		targetAn, err := resolveNamedAnalyzerWithCtx(trimmedAn, bctx)
+		if err != nil {
+			return nil, err
+		}
 		return func(phrase string) ([]string, error) {
-			resp, err := Analyze(AnalyzeRequest{
-				Text:     []string{phrase},
-				Analyzer: anName,
-				Config:   bctx.cfg,
-				Options:  bctx.opts,
-			})
+			toks, err := runCompiledAnalyzerSingleText(targetAn, phrase, maxTok)
 			if err != nil {
 				return nil, err
 			}
-			terms := make([]string, 0, len(resp.Tokens))
-			for _, t := range resp.Tokens {
-				terms = append(terms, t.Token)
+			terms := make([]string, 0, len(toks))
+			for _, t := range toks {
+				terms = append(terms, t.Term)
 			}
 			return terms, nil
 		}, nil
@@ -999,7 +1142,7 @@ func buildSynonymPhraseAnalyzer(def map[string]any, bctx filterBuildContext) (fu
 	filts := bctx.precedingFilts
 	if tokName, ok := def["tokenizer"].(string); ok && strings.TrimSpace(tokName) != "" {
 		var err error
-		tok, err = resolveTokenizerStep(tokName, bctx.cfg)
+		tok, err = resolveTokenizerStepWithOpts(tokName, bctx.cfg, bctx.opts)
 		if err != nil {
 			return nil, err
 		}
@@ -1016,12 +1159,18 @@ func buildSynonymPhraseAnalyzer(def map[string]any, bctx filterBuildContext) (fu
 	return func(phrase string) ([]string, error) {
 		cs := newCharStream(phrase, 0)
 		for _, cf := range chars {
-			cs = cf.apply(cs)
+			var cfErr error
+			cs, cfErr = cf.apply(cs)
+			if cfErr != nil {
+				return nil, cfErr
+			}
 		}
-		toks := tok.tokenize(cs, 0)
+		toks, err := tok.tokenize(cs, 0, newTokenStreamBudget(maxTok))
+		if err != nil {
+			return nil, err
+		}
 		for _, tf := range filts {
-			var err error
-			toks, err = tf.apply(toks)
+			toks, err = tf.apply(toks, newTokenStreamBudget(maxTok))
 			if err != nil {
 				return nil, err
 			}
@@ -1034,23 +1183,34 @@ func buildSynonymPhraseAnalyzer(def map[string]any, bctx filterBuildContext) (fu
 	}, nil
 }
 
+const (
+	maxTermsPerSynonymRule     = 1024
+	maxCompiledSynonymMappings = 65536
+)
+
 func compileSynonymEntries(lines []string, format string, expand, lenient bool, analyzePhrase func(string) ([]string, error)) ([]synonymEntry, error) {
 	if format == "wordnet" {
 		return compileWordNetSynonyms(lines, expand, lenient, analyzePhrase)
 	}
 	type mergedRule struct {
-		src      []string
-		targets  [][]string
-		keepOrig bool
+		src         []string
+		targets     [][]string
+		seenTargets map[string]bool
+		keepOrig    bool
 	}
 	var order []string
 	byKey := make(map[string]*mergedRule)
+	totalMappings := 0
 
-	addMapping := func(src []string, dst []string, keepOrig bool) {
+	addMapping := func(src []string, dst []string, keepOrig bool) error {
 		key := strings.Join(src, "\x00")
 		mr, exists := byKey[key]
 		if !exists {
-			mr = &mergedRule{src: src, keepOrig: keepOrig}
+			mr = &mergedRule{
+				src:         src,
+				seenTargets: make(map[string]bool),
+				keepOrig:    keepOrig,
+			}
 			byKey[key] = mr
 			order = append(order, key)
 		} else if !keepOrig {
@@ -1060,14 +1220,19 @@ func compileSynonymEntries(lines []string, format string, expand, lenient bool, 
 			if !mr.keepOrig {
 				mr.keepOrig = true
 			}
-			return
+			return nil
 		}
-		for _, ex := range mr.targets {
-			if slicesEqualStr(ex, dst) {
-				return
-			}
+		dstKey := strings.Join(dst, "\x00")
+		if mr.seenTargets[dstKey] {
+			return nil
 		}
+		totalMappings++
+		if totalMappings > maxCompiledSynonymMappings {
+			return newIllegalArgError(fmt.Sprintf("Synonym rules exceed maximum compiled mappings [%d]", maxCompiledSynonymMappings))
+		}
+		mr.seenTargets[dstKey] = true
 		mr.targets = append(mr.targets, dst)
+		return nil
 	}
 
 	for _, raw := range lines {
@@ -1084,8 +1249,14 @@ func compileSynonymEntries(lines []string, format string, expand, lenient bool, 
 				}
 				return nil, newIllegalArgError(fmt.Sprintf("Invalid synonym rule [%s]", raw))
 			}
+			lhsParts := splitUnescapedComma(lhsRaw)
+			rhsParts := splitUnescapedComma(rhsRaw)
+			if len(lhsParts)+len(rhsParts) > maxTermsPerSynonymRule {
+				return nil, newIllegalArgError(fmt.Sprintf("Synonym rule exceeds maximum allowed terms [%d]", maxTermsPerSynonymRule))
+			}
+			ruleTerms := 0
 			var lhsPhrases [][]string
-			for _, part := range splitUnescapedComma(lhsRaw) {
+			for _, part := range lhsParts {
 				toks, err := analyzePhrase(unescapeSynonymPhrase(strings.TrimSpace(part)))
 				if err != nil {
 					if lenient {
@@ -1099,10 +1270,14 @@ func compileSynonymEntries(lines []string, format string, expand, lenient bool, 
 					}
 					return nil, newIllegalArgError(fmt.Sprintf("Synonym phrase [%s] analyzed to empty token list", part))
 				}
+				ruleTerms += len(toks)
+				if ruleTerms > maxTermsPerSynonymRule {
+					return nil, newIllegalArgError(fmt.Sprintf("Synonym rule exceeds maximum allowed terms [%d]", maxTermsPerSynonymRule))
+				}
 				lhsPhrases = append(lhsPhrases, toks)
 			}
 			var rhsPhrases [][]string
-			for _, part := range splitUnescapedComma(rhsRaw) {
+			for _, part := range rhsParts {
 				toks, err := analyzePhrase(unescapeSynonymPhrase(strings.TrimSpace(part)))
 				if err != nil {
 					if lenient {
@@ -1116,11 +1291,17 @@ func compileSynonymEntries(lines []string, format string, expand, lenient bool, 
 					}
 					return nil, newIllegalArgError(fmt.Sprintf("Synonym replacement [%s] analyzed to empty token list", part))
 				}
+				ruleTerms += len(toks)
+				if ruleTerms > maxTermsPerSynonymRule {
+					return nil, newIllegalArgError(fmt.Sprintf("Synonym rule exceeds maximum allowed terms [%d]", maxTermsPerSynonymRule))
+				}
 				rhsPhrases = append(rhsPhrases, toks)
 			}
 			for _, lp := range lhsPhrases {
 				for _, rp := range rhsPhrases {
-					addMapping(lp, rp, false)
+					if err := addMapping(lp, rp, false); err != nil {
+						return nil, err
+					}
 				}
 			}
 			continue
@@ -1128,24 +1309,26 @@ func compileSynonymEntries(lines []string, format string, expand, lenient bool, 
 
 		// Equivalent synonym group: "a, b, c"
 		parts := splitUnescapedComma(line)
+		if len(parts) > maxTermsPerSynonymRule {
+			return nil, newIllegalArgError(fmt.Sprintf("Synonym rule exceeds maximum allowed terms [%d]", maxTermsPerSynonymRule))
+		}
 		if len(parts) < 2 {
 			if lenient {
 				continue
 			}
-			// Note: look at 20_analysis_stats_synonyms.yml line 26: `synonyms: ["foo bar", "bar => baz"]`!
-			// Wait: in Solr SynonymParser, a single entry WITHOUT comma like `"foo bar"` in `expand: true` is VALID in Solr!
-			// Wait: what does Solr SynonymParser do on `"foo bar"` without comma? Let's check!
-			// In Lucene SolrSynonymParser, `split(line, ",")` of `"foo bar"` has 1 phrase `["foo", "bar"]` mapping to itself (a no-op rule, NOT an error)!
-			// THANK GOODNESS WE REMEMBERED 20_analysis_stats_synonyms.yml LINE 26 (`synonyms: ["foo bar", "bar => baz"]`)!!
 			if len(parts) == 1 && strings.TrimSpace(parts[0]) != "" {
-				_, err := analyzePhrase(unescapeSynonymPhrase(strings.TrimSpace(parts[0])))
+				toks, err := analyzePhrase(unescapeSynonymPhrase(strings.TrimSpace(parts[0])))
 				if err != nil && !lenient {
 					return nil, err
+				}
+				if len(toks) > maxTermsPerSynonymRule {
+					return nil, newIllegalArgError(fmt.Sprintf("Synonym rule exceeds maximum allowed terms [%d]", maxTermsPerSynonymRule))
 				}
 				continue
 			}
 			return nil, newIllegalArgError(fmt.Sprintf("Invalid synonym rule [%s]", raw))
 		}
+		ruleTerms := 0
 		var phrases [][]string
 		for _, part := range parts {
 			toks, err := analyzePhrase(unescapeSynonymPhrase(strings.TrimSpace(part)))
@@ -1161,6 +1344,10 @@ func compileSynonymEntries(lines []string, format string, expand, lenient bool, 
 				}
 				return nil, newIllegalArgError(fmt.Sprintf("Synonym phrase [%s] analyzed to empty token list", part))
 			}
+			ruleTerms += len(toks)
+			if ruleTerms > maxTermsPerSynonymRule {
+				return nil, newIllegalArgError(fmt.Sprintf("Synonym rule exceeds maximum allowed terms [%d]", maxTermsPerSynonymRule))
+			}
 			phrases = append(phrases, toks)
 		}
 		if len(phrases) < 2 {
@@ -1169,13 +1356,17 @@ func compileSynonymEntries(lines []string, format string, expand, lenient bool, 
 		if expand {
 			for _, src := range phrases {
 				for _, dst := range phrases {
-					addMapping(src, dst, true)
+					if err := addMapping(src, dst, true); err != nil {
+						return nil, err
+					}
 				}
 			}
 		} else {
 			canonical := phrases[0]
 			for i := 1; i < len(phrases); i++ {
-				addMapping(phrases[i], canonical, false)
+				if err := addMapping(phrases[i], canonical, false); err != nil {
+					return nil, err
+				}
 			}
 		}
 	}
@@ -1288,8 +1479,15 @@ func slicesEqualStr(a, b []string) bool {
 	return true
 }
 
+func applySynonymFilter(tokens []Token, entries []synonymEntry, isGraph bool, budget *tokenStreamBudget) ([]Token, error) {
+	if isGraph {
+		return applySynonymGraph(tokens, entries, budget)
+	}
+	return applySynonymFlat(tokens, entries, budget)
+}
+
 // applySynonymFlat implements Lucene's classic (non-graph) SynonymFilter.
-func applySynonymFlat(tokens []Token, entries []synonymEntry) []Token {
+func applySynonymFlat(tokens []Token, entries []synonymEntry, budget *tokenStreamBudget) ([]Token, error) {
 	var out []Token
 	n := len(tokens)
 	posShift := 0
@@ -1306,6 +1504,9 @@ func applySynonymFlat(tokens []Token, entries []synonymEntry) []Token {
 		if matchedIdx < 0 {
 			cp := tokens[i].clone()
 			cp.Position += posShift
+			if err := budget.addToken(cp); err != nil {
+				return nil, err
+			}
 			out = append(out, cp)
 			i++
 			continue
@@ -1318,8 +1519,6 @@ func applySynonymFlat(tokens []Token, entries []synonymEntry) []Token {
 		endOff := tokens[i+m-1].EndOffset
 
 		if ent.keepOrig {
-			// Original tokens stay at basePos .. basePos+m-1; single-token synonyms sit at basePos with positionLength = m!
-			// Multi-token synonyms lay across basePos .. basePos+k-1.
 			type posBucket struct {
 				toks []Token
 			}
@@ -1337,11 +1536,14 @@ func applySynonymFlat(tokens []Token, entries []synonymEntry) []Token {
 			}
 			for _, tgt := range ent.targets {
 				for k, term := range tgt {
+					if err := budget.canAddOne(); err != nil {
+						return nil, err
+					}
 					pl := 1
 					if len(tgt) == 1 && m > 1 {
 						pl = m
 					}
-					buckets[k].toks = append(buckets[k].toks, Token{
+					synTok := Token{
 						Term:           term,
 						StartOffset:    startOff,
 						EndOffset:      endOff,
@@ -1349,11 +1551,17 @@ func applySynonymFlat(tokens []Token, entries []synonymEntry) []Token {
 						Position:       basePos + k,
 						PositionLength: pl,
 						TermFrequency:  1,
-					})
+					}
+					buckets[k].toks = append(buckets[k].toks, synTok)
 				}
 			}
 			for _, b := range buckets {
-				out = append(out, b.toks...)
+				for _, bt := range b.toks {
+					if err := budget.addToken(bt); err != nil {
+						return nil, err
+					}
+					out = append(out, bt)
+				}
 			}
 			i += m
 			continue
@@ -1369,6 +1577,9 @@ func applySynonymFlat(tokens []Token, entries []synonymEntry) []Token {
 		buckets := make([][]Token, maxTgtLen)
 		for _, tgt := range ent.targets {
 			for k, term := range tgt {
+				if err := budget.canAddOne(); err != nil {
+					return nil, err
+				}
 				buckets[k] = append(buckets[k], Token{
 					Term:           term,
 					StartOffset:    startOff,
@@ -1381,16 +1592,21 @@ func applySynonymFlat(tokens []Token, entries []synonymEntry) []Token {
 			}
 		}
 		for _, b := range buckets {
-			out = append(out, b...)
+			for _, bt := range b {
+				if err := budget.addToken(bt); err != nil {
+					return nil, err
+				}
+				out = append(out, bt)
+			}
 		}
 		posShift += maxTgtLen - m
 		i += m
 	}
-	return out
+	return out, nil
 }
 
 // applySynonymGraph implements Lucene's SynonymGraphFilter with exact internal node allocation!
-func applySynonymGraph(tokens []Token, entries []synonymEntry) []Token {
+func applySynonymGraph(tokens []Token, entries []synonymEntry, budget *tokenStreamBudget) ([]Token, error) {
 	var out []Token
 	n := len(tokens)
 	curNode := 0
@@ -1418,6 +1634,9 @@ func applySynonymGraph(tokens []Token, entries []synonymEntry) []Token {
 			cp := tokens[i].clone()
 			cp.Position = curNode
 			cp.PositionLength = 1
+			if err := budget.addToken(cp); err != nil {
+				return nil, err
+			}
 			out = append(out, cp)
 			curNode++
 			i++
@@ -1462,6 +1681,9 @@ func applySynonymGraph(tokens []Token, entries []synonymEntry) []Token {
 		for tIdx, tgt := range ent.targets {
 			intNodes := targetInternalNodes[tIdx]
 			for k, term := range tgt {
+				if err := budget.canAddOne(); err != nil {
+					return nil, err
+				}
 				u := startNode
 				if k > 0 {
 					u = intNodes[k-1]
@@ -1513,13 +1735,16 @@ func applySynonymGraph(tokens []Token, entries []synonymEntry) []Token {
 			return batch[a].pathOrder < batch[b].pathOrder
 		})
 		for _, item := range batch {
+			if err := budget.addToken(item.tok); err != nil {
+				return nil, err
+			}
 			out = append(out, item.tok)
 		}
 
 		curNode = endNode
 		i += m
 	}
-	return out
+	return out, nil
 }
 
 func matchTokenPhrase(toks []Token, phrase []string) bool {
@@ -1538,64 +1763,74 @@ func matchTokenPhrase(toks []Token, phrase []string) bool {
 }
 
 // applyFlattenGraph implements Lucene's FlattenGraphFilter: compacts sparse internal DAG node IDs
-// so every node's output position is the longest step-distance from the root, then stably orders by Position.
+// via dense coordinate compression (O(|tokens| log |tokens|) memory) so every node's output position
+// is the longest step-distance from the root, then stably orders by Position.
 func applyFlattenGraph(tokens []Token) []Token {
 	if len(tokens) == 0 {
 		return nil
 	}
-	maxNode := 0
-	for _, tok := range tokens {
-		pl := tok.PositionLength
-		if pl < 1 {
-			pl = 1
-		}
-		end := tok.Position + pl
-		if end > maxNode {
-			maxNode = end
-		}
-	}
 
-	outPos := make([]int, maxNode+1)
-	seen := make([]bool, maxNode+1)
-	firstNode := tokens[0].Position
-	outPos[firstNode] = firstNode
-	seen[firstNode] = true
-
-	// Relax DAG edges in ascending start-node order.
 	sorted := make([]Token, len(tokens))
+	rawNodes := make([]int, 0, len(tokens)*2)
 	for i, t := range tokens {
 		sorted[i] = t.clone()
 		if sorted[i].PositionLength < 1 {
 			sorted[i].PositionLength = 1
 		}
+		u := sorted[i].Position
+		v := u + sorted[i].PositionLength
+		rawNodes = append(rawNodes, u, v)
 	}
+	sort.Ints(rawNodes)
+	uniqueNodes := rawNodes[:0]
+	for i, n := range rawNodes {
+		if i == 0 || n != rawNodes[i-1] {
+			uniqueNodes = append(uniqueNodes, n)
+		}
+	}
+	kNodes := len(uniqueNodes)
+	nodeToRank := make(map[int]int, kNodes)
+	for r, n := range uniqueNodes {
+		nodeToRank[n] = r
+	}
+
 	sort.SliceStable(sorted, func(i, j int) bool {
 		return sorted[i].Position < sorted[j].Position
 	})
 
+	outPos := make([]int, kNodes)
+	seen := make([]bool, kNodes)
+	firstNode := sorted[0].Position
+	rFirst := nodeToRank[firstNode]
+	outPos[rFirst] = firstNode
+	seen[rFirst] = true
+
+	// Relax DAG edges in ascending start-node order.
 	lastStart := firstNode
 	lastOut := firstNode
 	for _, tok := range sorted {
 		u := tok.Position
-		if !seen[u] {
+		ru := nodeToRank[u]
+		if !seen[ru] {
 			gap := u - lastStart
 			if gap < 1 {
 				gap = 1
 			}
-			outPos[u] = lastOut + gap
-			seen[u] = true
+			outPos[ru] = lastOut + gap
+			seen[ru] = true
 		}
 		if u > lastStart {
 			lastStart = u
-			if outPos[u] > lastOut {
-				lastOut = outPos[u]
+			if outPos[ru] > lastOut {
+				lastOut = outPos[ru]
 			}
 		}
 		v := u + tok.PositionLength
-		cand := outPos[u] + 1
-		if !seen[v] || cand > outPos[v] {
-			outPos[v] = cand
-			seen[v] = true
+		rv := nodeToRank[v]
+		cand := outPos[ru] + 1
+		if !seen[rv] || cand > outPos[rv] {
+			outPos[rv] = cand
+			seen[rv] = true
 		}
 	}
 
@@ -1612,8 +1847,10 @@ func applyFlattenGraph(tokens []Token) []Token {
 		}
 		u := cp.Position
 		v := u + pl
-		cp.Position = outPos[u]
-		newPL := outPos[v] - outPos[u]
+		ru := nodeToRank[u]
+		rv := nodeToRank[v]
+		cp.Position = outPos[ru]
+		newPL := outPos[rv] - outPos[ru]
 		if newPL < 1 {
 			newPL = 1
 		}

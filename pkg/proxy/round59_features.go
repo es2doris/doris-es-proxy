@@ -2483,6 +2483,9 @@ func parseIngestDateValueWithLocaleRound59(rawVal string, formats []any, tzName,
 		return time.Time{}, "", err
 	}
 	normInput := normalizeLocalizedDateInputToEnglishRound59(rawVal, lang)
+	if wt, okWeek := parseIngestWeekDateRound63(normInput, formats, tzName); okWeek {
+		return wt, lang, nil
+	}
 	t, pErr := parseIngestDateValueWithRawLocaleRound60(normInput, formats, tzName, rawLocale)
 	return t, lang, pErr
 }

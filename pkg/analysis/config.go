@@ -102,23 +102,23 @@ func ParseIndexAnalysisConfig(rawSettings map[string]any, opts Options) (*IndexA
 	if analyzeMap, ok := expanded["analyze"].(map[string]any); ok {
 		if rawMax, hasMax := analyzeMap["max_token_count"]; hasMax {
 			n, valid := extractInt(rawMax)
-			if !valid || n < 1 {
-				return nil, newIllegalArgError("index.analyze.max_token_count must be a positive integer")
+			if !valid || n < 1 || n > MaxAllowedTokenCount {
+				return nil, newIllegalArgError(fmt.Sprintf("index.analyze.max_token_count must be between 1 and %d", MaxAllowedTokenCount))
 			}
 			cfg.MaxTokenCount = n
 		}
 	}
 	if rawND, hasND := expanded["max_ngram_diff"]; hasND {
 		n, valid := extractInt(rawND)
-		if !valid || n < 0 {
-			return nil, newIllegalArgError("index.max_ngram_diff must be >= 0")
+		if !valid || n < 0 || n > MaxAllowedNGramDiff {
+			return nil, newIllegalArgError(fmt.Sprintf("index.max_ngram_diff must be between 0 and %d", MaxAllowedNGramDiff))
 		}
 		cfg.MaxNGramDiff = n
 	}
 	if rawSD, hasSD := expanded["max_shingle_diff"]; hasSD {
 		n, valid := extractInt(rawSD)
-		if !valid || n < 0 {
-			return nil, newIllegalArgError("index.max_shingle_diff must be >= 0")
+		if !valid || n < 0 || n > MaxAllowedShingleDiff {
+			return nil, newIllegalArgError(fmt.Sprintf("index.max_shingle_diff must be between 0 and %d", MaxAllowedShingleDiff))
 		}
 		cfg.MaxShingleDiff = n
 	}
@@ -154,7 +154,7 @@ func ParseIndexAnalysisConfig(rawSettings map[string]any, opts Options) (*IndexA
 		if strings.TrimSpace(typStr) == "" {
 			return nil, newIllegalArgError(fmt.Sprintf("Tokenizer [%s] must specify [type]", name))
 		}
-		if _, err := buildTokenizer(name, typStr, def, cfg.MaxNGramDiff); err != nil {
+		if _, err := buildTokenizerWithOpts(name, typStr, def, cfg.MaxNGramDiff, opts); err != nil {
 			return nil, err
 		}
 	}
@@ -163,7 +163,11 @@ func ParseIndexAnalysisConfig(rawSettings map[string]any, opts Options) (*IndexA
 		if strings.TrimSpace(typStr) == "" {
 			return nil, newIllegalArgError(fmt.Sprintf("Token filter [%s] must specify [type]", name))
 		}
-		if _, err := buildTokenFilter(name, typStr, def, false, filterBuildContext{cfg: cfg, opts: opts}); err != nil {
+		initCtx, err := (filterBuildContext{cfg: cfg, opts: opts}).enterFilter(name)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := buildTokenFilter(name, typStr, def, false, initCtx); err != nil {
 			return nil, err
 		}
 	}
@@ -175,7 +179,11 @@ func ParseIndexAnalysisConfig(rawSettings map[string]any, opts Options) (*IndexA
 		cfg.compiledNormalizers[name] = norm
 	}
 	for name, def := range cfg.AnalyzerDefs {
-		an, err := compileDefinedAnalyzer(name, def, cfg, opts)
+		initCtx, err := (filterBuildContext{cfg: cfg, opts: opts}).enterAnalyzer(name)
+		if err != nil {
+			return nil, err
+		}
+		an, err := compileDefinedAnalyzerWithCtx(name, def, initCtx)
 		if err != nil {
 			return nil, err
 		}
@@ -195,7 +203,7 @@ func (c *IndexAnalysisConfig) HasAnalyzer(name string) bool {
 	return isBuiltInAnalyzerType(name)
 }
 
-// HasNormalizer reports whether name is a custom normalizer in c or the built-in `lowercase`/`uppercase` normalizer.
+// HasNormalizer reports whether name is a custom normalizer in c or a built-in normalizer.
 func (c *IndexAnalysisConfig) HasNormalizer(name string) bool {
 	if c != nil {
 		if _, ok := c.NormalizerDefs[name]; ok {
@@ -203,7 +211,7 @@ func (c *IndexAnalysisConfig) HasNormalizer(name string) bool {
 		}
 	}
 	ln := strings.ToLower(strings.TrimSpace(name))
-	return ln == "lowercase" || ln == "uppercase" || ln == "asciifolding"
+	return ln == "lowercase" || ln == "uppercase" || ln == "asciifolding" || ln == "icu_normalizer" || ln == "icu_folding"
 }
 
 // UsesSynonymSet returns sorted names of custom analyzers in c that reference a filter with `synonyms_set == setID`.
@@ -484,11 +492,11 @@ func ComputeClusterAnalysisStats(indices []IndexStatsInput) ClusterAnalysisStats
 	}
 }
 
-func compileDefinedAnalyzer(name string, def map[string]any, cfg *IndexAnalysisConfig, opts Options) (*compiledAnalyzer, error) {
+func compileDefinedAnalyzerWithCtx(name string, def map[string]any, bctx filterBuildContext) (*compiledAnalyzer, error) {
 	typStr, _ := def["type"].(string)
 	normType := strings.ToLower(strings.TrimSpace(typStr))
 	if normType != "" && normType != "custom" {
-		return buildBuiltInOrTypedAnalyzer(name, normType, def, cfg, opts)
+		return buildBuiltInOrTypedAnalyzerWithCtx(name, normType, def, bctx)
 	}
 	// Custom analyzer
 	tokSpec := def["tokenizer"]
@@ -504,7 +512,7 @@ func compileDefinedAnalyzer(name string, def map[string]any, cfg *IndexAnalysisC
 	if len(filtSteps) == 0 {
 		filtSteps = extractFilterStepList(def["token_filter"])
 	}
-	cfs, tok, tfs, err := compileCustomChain(charSteps, tokSpec, filtSteps, false, cfg, opts)
+	cfs, tok, tfs, err := compileCustomChainWithCtx(charSteps, tokSpec, filtSteps, false, bctx)
 	if err != nil {
 		return nil, err
 	}
@@ -525,8 +533,12 @@ func compileDefinedNormalizer(name string, def map[string]any, cfg *IndexAnalysi
 	typStr, _ := def["type"].(string)
 	normType := strings.ToLower(strings.TrimSpace(typStr))
 	if normType != "" && normType != "custom" {
-		if normType == "lowercase" || normType == "uppercase" || normType == "asciifolding" {
-			cfs, tok, tfs, err := compileCustomChain(nil, "keyword", []any{normType}, true, cfg, opts)
+		if normType == "lowercase" || normType == "uppercase" || normType == "asciifolding" || normType == "icu_normalizer" || normType == "icu_folding" {
+			filterSpec := any(normType)
+			if def != nil && (normType == "icu_normalizer" || normType == "icu_folding") {
+				filterSpec = def
+			}
+			cfs, tok, tfs, err := compileCustomChain(nil, "keyword", []any{filterSpec}, true, cfg, opts)
 			if err != nil {
 				return nil, err
 			}
@@ -568,16 +580,32 @@ func compileCustomChain(
 	cfg *IndexAnalysisConfig,
 	opts Options,
 ) ([]*compiledCharFilter, *compiledTokenizer, []*compiledTokenFilter, error) {
+	return compileCustomChainWithCtx(charSteps, tokSpec, filtSteps, isNormalizer, filterBuildContext{cfg: cfg, opts: opts})
+}
+
+func compileCustomChainWithCtx(
+	charSteps []any,
+	tokSpec any,
+	filtSteps []any,
+	isNormalizer bool,
+	parentCtx filterBuildContext,
+) ([]*compiledCharFilter, *compiledTokenizer, []*compiledTokenFilter, error) {
+	if len(charSteps) > MaxFilterChainLength {
+		return nil, nil, nil, newIllegalArgError(fmt.Sprintf("char_filter chain length [%d] exceeds maximum allowed [%d]", len(charSteps), MaxFilterChainLength))
+	}
+	if len(filtSteps) > MaxFilterChainLength {
+		return nil, nil, nil, newIllegalArgError(fmt.Sprintf("filter chain length [%d] exceeds maximum allowed [%d]", len(filtSteps), MaxFilterChainLength))
+	}
 	cfs := make([]*compiledCharFilter, 0, len(charSteps))
 	for _, step := range charSteps {
-		cf, err := resolveCharFilterStep(step, cfg, opts)
+		cf, err := resolveCharFilterStep(step, parentCtx.cfg, parentCtx.opts)
 		if err != nil {
 			return nil, nil, nil, err
 		}
 		cfs = append(cfs, cf)
 	}
 
-	tok, err := resolveTokenizerStep(tokSpec, cfg)
+	tok, err := resolveTokenizerStepWithOpts(tokSpec, parentCtx.cfg, parentCtx.opts)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -585,11 +613,14 @@ func compileCustomChain(
 	tfs := make([]*compiledTokenFilter, 0, len(filtSteps))
 	for _, step := range filtSteps {
 		bctx := filterBuildContext{
-			cfg:            cfg,
-			opts:           opts,
-			precedingChars: cfs,
-			chainTokenizer: tok,
-			precedingFilts: append([]*compiledTokenFilter(nil), tfs...),
+			cfg:               parentCtx.cfg,
+			opts:              parentCtx.opts,
+			precedingChars:    cfs,
+			chainTokenizer:    tok,
+			precedingFilts:    append([]*compiledTokenFilter(nil), tfs...),
+			visitingFilters:   parentCtx.visitingFilters,
+			visitingAnalyzers: parentCtx.visitingAnalyzers,
+			depth:             parentCtx.depth,
 		}
 		tf, rawName, err := resolveTokenFilterStepWithRawName(step, bctx)
 		if err != nil {
@@ -625,7 +656,7 @@ func resolveCharFilterStep(step any, cfg *IndexAnalysisConfig, opts Options) (*c
 	}
 }
 
-func resolveTokenizerStep(spec any, cfg *IndexAnalysisConfig) (*compiledTokenizer, error) {
+func resolveTokenizerStepWithOpts(spec any, cfg *IndexAnalysisConfig, opts Options) (*compiledTokenizer, error) {
 	maxNGramDiff := DefaultMaxNGramDiff
 	if cfg != nil {
 		maxNGramDiff = cfg.MaxNGramDiff
@@ -636,16 +667,16 @@ func resolveTokenizerStep(spec any, cfg *IndexAnalysisConfig) (*compiledTokenize
 		if cfg != nil {
 			if def, ok := cfg.TokenizerDefs[name]; ok {
 				typStr, _ := def["type"].(string)
-				return buildTokenizer(name, typStr, def, maxNGramDiff)
+				return buildTokenizerWithOpts(name, typStr, def, maxNGramDiff, opts)
 			}
 		}
-		return buildTokenizer(name, name, nil, maxNGramDiff)
+		return buildTokenizerWithOpts(name, name, nil, maxNGramDiff, opts)
 	case map[string]any:
 		typStr, _ := v["type"].(string)
 		if strings.TrimSpace(typStr) == "" {
 			return nil, newIllegalArgError("Inline tokenizer requires [type]")
 		}
-		return buildTokenizer("__anonymous__"+typStr, typStr, v, maxNGramDiff)
+		return buildTokenizerWithOpts("__anonymous__"+typStr, typStr, v, maxNGramDiff, opts)
 	default:
 		return nil, newIllegalArgError(fmt.Sprintf("Invalid tokenizer specification [%v]", spec))
 	}
@@ -662,19 +693,32 @@ func resolveTokenFilterStepWithRawName(step any, bctx filterBuildContext) (*comp
 		name := strings.TrimSpace(v)
 		if bctx.cfg != nil {
 			if def, ok := bctx.cfg.FilterDefs[name]; ok {
+				subCtx, err := bctx.enterFilter(name)
+				if err != nil {
+					return nil, name, err
+				}
 				typStr, _ := def["type"].(string)
-				tf, err := buildTokenFilter(name, typStr, def, false, bctx)
+				tf, err := buildTokenFilter(name, typStr, def, false, subCtx)
 				return tf, name, err
 			}
 		}
-		tf, err := buildTokenFilter(name, name, nil, true, bctx)
+		if bctx.depth >= maxFilterNestingDepth {
+			return nil, name, newIllegalArgError(fmt.Sprintf("Token filter [%s] exceeds maximum nesting depth [%d]", name, maxFilterNestingDepth))
+		}
+		subCtx := bctx
+		subCtx.depth = bctx.depth + 1
+		tf, err := buildTokenFilter(name, name, nil, true, subCtx)
 		return tf, name, err
 	case map[string]any:
 		typStr, _ := v["type"].(string)
 		if strings.TrimSpace(typStr) == "" {
 			return nil, "", newIllegalArgError("Inline token filter requires [type]")
 		}
-		tf, err := buildTokenFilter("__anonymous__"+typStr, typStr, v, false, bctx)
+		subCtx, err := bctx.enterFilter("")
+		if err != nil {
+			return nil, typStr, err
+		}
+		tf, err := buildTokenFilter("__anonymous__"+typStr, typStr, v, false, subCtx)
 		return tf, typStr, err
 	default:
 		return nil, "", newIllegalArgError(fmt.Sprintf("Invalid token filter specification [%v]", step))
