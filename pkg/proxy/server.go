@@ -21294,10 +21294,16 @@ func collectScalarValuesAtPathWithNull(node any, path []string, nullValue any) [
 	}
 	switch curr := node.(type) {
 	case map[string]any:
-		if next, exists := curr[path[0]]; exists {
-			return collectScalarValuesAtPathWithNull(next, path[1:], nullValue)
+		if len(path) == 1 {
+			if next, exists := curr[path[0]]; exists {
+				return collectScalarValuesAtPathWithNull(next, nil, nullValue)
+			}
+			return nil
 		}
 		if len(path) > 1 {
+			if next, exists := curr[path[0]]; exists {
+				return collectScalarValuesAtPathWithNull(next, path[1:], nullValue)
+			}
 			if flat, exists := curr[strings.Join(path, ".")]; exists {
 				return collectScalarValuesAtPathWithNull(flat, nil, nullValue)
 			}

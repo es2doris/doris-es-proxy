@@ -655,3 +655,143 @@ func TestRound63_DorisSQLBackend_RoutingProjectionFallbackAndBEAllowlist(t *test
 		}
 	}
 }
+
+func TestRound63_StreamLoadClient_DorisFE307EmbeddedUserinfo(t *testing.T) {
+	t.Parallel()
+
+	loopbackLocations := []string{
+		"http://root:@127.0.0.1:8040/api/es_compat/orders/_stream_load",
+		"http://root%40default_cluster:@127.0.0.1:8040/api/es_compat/orders/_stream_load",
+		"http://default_cluster:root:@127.0.0.1:8040/api/es_compat/orders/_stream_load",
+	}
+	for _, loc := range loopbackLocations {
+		sl := NewStreamLoadClient(StreamLoadConfig{
+			FEHTTPEndpoint: "http://127.0.0.1:8030",
+			User:           "root",
+			Password:       "",
+			Database:       "es_compat",
+			Timeout:        2 * time.Second,
+		})
+		var beHits atomic.Int32
+		var gotAuth string
+		var sawUserinfo atomic.Bool
+		sl.httpClient.Transport = round63RoundTripFunc(func(req *http.Request) (*http.Response, error) {
+			if req.URL.Host == "127.0.0.1:8030" {
+				return newRound63JSONResponse(req, http.StatusTemporaryRedirect, map[string]string{
+					"Location": loc,
+				}, ""), nil
+			}
+			beHits.Add(1)
+			if req.URL.User != nil {
+				sawUserinfo.Store(true)
+			}
+			gotAuth = req.Header.Get("Authorization")
+			return newRound63JSONResponse(req, http.StatusOK, nil, `{"Status":"Success","NumberTotalRows":1,"NumberLoadedRows":1}`), nil
+		})
+		if err := sl.LoadNDJSON(context.Background(), "orders", []byte(`{"_id":"1"}`+"\n"), true); err != nil {
+			t.Fatalf("loc=%q: LoadNDJSON failed: %v", loc, err)
+		}
+		if beHits.Load() != 1 {
+			t.Fatalf("loc=%q: expected 1 BE hit, got %d", loc, beHits.Load())
+		}
+		if sawUserinfo.Load() {
+			t.Fatalf("loc=%q: expected req.URL.User stripped before BE request", loc)
+		}
+		if !strings.HasPrefix(gotAuth, "Basic ") {
+			t.Fatalf("loc=%q: expected Basic Authorization header forwarded, got %q", loc, gotAuth)
+		}
+		if cached, _ := sl.cachedBEBase.Load().(string); cached != "http://127.0.0.1:8040" {
+			t.Fatalf("loc=%q: cachedBEBase = %q, want http://127.0.0.1:8040", loc, cached)
+		}
+	}
+
+	matchingHTTPS := []string{
+		"https://doris_ingest:ingest_pw@doris-be-01.prod.example.com:8040/api/es_compat/orders/_stream_load",
+		"https://default_cluster:doris_ingest:ingest_pw@doris-be-01.prod.example.com:8040/api/es_compat/orders/_stream_load",
+	}
+	for _, loc := range matchingHTTPS {
+		sl := NewStreamLoadClient(StreamLoadConfig{
+			FEHTTPEndpoint: "https://doris-fe.prod.example.com:8030",
+			User:           "doris_ingest",
+			Password:       "ingest_pw",
+			Database:       "es_compat",
+			Timeout:        2 * time.Second,
+		})
+		sl.AllowBEHosts([]string{"doris-be-01.prod.example.com"})
+		var sawUserinfo atomic.Bool
+		sl.httpClient.Transport = round63RoundTripFunc(func(req *http.Request) (*http.Response, error) {
+			if req.URL.Host == "doris-fe.prod.example.com:8030" {
+				return newRound63JSONResponse(req, http.StatusTemporaryRedirect, map[string]string{
+					"Location": loc,
+				}, ""), nil
+			}
+			if req.URL.User != nil {
+				sawUserinfo.Store(true)
+			}
+			return newRound63JSONResponse(req, http.StatusOK, nil, `{"Status":"Success","NumberTotalRows":1,"NumberLoadedRows":1}`), nil
+		})
+		if err := sl.LoadNDJSON(context.Background(), "orders", []byte(`{"_id":"1"}`+"\n"), true); err != nil {
+			t.Fatalf("loc=%q: LoadNDJSON failed: %v", loc, err)
+		}
+		if sawUserinfo.Load() {
+			t.Fatalf("loc=%q: expected req.URL.User stripped before BE request", loc)
+		}
+		if cached, _ := sl.cachedBEBase.Load().(string); cached != "https://doris-be-01.prod.example.com:8040" {
+			t.Fatalf("loc=%q: cachedBEBase = %q, want https://doris-be-01.prod.example.com:8040", loc, cached)
+		}
+	}
+
+	rejectedCases := []struct {
+		name     string
+		location string
+		wantErr  string
+	}{
+		{
+			name:     "foreign_credentials",
+			location: "https://evil:secret@doris-be-01.prod.example.com:8040/api/es_compat/orders/_stream_load",
+			wantErr:  "embedded userinfo",
+		},
+		{
+			name:     "wrong_password",
+			location: "https://doris_ingest:wrong_pw@doris-be-01.prod.example.com:8040/api/es_compat/orders/_stream_load",
+			wantErr:  "embedded userinfo",
+		},
+		{
+			name:     "untrusted_host_with_matching_creds",
+			location: "https://doris_ingest:ingest_pw@evil.attacker.example:8040/api/es_compat/orders/_stream_load",
+			wantErr:  "untrusted redirect host",
+		},
+		{
+			name:     "scheme_downgrade_with_matching_creds",
+			location: "http://doris_ingest:ingest_pw@doris-be-01.prod.example.com:8040/api/es_compat/orders/_stream_load",
+			wantErr:  "scheme downgrade",
+		},
+	}
+	for _, tc := range rejectedCases {
+		sl := NewStreamLoadClient(StreamLoadConfig{
+			FEHTTPEndpoint: "https://doris-fe.prod.example.com:8030",
+			User:           "doris_ingest",
+			Password:       "ingest_pw",
+			Database:       "es_compat",
+			Timeout:        2 * time.Second,
+		})
+		sl.AllowBEHosts([]string{"doris-be-01.prod.example.com"})
+		var targetHits atomic.Int32
+		sl.httpClient.Transport = round63RoundTripFunc(func(req *http.Request) (*http.Response, error) {
+			if req.URL.Host == "doris-fe.prod.example.com:8030" {
+				return newRound63JSONResponse(req, http.StatusTemporaryRedirect, map[string]string{
+					"Location": tc.location,
+				}, ""), nil
+			}
+			targetHits.Add(1)
+			return newRound63JSONResponse(req, http.StatusOK, nil, `{"Status":"Success"}`), nil
+		})
+		err := sl.LoadNDJSON(context.Background(), "orders", []byte(`{"_id":"1"}`+"\n"), true)
+		if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+			t.Fatalf("%s: expected error containing %q, got %v", tc.name, tc.wantErr, err)
+		}
+		if targetHits.Load() != 0 {
+			t.Fatalf("%s: expected 0 target hits, got %d", tc.name, targetHits.Load())
+		}
+	}
+}

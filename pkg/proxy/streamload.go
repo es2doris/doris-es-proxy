@@ -423,10 +423,43 @@ func (c *StreamLoadClient) validateCachedBEBaseURL(rawBase string) bool {
 	return c.validateStreamLoadTargetURL(&uCopy) == nil
 }
 
+func (c *StreamLoadClient) matchesConfiguredRedirectUserinfo(u *url.Userinfo) bool {
+	if u == nil {
+		return true
+	}
+	user := u.Username()
+	pass, hasPass := u.Password()
+	if user == "" && (!hasPass || pass == "") {
+		return true
+	}
+	cfgUser := c.cfg.User
+	cfgPass := c.cfg.Password
+	passOK := !hasPass || pass == "" || pass == cfgPass
+	if user == cfgUser && passOK {
+		return true
+	}
+	// Apache Doris FE 307 Stream Load redirects may emit cluster-qualified usernames such as
+	// "default_cluster:root" (encoded or raw) or "root@default_cluster" in Location userinfo.
+	if cfgUser != "" && len(user) > len(cfgUser)+1 &&
+		(strings.HasSuffix(user, ":"+cfgUser) || strings.HasPrefix(user, cfgUser+"@")) &&
+		passOK {
+		return true
+	}
+	if cfgUser != "" && user != "" && hasPass {
+		if pass == cfgUser || pass == cfgUser+":" || pass == cfgUser+":"+cfgPass {
+			return true
+		}
+	}
+	return false
+}
+
 func (c *StreamLoadClient) checkStreamLoadRedirect(req *http.Request, via []*http.Request) error {
 	if len(via) >= 5 {
 		req.Header.Del("Authorization")
 		return fmt.Errorf("stopped after 5 redirects")
+	}
+	if len(via) > 0 && req.URL != nil && req.URL.User != nil && c.matchesConfiguredRedirectUserinfo(req.URL.User) {
+		req.URL.User = nil
 	}
 	feURL, err := c.validateStreamLoadTargetHostAndScheme(req.URL)
 	if err != nil {
