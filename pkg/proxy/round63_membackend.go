@@ -35,9 +35,19 @@ import (
 // Round 63 F10: Apache Doris 4.1.3 Strict-Cast & Nereids Typing in MemoryBackend
 // ----------------------------------------------------------------------------
 
+var (
+	reNereidsFromBaseMatchedR65 = regexp.MustCompile("(?i)\\bFROM\\s+`?base_matched`?(?:\\s|$|\\)|,|;)")
+	reNereidsMatchFuncR65       = regexp.MustCompile(`(?i)\bMATCH_(?:ALL|ANY|PHRASE|PHRASE_PREFIX|REGEXP|BOOL_PREFIX)\b`)
+	reNereidsScoreCallR65       = regexp.MustCompile(`(?i)\bscore\s*\(\s*\)`)
+	reNereidsOrderByR65         = regexp.MustCompile(`(?i)\bORDER\s+BY\b`)
+	reNereidsCastCoalesceR65    = regexp.MustCompile(`(?i)\bCAST\s*\(\s*COALESCE\s*\(`)
+)
+
 // checkStrictNereidsSQLTypesR63Mem rejects SQL expressions that Apache Doris 4.1.3 Nereids
 // rejects at analysis time (`C-07`: `CONV(...) & mask` or `'literal' & mask` without an
-// explicit `CAST(... AS BIGINT/INT/LARGEINT)` around the `VARCHAR` operand).
+// explicit `CAST(... AS BIGINT/INT/LARGEINT)` around the `VARCHAR` operand), 1-arg `JSON_TYPE`,
+// `MATCH_*` in projections/`CAST(COALESCE(...))`/`FROM base_matched`, `score()` in `base_matched`
+// consumers, unparenthesized `ORDER BY` inside `UNION ALL` branches, and invalid strict scalar casts.
 func checkStrictNereidsSQLTypesR63Mem(sqlStr string) error {
 	// Scan outside SQL string literals and backticks for top-level `CONV(...)` directly
 	// participating in `&` without an enclosing `CAST(` / `TRY_CAST(`.
@@ -93,6 +103,568 @@ func checkStrictNereidsSQLTypesR63Mem(sqlStr string) error {
 		argCount := countTopLevelSQLCallArgsR64Mem(sqlStr, absIdx+len("JSON_TYPE"))
 		if argCount >= 0 && argCount != 2 {
 			return fmt.Errorf("errCode = 2, detailMessage = Unexpected exception: Can not found function 'json_type' with %d arguments in Doris 4.1.3 Nereids; use JSON_TYPE(doc, path)", argCount)
+		}
+	}
+	// Reject `MATCH_*` inside `CAST(COALESCE(...))` and `SELECT` projections.
+	if hasMatchInCastCoalesceR65Mem(sqlStr) {
+		return fmt.Errorf("errCode = 2, detailMessage = Unexpected exception: MATCH predicate cannot appear inside CAST(COALESCE(...)) in Doris 4.1.3 Nereids")
+	}
+	if hasMatchInSelectProjectionR65Mem(sqlStr) {
+		return fmt.Errorf("errCode = 2, detailMessage = Unexpected exception: MATCH predicate is not allowed in SELECT projection list in Doris 4.1.3 Nereids")
+	}
+	// Reject `MATCH_*` and `score()` inside `FROM base_matched` consumers.
+	for _, seg := range extractFromBaseMatchedSegmentsR65Mem(sqlStr) {
+		if reNereidsMatchFuncR65.MatchString(seg) {
+			return fmt.Errorf("errCode = 2, detailMessage = Unexpected exception: MATCH predicate cannot reference CTE base_matched in Doris 4.1.3 Nereids")
+		}
+		if reNereidsScoreCallR65.MatchString(seg) {
+			return fmt.Errorf("errCode = 2, detailMessage = Unexpected exception: score() cannot reference CTE base_matched in Doris 4.1.3 Nereids")
+		}
+	}
+	// Reject unparenthesized `ORDER BY` inside `UNION ALL` branches.
+	if hasUnparenthesizedOrderByInUnionAllR65Mem(sqlStr) {
+		return fmt.Errorf("errCode = 2, detailMessage = Syntax error: unparenthesized ORDER BY inside UNION ALL branch in Doris 4.1.3 Nereids")
+	}
+	// Reject invalid string literals inside strict scalar `CAST('<lit>' AS DOUBLE|FLOAT|LARGEINT|BIGINT|INT)`.
+	if err := checkStaticStrictCastLiteralsR65Mem(sqlStr); err != nil {
+		return err
+	}
+	return nil
+}
+
+func blankQuotedAndBacktickedR65Mem(s string, keepBackticks bool) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	inS, inD, inB := false, false, false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if inS {
+			b.WriteByte(' ')
+			if c == '\\' && i+1 < len(s) {
+				b.WriteByte(' ')
+				i++
+				continue
+			}
+			if c == '\'' {
+				if i+1 < len(s) && s[i+1] == '\'' {
+					b.WriteByte(' ')
+					i++
+					continue
+				}
+				inS = false
+			}
+			continue
+		}
+		if inD {
+			b.WriteByte(' ')
+			if c == '\\' && i+1 < len(s) {
+				b.WriteByte(' ')
+				i++
+				continue
+			}
+			if c == '"' {
+				inD = false
+			}
+			continue
+		}
+		if inB {
+			if keepBackticks {
+				b.WriteByte(c)
+			} else {
+				b.WriteByte(' ')
+			}
+			if c == '`' {
+				if i+1 < len(s) && s[i+1] == '`' {
+					if keepBackticks {
+						b.WriteByte('`')
+					} else {
+						b.WriteByte(' ')
+					}
+					i++
+					continue
+				}
+				inB = false
+			}
+			continue
+		}
+		switch c {
+		case '\'':
+			inS = true
+			b.WriteByte(' ')
+		case '"':
+			inD = true
+			b.WriteByte(' ')
+		case '`':
+			inB = true
+			if keepBackticks {
+				b.WriteByte(c)
+			} else {
+				b.WriteByte(' ')
+			}
+		default:
+			b.WriteByte(c)
+		}
+	}
+	return b.String()
+}
+
+func findSelectStartBackwardR65Mem(masked string, fromPos int) int {
+	depth := 0
+	for i := fromPos - 1; i >= 0; i-- {
+		switch masked[i] {
+		case ')':
+			depth++
+		case '(':
+			if depth == 0 {
+				return i + 1
+			}
+			depth--
+		default:
+			if depth == 0 && i+6 <= fromPos && strings.EqualFold(masked[i:i+6], "SELECT") {
+				prevOK := i == 0 || !isIdentByteR63Mem(masked[i-1])
+				nextOK := i+6 == fromPos || !isIdentByteR63Mem(masked[i+6])
+				if prevOK && nextOK {
+					return i
+				}
+			}
+		}
+	}
+	return 0
+}
+
+func extractFromBaseMatchedSegmentsR65Mem(sqlStr string) []string {
+	maskedNoStrings := blankQuotedAndBacktickedR65Mem(sqlStr, true)
+	locs := reNereidsFromBaseMatchedR65.FindAllStringIndex(maskedNoStrings, -1)
+	if len(locs) == 0 {
+		return nil
+	}
+	maskedAll := blankQuotedAndBacktickedR65Mem(sqlStr, false)
+	segs := make([]string, 0, len(locs))
+	for _, loc := range locs {
+		startIdx := findSelectStartBackwardR65Mem(maskedAll, loc[0])
+		depth := 0
+		endIdx := len(maskedAll)
+		for i := loc[1]; i < len(maskedAll); i++ {
+			switch maskedAll[i] {
+			case '(':
+				depth++
+			case ')':
+				if depth == 0 {
+					endIdx = i
+					goto doneSeg
+				}
+				depth--
+			}
+		}
+	doneSeg:
+		segs = append(segs, maskedAll[startIdx:loc[0]]+" "+maskedAll[loc[1]:endIdx])
+	}
+	return segs
+}
+
+func hasMatchInCastCoalesceR65Mem(sqlStr string) bool {
+	if !reNereidsMatchFuncR65.MatchString(sqlStr) {
+		return false
+	}
+	masked := blankQuotedAndBacktickedR65Mem(sqlStr, false)
+	searchFrom := 0
+	for searchFrom < len(masked) {
+		loc := reNereidsCastCoalesceR65.FindStringIndex(masked[searchFrom:])
+		if loc == nil {
+			return false
+		}
+		castStart := searchFrom + loc[0]
+		openIdx := strings.IndexByte(masked[castStart:], '(')
+		if openIdx < 0 {
+			return false
+		}
+		closeIdx := memFindMatchingParen(sqlStr, castStart+openIdx)
+		if closeIdx < 0 {
+			searchFrom = castStart + openIdx + 1
+			continue
+		}
+		if reNereidsMatchFuncR65.MatchString(masked[castStart : closeIdx+1]) {
+			return true
+		}
+		searchFrom = castStart + openIdx + 1
+	}
+	return false
+}
+
+func hasMatchInSelectProjectionR65Mem(sqlStr string) bool {
+	if !reNereidsMatchFuncR65.MatchString(sqlStr) {
+		return false
+	}
+	masked := blankQuotedAndBacktickedR65Mem(sqlStr, false)
+	inProjByDepth := make(map[int]bool)
+	depth := 0
+	for i := 0; i < len(masked); {
+		c := masked[i]
+		switch c {
+		case '(':
+			depth++
+			i++
+		case ')':
+			delete(inProjByDepth, depth)
+			if depth > 0 {
+				depth--
+			}
+			i++
+		default:
+			if isIdentByteR63Mem(c) {
+				j := i + 1
+				for j < len(masked) && isIdentByteR63Mem(masked[j]) {
+					j++
+				}
+				tok := masked[i:j]
+				switch {
+				case strings.EqualFold(tok, "SELECT"):
+					inProjByDepth[depth] = true
+				case strings.EqualFold(tok, "FROM"):
+					inProjByDepth[depth] = false
+				case strings.EqualFold(tok, "WHERE") || strings.EqualFold(tok, "GROUP") || strings.EqualFold(tok, "HAVING") || strings.EqualFold(tok, "UNION"):
+					inProjByDepth[depth] = false
+				case reNereidsMatchFuncR65.MatchString(tok):
+					if inProjByDepth[depth] {
+						return true
+					}
+				}
+				i = j
+			} else {
+				i++
+			}
+		}
+	}
+	return false
+}
+
+func hasUnparenthesizedOrderByInUnionAllR65Mem(sqlStr string) bool {
+	if !strings.Contains(strings.ToUpper(sqlStr), "UNION ALL") {
+		return false
+	}
+	masked := blankQuotedAndBacktickedR65Mem(sqlStr, false)
+	body := skipLeadingWithCTEsForUnionR65Mem(masked)
+	branches := splitTopLevelUnionAllR65Mem(body)
+	if len(branches) <= 1 {
+		return false
+	}
+	for idx, br := range branches {
+		trimmed := strings.TrimSpace(br)
+		if trimmed == "" {
+			continue
+		}
+		if strings.HasPrefix(trimmed, "(") {
+			closeIdx := memFindMatchingParen(trimmed, 0)
+			if closeIdx == len(trimmed)-1 {
+				continue
+			}
+			// Allow a trailing union-wide `ORDER BY` only after a closing `)` on the final branch.
+			if idx == len(branches)-1 && closeIdx > 0 {
+				afterClose := strings.TrimSpace(trimmed[closeIdx+1:])
+				if strings.HasPrefix(strings.ToUpper(afterClose), "ORDER ") {
+					continue
+				}
+			}
+			if closeIdx > 0 && hasTopLevelOrderByR65Mem(trimmed[closeIdx+1:]) {
+				return true
+			}
+			continue
+		}
+		if hasTopLevelOrderByR65Mem(trimmed) {
+			return true
+		}
+	}
+	return false
+}
+
+func skipLeadingWithCTEsForUnionR65Mem(masked string) string {
+	trimmed := strings.TrimSpace(masked)
+	if len(trimmed) < 5 || !strings.EqualFold(trimmed[:4], "WITH") || isIdentByteR63Mem(trimmed[4]) {
+		return trimmed
+	}
+	depth := 0
+	sawParen := false
+	for i := 4; i < len(trimmed); i++ {
+		switch trimmed[i] {
+		case '(':
+			depth++
+			sawParen = true
+		case ')':
+			if depth > 0 {
+				depth--
+			}
+		default:
+			if sawParen && depth == 0 {
+				rest := strings.TrimSpace(trimmed[i:])
+				if strings.HasPrefix(rest, ",") {
+					continue
+				}
+				if strings.HasPrefix(rest, "(") || (len(rest) >= 6 && strings.EqualFold(rest[:6], "SELECT") && (len(rest) == 6 || !isIdentByteR63Mem(rest[6]))) {
+					return rest
+				}
+			}
+		}
+	}
+	return trimmed
+}
+
+func splitTopLevelUnionAllR65Mem(masked string) []string {
+	var branches []string
+	depth := 0
+	start := 0
+	for i := 0; i < len(masked); i++ {
+		switch masked[i] {
+		case '(':
+			depth++
+		case ')':
+			if depth > 0 {
+				depth--
+			}
+		default:
+			if depth == 0 && i+len("UNION ALL") <= len(masked) && strings.EqualFold(masked[i:i+len("UNION ALL")], "UNION ALL") {
+				prevOK := i == 0 || !isIdentByteR63Mem(masked[i-1])
+				nextPos := i + len("UNION ALL")
+				nextOK := nextPos == len(masked) || !isIdentByteR63Mem(masked[nextPos])
+				if prevOK && nextOK {
+					branches = append(branches, masked[start:i])
+					start = nextPos
+					i = nextPos - 1
+				}
+			}
+		}
+	}
+	if start < len(masked) {
+		branches = append(branches, masked[start:])
+	}
+	return branches
+}
+
+func hasTopLevelOrderByR65Mem(masked string) bool {
+	var top strings.Builder
+	top.Grow(len(masked))
+	depth := 0
+	for i := 0; i < len(masked); i++ {
+		switch masked[i] {
+		case '(':
+			depth++
+		case ')':
+			if depth > 0 {
+				depth--
+			}
+		default:
+			if depth == 0 {
+				top.WriteByte(masked[i])
+			}
+		}
+	}
+	return reNereidsOrderByR65.MatchString(top.String())
+}
+
+func validateStrictCastValueR65Mem(val any, targetType string) error {
+	if val == nil {
+		return nil
+	}
+	switch targetType {
+	case "DOUBLE", "FLOAT":
+		if _, ok := toFloat(val); !ok {
+			return fmt.Errorf("errCode = 2, detailMessage = [DATA_QUALITY_ERROR] Can not parse value %v as %s in strict cast mode", val, targetType)
+		}
+	case "LARGEINT":
+		if memCoerceSQLLargeInt(val) == nil {
+			return fmt.Errorf("errCode = 2, detailMessage = [DATA_QUALITY_ERROR] Can not parse value %v as LARGEINT in strict cast mode", val)
+		}
+	case "BIGINT", "INT":
+		switch tv := val.(type) {
+		case int, int32, int64:
+			return nil
+		case uint64:
+			if targetType == "BIGINT" && tv > math.MaxInt64 {
+				return fmt.Errorf("errCode = 2, detailMessage = [DATA_QUALITY_ERROR] Out of range value %v for %s in strict cast mode", val, targetType)
+			}
+			return nil
+		case float64:
+			if math.IsNaN(tv) || math.IsInf(tv, 0) {
+				return fmt.Errorf("errCode = 2, detailMessage = [DATA_QUALITY_ERROR] Invalid float value %v for %s in strict cast mode", val, targetType)
+			}
+		case json.Number:
+			if _, err := tv.Int64(); err != nil {
+				return fmt.Errorf("errCode = 2, detailMessage = [DATA_QUALITY_ERROR] Can not parse value %q as %s in strict cast mode", tv.String(), targetType)
+			}
+		case string:
+			trimmed := strings.TrimSpace(tv)
+			if trimmed == "" {
+				return fmt.Errorf("errCode = 2, detailMessage = [DATA_QUALITY_ERROR] Can not parse empty string as %s in strict cast mode", targetType)
+			}
+			bitSize := 64
+			if targetType == "INT" {
+				bitSize = 32
+			}
+			if _, err := strconv.ParseInt(trimmed, 10, bitSize); err != nil {
+				return fmt.Errorf("errCode = 2, detailMessage = [DATA_QUALITY_ERROR] Can not parse value %q as %s in strict cast mode", trimmed, targetType)
+			}
+		default:
+			return fmt.Errorf("errCode = 2, detailMessage = [DATA_QUALITY_ERROR] Unsupported value %T for CAST AS %s in strict cast mode", val, targetType)
+		}
+	}
+	return nil
+}
+
+type strictCastSiteR65Mem struct {
+	absStart   int
+	inner      string
+	targetType string
+}
+
+func extractStrictNumericCastSitesR65Mem(sqlStr string) []strictCastSiteR65Mem {
+	upper := strings.ToUpper(sqlStr)
+	if !strings.Contains(upper, "CAST(") {
+		return nil
+	}
+	var sites []strictCastSiteR65Mem
+	searchFrom := 0
+	for {
+		idx := strings.Index(upper[searchFrom:], "CAST(")
+		if idx < 0 {
+			break
+		}
+		absIdx := searchFrom + idx
+		searchFrom = absIdx + len("CAST(")
+		if absIdx > 0 && isIdentByteR63Mem(upper[absIdx-1]) {
+			continue
+		}
+		if isOffsetInsideQuotesOrBackticksR63Mem(sqlStr, absIdx) {
+			continue
+		}
+		closeParen := memFindMatchingParen(sqlStr, absIdx+len("CAST"))
+		if closeParen < 0 {
+			continue
+		}
+		body := sqlStr[absIdx+len("CAST(") : closeParen]
+		asIdx := findTopLevelLastAsR63Mem(body)
+		if asIdx <= 0 {
+			continue
+		}
+		inner := strings.TrimSpace(body[:asIdx])
+		targetType := strings.ToUpper(strings.TrimSpace(body[asIdx+4:]))
+		switch targetType {
+		case "DOUBLE", "FLOAT", "LARGEINT", "BIGINT", "INT":
+		default:
+			continue
+		}
+		innerUpper := strings.ToUpper(inner)
+		if strings.HasPrefix(innerUpper, "`_DOC`") || strings.HasPrefix(innerUpper, "_DOC") ||
+			strings.HasPrefix(innerUpper, "`BASE_MATCHED`.`_DOC`") {
+			continue
+		}
+		if targetType == "INT" && strings.HasPrefix(innerUpper, "COALESCE(") &&
+			(strings.HasSuffix(innerUpper, ", FALSE)") || strings.HasSuffix(innerUpper, ", TRUE)")) {
+			continue
+		}
+		sites = append(sites, strictCastSiteR65Mem{
+			absStart:   absIdx,
+			inner:      inner,
+			targetType: targetType,
+		})
+	}
+	return sites
+}
+
+func checkStaticStrictCastLiteralsR65Mem(sqlStr string) error {
+	for _, site := range extractStrictNumericCastSitesR65Mem(sqlStr) {
+		if strings.HasPrefix(site.inner, "'") && strings.HasSuffix(site.inner, "'") && len(site.inner) >= 2 {
+			if err := validateStrictCastValueR65Mem(unquoteSQLLiteral(site.inner), site.targetType); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func isStrictCastRowExprCandidateR65Mem(inner string) bool {
+	u := strings.ToUpper(strings.TrimSpace(inner))
+	if strings.Contains(u, "JSON_EXTRACT_STRING(") || strings.Contains(u, "SPLIT_PART(") || strings.Contains(u, "REGEXP_EXTRACT(") {
+		return true
+	}
+	if strings.HasPrefix(inner, "`") && strings.HasSuffix(inner, "`") && strings.Count(inner, "`") == 2 {
+		col := inner[1 : len(inner)-1]
+		return col != "_id" && col != "_version" && col != "_score" && col != "_total_hits" && col != "_doc" && col != "_source"
+	}
+	return false
+}
+
+func extractEnclosingArrayMapColForCastR65Mem(sqlStr string, castPos int) (string, string, bool) {
+	upperPfx := strings.ToUpper(sqlStr[:castPos])
+	bestStart := -1
+	bestLen := 0
+	for _, kw := range []string{"ARRAY_MAP(", "ARRAY_EXISTS(", "ARRAY_FILTER("} {
+		if idx := strings.LastIndex(upperPfx, kw); idx > bestStart && !isOffsetInsideQuotesOrBackticksR63Mem(sqlStr, idx) {
+			bestStart = idx
+			bestLen = len(kw)
+		}
+	}
+	if bestStart < 0 {
+		return "", "", false
+	}
+	closeAM := memFindMatchingParen(sqlStr, bestStart+bestLen-1)
+	if closeAM <= castPos {
+		return "", "", false
+	}
+	amBody := sqlStr[bestStart+bestLen : closeAM]
+	parts := splitTopLevelArgs(amBody)
+	if len(parts) != 2 {
+		return "", "", false
+	}
+	paramName := "_x"
+	if arrow := strings.Index(parts[0], "->"); arrow > 0 {
+		if p := strings.TrimSpace(parts[0][:arrow]); p != "" {
+			paramName = p
+		}
+	}
+	return strings.TrimSpace(parts[1]), paramName, true
+}
+
+// checkStrictCastRowsR65Mem enforces Doris 4.1.3 strict cast semantics (`enable_strict_cast=true`)
+// on row-level `CAST(... AS DOUBLE|FLOAT|LARGEINT|BIGINT|INT)` expressions when executing against MemoryBackend.
+func checkStrictCastRowsR65Mem(tbl map[string]map[string]any, sqlStr string) error {
+	if len(tbl) == 0 {
+		return nil
+	}
+	sites := extractStrictNumericCastSitesR65Mem(sqlStr)
+	if len(sites) == 0 {
+		return nil
+	}
+	for _, site := range sites {
+		if arrExpr, paramName, okAM := extractEnclosingArrayMapColForCastR65Mem(sqlStr, site.absStart); okAM {
+			innerTrim := strings.Trim(strings.TrimSpace(site.inner), "`")
+			if innerTrim == strings.Trim(paramName, "`") || innerTrim == "_x" || innerTrim == "_el" {
+				for _, row := range tbl {
+					if isTombstoneRow(row) {
+						continue
+					}
+					arrVal := resolveColumnValue(row, arrExpr)
+					if arrVal == nil {
+						continue
+					}
+					for _, elem := range asSliceOrSingle(arrVal) {
+						if err := validateStrictCastValueR65Mem(elem, site.targetType); err != nil {
+							return err
+						}
+					}
+				}
+				continue
+			}
+		}
+		if !isStrictCastRowExprCandidateR65Mem(site.inner) {
+			continue
+		}
+		for _, row := range tbl {
+			if isTombstoneRow(row) {
+				continue
+			}
+			val := resolveColumnValue(row, site.inner)
+			if err := validateStrictCastValueR65Mem(val, site.targetType); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -1458,7 +2030,7 @@ func prepareScoreEvaluatorR63Mem(ctx context.Context, tbl map[string]map[string]
 			dl = 1
 		}
 		dlNorm := float64(luceneSmallFloatLengthR63Mem(dl))
-		tfNorm := tf / (tf + sp.k1*(1.0-sp.bParam+sp.bParam*(dlNorm/sp.avgdl)))
+		tfNorm := (tf * (sp.k1 + 1.0)) / (tf + sp.k1*(1.0-sp.bParam+sp.bParam*(dlNorm/sp.avgdl)))
 		return sp.boost * sp.idf * tfNorm
 	}
 

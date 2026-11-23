@@ -859,19 +859,20 @@ func (s *Server) handleClusterHealthR61Admin(w http.ResponseWriter, r *http.Requ
 // ============================================================================
 
 var reservedMappingRootKeysR61CRUD = map[string]bool{
-	"properties":           true,
-	"dynamic":              true,
-	"dynamic_templates":    true,
-	"_source":              true,
-	"_size":                true,
-	"_meta":                true,
-	"_routing":             true,
-	"_field_names":         true,
-	"runtime":              true,
-	"date_detection":       true,
-	"numeric_detection":    true,
-	"dynamic_date_formats": true,
-	"subobjects":           true,
+	"properties":             true,
+	"dynamic":                true,
+	"dynamic_templates":      true,
+	"_source":                true,
+	"_size":                  true,
+	"_meta":                  true,
+	"_routing":               true,
+	"_field_names":           true,
+	"_data_stream_timestamp": true,
+	"runtime":                true,
+	"date_detection":         true,
+	"numeric_detection":      true,
+	"dynamic_date_formats":   true,
+	"subobjects":             true,
 }
 
 func effectiveIndexLegacyTypeR61CRUD(idx *schema.IndexSchema) string {
@@ -2032,6 +2033,14 @@ func (s *Server) handlePutMappingR61CRUD(w http.ResponseWriter, r *http.Request)
 		if oldSchema != nil {
 			oldRaw = oldSchema.RawMapping
 		}
+		if len(spec.Runtime) > 0 && oldSchema != nil && oldSchema.IndexMode == "time_series" {
+			if err := schema.ValidateTSDBRuntimeFieldsRoutingPath(oldSchema.RoutingPath, spec.Runtime); err != nil {
+				s.mu.RUnlock()
+				et, er := splitSchemaErrorPrefixR61CRUD(err, "illegal_argument_exception")
+				writeESError(w, http.StatusBadRequest, et, er)
+				return
+			}
+		}
 		if err := schema.ValidateMappingUpdateCompatibility(oldRaw, &spec); err != nil {
 			s.mu.RUnlock()
 			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", err.Error())
@@ -2053,6 +2062,22 @@ func (s *Server) handlePutMappingR61CRUD(w http.ResponseWriter, r *http.Request)
 					return
 				}
 			}
+			if oldSchema != nil {
+				if oldSchema.IndexMode == "time_series" {
+					if err := schema.ValidateTSDBRuntimeFieldsRoutingPath(oldSchema.RoutingPath, spec.Runtime); err != nil {
+						s.mu.RUnlock()
+						et, er := splitSchemaErrorPrefixR61CRUD(err, "illegal_argument_exception")
+						writeESError(w, http.StatusBadRequest, et, er)
+						return
+					}
+				}
+				if err := schema.ValidateTSDBRuntimeShadowing(oldSchema, spec.Runtime); err != nil {
+					s.mu.RUnlock()
+					et, er := splitSchemaErrorPrefixR61CRUD(err, "illegal_argument_exception")
+					writeESError(w, http.StatusBadRequest, et, er)
+					return
+				}
+			}
 		}
 		mergedPreview := schema.MergeMappingSpecs(oldRaw, &spec)
 		if err := validateAliasFieldsInMapping(mergedPreview); err != nil {
@@ -2067,6 +2092,12 @@ func (s *Server) handlePutMappingR61CRUD(w http.ResponseWriter, r *http.Request)
 			return
 		}
 		if oldSchema != nil && oldSchema.IndexMode == "time_series" {
+			if spec.Routing != nil {
+				s.mu.RUnlock()
+				writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
+					"routing is forbidden on CRUD operations that target indices in [index.mode=time_series]")
+				return
+			}
 			if err := schema.ValidateTSDBMapping(mergedPreview, oldSchema.RoutingPath); err != nil {
 				s.mu.RUnlock()
 				et, er := splitSchemaErrorPrefixR61CRUD(err, "illegal_argument_exception")
@@ -2101,8 +2132,21 @@ func (s *Server) handlePutMappingR61CRUD(w http.ResponseWriter, r *http.Request)
 		newSchema.ES8Mode = isES8
 		if oldSchema != nil {
 			newSchema.CopyIndexMappingSettingsFrom(oldSchema)
-		} else if custom := s.indexCustomSettings[indexName]; len(custom) > 0 {
-			_ = parseAndApplyIndexMappingSettingsRound59(custom, newSchema)
+		}
+		if custom := s.indexCustomSettings[indexName]; len(custom) > 0 {
+			if oldSchema == nil {
+				_ = parseAndApplyIndexMappingSettingsRound59(custom, newSchema)
+			}
+			_ = newSchema.SetAnalysisSettings(normalizeJSONNumbersForAnalysisR65(custom))
+		}
+		if newSchema.IndexMode == "time_series" {
+			schema.ApplyIndexModeDefaults(newSchema)
+			if newSchema.RawMapping == nil {
+				newSchema.RawMapping = &esast.MappingSpec{}
+			}
+			if newSchema.RawMapping.Source == nil && !newSchema.SourceDisabled() {
+				newSchema.RawMapping.Source = map[string]any{"mode": "synthetic"}
+			}
 		}
 		if effectivePutType != "" && newSchema.LegacyTypeName == "" {
 			newSchema.LegacyTypeName = effectivePutType
@@ -3882,6 +3926,24 @@ func (s *Server) validateAndEvolveExistingIndexR61CRUD(
 	if idx == nil || len(sampleDocs) == 0 {
 		return idx, nil
 	}
+	if idx.AnalysisConfig == nil {
+		s.mu.RLock()
+		cs := s.indexCustomSettings[indexName]
+		var csCopy map[string]any
+		if len(cs) > 0 {
+			csCopy = deepCloneDocMap(cs)
+		}
+		s.mu.RUnlock()
+		if len(csCopy) > 0 {
+			restored := idx.CloneIndexSchema()
+			if err := restored.SetAnalysisSettings(normalizeJSONNumbersForAnalysisR65(csCopy)); err == nil && restored.AnalysisConfig != nil {
+				s.mu.Lock()
+				s.indices[indexName] = restored
+				s.mu.Unlock()
+				idx = restored
+			}
+		}
+	}
 	effES8 := es8Mode || idx.ES8Mode
 	if nextRaw, added := applyDynamicRuntimeInferenceRound59(sampleDocs, idx.RawMapping); added {
 		cand := schema.CompileIndexSchema(s.dorisDB, indexName, nextRaw)
@@ -4057,12 +4119,43 @@ func (s *Server) ensureWritableIndexSchemaWithDocsErrR61CRUD(
 			compiled.SyntheticSource = true
 		}
 	}
+	mergedDynSettings := make(map[string]any, len(tplCustomSettings)+len(curCustomSettings))
+	for k, v := range tplCustomSettings {
+		mergedDynSettings[k] = v
+	}
+	for k, v := range curCustomSettings {
+		mergedDynSettings[k] = v
+	}
+	if len(mergedDynSettings) > 0 {
+		_ = compiled.SetAnalysisSettings(normalizeJSONNumbersForAnalysisR65(mergedDynSettings))
+	}
+	if compiled.IndexMode == "time_series" {
+		schema.ApplyIndexModeDefaults(compiled)
+		if compiled.RawMapping == nil {
+			compiled.RawMapping = &esast.MappingSpec{}
+		}
+		if compiled.RawMapping.Source == nil && !compiled.SourceDisabled() {
+			compiled.RawMapping.Source = map[string]any{"mode": "synthetic"}
+		}
+	}
 	if len(sampleDocs) > 0 {
 		if delta := detectArrayPromotions(compiled, sampleDocs); delta != nil {
 			prev := compiled
 			effectiveMappings = schema.MergeMappingSpecs(effectiveMappings, delta)
 			compiled = schema.CompileIndexSchema(s.dorisDB, indexName, effectiveMappings)
 			compiled.CopyIndexMappingSettingsFrom(prev)
+			if len(mergedDynSettings) > 0 {
+				_ = compiled.SetAnalysisSettings(normalizeJSONNumbersForAnalysisR65(mergedDynSettings))
+			}
+			if compiled.IndexMode == "time_series" {
+				schema.ApplyIndexModeDefaults(compiled)
+				if compiled.RawMapping == nil {
+					compiled.RawMapping = &esast.MappingSpec{}
+				}
+				if compiled.RawMapping.Source == nil && !compiled.SourceDisabled() {
+					compiled.RawMapping.Source = map[string]any{"mode": "synthetic"}
+				}
+			}
 		}
 		if err := schema.ValidateMappingLimits(compiled, compiled.RawMapping); err != nil {
 			return nil, err
@@ -4309,6 +4402,13 @@ func applyUpdateDocWithFieldsAPIR61CRUD(
 	params["__is_update_doc"] = !isUBQ
 	params["__is_es8"] = isES8
 	params["__mutable_fields_api"] = true
+	if updReq.MetaOp != "" {
+		params["_ctx_op"] = updReq.MetaOp
+	} else if !found {
+		params["_ctx_op"] = "create"
+	} else {
+		params["_ctx_op"] = "index"
+	}
 	if !found {
 		params["__upsert_insert_mode"] = true
 		if routingRequired && origRouting == "" {
@@ -4324,7 +4424,7 @@ func applyUpdateDocWithFieldsAPIR61CRUD(
 		}
 		return nil, "", err
 	}
-	if op == "" {
+	if op == "" || (!found && op == "create") {
 		op = "index"
 	}
 
@@ -4645,6 +4745,9 @@ func (s *Server) validateTSDBSearchConstraintsR61CRUD(r *http.Request, rawIndex 
 	if scSt, scET, scER := s.checkMaxOpenScrollContextR62Admin(r, rawIndex, req); scSt != 0 {
 		return scSt, scET, scER
 	}
+	if qSt, qET, qER := s.validateES8QueryCompatR61CRUD(r, req); qSt != 0 {
+		return qSt, qET, qER
+	}
 	ctx := context.Background()
 	if r != nil {
 		ctx = r.Context()
@@ -4682,6 +4785,130 @@ func (s *Server) validateTSDBSearchConstraintsR61CRUD(r *http.Request, rawIndex 
 			return http.StatusBadRequest,
 				"illegal_argument_exception",
 				"Fielddata is not supported on [_id] field in [time_series] indices"
+		}
+	}
+	return 0, "", ""
+}
+
+func (s *Server) validateES8QueryCompatR61CRUD(r *http.Request, req *esast.SearchRequest) (int, string, string) {
+	if s == nil || req == nil {
+		return 0, "", ""
+	}
+	targetIsES8 := strings.HasPrefix(s.getTargetESVersion(), "8.")
+	reqIsES8 := s.isES8Mode(r)
+	if !targetIsES8 && !reqIsES8 {
+		return 0, "", ""
+	}
+	var st int
+	var et, er string
+	var checkQ func(q *esast.Query) bool
+	checkQ = func(q *esast.Query) bool {
+		if q == nil {
+			return false
+		}
+		if reqIsES8 && q.GeoBoundingBox != nil && q.GeoBoundingBox.Type != "" {
+			st, et, er = http.StatusBadRequest, "parsing_exception", "failed to parse [geo_bounding_box] query. unexpected field [type]"
+			return true
+		}
+		if targetIsES8 {
+			if q.Type != nil {
+				st, et, er = http.StatusBadRequest, "parsing_exception", "[types removal] Type queries are deprecated, prefer to filter on a field instead."
+				return true
+			}
+			if len(q.Common) > 0 {
+				st, et, er = http.StatusBadRequest, "parsing_exception", "Common Terms Query usage is not supported. Use [match] query which can efficiently skip blocks of documents if the total number of hits is not tracked."
+				return true
+			}
+			for _, me := range q.Match {
+				if me.CutoffFrequency != 0 {
+					st, et, er = http.StatusBadRequest, "illegal_argument_exception", "cutoff_freqency is not supported. The [match] query can skip block of documents efficiently if the total number of hits is not tracked"
+					return true
+				}
+			}
+		}
+		if q.Bool != nil {
+			for i := range q.Bool.Must {
+				if checkQ(&q.Bool.Must[i]) {
+					return true
+				}
+			}
+			for i := range q.Bool.Filter {
+				if checkQ(&q.Bool.Filter[i]) {
+					return true
+				}
+			}
+			for i := range q.Bool.Should {
+				if checkQ(&q.Bool.Should[i]) {
+					return true
+				}
+			}
+			for i := range q.Bool.MustNot {
+				if checkQ(&q.Bool.MustNot[i]) {
+					return true
+				}
+			}
+		}
+		if q.DisMax != nil {
+			for i := range q.DisMax.Queries {
+				if checkQ(&q.DisMax.Queries[i]) {
+					return true
+				}
+			}
+		}
+		if q.Boosting != nil {
+			if checkQ(&q.Boosting.Positive) || checkQ(&q.Boosting.Negative) {
+				return true
+			}
+		}
+		if q.ConstantScore != nil && checkQ(&q.ConstantScore.Filter) {
+			return true
+		}
+		if q.FunctionScore != nil && checkQ(q.FunctionScore.Query) {
+			return true
+		}
+		if q.ScriptScore != nil && checkQ(q.ScriptScore.Query) {
+			return true
+		}
+		if q.Nested != nil && checkQ(&q.Nested.Query) {
+			return true
+		}
+		if q.HasChild != nil && checkQ(&q.HasChild.Query) {
+			return true
+		}
+		if q.HasParent != nil && checkQ(&q.HasParent.Query) {
+			return true
+		}
+		if q.Pinned != nil && checkQ(q.Pinned.Organic) {
+			return true
+		}
+		if q.Rule != nil && checkQ(q.Rule.Organic) {
+			return true
+		}
+		if q.KNN != nil {
+			for i := range q.KNN.Filter {
+				if checkQ(&q.KNN.Filter[i]) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	if checkQ(req.Query) {
+		return st, et, er
+	}
+	if checkQ(req.PostFilter) {
+		return st, et, er
+	}
+	for i := range req.Rescore {
+		if checkQ(req.Rescore[i].Query.RescoreQuery) {
+			return st, et, er
+		}
+	}
+	for i := range req.KNN {
+		for j := range req.KNN[i].Filter {
+			if checkQ(&req.KNN[i].Filter[j]) {
+				return st, et, er
+			}
 		}
 	}
 	return 0, "", ""

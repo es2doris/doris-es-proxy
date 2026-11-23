@@ -136,8 +136,85 @@ func (s *Server) recordDynamicallyInferredFieldsWave3R63(
 	}
 
 	var prevProps map[string]esast.FieldProperty
+	var dynTemplates []map[string]any
 	if prevSpec != nil {
 		prevProps = prevSpec.Properties
+		dynTemplates = prevSpec.DynamicTemplates
+	}
+	templateExplicitPaths := make(map[string]bool)
+	if len(dynTemplates) > 0 {
+		var collectTplProps func(props map[string]any, prefix string)
+		collectTplProps = func(props map[string]any, prefix string) {
+			for pName, rawProp := range props {
+				fullP := pName
+				if prefix != "" {
+					fullP = prefix + "." + pName
+				}
+				templateExplicitPaths[fullP] = true
+				if pMap, okP := rawProp.(map[string]any); okP {
+					if subP, okSP := pMap["properties"].(map[string]any); okSP {
+						collectTplProps(subP, fullP)
+					}
+				}
+			}
+		}
+		matchesTplRule := func(rule map[string]any, leafName, fullPath, detectedType string) bool {
+			if mmt, _ := rule["match_mapping_type"].(string); mmt != "" && mmt != "*" && !strings.EqualFold(mmt, detectedType) {
+				return false
+			}
+			if mPat, _ := rule["match"].(string); mPat != "" && !matchWildcardPattern(mPat, leafName) {
+				return false
+			}
+			if uPat, _ := rule["unmatch"].(string); uPat != "" && matchWildcardPattern(uPat, leafName) {
+				return false
+			}
+			if pmPat, _ := rule["path_match"].(string); pmPat != "" && !matchWildcardPattern(pmPat, fullPath) {
+				return false
+			}
+			if puPat, _ := rule["path_unmatch"].(string); puPat != "" && matchWildcardPattern(puPat, fullPath) {
+				return false
+			}
+			return true
+		}
+		var scanTplFields func(curInf map[string]esast.FieldProperty, prefix string)
+		scanTplFields = func(curInf map[string]esast.FieldProperty, prefix string) {
+			for name, prop := range curInf {
+				full := name
+				if prefix != "" {
+					full = prefix + "." + name
+				}
+				detType := strings.ToLower(strings.TrimSpace(prop.Type))
+				if detType == "" && len(prop.Properties) > 0 {
+					detType = "object"
+				}
+				if rawStrPaths[full] {
+					detType = "string"
+				}
+				for _, tplEntry := range dynTemplates {
+					for _, rawRule := range tplEntry {
+						rule, okR := rawRule.(map[string]any)
+						if !okR {
+							continue
+						}
+						if matchesTplRule(rule, name, full, detType) {
+							if mapping, okM := rule["mapping"].(map[string]any); okM {
+								if mt, _ := mapping["type"].(string); mt != "" && !strings.EqualFold(mt, "text") {
+									templateExplicitPaths[full] = true
+								}
+								if subProps, okSP := mapping["properties"].(map[string]any); okSP {
+									collectTplProps(subProps, full)
+								}
+							}
+							break
+						}
+					}
+				}
+				if len(prop.Properties) > 0 {
+					scanTplFields(prop.Properties, full)
+				}
+			}
+		}
+		scanTplFields(inferred.Properties, "")
 	}
 
 	st := s.getOrCreateWave3PolishStateR63()
@@ -165,7 +242,7 @@ func (s *Server) recordDynamicallyInferredFieldsWave3R63(
 					subPrev = ep.Properties
 				}
 			}
-			if !hadExplicit {
+			if !hadExplicit && !templateExplicitPaths[full] {
 				tLower := strings.ToLower(strings.TrimSpace(prop.Type))
 				if tLower == "text" || (tLower == "keyword" && rawStrPaths[full]) {
 					st.dynamicTextFieldsByIdx[indexName][full] = true
@@ -987,6 +1064,9 @@ func emitCreateIndexWave3DeprecationWarningsR63(
 		}
 		if hasMultifieldForType(mappings.Properties, "constant_keyword") {
 			emitESDeprecationWarningRound61(w, s, r, "Adding multifields to [constant_keyword] mappers has no effect and will be forbidden in future")
+		}
+		if hasMultifieldForType(mappings.Properties, "join") {
+			emitESDeprecationWarningRound61(w, s, r, "Adding multifields to [join] mappers has no effect and will be forbidden in future")
 		}
 	}
 }

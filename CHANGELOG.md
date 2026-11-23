@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-11-23
+
+### Added
+- **Round-65 `v8.15.5 -> 98.90%` (`4,565 / 4,616`), `327`-Endpoint Go SDK v8 Suite, `316`-File Live Doris Expansion & `83.5%` Offline Statement Coverage:** Held **`1,985 / 1,985` (`100.00%`, `0` failures)** on upstream `v7.10.2` (CI ratcheted `1975 -> CONFORMANCE_MIN_V7_PASSED=1980`) and lifted upstream `v8.15.5` from `4,155` to **`4,565 / 4,616` unskipped (`98.90%`)** sections passed (CI ratcheted `4150 -> CONFORMANCE_MIN_V8_PASSED=4500`); expanded `TestLiveDorisUpstreamYAMLConformance_E2E` (`liveDorisTier1UpstreamYAMLSpecs`) from `206` to **`316` upstream YAML files** (`MemoryBackend` precheck: **`2,605 / 2,610` unskipped (`99.81%`)**; `DORIS_LIVE_YAML_MIN_PASSED` ratcheted `1400 -> 2350`, job timeout `35 -> 50` min); expanded `e2e/sdkconformance` with `Round65_01`–`Round65_10` to **`327` distinct `schema.json`-validated endpoints** (`499` HTTP responses verified, `minValidatedEndpointsTarget` ratcheted `190 -> 265`); and lifted offline merged statement coverage (`CONFORMANCE_CACHE_DIR=/nonexistent`) to **`83.51%` (`83.5%`, `161,132 / 192,950`)** (CI gate ratcheted `80.0% -> 82.0%`).
+- **ES 8.x Query/Aggs/TSDB/X-Pack & Ingest Runtime Parity:** Added `moving_percentiles` & `cumulative_cardinality` AST/execution, `rrf` & pinned docs AST validation, TSDB `passthrough` dimensions & synthetic `_source` validation, `multi_terms`/`top_metrics`/specialized analytics & `DeferableBucketAggregator` guards on `auto_date_histogram`/`variable_width_histogram`, `transform`/`rollup`/`autoscaling`/`profiling`/`inference`/`search_application`/`searchable_snapshots`/`watcher`/`license`/`voting_config_exclusions`/`_monitoring/bulk` X-Pack & REST endpoints, ingest `ctx._dynamic_templates` propagation (`_doc`, `_bulk`, and reroutes), and data-stream lazy rollover materialization on subsequent writes.
+
+### Fixed
+- **Runtime Scoring, Wire Warnings & ES\|QL/EQL Compliance:** Fixed BM25 numerator scoring factor (`(tf * (k1 + 1))`), emitted ES 8 deprecation warnings for `geo_bounding_box.type` under `compatible-with=7`, enforced custom date format rejection of unexpected fractional seconds when `S`/`n` is absent, restored `AnalysisConfig` during backend catalog sync, preserved `percolator` `matched_queries` ordering without corrupting slots, aligned `logstash` pipeline `no_body` responses, and refined ES\|QL/EQL typing, sorting, and response schemas.
+
+### Security & Fuzzing
+- **SSRF/`file://` Containment, `_terms_enum` Fail-Closed Auth, Pure-Go H3 Bounds, Strict Doris SQL & `27` Fuzz Targets:** Hardened `repository_url` URL parsing and `fetchURLSnapshotCatalogBytesR64` SSRF protections plus `path.repo` FS containment and cloned snapshot disk-sync iteration; isolated shard request cache keys by authenticated principal; made `_terms_enum` DLS/FLS authorization fail-closed and capped allocations with `maxTermsEnumSize = 65536`; enforced `maxGridCellsLimit` cumulatively across `spatial.GridDisk` BFS and polygon polyfill plus fixed `greatCircleDistanceRads` antimeridian wraparound; eliminated remaining raw `CAST` / `MATCH_*` / `score()` CTE leaks with matching `MemoryBackend` strict Nereids SQL checks; hardened `headResponseWriterR64`, `?format=yaml` NDJSON handling, and `Accept` `;q=0` negotiation; and expanded `Makefile` `fuzz` from `21` to **`27` `testing.F` targets** (adding `FuzzSpatialH3PolyfillAndGridDisk`, `FuzzValidateTSDBSettingsAndMappings`, `FuzzSpatialWKTGeoJSONAndGrid`, `FuzzTermsEnumDLSFLS`, `FuzzWireMiddlewareYAMLHead`, and `FuzzRepositoryURLValidator`).
+
 ## [0.20.0] - 2026-11-22
 
 ### Added
@@ -119,7 +131,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Round-5 Production Hardening:** Added `StreamLoadCoalescer` (`--bulk-coalesce-ms`), `QueryResultCache` (`--query-cache-ttl`) with automatic write invalidation and `now` date-math bypass, inbound HTTP `Basic` / `ApiKey` / `Bearer` authentication, native HTTPS/TLS (`--tls-cert` / `--tls-key`), and `migrate-schema --out-dir`.
 - **Packaging:** Added Helm chart (`deploy/helm/doris-es-proxy`), Prometheus `ServiceMonitor`, Grafana dashboard (`deploy/grafana/doris-es-proxy-dashboard.json`), and GitHub Actions release pipeline (`.github/workflows/release.yml`).
 
-[Unreleased]: https://github.com/es2doris/doris-es-proxy/compare/v0.17.0...HEAD
+[Unreleased]: https://github.com/es2doris/doris-es-proxy/compare/v0.21.0...HEAD
+[0.21.0]: https://github.com/es2doris/doris-es-proxy/compare/v0.20.0...v0.21.0
+[0.20.0]: https://github.com/es2doris/doris-es-proxy/compare/v0.19.0...v0.20.0
+[0.19.0]: https://github.com/es2doris/doris-es-proxy/compare/v0.18.0...v0.19.0
+[0.18.0]: https://github.com/es2doris/doris-es-proxy/compare/v0.17.0...v0.18.0
 [0.17.0]: https://github.com/es2doris/doris-es-proxy/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/es2doris/doris-es-proxy/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/es2doris/doris-es-proxy/compare/v0.14.0...v0.15.0

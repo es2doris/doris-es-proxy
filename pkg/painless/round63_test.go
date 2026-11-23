@@ -2154,20 +2154,69 @@ func FuzzEvalPainless(f *testing.F) {
 		"BitSet bs = new BitSet(); bs.flip(0, 20000); return bs.cardinality();",
 		"return 'abc'.repeat(1L << 62);",
 		"return field('nan_val').asBigInteger(0L);",
+		// F7b: GeoShapeDocValues & GeoPoint doc values / WKT parsing (Infinity, POLYGON, GEOMETRYCOLLECTION)
+		"return doc['geo_shape'].getBoundingBox().bottomRight().getLat();",
+		"return doc['geo_shape'].getBoundingBox().topLeft().getLon();",
+		"return doc['geo_shape'].getCentroid().lat + doc['geo_shape'].getLabelPosition().lon;",
+		"return doc['geo_shape'].getDimensionalType() + doc['geo_shape'].getMercatorWidth() + doc['geo_shape'].getMercatorHeight();",
+		"return doc['geo_point'].getBoundingBox().bottomRight().lat;",
+		"return doc['geo_point'].getCentroid().lon;",
+		"return doc['wkt_gc'].getBoundingBox().bottomRight().getLon();",
+		"return doc['wkt_inf'].getCentroid().lat;",
+		"POLYGON((24.04725 59.942,24.04825 59.94125,24.04875 59.94125,24.04875 59.94175,24.048 59.9425,24.0475 59.94275,24.0465 59.94225,24.046 59.94225,24.04575 59.9425,24.04525 59.94225,24.04725 59.942))",
+		"GEOMETRYCOLLECTION(POINT(1 2),LINESTRING(0 0,2 2),POLYGON((0 0,2 0,2 2,0 2,0 0)))",
+		"POINT(Infinity -Infinity)",
+		"ENVELOPE(-Infinity, Infinity, 10, -10)",
+		// F7b: hamming() on bit/byte vectors & score/filter script contexts
+		"return hamming(new byte[]{1, 2, 3, 4, 5}, 'vec_byte');",
+		"return hamming('006ff30e84', 'vec_byte');",
+		"return hamming([-128, 0, 127, 1, -1], 'vec_bit');",
+		"return hamming('006ff30e84', 'vec_bit');",
+		"return dotProduct([1.0, 2.0, 3.0], 'vec_float') + cosineSimilarity([1.0, 2.0, 3.0], 'vec_float');",
+		"return l1norm([0, 111, -13, 14, -124], 'vec_byte') + l2norm([0, 111, -13, 14, -124], 'vec_bit');",
+		"return _score * 2.0 + doc['num'].value;",
+		"return doc['num'].size() > 0 && !doc['geo_shape'].isEmpty();",
 	}
 	for _, s := range seeds {
 		f.Add(s)
 	}
 	f.Fuzz(func(t *testing.T, script string) {
 		doc := map[string]any{
-			"date":    "2020/05/15",
-			"u":       uint64(18446744073709551615),
-			"a":       map[string]any{"b": "init"},
-			"nan_val": math.NaN(),
+			"date":      "2020/05/15",
+			"u":         uint64(18446744073709551615),
+			"a":         map[string]any{"b": "init"},
+			"nan_val":   math.NaN(),
+			"num":       int64(42),
+			"geo_point": "41.12,-71.34",
+			"geo_shape": "POLYGON((24.04725 59.942,24.04825 59.94125,24.04875 59.94125,24.04875 59.94175,24.048 59.9425,24.0475 59.94275,24.0465 59.94225,24.046 59.94225,24.04575 59.9425,24.04525 59.94225,24.04725 59.942))",
+			"wkt_gc":    "GEOMETRYCOLLECTION(POINT(1 2),POLYGON((0 0,2 0,2 2,0 2,0 0)))",
+			"wkt_inf":   "POINT(Infinity 10)",
+			"vec_byte":  []any{0, 111, -13, 14, -124},
+			"vec_bit":   "006ff30e84",
+			"vec_float": []any{1.0, 2.0, 3.0},
 		}
 		params := map[string]any{
 			"_ingest": map[string]any{"timestamp": "2020-05-15T00:00:00Z"},
+			"_score":  1.5,
+			"__field_types": map[string]string{
+				"geo_point": "geo_point",
+				"geo_shape": "geo_shape",
+				"wkt_gc":    "geo_shape",
+				"wkt_inf":   "geo_shape",
+				"vec_byte":  "dense_vector",
+				"vec_bit":   "dense_vector",
+				"vec_float": "dense_vector",
+				"num":       "long",
+			},
+			"__vector_element_types": map[string]string{
+				"vec_byte":  "byte",
+				"vec_bit":   "bit",
+				"vec_float": "float",
+			},
 		}
 		_, _ = Eval(doc, script, params)
+		_, _, _ = EvalNumber(doc, script, params)
+		_, _ = EvalFilter(doc, script, params)
+		_, _ = ParseGeoShapeDocValues(script)
 	})
 }

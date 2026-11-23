@@ -2,11 +2,14 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -15,9 +18,11 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/es2doris/doris-es-proxy/pkg/esast"
+	"github.com/es2doris/doris-es-proxy/pkg/painless"
 	"github.com/es2doris/doris-es-proxy/pkg/schema"
 )
 
@@ -355,24 +360,519 @@ func formatSnapshotResponseItemRound61(rawSnap map[string]any, repoName string, 
 
 const proxySnapshotCatalogFileR64 = "_proxy_snapshots.json"
 
-func persistFSSnapshotsDiskR64(repoObj map[string]any, bySnap map[string]map[string]any) {
-	if repoObj == nil {
-		return
+const maxSnapshotURLCatalogBytesR65 = 16 << 20
+
+type validatedSnapshotURLR65 struct {
+	scheme             string
+	cleanedURL         string
+	resolvedFilePath   string
+	matchedPathRepo    string
+	explicitHostAllow  bool
+	explicitAllowedIPs []netip.Addr
+}
+
+func extractSettingStringsLockedR65(settings map[string]any, dottedKey string) []string {
+	if len(settings) == 0 {
+		return nil
 	}
-	repoType, _ := repoObj["type"].(string)
-	if strings.TrimSpace(repoType) != "fs" {
-		return
+	raw, exists := settings[dottedKey]
+	if !exists || raw == nil {
+		var found bool
+		raw, found = lookupNestedClusterSettingR62Admin(settings, dottedKey)
+		if !found || raw == nil {
+			return nil
+		}
 	}
-	settings, _ := repoObj["settings"].(map[string]any)
-	loc, _ := settings["location"].(string)
-	loc = strings.TrimSpace(loc)
-	if loc == "" {
-		return
+	var out []string
+	appendItem := func(s string) {
+		for _, part := range strings.Split(s, ",") {
+			p := strings.TrimSpace(part)
+			if p != "" {
+				out = append(out, p)
+			}
+		}
 	}
-	info, err := os.Stat(loc)
-	if err != nil || !info.IsDir() {
-		return
+	switch v := raw.(type) {
+	case string:
+		appendItem(v)
+	case []string:
+		for _, s := range v {
+			appendItem(s)
+		}
+	case []any:
+		for _, item := range v {
+			if item == nil {
+				continue
+			}
+			appendItem(fmt.Sprintf("%v", item))
+		}
 	}
+	return out
+}
+
+// resolveSymlinkBestEffortR65 resolves symlinks cleanly (even for macOS /var -> /private/var
+// or not-yet-created subdirectories) and follows dangling symlinks via os.Readlink so
+// containment checks cannot be bypassed with non-existent symlink targets.
+func resolveSymlinkBestEffortR65(rawPath string) (string, error) {
+	return resolveSymlinkBestEffortDepthR65(rawPath, 0)
+}
+
+func resolveSymlinkBestEffortDepthR65(rawPath string, depth int) (string, error) {
+	if depth > 40 {
+		return "", fmt.Errorf("too many levels of symbolic links")
+	}
+	p := strings.TrimSpace(rawPath)
+	if p == "" {
+		return "", fmt.Errorf("empty path")
+	}
+	if len(p) > 4096 {
+		return "", fmt.Errorf("path exceeds maximum length")
+	}
+	for i := 0; i < len(p); i++ {
+		if p[i] < 0x20 || p[i] == 0x7f {
+			return "", fmt.Errorf("control characters are not allowed in path")
+		}
+	}
+	abs, err := filepath.Abs(filepath.Clean(p))
+	if err != nil {
+		return "", err
+	}
+	if resolved, evalErr := filepath.EvalSymlinks(abs); evalErr == nil {
+		return filepath.Clean(resolved), nil
+	} else if !os.IsNotExist(evalErr) {
+		return "", evalErr
+	}
+
+	cur := abs
+	var tail []string
+	for {
+		if fi, lErr := os.Lstat(cur); lErr == nil && fi.Mode()&os.ModeSymlink != 0 {
+			linkTarget, rlErr := os.Readlink(cur)
+			if rlErr != nil {
+				return "", rlErr
+			}
+			if !filepath.IsAbs(linkTarget) {
+				linkTarget = filepath.Join(filepath.Dir(cur), linkTarget)
+			}
+			resolvedTarget, rtErr := resolveSymlinkBestEffortDepthR65(linkTarget, depth+1)
+			if rtErr != nil {
+				return "", rtErr
+			}
+			out := resolvedTarget
+			for i := len(tail) - 1; i >= 0; i-- {
+				out = filepath.Join(out, tail[i])
+			}
+			return filepath.Clean(out), nil
+		}
+		if resolved, evalErr := filepath.EvalSymlinks(cur); evalErr == nil {
+			out := resolved
+			for i := len(tail) - 1; i >= 0; i-- {
+				out = filepath.Join(out, tail[i])
+			}
+			return filepath.Clean(out), nil
+		} else if !os.IsNotExist(evalErr) {
+			return "", evalErr
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			break
+		}
+		tail = append(tail, filepath.Base(cur))
+		cur = parent
+	}
+	return "", fmt.Errorf("unable to resolve path [%s]", rawPath)
+}
+
+func extractConfiguredPathReposLockedR65(settings map[string]any) []string {
+	rawRoots := extractSettingStringsLockedR65(settings, "path.repo")
+	if len(rawRoots) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(rawRoots))
+	out := make([]string, 0, len(rawRoots))
+	for _, r := range rawRoots {
+		resolved, err := resolveSymlinkBestEffortR65(r)
+		if err != nil || resolved == "" {
+			continue
+		}
+		if _, dup := seen[resolved]; dup {
+			continue
+		}
+		seen[resolved] = struct{}{}
+		out = append(out, resolved)
+	}
+	return out
+}
+
+func extractAllowedRepoURLsLockedR65(settings map[string]any) []string {
+	return extractSettingStringsLockedR65(settings, "repositories.url.allowed_urls")
+}
+
+func isPathContainedR65(targetPath, rootDir string) bool {
+	if targetPath == "" || rootDir == "" {
+		return false
+	}
+	rel, err := filepath.Rel(rootDir, targetPath)
+	if err != nil || rel == "" {
+		return false
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return false
+	}
+	if filepath.IsAbs(rel) {
+		return false
+	}
+	return true
+}
+
+func isAmbiguousOrNonStandardIPLiteralR65(host string) bool {
+	if host == "" {
+		return false
+	}
+	if _, err := netip.ParseAddr(host); err == nil {
+		return false
+	}
+	lower := strings.ToLower(host)
+	// Pure integer IPv4 (e.g., 2130706433) or hex literal (0x7f000001).
+	if strings.HasPrefix(lower, "0x") {
+		if _, err := strconv.ParseUint(lower[2:], 16, 64); err == nil {
+			return true
+		}
+	}
+	allDigits := true
+	for i := 0; i < len(lower); i++ {
+		if lower[i] < '0' || lower[i] > '9' {
+			allDigits = false
+			break
+		}
+	}
+	if allDigits {
+		return true
+	}
+	// Dotted numeric forms such as 0177.0.0.1, 127.1, 127.0.1, 0x7f.0.0.1.
+	parts := strings.Split(lower, ".")
+	if len(parts) >= 2 && len(parts) <= 4 {
+		allNum := true
+		for _, p := range parts {
+			if p == "" {
+				allNum = false
+				break
+			}
+			if _, err := strconv.ParseUint(p, 0, 64); err != nil {
+				allNum = false
+				break
+			}
+		}
+		if allNum {
+			return true
+		}
+	}
+	return false
+}
+
+func isUnconditionallyBlockedSnapshotHostOrIPR65(host string, ip *netip.Addr) bool {
+	lower := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
+	if lower == "metadata.google.internal" || lower == "metadata" || lower == "metadata.goog" {
+		return true
+	}
+	if ip != nil {
+		u := ip.Unmap()
+		if u.IsLinkLocalUnicast() || u.IsLinkLocalMulticast() || u.IsMulticast() || u.IsUnspecified() {
+			return true
+		}
+		if u.Is4() {
+			b := u.As4()
+			// Block 169.254.0.0/16 IMDS/link-local and 0.0.0.0/8.
+			if (b[0] == 169 && b[1] == 254) || b[0] == 0 {
+				return true
+			}
+		}
+		// AWS EC2 IPv6 IMDS fd00:ec2::254
+		if u.String() == "fd00:ec2::254" {
+			return true
+		}
+	}
+	return false
+}
+
+func isPrivateOrLoopbackSnapshotHostOrIPR65(host string, ip *netip.Addr) bool {
+	lower := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
+	if lower == "localhost" || strings.HasSuffix(lower, ".localhost") ||
+		strings.HasSuffix(lower, ".internal") || strings.HasSuffix(lower, ".local") {
+		return true
+	}
+	if ip != nil {
+		u := ip.Unmap()
+		if isBlockedRemoteReindexIPRound62(u) || u.IsLoopback() || u.IsPrivate() || u.IsLinkLocalUnicast() || u.IsUnspecified() {
+			return true
+		}
+	}
+	return false
+}
+
+func matchExplicitAllowedURLPatternR65(pattern, targetURL, targetScheme, targetHost string) (matched bool, explicitHost bool, literalIPs []netip.Addr) {
+	if !matchWildcardPattern(pattern, targetURL) {
+		return false, false, nil
+	}
+	pTrim := strings.TrimSpace(pattern)
+	// Extract scheme/authority host from pattern when present without wildcards.
+	idx := strings.Index(pTrim, "://")
+	if idx <= 0 {
+		return true, false, nil
+	}
+	patScheme := strings.ToLower(strings.TrimSpace(pTrim[:idx]))
+	if strings.ContainsAny(patScheme, "*?") || patScheme != targetScheme {
+		return true, false, nil
+	}
+	rest := pTrim[idx+3:]
+	authEnd := len(rest)
+	for i := 0; i < len(rest); i++ {
+		if rest[i] == '/' || rest[i] == '?' || rest[i] == '#' {
+			authEnd = i
+			break
+		}
+	}
+	patAuth := rest[:authEnd]
+	if patAuth == "" || strings.Contains(patAuth, "@") {
+		return true, false, nil
+	}
+	// Strip port suffix from authority (handle IPv6 [::1]:port or [::1]*).
+	patHost := patAuth
+	if strings.HasPrefix(patAuth, "[") {
+		if closeIdx := strings.IndexByte(patAuth, ']'); closeIdx > 1 {
+			patHost = patAuth[1:closeIdx]
+		} else {
+			return true, false, nil
+		}
+	} else {
+		// Split on ':' or trailing '*' attached directly after portless host.
+		if colon := strings.IndexByte(patHost, ':'); colon >= 0 {
+			patHost = patHost[:colon]
+		}
+		// Handle patterns like "http://snapshot.test*" where path/port wildcard has no '/' before '*'.
+		if strings.ContainsAny(patHost, "*?") {
+			return true, false, nil
+		}
+	}
+	patHost = strings.TrimSpace(patHost)
+	if patHost == "" || strings.ContainsAny(patHost, "*?") {
+		return true, false, nil
+	}
+	if !strings.EqualFold(patHost, targetHost) {
+		return true, false, nil
+	}
+	if addr, err := netip.ParseAddr(patHost); err == nil {
+		literalIPs = append(literalIPs, addr.Unmap())
+	}
+	return true, true, literalIPs
+}
+
+func evaluateAllowedURLPatternsR65(patterns []string, rawURL, scheme, host string) (allowed bool, explicitHost bool, explicitIPs []netip.Addr) {
+	if len(patterns) == 0 {
+		return false, false, nil
+	}
+	var positives []string
+	for _, rawPat := range patterns {
+		pat := strings.TrimSpace(rawPat)
+		if pat == "" {
+			continue
+		}
+		if strings.HasPrefix(pat, "-") {
+			if matchWildcardPattern(strings.TrimPrefix(pat, "-"), rawURL) {
+				return false, false, nil
+			}
+			continue
+		}
+		positives = append(positives, pat)
+	}
+	for _, pat := range positives {
+		m, eh, ips := matchExplicitAllowedURLPatternR65(pat, rawURL, scheme, host)
+		if m {
+			allowed = true
+			if eh {
+				explicitHost = true
+				explicitIPs = append(explicitIPs, ips...)
+			}
+		}
+	}
+	return allowed, explicitHost, explicitIPs
+}
+
+func hasPathTraversalSegmentR65(rawURL string, parsed *url.URL) bool {
+	checkSegments := func(p string) bool {
+		for _, seg := range strings.Split(strings.ReplaceAll(p, "\\", "/"), "/") {
+			if seg == "" {
+				continue
+			}
+			if seg == ".." {
+				return true
+			}
+			if unesc, err := url.PathUnescape(seg); err == nil && unesc == ".." {
+				return true
+			}
+			lowerSeg := strings.ToLower(seg)
+			if lowerSeg == "%2e%2e" || lowerSeg == ".%2e" || lowerSeg == "%2e." {
+				return true
+			}
+		}
+		return false
+	}
+	if checkSegments(rawURL) {
+		return true
+	}
+	if parsed != nil && (checkSegments(parsed.Path) || checkSegments(parsed.EscapedPath())) {
+		return true
+	}
+	return false
+}
+
+func parseAndValidateSnapshotRepoURLR65(rawURL string, pathRepos []string, allowedPatterns []string) (*validatedSnapshotURLR65, error) {
+	trimmed := strings.TrimSpace(rawURL)
+	if trimmed == "" {
+		return nil, fmt.Errorf("missing [url] in settings")
+	}
+	if strings.ContainsRune(trimmed, '\\') {
+		return nil, fmt.Errorf("backslashes are not allowed in repository URL")
+	}
+	for i := 0; i < len(trimmed); i++ {
+		if trimmed[i] < 0x20 || trimmed[i] == 0x7f {
+			return nil, fmt.Errorf("control characters are not allowed in repository URL")
+		}
+	}
+	parsed, err := url.Parse(trimmed)
+	if err != nil {
+		return nil, fmt.Errorf("invalid repository URL: %w", err)
+	}
+	if parsed.User != nil || strings.Contains(parsed.Host, "@") {
+		return nil, fmt.Errorf("userinfo is not allowed in repository URL")
+	}
+	if parsed.RawQuery != "" || parsed.Fragment != "" || strings.ContainsAny(trimmed, "?#") {
+		return nil, fmt.Errorf("query strings and fragments are not allowed in repository URL")
+	}
+	if hasPathTraversalSegmentR65(trimmed, parsed) {
+		return nil, fmt.Errorf("path traversal segments are not allowed in repository URL")
+	}
+
+	scheme := strings.ToLower(strings.TrimSpace(parsed.Scheme))
+	switch scheme {
+	case "file":
+		if parsed.Host != "" {
+			return nil, fmt.Errorf("unsupported file URL host [%s]", parsed.Host)
+		}
+		if parsed.Port() != "" {
+			return nil, fmt.Errorf("port is not allowed in file repository URL")
+		}
+		if len(pathRepos) == 0 {
+			return nil, fmt.Errorf("path.repo is not configured")
+		}
+		if len(allowedPatterns) == 0 {
+			return nil, fmt.Errorf("repositories.url.allowed_urls is not configured")
+		}
+		allowed, _, _ := evaluateAllowedURLPatternsR65(allowedPatterns, trimmed, scheme, parsed.Host)
+		if !allowed {
+			return nil, fmt.Errorf("url does not match repositories.url.allowed_urls")
+		}
+		fsPath := filepath.FromSlash(parsed.Path)
+		if fsPath == "" || !filepath.IsAbs(fsPath) {
+			return nil, fmt.Errorf("file URL path must be absolute")
+		}
+		resolvedPath, rErr := resolveSymlinkBestEffortR65(fsPath)
+		if rErr != nil {
+			return nil, fmt.Errorf("cannot resolve file repository path: %w", rErr)
+		}
+		matchedRoot := ""
+		for _, root := range pathRepos {
+			if isPathContainedR65(resolvedPath, root) {
+				matchedRoot = root
+				break
+			}
+		}
+		if matchedRoot == "" {
+			return nil, fmt.Errorf("resolved path is outside configured path.repo")
+		}
+		return &validatedSnapshotURLR65{
+			scheme:           "file",
+			cleanedURL:       trimmed,
+			resolvedFilePath: resolvedPath,
+			matchedPathRepo:  matchedRoot,
+		}, nil
+
+	case "http", "https":
+		host := strings.TrimSpace(parsed.Hostname())
+		if host == "" || strings.ContainsAny(host, "*?% \t") {
+			return nil, fmt.Errorf("invalid hostname in repository URL")
+		}
+		if strings.Count(parsed.Host, ":") > 1 && !strings.HasPrefix(parsed.Host, "[") {
+			return nil, fmt.Errorf("invalid authority in repository URL")
+		}
+		if portStr := parsed.Port(); portStr != "" {
+			p, pErr := strconv.Atoi(portStr)
+			if pErr != nil || p < 1 || p > 65535 {
+				return nil, fmt.Errorf("invalid port in repository URL")
+			}
+		}
+		if isAmbiguousOrNonStandardIPLiteralR65(host) {
+			return nil, fmt.Errorf("non-canonical numeric host [%s] is not allowed", host)
+		}
+		if len(allowedPatterns) == 0 {
+			return nil, fmt.Errorf("repositories.url.allowed_urls is not configured")
+		}
+		allowed, explicitHost, explicitIPs := evaluateAllowedURLPatternsR65(allowedPatterns, trimmed, scheme, host)
+		if !allowed {
+			return nil, fmt.Errorf("url does not match repositories.url.allowed_urls")
+		}
+		var parsedIP *netip.Addr
+		if addr, addrErr := netip.ParseAddr(host); addrErr == nil {
+			u := addr.Unmap()
+			parsedIP = &u
+		}
+		if isUnconditionallyBlockedSnapshotHostOrIPR65(host, parsedIP) {
+			return nil, fmt.Errorf("target host or IP [%s] is blocked", host)
+		}
+		if isPrivateOrLoopbackSnapshotHostOrIPR65(host, parsedIP) && !explicitHost {
+			return nil, fmt.Errorf("private/loopback target [%s] requires explicit host entry in repositories.url.allowed_urls", host)
+		}
+		return &validatedSnapshotURLR65{
+			scheme:             scheme,
+			cleanedURL:         strings.TrimRight(trimmed, "/"),
+			explicitHostAllow:  explicitHost,
+			explicitAllowedIPs: explicitIPs,
+		}, nil
+
+	default:
+		return nil, fmt.Errorf("unsupported repository URL scheme [%s]", scheme)
+	}
+}
+
+func validateFSRepoLocationR65(loc string, pathRepos []string) (resolvedLoc string, err error) {
+	trimmed := strings.TrimSpace(loc)
+	if trimmed == "" {
+		return "", nil
+	}
+	if len(pathRepos) == 0 {
+		// Compatibility mode when path.repo is not configured: keep fs repositories in-memory only.
+		return "", nil
+	}
+	if strings.ContainsRune(trimmed, '\x00') || hasPathTraversalSegmentR65(trimmed, nil) {
+		return "", fmt.Errorf("location [%s] contains invalid path traversal", loc)
+	}
+	candidate := filepath.FromSlash(trimmed)
+	if !filepath.IsAbs(candidate) {
+		candidate = filepath.Join(pathRepos[0], candidate)
+	}
+	resolved, rErr := resolveSymlinkBestEffortR65(candidate)
+	if rErr != nil {
+		return "", fmt.Errorf("location [%s] cannot be resolved: %w", loc, rErr)
+	}
+	for _, root := range pathRepos {
+		if isPathContainedR65(resolved, root) {
+			return resolved, nil
+		}
+	}
+	return "", fmt.Errorf("location [%s] is outside configured path.repo", loc)
+}
+
+func buildFSSnapshotCatalogPayloadLockedR64(bySnap map[string]map[string]any) ([]byte, bool) {
 	out := make(map[string]map[string]any, len(bySnap))
 	for sName, rawSnap := range bySnap {
 		if rawSnap == nil {
@@ -401,51 +901,191 @@ func persistFSSnapshotsDiskR64(repoObj map[string]any, bySnap map[string]map[str
 	}
 	payload, err := json.Marshal(out)
 	if err != nil {
+		return nil, false
+	}
+	return payload, true
+}
+
+func persistFSSnapshotsDiskPayloadR65(repoObj map[string]any, payload []byte, pathRepos []string) {
+	if repoObj == nil || len(payload) == 0 || len(pathRepos) == 0 {
 		return
 	}
-	tmpPath := filepath.Join(loc, proxySnapshotCatalogFileR64+".tmp")
-	finalPath := filepath.Join(loc, proxySnapshotCatalogFileR64)
-	if err := os.WriteFile(tmpPath, payload, 0o600); err != nil {
+	repoType, _ := repoObj["type"].(string)
+	if strings.TrimSpace(repoType) != "fs" {
+		return
+	}
+	settings, _ := repoObj["settings"].(map[string]any)
+	loc, _ := settings["location"].(string)
+	resolvedLoc, err := validateFSRepoLocationR65(loc, pathRepos)
+	if err != nil || resolvedLoc == "" {
+		return
+	}
+	lfi, lErr := os.Lstat(resolvedLoc)
+	if lErr != nil || lfi.Mode()&os.ModeSymlink != 0 || !lfi.IsDir() {
+		return
+	}
+	finalPath := filepath.Join(resolvedLoc, proxySnapshotCatalogFileR64)
+	if ffi, fErr := os.Lstat(finalPath); fErr == nil {
+		if ffi.Mode()&os.ModeSymlink != 0 {
+			return
+		}
+		resolvedFinal, rfErr := resolveSymlinkBestEffortR65(finalPath)
+		if rfErr != nil || !isPathContainedR65(resolvedFinal, resolvedLoc) {
+			return
+		}
+	}
+	tmpFile, err := os.CreateTemp(resolvedLoc, ".proxy_snapshots_*.tmp")
+	if err != nil {
+		return
+	}
+	tmpPath := tmpFile.Name()
+	cleanupTmp := true
+	defer func() {
+		if cleanupTmp {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+	if err := tmpFile.Chmod(0o600); err != nil {
+		_ = tmpFile.Close()
+		return
+	}
+	if _, err := tmpFile.Write(payload); err != nil {
+		_ = tmpFile.Close()
+		return
+	}
+	if err := tmpFile.Close(); err != nil {
 		return
 	}
 	if err := os.Rename(tmpPath, finalPath); err != nil {
-		_ = os.WriteFile(finalPath, payload, 0o600)
-		_ = os.Remove(tmpPath)
+		return
+	}
+	cleanupTmp = false
+}
+
+func isIPAuthorizedByExplicitAllowlistR65(ip netip.Addr, v *validatedSnapshotURLR65) bool {
+	u := ip.Unmap()
+	if isUnconditionallyBlockedSnapshotHostOrIPR65("", &u) {
+		return false
+	}
+	if !isBlockedRemoteReindexIPRound62(u) && !u.IsLoopback() && !u.IsPrivate() && !u.IsLinkLocalUnicast() && !u.IsUnspecified() {
+		return true
+	}
+	if v != nil && v.explicitHostAllow {
+		for _, allowedIP := range v.explicitAllowedIPs {
+			if allowedIP.Unmap() == u {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func buildSnapshotURLTransportR65(v *validatedSnapshotURLR65) *http.Transport {
+	dialer := &net.Dialer{Timeout: 3 * time.Second}
+	return &http.Transport{
+		Proxy:             nil,
+		DisableKeepAlives: true,
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			host, port, err := net.SplitHostPort(addr)
+			if err != nil {
+				return nil, fmt.Errorf("invalid dial address: %w", err)
+			}
+			var candidateIPs []netip.Addr
+			if parsed, pErr := netip.ParseAddr(host); pErr == nil {
+				if !isIPAuthorizedByExplicitAllowlistR65(parsed, v) {
+					return nil, fmt.Errorf("ssrf blocked: IP [%s] is not permitted", parsed.String())
+				}
+				candidateIPs = append(candidateIPs, parsed.Unmap())
+			} else {
+				addrs, rErr := net.DefaultResolver.LookupIPAddr(ctx, host)
+				if rErr != nil || len(addrs) == 0 {
+					return nil, fmt.Errorf("dns resolution failed for [%s]", host)
+				}
+				for _, ipAddr := range addrs {
+					parsed, ok := netip.AddrFromSlice(ipAddr.IP)
+					if !ok {
+						continue
+					}
+					u := parsed.Unmap()
+					if !isIPAuthorizedByExplicitAllowlistR65(u, v) {
+						return nil, fmt.Errorf("ssrf blocked: resolved IP [%s] for host [%s] is forbidden", u.String(), host)
+					}
+					candidateIPs = append(candidateIPs, u)
+				}
+			}
+			if len(candidateIPs) == 0 {
+				return nil, fmt.Errorf("no permissible IP addresses for [%s]", host)
+			}
+			var lastErr error
+			for _, ip := range candidateIPs {
+				conn, dErr := dialer.DialContext(ctx, network, net.JoinHostPort(ip.String(), port))
+				if dErr == nil {
+					return conn, nil
+				}
+				lastErr = dErr
+			}
+			if lastErr != nil {
+				return nil, lastErr
+			}
+			return nil, fmt.Errorf("unable to connect to [%s]", addr)
+		},
 	}
 }
 
-func fetchURLSnapshotCatalogBytesR64(rawURL string) ([]byte, bool) {
-	trimmed := strings.TrimSpace(rawURL)
-	if trimmed == "" {
-		return nil, false
-	}
-	parsed, err := url.Parse(trimmed)
+func fetchURLSnapshotCatalogBytesR64(rawURL string, pathRepos []string, allowedPatterns []string) ([]byte, bool) {
+	v, err := parseAndValidateSnapshotRepoURLR65(rawURL, pathRepos, allowedPatterns)
 	if err != nil {
 		return nil, false
 	}
-	switch strings.ToLower(parsed.Scheme) {
+	switch v.scheme {
 	case "file":
-		dirPath := parsed.Path
-		if parsed.Host != "" && parsed.Host != "localhost" {
-			dirPath = filepath.Join(string(filepath.Separator)+parsed.Host, parsed.Path)
-		}
-		if dirPath == "" {
+		catalogPath := filepath.Join(v.resolvedFilePath, proxySnapshotCatalogFileR64)
+		resolvedCatalog, rcErr := resolveSymlinkBestEffortR65(catalogPath)
+		if rcErr != nil || !isPathContainedR65(resolvedCatalog, v.matchedPathRepo) {
 			return nil, false
 		}
-		b, readErr := os.ReadFile(filepath.Join(filepath.FromSlash(dirPath), proxySnapshotCatalogFileR64))
-		if readErr != nil {
+		lfi, lErr := os.Lstat(resolvedCatalog)
+		if lErr != nil || !lfi.Mode().IsRegular() || lfi.Size() > maxSnapshotURLCatalogBytesR65 {
+			return nil, false
+		}
+		resolvedRoot, rrErr := resolveSymlinkBestEffortR65(v.matchedPathRepo)
+		if rrErr != nil {
+			return nil, false
+		}
+		relCatalog, relErr := filepath.Rel(resolvedRoot, resolvedCatalog)
+		if relErr != nil || relCatalog == "." || strings.HasPrefix(relCatalog, "..") || filepath.IsAbs(relCatalog) {
+			return nil, false
+		}
+		root, rootErr := os.OpenRoot(resolvedRoot)
+		if rootErr != nil {
+			return nil, false
+		}
+		defer func() { _ = root.Close() }()
+		f, openErr := root.Open(relCatalog)
+		if openErr != nil {
+			return nil, false
+		}
+		defer func() { _ = f.Close() }()
+		b, readErr := io.ReadAll(io.LimitReader(f, maxSnapshotURLCatalogBytesR65+1))
+		if readErr != nil || int64(len(b)) > maxSnapshotURLCatalogBytesR65 {
 			return nil, false
 		}
 		return b, true
+
 	case "http", "https":
-		target := strings.TrimRight(trimmed, "/") + "/" + proxySnapshotCatalogFileR64
+		target := v.cleanedURL + "/" + proxySnapshotCatalogFileR64
 		client := &http.Client{
-			Timeout: 5 * time.Second,
+			Timeout:   5 * time.Second,
+			Transport: buildSnapshotURLTransportR65(v),
 			CheckRedirect: func(*http.Request, []*http.Request) error {
 				return http.ErrUseLastResponse
 			},
 		}
-		resp, getErr := client.Get(target)
+		req, reqErr := http.NewRequest(http.MethodGet, target, nil)
+		if reqErr != nil {
+			return nil, false
+		}
+		resp, getErr := client.Do(req)
 		if getErr != nil {
 			return nil, false
 		}
@@ -453,11 +1093,12 @@ func fetchURLSnapshotCatalogBytesR64(rawURL string) ([]byte, bool) {
 		if resp.StatusCode != http.StatusOK {
 			return nil, false
 		}
-		b, readErr := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
-		if readErr != nil {
+		b, readErr := io.ReadAll(io.LimitReader(resp.Body, maxSnapshotURLCatalogBytesR65+1))
+		if readErr != nil || int64(len(b)) > maxSnapshotURLCatalogBytesR65 {
 			return nil, false
 		}
 		return b, true
+
 	default:
 		return nil, false
 	}
@@ -469,7 +1110,11 @@ func (s *Server) syncURLRepoSnapshotsByExprR64(repoExpr string) {
 		url  string
 	}
 	var targets []repoTarget
+	var pathRepos []string
+	var allowedURLs []string
 	s.mu.RLock()
+	pathRepos = extractConfiguredPathReposLockedR65(s.clusterPersistentSettings)
+	allowedURLs = extractAllowedRepoURLsLockedR65(s.clusterPersistentSettings)
 	for rName, rObj := range s.snapshotRepos {
 		if rObj == nil {
 			continue
@@ -489,13 +1134,52 @@ func (s *Server) syncURLRepoSnapshotsByExprR64(repoExpr string) {
 	}
 	s.mu.RUnlock()
 
-	for _, tgt := range targets {
-		raw, ok := fetchURLSnapshotCatalogBytesR64(tgt.url)
-		if !ok {
+	if len(targets) == 0 {
+		return
+	}
+
+	type fetchedResult struct {
+		name string
+		raw  []byte
+		ok   bool
+	}
+	results := make([]fetchedResult, len(targets))
+	workers := 4
+	if len(targets) < workers {
+		workers = len(targets)
+	}
+	if workers <= 1 {
+		for i, tgt := range targets {
+			raw, ok := fetchURLSnapshotCatalogBytesR64(tgt.url, pathRepos, allowedURLs)
+			results[i] = fetchedResult{name: tgt.name, raw: raw, ok: ok}
+		}
+	} else {
+		jobs := make(chan int, len(targets))
+		for i := range targets {
+			jobs <- i
+		}
+		close(jobs)
+		var wg sync.WaitGroup
+		for w := 0; w < workers; w++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for idx := range jobs {
+					tgt := targets[idx]
+					raw, ok := fetchURLSnapshotCatalogBytesR64(tgt.url, pathRepos, allowedURLs)
+					results[idx] = fetchedResult{name: tgt.name, raw: raw, ok: ok}
+				}
+			}()
+		}
+		wg.Wait()
+	}
+
+	for _, res := range results {
+		if !res.ok {
 			continue
 		}
 		var diskSnaps map[string]map[string]any
-		dec := json.NewDecoder(bytes.NewReader(raw))
+		dec := json.NewDecoder(bytes.NewReader(res.raw))
 		dec.UseNumber()
 		if err := dec.Decode(&diskSnaps); err != nil || diskSnaps == nil {
 			continue
@@ -505,7 +1189,7 @@ func (s *Server) syncURLRepoSnapshotsByExprR64(repoExpr string) {
 			if snapData == nil {
 				continue
 			}
-			snapData["repository"] = tgt.name
+			snapData["repository"] = res.name
 			if rawSchemas, okRS := snapData["__schemas_raw"].(map[string]any); okRS {
 				compiled := make(map[string]*schema.IndexSchema, len(rawSchemas))
 				for idxName, rawMapAny := range rawSchemas {
@@ -528,12 +1212,12 @@ func (s *Server) syncURLRepoSnapshotsByExprR64(repoExpr string) {
 			loaded[sName] = snapData
 		}
 		s.mu.Lock()
-		if curRepo := s.snapshotRepos[tgt.name]; curRepo != nil {
+		if curRepo := s.snapshotRepos[res.name]; curRepo != nil {
 			if curType, _ := curRepo["type"].(string); strings.TrimSpace(curType) == "url" {
 				if s.snapshots == nil {
 					s.snapshots = make(map[string]map[string]map[string]any)
 				}
-				s.snapshots[tgt.name] = loaded
+				s.snapshots[res.name] = loaded
 			}
 		}
 		s.mu.Unlock()
@@ -541,26 +1225,34 @@ func (s *Server) syncURLRepoSnapshotsByExprR64(repoExpr string) {
 }
 
 func (s *Server) syncAllFSRepositoriesDiskR64() {
-	type fsPair struct {
+	type fsPayloadPair struct {
 		repoObj map[string]any
-		bySnap  map[string]map[string]any
+		payload []byte
 	}
-	var pairs []fsPair
+	var pairs []fsPayloadPair
+	var pathRepos []string
 	s.mu.RLock()
-	for rName, rObj := range s.snapshotRepos {
-		if rObj == nil {
-			continue
-		}
-		if rt, _ := rObj["type"].(string); strings.TrimSpace(rt) == "fs" {
-			pairs = append(pairs, fsPair{
-				repoObj: deepCloneDocMap(rObj),
-				bySnap:  s.snapshots[rName],
-			})
+	pathRepos = extractConfiguredPathReposLockedR65(s.clusterPersistentSettings)
+	if len(pathRepos) > 0 {
+		for rName, rObj := range s.snapshotRepos {
+			if rObj == nil {
+				continue
+			}
+			if rt, _ := rObj["type"].(string); strings.TrimSpace(rt) == "fs" {
+				payload, ok := buildFSSnapshotCatalogPayloadLockedR64(s.snapshots[rName])
+				if !ok {
+					continue
+				}
+				pairs = append(pairs, fsPayloadPair{
+					repoObj: deepCloneDocMap(rObj),
+					payload: payload,
+				})
+			}
 		}
 	}
 	s.mu.RUnlock()
 	for _, p := range pairs {
-		persistFSSnapshotsDiskR64(p.repoObj, p.bySnap)
+		persistFSSnapshotsDiskPayloadR65(p.repoObj, p.payload, pathRepos)
 	}
 }
 
@@ -569,6 +1261,8 @@ func (s *Server) handleSnapshotRepo(w http.ResponseWriter, r *http.Request) {
 	repo := strings.TrimSpace(r.PathValue("repository"))
 	if repo == "_status" && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
 		if r.Method == http.MethodHead {
+			payload, _ := json.Marshal(map[string]any{"snapshots": collectActiveSnapshotStatusesRound63(s)})
+			w.Header().Set("Content-Length", strconv.Itoa(len(payload)))
 			ensureESCompatHeaders(w, r)
 			w.WriteHeader(http.StatusOK)
 			return
@@ -595,9 +1289,12 @@ func (s *Server) handleSnapshotRepo(w http.ResponseWriter, r *http.Request) {
 			}
 			s.mu.RUnlock()
 			if r.Method == http.MethodHead {
+				ensureESCompatHeaders(w, r)
 				if len(out) == 0 && repo != "" {
 					w.WriteHeader(http.StatusNotFound)
 				} else {
+					payload, _ := json.Marshal(out)
+					w.Header().Set("Content-Length", strconv.Itoa(len(payload)))
 					w.WriteHeader(http.StatusOK)
 				}
 				return
@@ -622,6 +1319,7 @@ func (s *Server) handleSnapshotRepo(w http.ResponseWriter, r *http.Request) {
 			} else if !ignoreUnavailable {
 				s.mu.RUnlock()
 				if r.Method == http.MethodHead {
+					ensureESCompatHeaders(w, r)
 					w.WriteHeader(http.StatusNotFound)
 					return
 				}
@@ -631,9 +1329,12 @@ func (s *Server) handleSnapshotRepo(w http.ResponseWriter, r *http.Request) {
 		}
 		s.mu.RUnlock()
 		if r.Method == http.MethodHead {
+			ensureESCompatHeaders(w, r)
 			if len(out) == 0 {
 				w.WriteHeader(http.StatusNotFound)
 			} else {
+				payload, _ := json.Marshal(out)
+				w.Header().Set("Content-Length", strconv.Itoa(len(payload)))
 				w.WriteHeader(http.StatusOK)
 			}
 			return
@@ -666,6 +1367,25 @@ func (s *Server) handleSnapshotRepo(w http.ResponseWriter, r *http.Request) {
 		if st, ok := reqMap["settings"].(map[string]any); ok && st != nil {
 			settings = st
 		}
+		s.mu.RLock()
+		pathRepos := extractConfiguredPathReposLockedR65(s.clusterPersistentSettings)
+		allowedURLs := extractAllowedRepoURLsLockedR65(s.clusterPersistentSettings)
+		s.mu.RUnlock()
+		if repoType == "fs" {
+			loc, _ := settings["location"].(string)
+			if len(pathRepos) > 0 {
+				if strings.TrimSpace(loc) == "" {
+					writeESError(w, http.StatusBadRequest, "repository_exception",
+						fmt.Sprintf("[%s] failed to create repository: missing [location] in settings", repo))
+					return
+				}
+				if _, locErr := validateFSRepoLocationR65(loc, pathRepos); locErr != nil {
+					writeESError(w, http.StatusBadRequest, "repository_exception",
+						fmt.Sprintf("[%s] failed to create repository: location [%s] doesn't match any of the locations specified by path.repo (%s)", repo, loc, locErr.Error()))
+					return
+				}
+			}
+		}
 		if repoType == "url" {
 			urlStr, _ := settings["url"].(string)
 			urlTrim := strings.TrimSpace(urlStr)
@@ -674,35 +1394,9 @@ func (s *Server) handleSnapshotRepo(w http.ResponseWriter, r *http.Request) {
 					fmt.Sprintf("[%s] failed to create repository: missing [url] in settings", repo))
 				return
 			}
-			s.mu.RLock()
-			allowedURLs := ""
-			if s.clusterPersistentSettings != nil {
-				switch av := s.clusterPersistentSettings["repositories.url.allowed_urls"].(type) {
-				case string:
-					allowedURLs = av
-				case []any:
-					parts := make([]string, 0, len(av))
-					for _, it := range av {
-						if ps := strings.TrimSpace(fmt.Sprintf("%v", it)); ps != "" {
-							parts = append(parts, ps)
-						}
-					}
-					allowedURLs = strings.Join(parts, ",")
-				case []string:
-					allowedURLs = strings.Join(av, ",")
-				}
-			}
-			s.mu.RUnlock()
-			effectiveAllowed := strings.TrimSpace(allowedURLs)
-			isAllowed := false
-			if effectiveAllowed != "" {
-				isAllowed = matchMultiWildcardWithExclusions(effectiveAllowed, urlTrim)
-			} else if strings.HasPrefix(urlTrim, "http://snapshot.test") || strings.HasPrefix(urlTrim, "https://snapshot.test") {
-				isAllowed = true
-			}
-			if !isAllowed {
+			if _, valErr := parseAndValidateSnapshotRepoURLR65(urlTrim, pathRepos, allowedURLs); valErr != nil {
 				writeESError(w, http.StatusBadRequest, "repository_exception",
-					fmt.Sprintf("[%s] failed to create repository: url [%s] doesn't match any of the locations specified by path.repo or repositories.url.allowed_urls", repo, urlStr))
+					fmt.Sprintf("[%s] failed to create repository: url [%s] doesn't match any of the locations specified by path.repo or repositories.url.allowed_urls (%s)", repo, urlStr, valErr.Error()))
 				return
 			}
 		}
@@ -737,6 +1431,31 @@ func (s *Server) handleSnapshotRepo(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method")
 	}
+}
+
+func indexHasIncompleteSourceR65Locked(sc *schema.IndexSchema) bool {
+	if sc == nil {
+		return false
+	}
+	if sc.SourceDisabled() || sc.SyntheticSource || strings.EqualFold(strings.TrimSpace(sc.SourceMode), "synthetic") {
+		return true
+	}
+	inc, exc := sc.SourceIncludesExcludes()
+	if len(inc) > 0 || len(exc) > 0 {
+		return true
+	}
+	if sc.SourceConfig != nil {
+		if strings.EqualFold(strings.TrimSpace(sc.SourceConfig.Mode), "synthetic") ||
+			len(sc.SourceConfig.Includes) > 0 || len(sc.SourceConfig.Excludes) > 0 {
+			return true
+		}
+	}
+	if sc.RawMapping != nil && sc.RawMapping.Source != nil {
+		if rawMode, ok := sc.RawMapping.Source["mode"].(string); ok && strings.EqualFold(strings.TrimSpace(rawMode), "synthetic") {
+			return true
+		}
+	}
+	return false
 }
 
 // handleSnapshotActionOrItem implements `/_snapshot/{repository}/_verify`, `/_snapshot/{repository}/_status`, and `/_snapshot/{repository}/{snapshot}` (F1).
@@ -1113,10 +1832,46 @@ func (s *Server) handleSnapshotActionOrItem(w http.ResponseWriter, r *http.Reque
 		if b, ok := reqMap["include_global_state"].(bool); ok {
 			includeGlobalState = b
 		}
+		isSourceOnlyRepo := strings.EqualFold(strings.TrimSpace(repoType), "source")
+		var successfulIndices []string
+		var failures []any
 		snapShardTotal := 0
+		snapSuccessfulShards := 0
+		snapFailedShards := 0
+		s.mu.RLock()
 		for _, idxName := range indices {
 			ns, _, _ := s.getIndexShardAndReplicaCounts(idxName)
+			if ns < 1 {
+				ns = 1
+			}
 			snapShardTotal += ns
+			srcModeSetting := strings.ToLower(strings.TrimSpace(fmt.Sprintf("%v", s.indexCustomSettings[idxName]["index.mapping.source.mode"])))
+			if isSourceOnlyRepo && (indexHasIncompleteSourceR65Locked(s.indices[idxName]) ||
+				srcModeSetting == "synthetic" || srcModeSetting == "disabled") {
+				snapFailedShards += ns
+				failures = append(failures, map[string]any{
+					"index":      idxName,
+					"index_uuid": idxName + "-uuid",
+					"shard_id":   0,
+					"reason":     "IllegalStateException[Can't snapshot _source only on an index that has incomplete source ie. has _source disabled or filters the source]",
+					"node_id":    "doris-fe-1",
+					"status":     "FAILED",
+				})
+				continue
+			}
+			snapSuccessfulShards += ns
+			successfulIndices = append(successfulIndices, idxName)
+		}
+		s.mu.RUnlock()
+		if successfulIndices == nil {
+			successfulIndices = []string{}
+		}
+		if failures == nil {
+			failures = []any{}
+		}
+		snapState := "SUCCESS"
+		if snapFailedShards > 0 {
+			snapState = "PARTIAL"
 		}
 		snapVersionID := int64(8150599)
 		if !s.isES8Mode(r) {
@@ -1128,20 +1883,20 @@ func (s *Server) handleSnapshotActionOrItem(w http.ResponseWriter, r *http.Reque
 			"uuid":                 snap + "-uuid",
 			"version_id":           snapVersionID,
 			"version":              s.effectiveClusterESVersionNumber(r),
-			"indices":              indices,
+			"indices":              successfulIndices,
 			"data_streams":         []any{},
 			"include_global_state": includeGlobalState,
-			"state":                "SUCCESS",
+			"state":                snapState,
 			"start_time":           "2026-01-01T00:00:00.000Z",
 			"start_time_in_millis": int64(1767225600000),
 			"end_time":             "2026-01-01T00:00:01.000Z",
 			"end_time_in_millis":   int64(1767225601000),
 			"duration_in_millis":   int64(1000),
-			"failures":             []any{},
+			"failures":             failures,
 			"shards": map[string]any{
 				"total":      snapShardTotal,
-				"failed":     0,
-				"successful": snapShardTotal,
+				"failed":     snapFailedShards,
+				"successful": snapSuccessfulShards,
 			},
 		}
 		if meta, okM := reqMap["metadata"].(map[string]any); okM && meta != nil {
@@ -1155,7 +1910,7 @@ func (s *Server) handleSnapshotActionOrItem(w http.ResponseWriter, r *http.Reque
 				fmt.Sprintf("[%s:%s] Invalid snapshot name [%s], snapshot with the same name already exists", repo, snap, snap))
 			return
 		}
-		savedSchemas, savedDocs, savedSettings, savedAliases := s.exportSnapshotIndexData(r.Context(), indices)
+		savedSchemas, savedDocs, savedSettings, savedAliases := s.exportSnapshotIndexData(r.Context(), successfulIndices)
 		s.mu.Lock()
 		if s.snapshots != nil && s.snapshots[repo] != nil && s.snapshots[repo][snap] != nil {
 			s.mu.Unlock()
@@ -1167,7 +1922,7 @@ func (s *Server) handleSnapshotActionOrItem(w http.ResponseWriter, r *http.Reque
 		snapObj["__docs"] = savedDocs
 		snapObj["__settings"] = savedSettings
 		snapObj["__aliases"] = savedAliases
-		s.captureSnapshotExtraGlobalAndIndexStateLocked(snapObj, indices, includeGlobalState)
+		s.captureSnapshotExtraGlobalAndIndexStateLocked(snapObj, successfulIndices, includeGlobalState)
 		if includeGlobalState {
 			if len(s.pipelines) > 0 {
 				savedPipes := make(map[string]any, len(s.pipelines))
@@ -1467,9 +2222,30 @@ func (s *Server) handleSnapshotItemAction(w http.ResponseWriter, r *http.Request
 			delete(s.closedIndices, targetIdx)
 			s.ensureIndexCreationDateLocked(targetIdx)
 			s.mu.Unlock()
-			s.persistIndex(r.Context(), targetIdx, restoredSchema)
 		}
 		s.restoreSnapshotIndexArtifacts(r.Context(), rawSnapRef, srcIdx, targetIdx, restoredSchema, reqMap, true)
+		storageMode := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("storage")))
+		if storageMode == "" && reqMap != nil {
+			if sm, okS := reqMap["storage"].(string); okS {
+				storageMode = strings.ToLower(strings.TrimSpace(sm))
+			}
+		}
+		if storageMode != "full_copy" {
+			storageMode = "shared_cache"
+		}
+		s.mu.Lock()
+		if s.indexCustomSettings == nil {
+			s.indexCustomSettings = make(map[string]map[string]any)
+		}
+		if s.indexCustomSettings[targetIdx] == nil {
+			s.indexCustomSettings[targetIdx] = make(map[string]any)
+		}
+		s.indexCustomSettings[targetIdx]["store.type"] = "snapshot"
+		s.indexCustomSettings[targetIdx]["store.snapshot.storage"] = storageMode
+		s.mu.Unlock()
+		if restoredSchema != nil {
+			s.persistIndex(r.Context(), targetIdx, restoredSchema)
+		}
 		recordIndexRecoverySourceR62Admin(s, targetIdx, "SNAPSHOT")
 		writeJSON(w, http.StatusOK, map[string]any{
 			"accepted": true,
@@ -2898,6 +3674,7 @@ func (s *Server) handleIngestGeoIPStats(w http.ResponseWriter, r *http.Request) 
 			"total_download_time":  0,
 			"databases_count":      dbCount,
 			"skipped_updates":      0,
+			"expired_databases":    0,
 		},
 		"nodes": nodesMap,
 	})
@@ -3121,6 +3898,7 @@ func (s *Server) handleWatcherWatchAction(w http.ResponseWriter, r *http.Request
 			"_id": recordID,
 			"watch_record": map[string]any{
 				"watch_id": id,
+				"user":     "elastic",
 				"node":     "doris-fe-1",
 				"state":    "executed",
 				"status":   statusObj,
@@ -3355,6 +4133,502 @@ func (s *Server) handleWatcherRoot(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleTransform implements `PUT/GET/DELETE /_transform/{id}`, `GET /_transform`, `POST /_transform/_preview` (F7).
+func validateTransformIDR65(id string) bool {
+	if id == "" || len(id) > 64 {
+		return false
+	}
+	for i := 0; i < len(id); i++ {
+		c := id[i]
+		isAlphaNum := (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')
+		if i == 0 || i == len(id)-1 {
+			if !isAlphaNum {
+				return false
+			}
+			continue
+		}
+		if !isAlphaNum && c != '-' && c != '_' {
+			return false
+		}
+	}
+	return true
+}
+
+func normalizeTransformConfigR65(entry map[string]any) map[string]any {
+	if entry == nil {
+		return nil
+	}
+	if srcMap, okS := entry["source"].(map[string]any); okS && srcMap != nil {
+		var idxSlice []any
+		switch iv := srcMap["index"].(type) {
+		case string:
+			for _, p := range strings.Split(iv, ",") {
+				if pt := strings.TrimSpace(p); pt != "" {
+					idxSlice = append(idxSlice, pt)
+				}
+			}
+		case []string:
+			for _, p := range iv {
+				if pt := strings.TrimSpace(p); pt != "" {
+					idxSlice = append(idxSlice, pt)
+				}
+			}
+		case []any:
+			for _, p := range iv {
+				if pt := strings.TrimSpace(fmt.Sprintf("%v", p)); pt != "" {
+					idxSlice = append(idxSlice, pt)
+				}
+			}
+		}
+		if len(idxSlice) > 0 {
+			srcMap["index"] = idxSlice
+		}
+		if _, hasQ := srcMap["query"]; !hasQ {
+			srcMap["query"] = map[string]any{"match_all": map[string]any{}}
+		}
+	}
+	if syncMap, okSy := entry["sync"].(map[string]any); okSy && syncMap != nil {
+		if tm, okTM := syncMap["time"].(map[string]any); okTM && tm != nil {
+			if _, hasDelay := tm["delay"]; !hasDelay {
+				tm["delay"] = "60s"
+			}
+		}
+	}
+	if pivotMap, okP := entry["pivot"].(map[string]any); okP && pivotMap != nil {
+		if aggsVal, hasAggs := pivotMap["aggs"]; hasAggs {
+			if _, hasFull := pivotMap["aggregations"]; !hasFull {
+				pivotMap["aggregations"] = aggsVal
+			}
+			delete(pivotMap, "aggs")
+		}
+	}
+	return entry
+}
+
+func (s *Server) validateTransformConfigBodyR65(w http.ResponseWriter, r *http.Request, body map[string]any, isPut bool, isPreview bool) ([]string, bool) {
+	if isPut {
+		if _, hasCT := body["create_time"]; hasCT {
+			writeESError(w, http.StatusBadRequest, "x_content_parse_exception", "Found [create_time], not allowed for strict parsing")
+			return nil, false
+		}
+		if _, hasVer := body["version"]; hasVer {
+			writeESError(w, http.StatusBadRequest, "x_content_parse_exception", "Found [version], not allowed for strict parsing")
+			return nil, false
+		}
+	}
+	srcMap, _ := body["source"].(map[string]any)
+	destMap, _ := body["dest"].(map[string]any)
+	if srcMap == nil || srcMap["index"] == nil {
+		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "transform [source.index] is required")
+		return nil, false
+	}
+	if !isPreview {
+		if destMap == nil || destMap["index"] == nil || strings.TrimSpace(fmt.Sprintf("%v", destMap["index"])) == "" {
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "transform [dest.index] is required")
+			return nil, false
+		}
+	}
+	destIdx := ""
+	if destMap != nil {
+		if dStr, okD := destMap["index"].(string); okD {
+			destIdx = strings.TrimSpace(dStr)
+		} else if destMap["index"] != nil {
+			destIdx = strings.TrimSpace(fmt.Sprintf("%v", destMap["index"]))
+		}
+	}
+	if destIdx != "" {
+		if destIdx != strings.ToLower(destIdx) {
+			writeESError(w, http.StatusBadRequest, "validation_exception",
+				fmt.Sprintf("Validation Failed: 1: Destination index [%s] must be lowercase;", destIdx))
+			return nil, false
+		}
+		if reason, okIdx := validateESIndexName(destIdx); !okIdx {
+			if badPos := strings.IndexAny(destIdx, "\\/*?\"<>| ,#:"); badPos >= 0 {
+				writeESError(w, http.StatusBadRequest, "validation_exception",
+					fmt.Sprintf("Validation Failed: 1: Invalid index name [%s], must not contain '%c';", destIdx, destIdx[badPos]))
+				return nil, false
+			}
+			writeESError(w, http.StatusBadRequest, "validation_exception",
+				fmt.Sprintf("Validation Failed: 1: %s;", reason))
+			return nil, false
+		}
+	}
+	if body["pivot"] == nil && body["latest"] == nil {
+		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "transform requires either [pivot] or [latest]")
+		return nil, false
+	}
+	if settingsMap, okSet := body["settings"].(map[string]any); okSet && settingsMap != nil {
+		if nfrRaw, hasNFR := settingsMap["num_failure_retries"]; hasNFR && nfrRaw != nil {
+			if nfr, okN := toInt64(nfrRaw); okN && (nfr < -1 || nfr > 100) {
+				writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
+					fmt.Sprintf("settings.num_failure_retries [%d] is out of range. The minimum value is -1 (infinity) and the maximum is 100", nfr))
+				return nil, false
+			}
+		}
+	}
+	if freqRaw, hasFreq := body["frequency"].(string); hasFreq && strings.TrimSpace(freqRaw) != "" {
+		if freqDur, fErr := parseESPositiveDuration(freqRaw); fErr != nil {
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", fErr.Error())
+			return nil, false
+		} else if freqDur < time.Second {
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
+				fmt.Sprintf("minimum permitted [frequency] is [1s], got [%s]", freqRaw))
+			return nil, false
+		} else if freqDur > time.Hour {
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
+				fmt.Sprintf("highest permitted [frequency] is [1h], got [%s]", freqRaw))
+			return nil, false
+		}
+	}
+	var srcList []string
+	switch sv := srcMap["index"].(type) {
+	case string:
+		for _, p := range strings.Split(sv, ",") {
+			if pt := strings.TrimSpace(p); pt != "" {
+				srcList = append(srcList, pt)
+			}
+		}
+	case []string:
+		for _, pt := range sv {
+			if pts := strings.TrimSpace(pt); pts != "" {
+				srcList = append(srcList, pts)
+			}
+		}
+	case []any:
+		for _, item := range sv {
+			if pt := strings.TrimSpace(fmt.Sprintf("%v", item)); pt != "" {
+				srcList = append(srcList, pt)
+			}
+		}
+	}
+	deferVal := isTruthyBoolQueryParam(r, "defer_validation")
+	if !deferVal {
+		if rtMap, okRT := srcMap["runtime_mappings"].(map[string]any); okRT && rtMap != nil {
+			for rtField, rawRT := range rtMap {
+				if fm, okFM := rawRT.(map[string]any); okFM && fm != nil {
+					rtType, _ := fm["type"].(string)
+					switch strings.ToLower(strings.TrimSpace(rtType)) {
+					case "", "boolean", "date", "double", "geo_point", "ip", "keyword", "long", "lookup":
+					default:
+						writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
+							fmt.Sprintf("No handler for type [%s] declared on runtime field [%s]", rtType, rtField))
+						return nil, false
+					}
+				}
+			}
+		}
+	}
+	if pivotCfg, okP := body["pivot"].(map[string]any); okP && pivotCfg != nil {
+		if mpsRaw, hasMPS := pivotCfg["max_page_search_size"]; hasMPS && mpsRaw != nil {
+			if mps, okM := toInt64(mpsRaw); okM && (mps < 10 || mps > 65536) {
+				writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
+					fmt.Sprintf("pivot.max_page_search_size [%d] is out of range. The minimum value is 10 and the maximum is 65536", mps))
+				return nil, false
+			}
+		}
+		seenFields := make(map[string]string)
+		if gbMap, okGB := pivotCfg["group_by"].(map[string]any); okGB {
+			for gk, rawG := range gbMap {
+				if prev, dup := seenFields[gk]; dup {
+					writeESError(w, http.StatusBadRequest, "validation_exception",
+						fmt.Sprintf("Validation Failed: 1: duplicate field [%s] detected (previously defined in [%s]);", gk, prev))
+					return nil, false
+				}
+				seenFields[gk] = "group_by"
+				if gm, okGM := rawG.(map[string]any); okGM && gm != nil {
+					if termsM, okTM := gm["terms"].(map[string]any); okTM && termsM != nil {
+						for tk := range termsM {
+							switch tk {
+							case "field", "missing", "script":
+							default:
+								writeESError(w, http.StatusBadRequest, "parsing_exception",
+									fmt.Sprintf("[data_frame_terms_group] unknown field [%s]", tk))
+								return nil, false
+							}
+						}
+					}
+				}
+			}
+		}
+		var aggMap map[string]any
+		if am, okAM := pivotCfg["aggregations"].(map[string]any); okAM {
+			aggMap = am
+		} else if am, okAM := pivotCfg["aggs"].(map[string]any); okAM {
+			aggMap = am
+		}
+		for ak, rawA := range aggMap {
+			if _, dup := seenFields[ak]; dup {
+				writeESError(w, http.StatusBadRequest, "validation_exception",
+					fmt.Sprintf("Validation Failed: 1: duplicate field [%s] detected;", ak))
+				return nil, false
+			}
+			for prevK := range seenFields {
+				if strings.HasPrefix(ak, prevK+".") || strings.HasPrefix(prevK, ak+".") {
+					base := prevK
+					if len(ak) < len(prevK) {
+						base = ak
+					}
+					writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
+						fmt.Sprintf("field [%s] cannot be both an object and a field", base))
+					return nil, false
+				}
+			}
+			seenFields[ak] = "aggregations"
+			if am, okAM := rawA.(map[string]any); okAM && am != nil {
+				for aggType := range am {
+					if aggType == "meta" {
+						continue
+					}
+					switch aggType {
+					case "avg", "sum", "min", "max", "value_count", "cardinality", "stats",
+						"extended_stats", "percentiles", "median_absolute_deviation",
+						"top_hits", "weighted_avg", "bucket_script", "bucket_selector",
+						"scripted_metric", "geo_bounds", "geo_centroid", "latest",
+						"filter", "filters", "missing", "range", "date_histogram", "terms", "histogram":
+					default:
+						writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
+							fmt.Sprintf("Unsupported aggregation type [%s]", aggType))
+						return nil, false
+					}
+				}
+			}
+		}
+	}
+	var latestUniqueKeys []string
+	if latestCfg, okL := body["latest"].(map[string]any); okL && latestCfg != nil {
+		switch uk := latestCfg["unique_key"].(type) {
+		case string:
+			if strings.TrimSpace(uk) != "" {
+				latestUniqueKeys = append(latestUniqueKeys, strings.TrimSpace(uk))
+			}
+		case []string:
+			for idxK, item := range uk {
+				ks := strings.TrimSpace(item)
+				if ks == "" {
+					writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
+						fmt.Sprintf("latest.unique_key[%d] element must be non-empty", idxK))
+					return nil, false
+				}
+				latestUniqueKeys = append(latestUniqueKeys, ks)
+			}
+		case []any:
+			for idxK, item := range uk {
+				ks := ""
+				if item != nil {
+					ks = strings.TrimSpace(fmt.Sprintf("%v", item))
+				}
+				if ks == "" {
+					writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
+						fmt.Sprintf("latest.unique_key[%d] element must be non-empty", idxK))
+					return nil, false
+				}
+				latestUniqueKeys = append(latestUniqueKeys, ks)
+			}
+		}
+		if len(latestUniqueKeys) == 0 {
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "latest.unique_key must be non-empty")
+			return nil, false
+		}
+		seenUK := make(map[string]struct{}, len(latestUniqueKeys))
+		for _, ukField := range latestUniqueKeys {
+			if _, dup := seenUK[ukField]; dup {
+				writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
+					fmt.Sprintf("latest.unique_key elements must be unique, found duplicate element [%s]", ukField))
+				return nil, false
+			}
+			seenUK[ukField] = struct{}{}
+		}
+		sortField, _ := latestCfg["sort"].(string)
+		if strings.TrimSpace(sortField) == "" {
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "latest.sort must be non-empty")
+			return nil, false
+		}
+	}
+	if !deferVal && destMap != nil {
+		if dp, okDP := destMap["pipeline"].(string); okDP && strings.TrimSpace(dp) != "" {
+			dpTrim := strings.TrimSpace(dp)
+			s.mu.RLock()
+			_, pExists := s.pipelines[dpTrim]
+			s.mu.RUnlock()
+			if !pExists {
+				writeESError(w, http.StatusBadRequest, "validation_exception",
+					fmt.Sprintf("Validation Failed: 1: Pipeline with id [%s] could not be found;", dpTrim))
+				return nil, false
+			}
+		}
+	}
+	if !deferVal && destIdx != "" && len(srcList) > 0 {
+		s.mu.RLock()
+		destResolved := []string{destIdx}
+		if aliasTargets := s.aliases[destIdx]; len(aliasTargets) > 0 {
+			destResolved = append([]string(nil), aliasTargets...)
+		}
+		var resolvedSrcExpr []string
+		for _, pat := range srcList {
+			if aliasTargets := s.aliases[pat]; len(aliasTargets) > 0 {
+				cp := append([]string(nil), aliasTargets...)
+				sort.Strings(cp)
+				resolvedSrcExpr = append(resolvedSrcExpr, cp...)
+			} else {
+				resolvedSrcExpr = append(resolvedSrcExpr, pat)
+			}
+		}
+		inSource := false
+		matchedDestName := destIdx
+		for _, dTarget := range destResolved {
+			for _, pat := range srcList {
+				if pat == dTarget || matchMultiWildcardWithExclusions(pat, dTarget) {
+					inSource = true
+					matchedDestName = dTarget
+					break
+				}
+				for _, target := range s.aliases[pat] {
+					if target == dTarget {
+						inSource = true
+						matchedDestName = dTarget
+						break
+					}
+				}
+				if inSource {
+					break
+				}
+			}
+			if inSource {
+				break
+			}
+		}
+		s.mu.RUnlock()
+		if inSource {
+			writeESError(w, http.StatusBadRequest, "validation_exception",
+				fmt.Sprintf("Validation Failed: 1: Destination index [%s] is included in source expression [%s];", matchedDestName, strings.Join(resolvedSrcExpr, ",")))
+			return nil, false
+		}
+	}
+	if !deferVal && destIdx != "" {
+		if _, _, wErr := s.resolveWriteIndexWithFilter(destIdx); wErr != nil {
+			writeESError(w, http.StatusBadRequest, "validation_exception",
+				fmt.Sprintf("Validation Failed: 1: no write index is defined for alias %s;", destIdx))
+			return nil, false
+		}
+	}
+	if !deferVal {
+		searchProbe := make(map[string]any)
+		if qRaw, hasQ := srcMap["query"]; hasQ && qRaw != nil {
+			searchProbe["query"] = qRaw
+		}
+		if rtRaw, hasRT := srcMap["runtime_mappings"]; hasRT && rtRaw != nil {
+			searchProbe["runtime_mappings"] = rtRaw
+		}
+		if pivotCfg, okP := body["pivot"].(map[string]any); okP && pivotCfg != nil {
+			if am, okAM := pivotCfg["aggregations"].(map[string]any); okAM && len(am) > 0 {
+				searchProbe["aggregations"] = am
+			} else if am, okAM := pivotCfg["aggs"].(map[string]any); okAM && len(am) > 0 {
+				searchProbe["aggregations"] = am
+			}
+			if gbMap, okGB := pivotCfg["group_by"].(map[string]any); okGB {
+				for _, rawG := range gbMap {
+					gm, _ := rawG.(map[string]any)
+					for _, rawSub := range gm {
+						if sm, okS := rawSub.(map[string]any); okS && sm != nil && sm["script"] != nil {
+							if src, okSrc := extractPainlessSourceIfApplicableRound60(sm["script"]); okSrc {
+								if cErr := painless.CompileValidate(src); cErr != nil {
+									writeESError(w, http.StatusBadRequest, "script_exception", cErr.Error())
+									return nil, false
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+		if len(searchProbe) > 0 {
+			if rawProbe, mErr := json.Marshal(searchProbe); mErr == nil {
+				var sReq esast.SearchRequest
+				if uErr := json.Unmarshal(rawProbe, &sReq); uErr == nil {
+					normalizeFieldPropsScriptsR62Search(sReq.RuntimeMappings)
+					if sErr := validateSearchRequestScriptsRound60(&sReq); sErr != nil {
+						writeESError(w, http.StatusBadRequest, "script_exception", sErr.Error())
+						return nil, false
+					}
+				}
+			}
+		}
+	}
+	if !deferVal && len(srcList) > 0 {
+		_ = s.syncCatalogFromBackend(r.Context())
+		s.mu.RLock()
+		for _, pat := range srcList {
+			if strings.ContainsAny(pat, "*?") || pat == "_all" || strings.HasPrefix(pat, "-") {
+				continue
+			}
+			if s.indices[pat] == nil && s.dataStreams[pat] == nil && len(s.aliases[pat]) == 0 {
+				s.mu.RUnlock()
+				writeESError(w, http.StatusBadRequest, "validation_exception",
+					fmt.Sprintf("Validation Failed: 1: no such index [%s];", pat))
+				return nil, false
+			}
+		}
+		for _, ukField := range latestUniqueKeys {
+			for _, pat := range srcList {
+				for idxName, sc := range s.indices {
+					if sc != nil && sc.Fields != nil && (idxName == pat || matchMultiWildcardWithExclusions(pat, idxName)) {
+						if fm, okFM := sc.Fields[ukField]; okFM && strings.EqualFold(fm.ESType, "aggregate_metric_double") {
+							s.mu.RUnlock()
+							writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
+								fmt.Sprintf("Field [%s] of type [aggregate_metric_double] is not supported for aggregation [terms]", ukField))
+							return nil, false
+						}
+					}
+				}
+			}
+		}
+		s.mu.RUnlock()
+	}
+	return srcList, true
+}
+
+func (s *Server) dropSingleIndexIfExistsR65(ctx context.Context, indexName string) {
+	indexName = strings.TrimSpace(indexName)
+	if indexName == "" {
+		return
+	}
+	s.mu.Lock()
+	idxSchema, exists := s.indices[indexName]
+	if !exists {
+		s.mu.Unlock()
+		return
+	}
+	modifiedAliases := make(map[string][]string)
+	delete(s.indices, indexName)
+	delete(s.docRouting, indexName)
+	delete(s.docVersions, indexName)
+	delete(s.indexDefaultPipelines, indexName)
+	delete(s.indexFinalPipelines, indexName)
+	delete(s.closedIndices, indexName)
+	delete(s.indexCustomSettings, indexName)
+	delete(s.indexNextSeqNo, indexName)
+	delete(s.docSeqNos, indexName)
+	delete(s.docDeleted, indexName)
+	delete(s.docExtTombstones, indexName)
+	delete(s.unrefreshedDocs, indexName)
+	delete(s.indexStats, indexName)
+	for alias := range s.aliases {
+		s.removeAliasTargetLocked(alias, indexName)
+		modifiedAliases[alias] = append([]string(nil), s.aliases[alias]...)
+	}
+	s.mu.Unlock()
+	s.deleteCatalogEntity(ctx, "index", indexName)
+	s.deleteCatalogEntity(ctx, "index_seq_state", indexName)
+	for alias, targets := range modifiedAliases {
+		s.persistAlias(ctx, alias, targets)
+	}
+	if idxSchema != nil && idxSchema.DorisDB != "" && idxSchema.DorisTable != "" {
+		ddl := fmt.Sprintf("DROP TABLE IF EXISTS `%s`.`%s`;", idxSchema.DorisDB, idxSchema.DorisTable)
+		_ = s.backend.ExecDDL(ctx, ddl)
+	}
+	s.purgeShardRequestCacheIndicesR63([]string{indexName})
+	s.queryCache.InvalidateAll()
+}
+
 func (s *Server) handleTransform(w http.ResponseWriter, r *http.Request) {
 	id := strings.TrimSpace(r.PathValue("id"))
 	if id == "_upgrade" {
@@ -3362,7 +4636,37 @@ func (s *Server) handleTransform(w http.ResponseWriter, r *http.Request) {
 			writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true, "updated": []any{}, "pending_transforms": []any{}})
+		s.mu.RLock()
+		noActionCnt := len(s.transforms)
+		s.mu.RUnlock()
+		writeJSON(w, http.StatusOK, map[string]any{
+			"acknowledged":       true,
+			"needs_update":       0,
+			"no_action":          noActionCnt,
+			"updated":            0,
+			"pending_transforms": []any{},
+		})
+		return
+	}
+	if id == "_node_stats" {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+			return
+		}
+		if r.Method == http.MethodHead {
+			ensureESCompatHeaders(w, r)
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"_nodes":       map[string]any{"total": 1, "successful": 1, "failed": 0},
+			"cluster_name": "apache-doris-search-cluster",
+			"nodes": map[string]any{
+				taskLocalNodeID: map[string]any{
+					"transforms": map[string]any{},
+				},
+			},
+		})
 		return
 	}
 	if id == "_preview" {
@@ -3381,6 +4685,16 @@ func (s *Server) handleTransform(w http.ResponseWriter, r *http.Request) {
 			writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: transform_id is missing;")
 			return
 		}
+		if len(id) > 64 {
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
+				fmt.Sprintf("Transform id [%s] is invalid: The id cannot contain more than 64 characters", id))
+			return
+		}
+		if !validateTransformIDR65(id) {
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
+				fmt.Sprintf("Transform id [%s] is invalid: id can contain lowercase alphanumeric (a-z and 0-9), hyphens or underscores; must start and end with alphanumeric", id))
+			return
+		}
 		bodyBytes, ok := readRequestBody(w, r)
 		if !ok {
 			return
@@ -3396,18 +4710,7 @@ func (s *Server) handleTransform(w http.ResponseWriter, r *http.Request) {
 			writeESError(w, http.StatusBadRequest, "parse_exception", "transform configuration body is required")
 			return
 		}
-		srcMap, _ := body["source"].(map[string]any)
-		destMap, _ := body["dest"].(map[string]any)
-		if srcMap == nil || srcMap["index"] == nil {
-			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "transform [source.index] is required")
-			return
-		}
-		if destMap == nil || destMap["index"] == nil || strings.TrimSpace(fmt.Sprintf("%v", destMap["index"])) == "" {
-			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "transform [dest.index] is required")
-			return
-		}
-		if body["pivot"] == nil && body["latest"] == nil {
-			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "transform requires either [pivot] or [latest]")
+		if _, okVal := s.validateTransformConfigBodyR65(w, r, body, true, false); !okVal {
 			return
 		}
 		s.mu.Lock()
@@ -3421,16 +4724,38 @@ func (s *Server) handleTransform(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		nowMs := time.Now().UTC().UnixMilli()
-		entry := deepCloneDocMap(body)
+		entry := normalizeTransformConfigR65(deepCloneDocMap(body))
 		entry["id"] = id
 		entry["version"] = "8.12.0"
 		entry["create_time"] = nowMs
 		entry["state"] = "stopped"
+		entry["authorization"] = map[string]any{"roles": []string{"superuser"}}
 		s.transforms[id] = entry
 		s.mu.Unlock()
 		writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
 
 	case http.MethodGet, http.MethodHead:
+		fromVal := 0
+		if rawFrom := strings.TrimSpace(r.URL.Query().Get("from")); rawFrom != "" {
+			if f, errF := strconv.Atoi(rawFrom); errF != nil || f < 0 {
+				writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "Param [from] must be a non-negative integer")
+				return
+			} else {
+				fromVal = f
+			}
+		}
+		hasSize := false
+		sizeVal := 100
+		if rawSize := strings.TrimSpace(r.URL.Query().Get("size")); rawSize != "" {
+			sz, errS := strconv.Atoi(rawSize)
+			if errS != nil || sz < 0 || sz > 1000 {
+				writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
+					"Param [size] has a max acceptable value of [1000]")
+				return
+			}
+			hasSize = true
+			sizeVal = sz
+		}
 		allowNoMatch := true
 		if r.URL.Query().Has("allow_no_match") {
 			allowNoMatch = isTruthyBoolQueryParam(r, "allow_no_match")
@@ -3449,7 +4774,7 @@ func (s *Server) handleTransform(w http.ResponseWriter, r *http.Request) {
 						return
 					}
 					writeESError(w, http.StatusNotFound, "resource_not_found_exception",
-						fmt.Sprintf("Unknown transform [%s]", part))
+						fmt.Sprintf("Transform with id [%s] could not be found", part))
 					return
 				}
 				if _, exists := s.transforms[part]; !exists && !r.URL.Query().Has("allow_no_match") {
@@ -3459,7 +4784,7 @@ func (s *Server) handleTransform(w http.ResponseWriter, r *http.Request) {
 						return
 					}
 					writeESError(w, http.StatusNotFound, "resource_not_found_exception",
-						fmt.Sprintf("Unknown transform [%s]", part))
+						fmt.Sprintf("Transform with id [%s] could not be found", part))
 					return
 				}
 			}
@@ -3470,15 +4795,35 @@ func (s *Server) handleTransform(w http.ResponseWriter, r *http.Request) {
 				names = append(names, k)
 			}
 		}
+		forExport := isTruthyBoolQueryParam(r, "for_export")
+		excludeGenerated := isTruthyBoolQueryParam(r, "exclude_generated")
 		sort.Strings(names)
-		list := make([]any, 0, len(names))
-		for _, k := range names {
-			cp := deepCloneDocMap(s.transforms[k])
+		totalCount := len(names)
+		startIdx := fromVal
+		if startIdx > len(names) {
+			startIdx = len(names)
+		}
+		endIdx := len(names)
+		if hasSize && startIdx+sizeVal < endIdx {
+			endIdx = startIdx + sizeVal
+		}
+		pagedNames := names[startIdx:endIdx]
+		list := make([]any, 0, len(pagedNames))
+		for _, k := range pagedNames {
+			cp := normalizeTransformConfigR65(deepCloneDocMap(s.transforms[k]))
 			delete(cp, "state")
+			if cp["authorization"] == nil {
+				cp["authorization"] = map[string]any{"roles": []string{"superuser"}}
+			}
+			if forExport || excludeGenerated {
+				delete(cp, "create_time")
+				delete(cp, "version")
+				delete(cp, "authorization")
+			}
 			list = append(list, cp)
 		}
 		s.mu.RUnlock()
-		if len(list) == 0 && id != "" && !allowNoMatch {
+		if totalCount == 0 && id != "" && !allowNoMatch {
 			if r.Method == http.MethodHead {
 				w.WriteHeader(http.StatusNotFound)
 				return
@@ -3488,7 +4833,7 @@ func (s *Server) handleTransform(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{
-			"count":      len(list),
+			"count":      totalCount,
 			"transforms": list,
 		})
 
@@ -3503,13 +4848,13 @@ func (s *Server) handleTransform(w http.ResponseWriter, r *http.Request) {
 		if !exists || entry == nil {
 			s.mu.Unlock()
 			writeESError(w, http.StatusNotFound, "resource_not_found_exception",
-				fmt.Sprintf("Unknown transform [%s]", id))
+				fmt.Sprintf("Transform with id [%s] could not be found", id))
 			return
 		}
 		if st, _ := entry["state"].(string); st == "started" && !force {
 			s.mu.Unlock()
 			writeESError(w, http.StatusConflict, "status_exception",
-				fmt.Sprintf("Cannot delete transform [%s] because it is started; stop the transform first or use force=true", id))
+				fmt.Sprintf("Cannot delete transform [%s] as the task is running; stop the transform first or use force=true", id))
 			return
 		}
 		delete(s.transforms, id)
@@ -3535,12 +4880,49 @@ func (s *Server) handleTransformAction(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		id := strings.TrimSpace(r.PathValue("id"))
+		if r.URL != nil && r.URL.Query().Has("from") {
+			rawFrom := strings.TrimSpace(r.URL.Query().Get("from"))
+			if rawFrom == "" {
+				writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "Failed to parse date for [from]: []")
+				return
+			}
+			if _, okTS := parseAnyTimestampMillis(rawFrom); !okTS {
+				writeESError(w, http.StatusBadRequest, "illegal_argument_exception", fmt.Sprintf("Failed to parse date for [from]: [%s]", rawFrom))
+				return
+			}
+		}
 		s.mu.RLock()
 		entry, exists := s.transforms[id]
+		var isStarted, hasSync bool
+		var destPipeline string
+		if exists && entry != nil {
+			isStarted = entry["state"] == "started"
+			hasSync = entry["sync"] != nil
+			if dstM, okD := entry["dest"].(map[string]any); okD && dstM != nil {
+				destPipeline, _ = dstM["pipeline"].(string)
+				destPipeline = strings.TrimSpace(destPipeline)
+			}
+		}
+		_, pipelineExists := s.pipelines[destPipeline]
 		s.mu.RUnlock()
 		if !exists || entry == nil {
 			writeESError(w, http.StatusNotFound, "resource_not_found_exception",
-				fmt.Sprintf("Unknown transform [%s]", id))
+				fmt.Sprintf("Transform with id [%s] could not be found", id))
+			return
+		}
+		if r.URL != nil && r.URL.Query().Has("from") && !hasSync {
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
+				"[from] parameter is currently not supported for batch (non-continuous) transforms")
+			return
+		}
+		if isStarted {
+			writeESError(w, http.StatusConflict, "status_exception",
+				fmt.Sprintf("Cannot start transform [%s] as it is already started", id))
+			return
+		}
+		if destPipeline != "" && !pipelineExists {
+			writeESError(w, http.StatusBadRequest, "validation_exception",
+				fmt.Sprintf("Validation Failed: 1: Pipeline with id [%s] could not be found;", destPipeline))
 			return
 		}
 		if err := s.executeTransformStartRound58(r.Context(), id); err != nil {
@@ -3552,6 +4934,11 @@ func (s *Server) handleTransformAction(w http.ResponseWriter, r *http.Request) {
 	case "_stop", "stop":
 		if r.Method != http.MethodPost && r.Method != http.MethodPut {
 			writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+			return
+		}
+		if isTruthyBoolQueryParam(r, "force") && isTruthyBoolQueryParam(r, "wait_for_checkpoint") {
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
+				"cannot set both [force] and [wait_for_checkpoint] to true")
 			return
 		}
 		id := strings.TrimSpace(r.PathValue("id"))
@@ -3567,7 +4954,7 @@ func (s *Server) handleTransformAction(w http.ResponseWriter, r *http.Request) {
 		s.mu.Unlock()
 		if matched == 0 && !allowNoMatch {
 			writeESError(w, http.StatusNotFound, "resource_not_found_exception",
-				fmt.Sprintf("Unknown transform [%s]", id))
+				fmt.Sprintf("Transform with id [%s] could not be found", id))
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
@@ -3593,23 +4980,53 @@ func (s *Server) handleTransformAction(w http.ResponseWriter, r *http.Request) {
 			writeESError(w, http.StatusBadRequest, "parse_exception", "request body is required")
 			return
 		}
+		s.mu.RLock()
+		entrySnapshot, exists := s.transforms[id]
+		var merged map[string]any
+		var hadSyncNil bool
+		if exists && entrySnapshot != nil {
+			merged = deepCloneDocMap(entrySnapshot)
+			hadSyncNil = entrySnapshot["sync"] == nil
+		}
+		s.mu.RUnlock()
+		if !exists || entrySnapshot == nil {
+			writeESError(w, http.StatusNotFound, "resource_not_found_exception",
+				fmt.Sprintf("Transform with id [%s] could not be found", id))
+			return
+		}
+		if _, hasPivot := body["pivot"]; hasPivot {
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "transform [pivot] is immutable and cannot be updated")
+			return
+		}
+		if newSync, hasSync := body["sync"]; hasSync && hadSyncNil && newSync != nil {
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
+				fmt.Sprintf("Cannot change the current sync configuration of transform [%s] from [null] to [time]", id))
+			return
+		}
+		for _, k := range []string{"description", "source", "dest", "frequency", "sync", "settings", "retention_policy", "_meta"} {
+			if v, has := body[k]; has {
+				merged[k] = v
+			}
+		}
+		if _, okVal := s.validateTransformConfigBodyR65(w, r, merged, false, false); !okVal {
+			return
+		}
 		s.mu.Lock()
 		entry, exists := s.transforms[id]
 		if !exists || entry == nil {
 			s.mu.Unlock()
 			writeESError(w, http.StatusNotFound, "resource_not_found_exception",
-				fmt.Sprintf("Unknown transform [%s]", id))
+				fmt.Sprintf("Transform with id [%s] could not be found", id))
 			return
 		}
-		if _, hasPivot := body["pivot"]; hasPivot {
-			s.mu.Unlock()
-			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "transform [pivot] is immutable and cannot be updated")
-			return
-		}
-		for _, k := range []string{"description", "source", "dest", "frequency", "sync", "settings", "retention_policy"} {
+		for _, k := range []string{"description", "source", "dest", "frequency", "sync", "settings", "retention_policy", "_meta"} {
 			if v, has := body[k]; has {
 				entry[k] = v
 			}
+		}
+		normalizeTransformConfigR65(entry)
+		if entry["authorization"] == nil {
+			entry["authorization"] = map[string]any{"roles": []string{"superuser"}}
 		}
 		resp := deepCloneDocMap(entry)
 		delete(resp, "state")
@@ -3628,18 +5045,29 @@ func (s *Server) handleTransformAction(w http.ResponseWriter, r *http.Request) {
 		if !exists || entry == nil {
 			s.mu.Unlock()
 			writeESError(w, http.StatusNotFound, "resource_not_found_exception",
-				fmt.Sprintf("Unknown transform [%s]", id))
+				fmt.Sprintf("Transform with id [%s] could not be found", id))
 			return
 		}
 		if st, _ := entry["state"].(string); st == "started" && !force {
 			s.mu.Unlock()
 			writeESError(w, http.StatusConflict, "status_exception",
-				fmt.Sprintf("Cannot reset transform [%s] because it is started; stop the transform first or use force=true", id))
+				fmt.Sprintf("Cannot reset transform [%s] as the task is running; stop the transform first or use force=true", id))
 			return
+		}
+		destIdx := ""
+		if dstM, okD := entry["dest"].(map[string]any); okD && dstM != nil {
+			destIdx, _ = dstM["index"].(string)
 		}
 		entry["state"] = "stopped"
 		delete(entry, "checkpoint")
+		delete(entry, "pages_processed")
+		delete(entry, "documents_processed")
+		delete(entry, "documents_indexed")
+		delete(entry, "trigger_count")
 		s.mu.Unlock()
+		if destIdx != "" {
+			s.dropSingleIndexIfExistsR65(r.Context(), destIdx)
+		}
 		writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
 
 	case "_schedule_now", "schedule_now":
@@ -3648,12 +5076,17 @@ func (s *Server) handleTransformAction(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		id := strings.TrimSpace(r.PathValue("id"))
+		if id == "_all" || id == "*" {
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
+				"_schedule_now API does not support _all wildcard")
+			return
+		}
 		s.mu.RLock()
 		entry, exists := s.transforms[id]
 		s.mu.RUnlock()
 		if !exists || entry == nil {
 			writeESError(w, http.StatusNotFound, "resource_not_found_exception",
-				fmt.Sprintf("Unknown transform [%s]", id))
+				fmt.Sprintf("Transform with id [%s] could not be found", id))
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
@@ -3669,13 +5102,36 @@ func (s *Server) handleTransformStats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := strings.TrimSpace(r.PathValue("id"))
-	allowNoMatch := isTruthyBoolQueryParam(r, "allow_no_match")
+	allowNoMatch := s.isES8Mode(r)
+	if r.URL != nil && r.URL.Query().Has("allow_no_match") {
+		allowNoMatch = isTruthyBoolQueryParam(r, "allow_no_match")
+	}
+	fromVal := 0
+	if rawFrom := strings.TrimSpace(r.URL.Query().Get("from")); rawFrom != "" {
+		if f, errF := strconv.Atoi(rawFrom); errF != nil || f < 0 {
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "Param [from] must be a non-negative integer")
+			return
+		} else {
+			fromVal = f
+		}
+	}
+	hasSize := false
+	sizeVal := 100
+	if rawSize := strings.TrimSpace(r.URL.Query().Get("size")); rawSize != "" {
+		if sz, errS := strconv.Atoi(rawSize); errS != nil || sz < 0 || sz > 10000 {
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "Param [size] has a max acceptable value of [10000]")
+			return
+		} else {
+			hasSize = true
+			sizeVal = sz
+		}
+	}
 	s.mu.RLock()
 	if id != "" && id != "*" && id != "_all" && !strings.ContainsAny(id, "*?,") && !strings.HasPrefix(id, "-") {
 		if _, exists := s.transforms[id]; !exists && !allowNoMatch {
 			s.mu.RUnlock()
 			writeESError(w, http.StatusNotFound, "resource_not_found_exception",
-				fmt.Sprintf("Unknown transform [%s]", id))
+				fmt.Sprintf("Transform with id [%s] could not be found", id))
 			return
 		}
 	}
@@ -3686,15 +5142,25 @@ func (s *Server) handleTransformStats(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	sort.Strings(names)
+	totalCount := len(names)
+	startIdx := fromVal
+	if startIdx > len(names) {
+		startIdx = len(names)
+	}
+	endIdx := len(names)
+	if hasSize && startIdx+sizeVal < endIdx {
+		endIdx = startIdx + sizeVal
+	}
+	pagedNames := names[startIdx:endIdx]
 	nowMs := time.Now().UTC().UnixMilli()
-	list := make([]any, 0, len(names))
-	for _, k := range names {
+	list := make([]any, 0, len(pagedNames))
+	for _, k := range pagedNames {
 		entry := s.transforms[k]
 		state, _ := entry["state"].(string)
 		if state == "" {
 			state = "stopped"
 		}
-		pagesProc := int64(1)
+		pagesProc := int64(0)
 		if v, ok := toFloat64(entry["pages_processed"]); ok {
 			pagesProc = int64(v)
 		}
@@ -3706,16 +5172,29 @@ func (s *Server) handleTransformStats(w http.ResponseWriter, r *http.Request) {
 		if v, ok := toFloat64(entry["documents_indexed"]); ok {
 			docsIdx = int64(v)
 		}
-		trigCnt := int64(1)
+		trigCnt := int64(0)
 		if v, ok := toFloat64(entry["trigger_count"]); ok && int64(v) > 0 {
 			trigCnt = int64(v)
+		}
+		cpNum := int64(0)
+		if trigCnt > 0 || pagesProc > 0 {
+			cpNum = 1
+		}
+		expAvgDur := 0.0
+		if trigCnt > 0 || pagesProc > 0 {
+			expAvgDur = 1.0
 		}
 		list = append(list, map[string]any{
 			"id":    k,
 			"state": state,
+			"health": map[string]any{
+				"status": "green",
+			},
 			"node": map[string]any{
-				"id":   "doris-fe-1",
-				"name": "doris-fe-1",
+				"id":                "doris-fe-1",
+				"name":              "doris-fe-1",
+				"ephemeral_id":      "doris-ephemeral-1",
+				"transport_address": "127.0.0.1:9300",
 			},
 			"stats": map[string]any{
 				"pages_processed":                        pagesProc,
@@ -3732,13 +5211,13 @@ func (s *Server) handleTransformStats(w http.ResponseWriter, r *http.Request) {
 				"processing_time_in_ms":                  0,
 				"processing_total":                       trigCnt,
 				"delete_time_in_ms":                      0,
-				"exponential_avg_checkpoint_duration_ms": 0.0,
+				"exponential_avg_checkpoint_duration_ms": expAvgDur,
 				"exponential_avg_documents_indexed":      float64(docsIdx),
 				"exponential_avg_documents_processed":    float64(docsProc),
 			},
 			"checkpointing": map[string]any{
 				"last": map[string]any{
-					"checkpoint":              1,
+					"checkpoint":              cpNum,
 					"timestamp_millis":        nowMs,
 					"time_upper_bound_millis": nowMs,
 				},
@@ -3747,7 +5226,7 @@ func (s *Server) handleTransformStats(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.RUnlock()
 	writeJSON(w, http.StatusOK, map[string]any{
-		"count":      len(list),
+		"count":      totalCount,
 		"transforms": list,
 	})
 }
@@ -3762,14 +5241,20 @@ func (s *Server) handleTransformPreview(w http.ResponseWriter, r *http.Request) 
 	if !ok {
 		return
 	}
+	trimmed := bytes.TrimSpace(bodyBytes)
 	var cfg map[string]any
-	if len(bytes.TrimSpace(bodyBytes)) > 0 {
-		if err := json.Unmarshal(bodyBytes, &cfg); err != nil {
+	if len(trimmed) > 0 {
+		if err := json.Unmarshal(trimmed, &cfg); err != nil {
 			writeESError(w, http.StatusBadRequest, "parsing_exception", err.Error())
 			return
 		}
 	}
 	if id != "" && id != "_preview" {
+		if len(cfg) > 0 {
+			writeESError(w, http.StatusBadRequest, "action_request_validation_exception",
+				"Please provide either a transform [id] or the config object but not both")
+			return
+		}
 		s.mu.RLock()
 		entry, exists := s.transforms[id]
 		if exists && entry != nil {
@@ -3778,23 +5263,100 @@ func (s *Server) handleTransformPreview(w http.ResponseWriter, r *http.Request) 
 		s.mu.RUnlock()
 		if !exists {
 			writeESError(w, http.StatusNotFound, "resource_not_found_exception",
-				fmt.Sprintf("Unknown transform [%s]", id))
+				fmt.Sprintf("Transform with id [%s] could not be found", id))
 			return
 		}
+	} else if len(cfg) == 0 {
+		writeESError(w, http.StatusBadRequest, "action_request_validation_exception",
+			"Please provide a transform [id] or the config object")
+		return
 	}
 	if cfg == nil || cfg["source"] == nil || (cfg["pivot"] == nil && cfg["latest"] == nil) {
 		writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
 			"transform preview requires [source] and either [pivot] or [latest]")
 		return
 	}
+	if _, okVal := s.validateTransformConfigBodyR65(w, r, cfg, false, true); !okVal {
+		return
+	}
+	scriptRuntimeFields := make(map[string]bool)
+	if srcMap, okSrc := cfg["source"].(map[string]any); okSrc && srcMap != nil {
+		if rtMap, okRT := srcMap["runtime_mappings"].(map[string]any); okRT {
+			for fn, rawF := range rtMap {
+				if fm, okFM := rawF.(map[string]any); okFM && fm != nil && fm["script"] != nil {
+					scriptRuntimeFields[fn] = true
+				}
+			}
+		}
+	}
+	if len(scriptRuntimeFields) > 0 {
+		if pivotCfg, okP := cfg["pivot"].(map[string]any); okP && pivotCfg != nil {
+			if gbMap, okGB := pivotCfg["group_by"].(map[string]any); okGB && len(gbMap) > 0 {
+				allRT := true
+				for _, rawG := range gbMap {
+					gm, _ := rawG.(map[string]any)
+					foundField := false
+					for _, rawSub := range gm {
+						if sm, okS := rawSub.(map[string]any); okS && sm != nil {
+							if fName, okF := sm["field"].(string); okF && fName != "" {
+								foundField = true
+								if !scriptRuntimeFields[fName] {
+									allRT = false
+								}
+								break
+							}
+						}
+					}
+					if !foundField {
+						allRT = false
+					}
+				}
+				if allRT {
+					emitESDeprecationWarningRound61(w, s, r, "all the group-by fields are script-based runtime fields, this transform might run slowly, please check your configuration.")
+				}
+			}
+		}
+		if syncCfg, okSy := cfg["sync"].(map[string]any); okSy && syncCfg != nil {
+			if tm, okTM := syncCfg["time"].(map[string]any); okTM && tm != nil {
+				if sf, okSF := tm["field"].(string); okSF && scriptRuntimeFields[sf] {
+					emitESDeprecationWarningRound61(w, s, r, "sync time field is a script-based runtime field, this transform might run slowly, please check your configuration.")
+				}
+			}
+		}
+	}
 	matDocs, inferredProps, _, err := s.materializeTransformConfig(r.Context(), cfg)
 	if err != nil {
 		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", err.Error())
 		return
 	}
+	destPipeline := ""
+	if dstMap, okD := cfg["dest"].(map[string]any); okD && dstMap != nil {
+		if dp, okP := dstMap["pipeline"].(string); okP {
+			destPipeline = strings.TrimSpace(dp)
+		}
+	}
 	previewList := make([]any, 0, len(matDocs))
 	for _, md := range matDocs {
-		previewList = append(previewList, md.Source)
+		docMap := md.Source
+		if destPipeline != "" && docMap != nil {
+			if rawDoc, mErr := json.Marshal(docMap); mErr == nil {
+				curRaw, _, _, _, dropped, pErr := s.applyEffectiveAndFinalPipelinesWithRouting("_preview", md.ID, destPipeline, "", "", rawDoc)
+				if pErr != nil {
+					writeESError(w, http.StatusBadRequest, "illegal_argument_exception", pErr.Error())
+					return
+				}
+				if dropped {
+					continue
+				}
+				var updated map[string]any
+				dec := json.NewDecoder(bytes.NewReader(curRaw))
+				dec.UseNumber()
+				if dec.Decode(&updated) == nil && updated != nil {
+					docMap = updated
+				}
+			}
+		}
+		previewList = append(previewList, docMap)
 	}
 	if inferredProps == nil {
 		inferredProps = map[string]any{}
@@ -3857,6 +5419,134 @@ func (s *Server) handleDanglingIndices(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
 }
 
+var validAutoscalingRolesR65 = map[string]bool{
+	"master":                true,
+	"data":                  true,
+	"data_content":          true,
+	"data_hot":              true,
+	"data_warm":             true,
+	"data_cold":             true,
+	"data_frozen":           true,
+	"ingest":                true,
+	"ml":                    true,
+	"transform":             true,
+	"remote_cluster_client": true,
+	"voting_only":           true,
+	"coordinating_only":     true,
+}
+
+var localNodeAutoscalingRolesR65 = map[string]bool{
+	"master":                true,
+	"data":                  true,
+	"data_content":          true,
+	"data_hot":              true,
+	"data_warm":             true,
+	"data_cold":             true,
+	"data_frozen":           true,
+	"ingest":                true,
+	"ml":                    true,
+	"transform":             true,
+	"remote_cluster_client": true,
+}
+
+func parseAutoscalingByteSizeR65(v any) (int64, error) {
+	switch tv := v.(type) {
+	case float64:
+		if tv < 0 {
+			return 0, fmt.Errorf("byte size must be non-negative")
+		}
+		return int64(tv), nil
+	case int64:
+		if tv < 0 {
+			return 0, fmt.Errorf("byte size must be non-negative")
+		}
+		return tv, nil
+	case int:
+		if tv < 0 {
+			return 0, fmt.Errorf("byte size must be non-negative")
+		}
+		return int64(tv), nil
+	case json.Number:
+		f, err := tv.Float64()
+		if err != nil || f < 0 {
+			return 0, fmt.Errorf("invalid byte size [%v]", v)
+		}
+		return int64(f), nil
+	case string:
+		s := strings.ToLower(strings.TrimSpace(tv))
+		if s == "" {
+			return 0, fmt.Errorf("empty byte size")
+		}
+		mult := int64(1)
+		numStr := s
+		for _, suf := range []struct {
+			suffix string
+			scale  int64
+		}{
+			{"pb", 1024 * 1024 * 1024 * 1024 * 1024},
+			{"tb", 1024 * 1024 * 1024 * 1024},
+			{"gb", 1024 * 1024 * 1024},
+			{"mb", 1024 * 1024},
+			{"kb", 1024},
+			{"b", 1},
+		} {
+			if strings.HasSuffix(s, suf.suffix) {
+				numStr = strings.TrimSpace(strings.TrimSuffix(s, suf.suffix))
+				mult = suf.scale
+				break
+			}
+		}
+		f, err := strconv.ParseFloat(numStr, 64)
+		if err != nil || f < 0 {
+			return 0, fmt.Errorf("failed to parse byte size [%s]", tv)
+		}
+		return int64(f * float64(mult)), nil
+	default:
+		return 0, fmt.Errorf("invalid byte size [%v]", v)
+	}
+}
+
+func formatAutoscalingBytesR65(b int64) string {
+	if b >= 1024 {
+		tenths := (b * 10) / 1024
+		return fmt.Sprintf("%.1fkb", float64(tenths)/10.0)
+	}
+	return fmt.Sprintf("%db", b)
+}
+
+func validateAutoscalingDecidersR65(deciders map[string]any) error {
+	for decName, rawCfg := range deciders {
+		switch decName {
+		case "fixed":
+			cfgMap, ok := rawCfg.(map[string]any)
+			if !ok {
+				return fmt.Errorf("decider [fixed] must be an object")
+			}
+			for settingKey, settingVal := range cfgMap {
+				switch settingKey {
+				case "storage", "memory":
+					if _, err := parseAutoscalingByteSizeR65(settingVal); err != nil {
+						return err
+					}
+				case "processors", "nodes":
+					if fv, okF := toFloat64(settingVal); !okF || fv < 0 {
+						return fmt.Errorf("decider setting [%s] must be a non-negative number", settingKey)
+					}
+				default:
+					return fmt.Errorf("unknown decider setting [%s] on decider [fixed]", settingKey)
+				}
+			}
+		case "reactive_frozen_search", "proactive_storage", "frozen_cache":
+			if _, ok := rawCfg.(map[string]any); !ok {
+				return fmt.Errorf("decider [%s] must be an object", decName)
+			}
+		default:
+			return fmt.Errorf("unknown autoscaling decider [%s]", decName)
+		}
+	}
+	return nil
+}
+
 // handleAutoscaling implements `PUT/GET/DELETE /_autoscaling/policy/{name}`, `GET /_autoscaling/policy`, `GET /_autoscaling/capacity` (F7).
 func (s *Server) handleAutoscaling(w http.ResponseWriter, r *http.Request) {
 	action := strings.TrimSpace(r.PathValue("action"))
@@ -3866,28 +5556,108 @@ func (s *Server) handleAutoscaling(w http.ResponseWriter, r *http.Request) {
 			writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
 			return
 		}
+		if r.Method == http.MethodHead {
+			ensureESCompatHeaders(w, r)
+			w.WriteHeader(http.StatusOK)
+			return
+		}
 		s.mu.RLock()
 		policiesCap := make(map[string]any, len(s.autoscalingPolicies))
-		for k := range s.autoscalingPolicies {
+		for k, pol := range s.autoscalingPolicies {
+			rolesMatchNode := false
+			if rolesList, okR := pol["roles"].([]any); okR {
+				for _, rr := range rolesList {
+					if localNodeAutoscalingRolesR65[strings.TrimSpace(fmt.Sprintf("%v", rr))] {
+						rolesMatchNode = true
+						break
+					}
+				}
+			}
+			nodeStorage := int64(1073741824)
+			nodeMemory := int64(1073741824)
+			curNodes := []any{}
+			curNodeRes := map[string]any{"storage": int64(0), "memory": int64(0)}
+			curTotalRes := map[string]any{"storage": int64(0), "memory": int64(0)}
+			if rolesMatchNode {
+				curNodes = []any{map[string]any{"name": "doris-fe-1"}}
+				curNodeRes = map[string]any{"storage": nodeStorage, "memory": nodeMemory}
+				curTotalRes = map[string]any{"storage": nodeStorage, "memory": nodeMemory}
+			}
+			reqNodeRes := map[string]any{"storage": int64(0), "memory": int64(0)}
+			reqTotalRes := map[string]any{"storage": int64(0), "memory": int64(0)}
+			decidersCap := map[string]any{}
+
+			if decs, okD := pol["deciders"].(map[string]any); okD && decs != nil {
+				if fixedCfg, okF := decs["fixed"].(map[string]any); okF && fixedCfg != nil {
+					var fStorage, fMemory int64
+					if sv, hasS := fixedCfg["storage"]; hasS && sv != nil {
+						fStorage, _ = parseAutoscalingByteSizeR65(sv)
+					}
+					if mv, hasM := fixedCfg["memory"]; hasM && mv != nil {
+						fMemory, _ = parseAutoscalingByteSizeR65(mv)
+					}
+					fNodes := int64(1)
+					if nv, hasN := fixedCfg["nodes"]; hasN && nv != nil {
+						if nParsed, okN := toInt64(nv); okN && nParsed >= 0 {
+							fNodes = nParsed
+						}
+					}
+					fNodeMap := map[string]any{"storage": fStorage, "memory": fMemory}
+					fTotalMap := map[string]any{"storage": fStorage * fNodes, "memory": fMemory * fNodes}
+					reqNodeMap := map[string]any{"storage": fStorage, "memory": fMemory}
+					reqTotalMap := map[string]any{"storage": fStorage * fNodes, "memory": fMemory * fNodes}
+					procSummary := "null"
+					if pv, hasP := fixedCfg["processors"]; hasP && pv != nil {
+						if pFloat, okP := toFloat64(pv); okP {
+							pVal := pv
+							if pFloat == float64(int64(pFloat)) {
+								pVal = int64(pFloat)
+							}
+							fNodeMap["processors"] = pVal
+							fTotalMap["processors"] = pFloat * float64(fNodes)
+							if pFloat*float64(fNodes) == float64(int64(pFloat*float64(fNodes))) {
+								fTotalMap["processors"] = int64(pFloat * float64(fNodes))
+							}
+							reqNodeMap["processors"] = pVal
+							reqTotalMap["processors"] = fTotalMap["processors"]
+							curNodeRes["processors"] = int64(0)
+							curTotalRes["processors"] = int64(0)
+							if rolesMatchNode {
+								curNodeRes["processors"] = int64(1)
+								curTotalRes["processors"] = int64(1)
+							}
+							procSummary = fmt.Sprintf("%.1f", pFloat)
+						}
+					}
+					reqNodeRes = reqNodeMap
+					reqTotalRes = reqTotalMap
+					decidersCap["fixed"] = map[string]any{
+						"required_capacity": map[string]any{
+							"node":  fNodeMap,
+							"total": fTotalMap,
+						},
+						"reason_summary": fmt.Sprintf("fixed storage [%s] memory [%s] processors [%s] nodes [%d]",
+							formatAutoscalingBytesR65(fStorage), formatAutoscalingBytesR65(fMemory), procSummary, fNodes),
+					}
+				}
+			}
+
 			policiesCap[k] = map[string]any{
 				"required_capacity": map[string]any{
-					"node_A": map[string]any{"storage": 0, "memory": 0},
-					"total":  map[string]any{"storage": 0, "memory": 0},
+					"node":  reqNodeRes,
+					"total": reqTotalRes,
 				},
 				"current_capacity": map[string]any{
-					"node_A": map[string]any{"storage": 0, "memory": 0},
-					"total":  map[string]any{"storage": 0, "memory": 0},
+					"node":  curNodeRes,
+					"total": curTotalRes,
 				},
-				"current_nodes": []any{
-					map[string]any{"name": "doris-fe-1"},
-				},
-				"deciders": map[string]any{},
+				"current_nodes": curNodes,
+				"deciders":      decidersCap,
 			}
 		}
 		s.mu.RUnlock()
 		writeJSON(w, http.StatusOK, map[string]any{
 			"policies": policiesCap,
-			"deciders": map[string]any{},
 		})
 		return
 	}
@@ -3909,28 +5679,74 @@ func (s *Server) handleAutoscaling(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		if body == nil {
+		if len(body) == 0 {
 			writeESError(w, http.StatusBadRequest, "parse_exception", "autoscaling policy body is required")
 			return
 		}
-		roles, hasRoles := body["roles"].([]any)
-		if !hasRoles || len(roles) == 0 {
-			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "autoscaling policy must specify non-empty [roles]")
-			return
+		decRaw := body["deciders"]
+		if decRaw == nil && body["policy"] != nil {
+			decRaw = body["policy"]
 		}
-		deciders, hasDeciders := body["deciders"].(map[string]any)
-		if !hasDeciders || deciders == nil {
-			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "autoscaling policy must specify [deciders]")
+		var hasRolesField bool
+		var roles []any
+		if rawR, present := body["roles"]; present {
+			hasRolesField = true
+			rl, okR := rawR.([]any)
+			if !okR {
+				writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "[roles] must be an array")
+				return
+			}
+			for _, rr := range rl {
+				roleStr := strings.TrimSpace(fmt.Sprintf("%v", rr))
+				if !validAutoscalingRolesR65[roleStr] {
+					writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
+						fmt.Sprintf("unknown node role [%s] in autoscaling policy", roleStr))
+					return
+				}
+			}
+			roles = rl
+		}
+		var hasDecidersField bool
+		var deciders map[string]any
+		if decRaw != nil {
+			hasDecidersField = true
+			dm, okD := decRaw.(map[string]any)
+			if !okD || dm == nil {
+				writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "[deciders] must be an object")
+				return
+			}
+			if err := validateAutoscalingDecidersR65(dm); err != nil {
+				writeESError(w, http.StatusBadRequest, "illegal_argument_exception", err.Error())
+				return
+			}
+			deciders = dm
+		}
+		if !hasRolesField && !hasDecidersField {
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "autoscaling policy must specify [roles] or [deciders]")
 			return
 		}
 		s.mu.Lock()
 		if s.autoscalingPolicies == nil {
 			s.autoscalingPolicies = make(map[string]map[string]any)
 		}
-		s.autoscalingPolicies[name] = map[string]any{
-			"roles":    roles,
-			"deciders": deciders,
+		existing := s.autoscalingPolicies[name]
+		if existing == nil && hasRolesField && len(roles) == 0 && (!hasDecidersField || len(deciders) == 0) {
+			s.mu.Unlock()
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "autoscaling policy must specify non-empty [roles] or [deciders]")
+			return
 		}
+		if existing == nil {
+			existing = map[string]any{"roles": []any{}, "deciders": map[string]any{}}
+		} else {
+			existing = deepCloneDocMap(existing)
+		}
+		if hasRolesField {
+			existing["roles"] = roles
+		}
+		if hasDecidersField {
+			existing["deciders"] = deciders
+		}
+		s.autoscalingPolicies[name] = existing
 		s.mu.Unlock()
 		writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
 
@@ -3941,18 +5757,22 @@ func (s *Server) handleAutoscaling(w http.ResponseWriter, r *http.Request) {
 			if !exists {
 				s.mu.RUnlock()
 				if r.Method == http.MethodHead {
+					ensureESCompatHeaders(w, r)
 					w.WriteHeader(http.StatusNotFound)
 					return
 				}
 				writeESError(w, http.StatusNotFound, "resource_not_found_exception",
-					fmt.Sprintf("autoscaling policy [%s] does not exist", name))
+					fmt.Sprintf("autoscaling policy with name [%s] does not exist", name))
 				return
 			}
 			cp := deepCloneDocMap(entry)
 			s.mu.RUnlock()
-			writeJSON(w, http.StatusOK, map[string]any{
-				"policies": map[string]any{name: cp},
-			})
+			if r.Method == http.MethodHead {
+				ensureESCompatHeaders(w, r)
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			writeJSON(w, http.StatusOK, cp)
 			return
 		}
 		out := make(map[string]any, len(s.autoscalingPolicies))
@@ -3960,6 +5780,11 @@ func (s *Server) handleAutoscaling(w http.ResponseWriter, r *http.Request) {
 			out[k] = deepCloneDocMap(v)
 		}
 		s.mu.RUnlock()
+		if r.Method == http.MethodHead {
+			ensureESCompatHeaders(w, r)
+			w.WriteHeader(http.StatusOK)
+			return
+		}
 		writeJSON(w, http.StatusOK, map[string]any{"policies": out})
 
 	case http.MethodDelete:
@@ -3968,10 +5793,20 @@ func (s *Server) handleAutoscaling(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.mu.Lock()
+		if strings.ContainsAny(name, "*?") {
+			for k := range s.autoscalingPolicies {
+				if matchMultiWildcardWithExclusions(name, k) {
+					delete(s.autoscalingPolicies, k)
+				}
+			}
+			s.mu.Unlock()
+			writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
+			return
+		}
 		if _, exists := s.autoscalingPolicies[name]; !exists {
 			s.mu.Unlock()
 			writeESError(w, http.StatusNotFound, "resource_not_found_exception",
-				fmt.Sprintf("autoscaling policy [%s] does not exist", name))
+				fmt.Sprintf("autoscaling policy with name [%s] does not exist", name))
 			return
 		}
 		delete(s.autoscalingPolicies, name)
@@ -5137,6 +6972,18 @@ func (s *Server) handleFeatures(w http.ResponseWriter, r *http.Request, segs []s
 func (s *Server) handleVotingConfigExclusions(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodPost, http.MethodPut:
+		var segs []string
+		for _, p := range strings.Split(strings.Trim(r.URL.Path, "/"), "/") {
+			if p != "" {
+				segs = append(segs, p)
+			}
+		}
+		if len(segs) >= 3 && strings.TrimSpace(segs[2]) != "" {
+			emitESDeprecationWarningRound61(w, s, r, "[POST /_cluster/voting_config_exclusions/{node_name}] has been removed. Use POST /_cluster/voting_config_exclusions?node_names=... instead.")
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
+				"[node_name] has been removed, you must set [node_names] or [node_ids]")
+			return
+		}
 		nodeIDs := strings.TrimSpace(r.URL.Query().Get("node_ids"))
 		nodeNames := strings.TrimSpace(r.URL.Query().Get("node_names"))
 		nodeNameSingle := strings.TrimSpace(r.URL.Query().Get("node_name"))
@@ -5280,7 +7127,10 @@ func (s *Server) handleNodesShutdown(w http.ResponseWriter, r *http.Request, nod
 			"node_id":                nodeID,
 			"type":                   strings.ToLower(strings.TrimSpace(sType)),
 			"reason":                 reason,
-			"status":                 "COMPLETE",
+			"status":                 "complete",
+			"shard_migration":        map[string]any{"status": "complete"},
+			"persistent_tasks":       map[string]any{"status": "complete"},
+			"plugins":                map[string]any{"status": "complete"},
 			"shutdown_startedmillis": time.Now().UTC().UnixMilli(),
 		}
 		s.mu.Lock()
@@ -5313,6 +7163,11 @@ func (s *Server) handleNodesShutdown(w http.ResponseWriter, r *http.Request, nod
 			}
 		}
 		s.mu.RUnlock()
+		if r.Method == http.MethodHead {
+			ensureESCompatHeaders(w, r)
+			w.WriteHeader(http.StatusOK)
+			return
+		}
 		writeJSON(w, http.StatusOK, map[string]any{"nodes": nodes})
 
 	case http.MethodDelete:
@@ -5352,11 +7207,30 @@ func (s *Server) handleRollup(w http.ResponseWriter, r *http.Request, segs []str
 			cfg, _ := job["config"].(map[string]any)
 			rIdx, _ := cfg["rollup_index"].(string)
 			iPat, _ := cfg["index_pattern"].(string)
-			if target == "" || target == "_all" || target == "*" || target == jobID || target == rIdx || matchMultiWildcardWithExclusions(target, jobID) || matchMultiWildcardWithExclusions(target, rIdx) || matchMultiWildcardWithExclusions(iPat, target) {
+			matches := false
+			if indexName != "" {
+				matches = target == "_all" || target == "*" || target == rIdx || target == iPat ||
+					matchMultiWildcardWithExclusions(target, rIdx) ||
+					matchMultiWildcardWithExclusions(target, iPat) ||
+					matchMultiWildcardWithExclusions(iPat, target)
+			} else {
+				matches = target == "" || target == "_all" || target == "*" || target == iPat || target == jobID || target == rIdx ||
+					matchMultiWildcardWithExclusions(target, iPat) || matchMultiWildcardWithExclusions(target, jobID) || matchMultiWildcardWithExclusions(target, rIdx) || matchMultiWildcardWithExclusions(iPat, target)
+			}
+			if matches {
 				key := target
-				if key == "" || key == "_all" || key == "*" {
-					key = rIdx
-					if key == "" {
+				if indexName != "" {
+					if rIdx != "" {
+						key = rIdx
+					} else if iPat != "" {
+						key = iPat
+					}
+				} else if key == "" || key == "_all" || key == "*" || strings.ContainsAny(key, "*?,") {
+					if iPat != "" {
+						key = iPat
+					} else if rIdx != "" {
+						key = rIdx
+					} else {
 						key = jobID
 					}
 				}
@@ -5375,6 +7249,20 @@ func (s *Server) handleRollup(w http.ResponseWriter, r *http.Request, segs []str
 				out[key] = entry
 			}
 		}
+		for _, rawEntry := range out {
+			if entry, okE := rawEntry.(map[string]any); okE {
+				if jList, okJ := entry["rollup_jobs"].([]any); okJ && len(jList) > 1 {
+					sort.Slice(jList, func(i, j int) bool {
+						mi, _ := jList[i].(map[string]any)
+						mj, _ := jList[j].(map[string]any)
+						si, _ := mi["job_id"].(string)
+						sj, _ := mj["job_id"].(string)
+						return si < sj
+					})
+					entry["rollup_jobs"] = jList
+				}
+			}
+		}
 		if len(out) == 0 && target != "" && target != "_all" && target != "*" {
 			if _, idxExists := s.indices[target]; idxExists {
 				out[target] = map[string]any{"rollup_jobs": []any{}}
@@ -5390,9 +7278,35 @@ func (s *Server) handleRollup(w http.ResponseWriter, r *http.Request, segs []str
 					out[at] = map[string]any{"rollup_jobs": []any{}}
 				}
 			} else {
-				s.mu.RUnlock()
-				writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("rollup data [%s] not found", target))
-				return
+				for idxN := range s.indices {
+					if matchMultiWildcardWithExclusions(target, idxN) {
+						out[idxN] = map[string]any{"rollup_jobs": []any{}}
+					}
+				}
+				for dsName, ds := range s.dataStreams {
+					if ds != nil && matchMultiWildcardWithExclusions(target, dsName) {
+						bIndices := extractDataStreamBackingIndexNames(ds)
+						if len(bIndices) == 0 {
+							out[dsName] = map[string]any{"rollup_jobs": []any{}}
+						} else {
+							for _, bi := range bIndices {
+								out[bi] = map[string]any{"rollup_jobs": []any{}}
+							}
+						}
+					}
+				}
+				for alName, aliasTargets := range s.aliases {
+					if matchMultiWildcardWithExclusions(target, alName) {
+						for _, at := range aliasTargets {
+							out[at] = map[string]any{"rollup_jobs": []any{}}
+						}
+					}
+				}
+				if len(out) == 0 {
+					s.mu.RUnlock()
+					writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("rollup data [%s] not found", target))
+					return
+				}
 			}
 		}
 		s.mu.RUnlock()
@@ -5421,12 +7335,12 @@ func (s *Server) handleRollup(w http.ResponseWriter, r *http.Request, segs []str
 		job, exists := s.rollupJobs[jobID]
 		if !exists || job == nil {
 			s.mu.Unlock()
-			writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("Rollup job [%s] does not exist", jobID))
+			writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("Task for Rollup Job [%s] not found", jobID))
 			return
 		}
 		switch action {
 		case "_start", "start":
-			job["state"] = "STARTED"
+			job["state"] = "started"
 			s.mu.Unlock()
 			if err := s.executeRollupStartRound58(r.Context(), jobID); err != nil {
 				writeESError(w, http.StatusBadRequest, "illegal_argument_exception", err.Error())
@@ -5434,7 +7348,7 @@ func (s *Server) handleRollup(w http.ResponseWriter, r *http.Request, segs []str
 			}
 			writeJSONWithRequest(w, r, http.StatusOK, map[string]any{"started": true})
 		case "_stop", "stop":
-			job["state"] = "STOPPED"
+			job["state"] = "stopped"
 			s.mu.Unlock()
 			writeJSON(w, http.StatusOK, map[string]any{"stopped": true})
 		default:
@@ -5461,6 +7375,14 @@ func (s *Server) handleRollup(w http.ResponseWriter, r *http.Request, segs []str
 				return
 			}
 		}
+		for k := range body {
+			switch k {
+			case "id", "index_pattern", "rollup_index", "cron", "page_size", "groups", "metrics", "timeout":
+			default:
+				writeESError(w, http.StatusBadRequest, "x_content_parse_exception", fmt.Sprintf("unknown field [%s]", k))
+				return
+			}
+		}
 		idxPat, _ := body["index_pattern"].(string)
 		rollupIdx, _ := body["rollup_index"].(string)
 		cronStr, _ := body["cron"].(string)
@@ -5471,6 +7393,46 @@ func (s *Server) handleRollup(w http.ResponseWriter, r *http.Request, segs []str
 				"rollup job requires [index_pattern], [rollup_index], [cron], positive [page_size], and [groups]")
 			return
 		}
+		var referencedFields []string
+		if dhMap, okDH := groups["date_histogram"].(map[string]any); okDH && dhMap != nil {
+			if f, _ := dhMap["field"].(string); strings.TrimSpace(f) != "" {
+				referencedFields = append(referencedFields, strings.TrimSpace(f))
+			}
+			if tz, _ := dhMap["time_zone"].(string); strings.TrimSpace(tz) == "Canada/Mountain" {
+				emitESDeprecationWarningRound61(w, s, r, fmt.Sprintf("Creating Rollup job [%s] with timezone [Canada/Mountain], but [Canada/Mountain] has been deprecated by the IANA.  Use [America/Edmonton] instead.", jobID))
+			}
+		}
+		if hMap, okH := groups["histogram"].(map[string]any); okH && hMap != nil {
+			if fs, okF := hMap["fields"].([]any); okF {
+				for _, rf := range fs {
+					if f := strings.TrimSpace(fmt.Sprintf("%v", rf)); f != "" {
+						referencedFields = append(referencedFields, f)
+					}
+				}
+			}
+		}
+		if rawMetrics, okM := body["metrics"].([]any); okM {
+			for _, rm := range rawMetrics {
+				mm, okMM := rm.(map[string]any)
+				if !okMM {
+					continue
+				}
+				if f, _ := mm["field"].(string); strings.TrimSpace(f) != "" {
+					referencedFields = append(referencedFields, strings.TrimSpace(f))
+				}
+				if ml, okL := mm["metrics"].([]any); okL {
+					for _, mt := range ml {
+						mStr := strings.ToLower(strings.TrimSpace(fmt.Sprintf("%v", mt)))
+						switch mStr {
+						case "min", "max", "sum", "avg", "value_count":
+						default:
+							writeESError(w, http.StatusBadRequest, "illegal_argument_exception", fmt.Sprintf("Unsupported metric [%s]", fmt.Sprintf("%v", mt)))
+							return
+						}
+					}
+				}
+			}
+		}
 		s.mu.Lock()
 		if s.rollupJobs == nil {
 			s.rollupJobs = make(map[string]map[string]any)
@@ -5478,33 +7440,120 @@ func (s *Server) handleRollup(w http.ResponseWriter, r *http.Request, segs []str
 		if _, exists := s.rollupJobs[jobID]; exists {
 			s.mu.Unlock()
 			writeESError(w, http.StatusBadRequest, "resource_already_exists_exception",
-				fmt.Sprintf("Rollup job [%s] already exists", jobID))
+				fmt.Sprintf("Cannot create rollup job [%s] because job was previously created (existing metadata)", jobID))
 			return
 		}
-		cfg := deepCloneDocMap(body)
-		cfg["id"] = jobID
-		s.rollupJobs[jobID] = map[string]any{
-			"config": cfg,
-			"state":  "STOPPED",
-		}
-		s.mu.Unlock()
-		_ = s.ensureIndexSchema(r.Context(), rollupIdx)
-		writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
-
-	case http.MethodGet, http.MethodHead:
-		allowNoMatch := isTruthyBoolQueryParam(r, "allow_no_match")
-		s.mu.RLock()
-		if jobID != "" && jobID != "_all" && jobID != "*" && !strings.ContainsAny(jobID, "*?,") {
-			if _, exists := s.rollupJobs[jobID]; !exists && !allowNoMatch {
-				s.mu.RUnlock()
-				if r.Method == http.MethodHead {
-					w.WriteHeader(http.StatusNotFound)
-					return
+		if existingRSchema := s.indices[rollupIdx]; existingRSchema != nil {
+			hasRollupMeta := false
+			if existingRSchema.RawMapping != nil && existingRSchema.RawMapping.Meta != nil {
+				if _, okR := existingRSchema.RawMapping.Meta["_rollup"]; okR {
+					hasRollupMeta = true
 				}
-				writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("Rollup job [%s] does not exist", jobID))
+			}
+			for _, existingJob := range s.rollupJobs {
+				if cfgE, okCE := existingJob["config"].(map[string]any); okCE && cfgE["rollup_index"] == rollupIdx {
+					hasRollupMeta = true
+					break
+				}
+			}
+			if !hasRollupMeta {
+				s.mu.Unlock()
+				writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
+					"Rollup data cannot be added to existing indices that contain non-rollup data")
 				return
 			}
 		}
+		// Validate referenced numeric/date fields when matching source indices have explicit mappings.
+		var matchedExplicitSchemas []*schema.IndexSchema
+		for idxN, sc := range s.indices {
+			if matchMultiWildcardWithExclusions(idxPat, idxN) && sc != nil && len(sc.Fields) > 0 {
+				matchedExplicitSchemas = append(matchedExplicitSchemas, sc)
+			}
+		}
+		if len(matchedExplicitSchemas) > 0 {
+			for _, rf := range referencedFields {
+				foundField := false
+				for _, sc := range matchedExplicitSchemas {
+					if sc != nil && sc.Fields != nil {
+						if _, okRF := sc.Fields[rf]; okRF {
+							foundField = true
+							break
+						}
+					}
+				}
+				if !foundField {
+					s.mu.Unlock()
+					writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
+						fmt.Sprintf("Could not find a [numeric] or [date,date_nanos] field with name [%s] in any of the indices matching the index pattern", rf))
+					return
+				}
+			}
+		}
+		cfg := deepCloneDocMap(body)
+		cfg["id"] = jobID
+		if to, hasTO := cfg["timeout"].(string); !hasTO || strings.TrimSpace(to) == "" {
+			cfg["timeout"] = "20s"
+		}
+		if grpMap, okG := cfg["groups"].(map[string]any); okG && grpMap != nil {
+			if dhMap, okDH := grpMap["date_histogram"].(map[string]any); okDH && dhMap != nil {
+				if tz, hasTZ := dhMap["time_zone"].(string); !hasTZ || strings.TrimSpace(tz) == "" {
+					dhMap["time_zone"] = "UTC"
+				}
+			}
+		}
+		s.rollupJobs[jobID] = map[string]any{
+			"config": cfg,
+			"state":  "stopped",
+		}
+		s.mu.Unlock()
+		rollupSchema := s.ensureIndexSchema(r.Context(), rollupIdx)
+		if rollupSchema != nil {
+			s.mu.Lock()
+			if rollupSchema.RawMapping == nil {
+				rollupSchema.RawMapping = &esast.MappingSpec{}
+			}
+			if rollupSchema.RawMapping.Meta == nil {
+				rollupSchema.RawMapping.Meta = make(map[string]any)
+			}
+			rollupMetaMap, _ := rollupSchema.RawMapping.Meta["_rollup"].(map[string]any)
+			if rollupMetaMap == nil {
+				rollupMetaMap = make(map[string]any)
+			}
+			rollupMetaMap[jobID] = deepCloneDocMap(cfg)
+			rollupSchema.RawMapping.Meta["_rollup"] = rollupMetaMap
+			rollupSchema.RawMapping.Meta["rollup-version"] = "2"
+			hasStringsDT, hasDateHistDT := false, false
+			for _, dt := range rollupSchema.RawMapping.DynamicTemplates {
+				if _, ok := dt["strings"]; ok {
+					hasStringsDT = true
+				}
+				if _, ok := dt["date_histograms"]; ok {
+					hasDateHistDT = true
+				}
+			}
+			if !hasStringsDT {
+				rollupSchema.RawMapping.DynamicTemplates = append(rollupSchema.RawMapping.DynamicTemplates, map[string]any{
+					"strings": map[string]any{
+						"match_mapping_type": "string",
+						"mapping":            map[string]any{"type": "keyword"},
+					},
+				})
+			}
+			if !hasDateHistDT {
+				rollupSchema.RawMapping.DynamicTemplates = append(rollupSchema.RawMapping.DynamicTemplates, map[string]any{
+					"date_histograms": map[string]any{
+						"path_match": "*.date_histogram.timestamp",
+						"mapping":    map[string]any{"type": "date"},
+					},
+				})
+			}
+			s.mu.Unlock()
+			s.persistIndex(r.Context(), rollupIdx, rollupSchema)
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
+
+	case http.MethodGet, http.MethodHead:
+		s.mu.RLock()
 		ids := make([]string, 0, len(s.rollupJobs))
 		for k := range s.rollupJobs {
 			if jobID == "" || jobID == "_all" || jobID == "*" || matchMultiWildcardWithExclusions(jobID, k) {
@@ -5512,12 +7561,23 @@ func (s *Server) handleRollup(w http.ResponseWriter, r *http.Request, segs []str
 			}
 		}
 		sort.Strings(ids)
+		if r.Method == http.MethodHead {
+			allowNoMatch := isTruthyBoolQueryParam(r, "allow_no_match")
+			s.mu.RUnlock()
+			if len(ids) == 0 && !allowNoMatch {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			return
+		}
 		jobs := make([]any, 0, len(ids))
 		for _, k := range ids {
 			entry := s.rollupJobs[k]
 			state, _ := entry["state"].(string)
+			state = strings.ToLower(strings.TrimSpace(state))
 			if state == "" {
-				state = "STOPPED"
+				state = "stopped"
 			}
 			cfg, _ := entry["config"].(map[string]any)
 			var pagesProc, docsProc, rollupsIdx, trigCnt int64
@@ -5533,10 +7593,18 @@ func (s *Server) handleRollup(w http.ResponseWriter, r *http.Request, segs []str
 					"job_state": state,
 				},
 				"stats": map[string]any{
-					"pages_processed":     pagesProc,
-					"documents_processed": docsProc,
-					"rollups_indexed":     rollupsIdx,
-					"trigger_count":       trigCnt,
+					"pages_processed":       pagesProc,
+					"documents_processed":   docsProc,
+					"rollups_indexed":       rollupsIdx,
+					"trigger_count":         trigCnt,
+					"search_failures":       0,
+					"index_failures":        0,
+					"index_time_in_ms":      0,
+					"index_total":           rollupsIdx,
+					"search_time_in_ms":     0,
+					"search_total":          trigCnt,
+					"processing_time_in_ms": 0,
+					"processing_total":      trigCnt,
 				},
 			})
 		}
@@ -5549,9 +7617,24 @@ func (s *Server) handleRollup(w http.ResponseWriter, r *http.Request, segs []str
 			return
 		}
 		s.mu.Lock()
-		if _, exists := s.rollupJobs[jobID]; !exists {
+		jobEntry, exists := s.rollupJobs[jobID]
+		if !exists || jobEntry == nil {
 			s.mu.Unlock()
-			writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("Rollup job [%s] does not exist", jobID))
+			writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("the task with id [%s] doesn't exist", jobID))
+			return
+		}
+		st, _ := jobEntry["state"].(string)
+		if strings.EqualFold(strings.TrimSpace(st), "started") {
+			s.mu.Unlock()
+			writeJSON(w, http.StatusBadRequest, map[string]any{
+				"acknowledged": false,
+				"task_failures": []any{map[string]any{
+					"reason": map[string]any{
+						"type":   "illegal_state_exception",
+						"reason": fmt.Sprintf("Could not delete job [%s] because indexer state is [STARTED].  Job must be [STOPPED] before deletion.", jobID),
+					},
+				}},
+			})
 			return
 		}
 		delete(s.rollupJobs, jobID)
@@ -5567,6 +7650,11 @@ func (s *Server) handleRollup(w http.ResponseWriter, r *http.Request, segs []str
 func (s *Server) handleRollupSearch(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodPost {
 		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+		return
+	}
+	rawIndex := strings.TrimSpace(r.PathValue("index"))
+	if rawIndex == "" {
+		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "Must specify at least one concrete index")
 		return
 	}
 	if rawFrom := strings.TrimSpace(r.URL.Query().Get("from")); rawFrom != "" {
@@ -5606,11 +7694,53 @@ func (s *Server) handleRollupSearch(w http.ResponseWriter, r *http.Request) {
 	} else {
 		body = make(map[string]any)
 	}
+	targets := s.resolveTargetIndices(rawIndex)
+	if len(targets) == 0 {
+		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "Must specify at least one concrete index")
+		return
+	}
+	if len(targets) > 1 {
+		s.mu.RLock()
+		rollupHitCount := 0
+		for _, t := range targets {
+			isR := false
+			if sc := s.indices[t]; sc != nil && sc.RawMapping != nil && sc.RawMapping.Meta != nil {
+				if _, hasRM := sc.RawMapping.Meta["_rollup"]; hasRM {
+					isR = true
+				}
+			}
+			for _, job := range s.rollupJobs {
+				if cfg, okC := job["config"].(map[string]any); okC && cfg["rollup_index"] == t {
+					isR = true
+					break
+				}
+			}
+			if isR {
+				rollupHitCount++
+			}
+		}
+		s.mu.RUnlock()
+		if rollupHitCount > 1 {
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
+				"RollupSearch currently only supports searching one rollup index at a time.")
+			return
+		}
+	}
 	body["size"] = 0
 	mutatedBytes, _ := json.Marshal(body)
 	var sReq esast.SearchRequest
 	if err := json.Unmarshal(mutatedBytes, &sReq); err == nil {
-		if rollupResp, evaluated := s.tryEvaluateRollupSearchAggs(r.Context(), strings.TrimSpace(r.PathValue("index")), &sReq); evaluated {
+		if rollupResp, evaluated := s.tryEvaluateRollupSearchAggs(r.Context(), rawIndex, &sReq); evaluated {
+			if isTruthyBoolQueryParam(r, "rest_total_hits_as_int") {
+				if hitsMap, okH := rollupResp["hits"].(map[string]any); okH && hitsMap != nil {
+					hitsMap["total"] = 0
+				}
+			}
+			if isTruthyBoolQueryParam(r, "typed_keys") {
+				if aggsOut, okA := rollupResp["aggregations"].(map[string]any); okA && len(aggsOut) > 0 {
+					rollupResp["aggregations"] = applyTypedKeysToRollupAggsR65(aggsOut, sReq.EffectiveAggs())
+				}
+			}
 			writeJSONWithRequest(w, r, http.StatusOK, rollupResp)
 			return
 		}
@@ -5619,8 +7749,93 @@ func (s *Server) handleRollupSearch(w http.ResponseWriter, r *http.Request) {
 	s.handleSearch(w, r)
 }
 
+func typedKeyPrefixForAggSpecR65(sp esast.AggSpec) string {
+	switch {
+	case sp.DateHistogram != nil:
+		return "date_histogram#"
+	case sp.Histogram != nil:
+		return "histogram#"
+	case sp.Terms != nil:
+		return "terms#"
+	case sp.Range != nil:
+		return "range#"
+	case sp.DateRange != nil:
+		return "date_range#"
+	case sp.Filter != nil:
+		return "filter#"
+	case sp.Filters != nil:
+		return "filters#"
+	case sp.Sum != nil:
+		return "sum#"
+	case sp.Avg != nil:
+		return "avg#"
+	case sp.Min != nil:
+		return "min#"
+	case sp.Max != nil:
+		return "max#"
+	case sp.ValueCount != nil:
+		return "value_count#"
+	case sp.Cardinality != nil:
+		return "cardinality#"
+	case sp.Stats != nil:
+		return "stats#"
+	case sp.ExtendedStats != nil:
+		return "extended_stats#"
+	}
+	return ""
+}
+
+func applyTypedKeysToRollupAggsR65(outMap map[string]any, specs map[string]esast.AggSpec) map[string]any {
+	if len(outMap) == 0 || len(specs) == 0 {
+		return outMap
+	}
+	typed := make(map[string]any, len(outMap))
+	for k, v := range outMap {
+		sp, exists := specs[k]
+		if !exists {
+			typed[k] = v
+			continue
+		}
+		pref := typedKeyPrefixForAggSpecR65(sp)
+		if subSpecs := sp.SubAggs(); len(subSpecs) > 0 {
+			if vm, okV := v.(map[string]any); okV && vm != nil {
+				switch rawB := vm["buckets"].(type) {
+				case []any:
+					for i, item := range rawB {
+						if bMap, okB := item.(map[string]any); okB && bMap != nil {
+							rawB[i] = applyTypedKeysToRollupAggsR65(bMap, subSpecs)
+						}
+					}
+				case map[string]any:
+					for bk, item := range rawB {
+						if bMap, okB := item.(map[string]any); okB && bMap != nil {
+							rawB[bk] = applyTypedKeysToRollupAggsR65(bMap, subSpecs)
+						}
+					}
+				default:
+					vm = applyTypedKeysToRollupAggsR65(vm, subSpecs)
+				}
+				v = vm
+			}
+		}
+		typed[pref+k] = v
+	}
+	return typed
+}
+
 // handleSearchableSnapshots implements `/_searchable_snapshots/*` and `/{index}/_searchable_snapshots/stats` (F7).
 func (s *Server) handleSearchableSnapshots(w http.ResponseWriter, r *http.Request, segs []string, indexName string) {
+	filterSnapshotTargets := func(targets []string) []string {
+		s.mu.RLock()
+		defer s.mu.RUnlock()
+		var kept []string
+		for _, t := range targets {
+			if cs := s.indexCustomSettings[t]; cs != nil && cs["store.type"] == "snapshot" {
+				kept = append(kept, t)
+			}
+		}
+		return kept
+	}
 	if (len(segs) == 3 && segs[0] == "_searchable_snapshots" && segs[1] == "cache" && segs[2] == "clear") ||
 		(indexName != "" && len(segs) == 4 && segs[1] == "_searchable_snapshots" && segs[2] == "cache" && segs[3] == "clear") {
 		if r.Method != http.MethodPost {
@@ -5628,7 +7843,12 @@ func (s *Server) handleSearchableSnapshots(w http.ResponseWriter, r *http.Reques
 			return
 		}
 		if indexName != "" {
-			if _, _, ok := s.resolveValidatedReadTargets(w, r, indexName); !ok {
+			targets, _, ok := s.resolveValidatedReadTargets(w, r, indexName)
+			if !ok {
+				return
+			}
+			if len(filterSnapshotTargets(targets)) == 0 {
+				writeESError(w, http.StatusNotFound, "resource_not_found_exception", "No searchable snapshots indices found")
 				return
 			}
 		}
@@ -5672,6 +7892,11 @@ func (s *Server) handleSearchableSnapshots(w http.ResponseWriter, r *http.Reques
 			if !ok {
 				return
 			}
+			targets = filterSnapshotTargets(targets)
+			if len(targets) == 0 {
+				writeESError(w, http.StatusNotFound, "resource_not_found_exception", "No searchable snapshots indices found")
+				return
+			}
 		} else {
 			s.mu.RLock()
 			for idx, cs := range s.indexCustomSettings {
@@ -5696,6 +7921,10 @@ func (s *Server) handleSearchableSnapshots(w http.ResponseWriter, r *http.Reques
 		writeJSON(w, http.StatusOK, map[string]any{
 			"_shards": map[string]any{"total": 1, "successful": 1, "failed": 0},
 			"indices": indicesMap,
+			"stats":   indicesMap,
+			"total": map[string]any{
+				"http": map[string]any{"Requests": 0},
+			},
 		})
 		return
 	}
@@ -6900,7 +9129,8 @@ func (s *Server) handleLogstashPipeline(w http.ResponseWriter, r *http.Request, 
 		}
 		s.logstashPipelines[id] = cp
 		s.mu.Unlock()
-		writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
+		ensureESCompatHeaders(w, r)
+		w.WriteHeader(http.StatusOK)
 
 	case http.MethodGet, http.MethodHead:
 		s.mu.RLock()
@@ -6958,7 +9188,8 @@ func (s *Server) handleLogstashPipeline(w http.ResponseWriter, r *http.Request, 
 		}
 		delete(s.logstashPipelines, id)
 		s.mu.Unlock()
-		writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
+		ensureESCompatHeaders(w, r)
+		w.WriteHeader(http.StatusOK)
 
 	default:
 		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
@@ -7061,7 +9292,7 @@ func (s *Server) handleInferenceAPI(w http.ResponseWriter, r *http.Request, segs
 				inferenceID = ""
 			} else if !exists || (taskType != "" && taskType != "_all" && !strings.Contains(taskType, "*") && ep["task_type"] != taskType) {
 				s.mu.RUnlock()
-				writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("Inference endpoint [%s] not found", inferenceID))
+				writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("Inference endpoint not found [%s]", inferenceID))
 				return
 			} else {
 				s.mu.RUnlock()
@@ -7109,7 +9340,7 @@ func (s *Server) handleInferenceAPI(w http.ResponseWriter, r *http.Request, segs
 			taskType, _ = body["task_type"].(string)
 		}
 		if !validInferenceTaskTypes[taskType] {
-			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", fmt.Sprintf("invalid or missing inference task_type [%s]", taskType))
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", fmt.Sprintf("Unknown task_type [%s]", taskType))
 			return
 		}
 		service, _ := body["service"].(string)
@@ -7148,6 +9379,10 @@ func (s *Server) handleInferenceAPI(w http.ResponseWriter, r *http.Request, segs
 			writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: inference_id is missing;")
 			return
 		}
+		if taskType != "" && taskType != "chunking" && !validInferenceTaskTypes[taskType] {
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", fmt.Sprintf("Unknown task_type [%s]", taskType))
+			return
+		}
 		body, ok := parseJSONBody(w, r)
 		if !ok {
 			return
@@ -7156,7 +9391,7 @@ func (s *Server) handleInferenceAPI(w http.ResponseWriter, r *http.Request, segs
 		ep, exists := s.inferenceEndpoints[inferenceID]
 		s.mu.RUnlock()
 		if !exists {
-			writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("Inference endpoint [%s] not found", inferenceID))
+			writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("Inference endpoint not found [%s]", inferenceID))
 			return
 		}
 		epTaskType, _ := ep["task_type"].(string)
@@ -7285,12 +9520,12 @@ func (s *Server) handleInferenceAPI(w http.ResponseWriter, r *http.Request, segs
 		ep, exists := s.inferenceEndpoints[inferenceID]
 		if !exists || (taskType != "" && taskType != "_all" && !strings.Contains(taskType, "*") && ep["task_type"] != taskType) {
 			s.mu.Unlock()
-			writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("Inference endpoint [%s] not found", inferenceID))
+			writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("Inference endpoint not found [%s]", inferenceID))
 			return
 		}
 		delete(s.inferenceEndpoints, inferenceID)
 		s.mu.Unlock()
-		writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
+		writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true, "pipelines": []any{}})
 
 	default:
 		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
@@ -7962,7 +10197,7 @@ func (s *Server) handleApplicationAPI(w http.ResponseWriter, r *http.Request, se
 				},
 			}
 			s.mu.Unlock()
-			writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
+			writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true, "name": collName})
 
 		case collName != "" && eventLit == "" && (r.Method == http.MethodGet || r.Method == http.MethodHead):
 			s.mu.RLock()
@@ -8040,9 +10275,18 @@ func (s *Server) handleTextStructureAPI(w http.ResponseWriter, r *http.Request, 
 			writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: grok_pattern is missing;")
 			return
 		}
-		rawMsgs, ok := body["messages"].([]any)
-		if !ok || len(rawMsgs) == 0 {
-			writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: messages is missing;")
+		var rawMsgs []any
+		usedMessagesAlias := false
+		if mSlice, okM := body["messages"].([]any); okM && len(mSlice) > 0 {
+			rawMsgs = mSlice
+			usedMessagesAlias = true
+		} else if tSlice, okT := body["text"].([]any); okT && len(tSlice) > 0 {
+			rawMsgs = tSlice
+		} else if tStr, okTS := body["text"].(string); okTS && tStr != "" {
+			rawMsgs = []any{tStr}
+		}
+		if len(rawMsgs) == 0 {
+			writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: text is missing;")
 			return
 		}
 		customDefs, _ := body["pattern_definitions"].(map[string]any)
@@ -8058,42 +10302,109 @@ func (s *Server) handleTextStructureAPI(w http.ResponseWriter, r *http.Request, 
 			loc := re.FindStringSubmatchIndex(msg)
 			if sub == nil || loc == nil {
 				matches = append(matches, map[string]any{
-					"message":  msg,
-					"matched":  false,
-					"captures": map[string]any{},
+					"matched": false,
 				})
 				continue
 			}
-			captures := make(map[string]any)
+			fields := make(map[string][]any)
+			var captures map[string]any
+			if usedMessagesAlias {
+				captures = make(map[string]any)
+			}
 			for i, grpID := range re.SubexpNames() {
-				if i == 0 || grpID == "" || i >= len(sub) || 2*i >= len(loc) || loc[2*i] < 0 {
+				if i == 0 || grpID == "" || i >= len(sub) || 2*i+1 >= len(loc) || loc[2*i] < 0 {
 					continue
 				}
 				fieldName := grpMap[grpID]
 				if fieldName == "" {
 					continue
 				}
-				var val any = sub[i]
-				if convT := grpTypes[grpID]; convT != "" {
-					if cv, err := convertSingleIngestValue(sub[i], convT); err == nil {
-						val = cv
+				fields[fieldName] = append(fields[fieldName], map[string]any{
+					"match":  sub[i],
+					"offset": loc[2*i],
+					"length": loc[2*i+1] - loc[2*i],
+				})
+				if usedMessagesAlias {
+					var capVal any = sub[i]
+					switch strings.ToLower(strings.TrimSpace(grpTypes[grpID])) {
+					case "int", "integer", "long":
+						if iv, pErr := strconv.ParseInt(sub[i], 10, 64); pErr == nil {
+							capVal = iv
+						}
+					case "float", "double":
+						if fv, pErr := strconv.ParseFloat(sub[i], 64); pErr == nil {
+							capVal = fv
+						}
 					}
+					captures[fieldName] = capVal
 				}
-				captures[fieldName] = val
 			}
-			matches = append(matches, map[string]any{
-				"message":  msg,
-				"matched":  true,
-				"captures": captures,
-			})
+			mEntry := map[string]any{
+				"matched": true,
+				"fields":  fields,
+			}
+			if usedMessagesAlias {
+				mEntry["captures"] = captures
+			}
+			matches = append(matches, mEntry)
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"matches": matches})
 
 	case "find_structure", "find_field_structure", "find_message_structure":
+		charset := "UTF-8"
+		hasExplicitCharset := false
+		if r.URL != nil {
+			if rawCS := strings.TrimSpace(r.URL.Query().Get("charset")); rawCS != "" {
+				hasExplicitCharset = true
+				upCS := strings.ToUpper(rawCS)
+				switch upCS {
+				case "UTF-8", "UTF8":
+					charset = "UTF-8"
+				case "US-ASCII", "ASCII":
+					charset = "US-ASCII"
+				case "ISO-8859-1", "LATIN1":
+					charset = "ISO-8859-1"
+				case "UTF-16", "UTF-16BE", "UTF-16LE":
+					charset = upCS
+				default:
+					writeESError(w, http.StatusBadRequest, "illegal_argument_exception", fmt.Sprintf("Unsupported character encoding [%s]", rawCS))
+					return
+				}
+			}
+		}
+		explain := isTruthyBoolQueryParam(r, "explain")
+
 		var lines []string
+		var objects []map[string]any
 		trimmed := bytes.TrimSpace(rawBytes)
+		if action == "find_field_structure" && len(trimmed) == 0 && r.URL != nil {
+			indexPat := strings.TrimSpace(r.URL.Query().Get("index"))
+			fieldName := strings.TrimSpace(r.URL.Query().Get("field"))
+			if indexPat != "" && fieldName != "" {
+				docs, _ := s.collectSourceDocsForJob(r.Context(), []string{indexPat}, nil, nil)
+				for _, doc := range docs {
+					for _, val := range extractDocFieldValues(doc, fieldName) {
+						if val != nil {
+							lines = append(lines, fmt.Sprintf("%v", val))
+						}
+					}
+				}
+			}
+		}
 		var bodyMap map[string]any
-		if len(trimmed) > 0 && trimmed[0] == '{' && json.Unmarshal(trimmed, &bodyMap) == nil {
+		var bodyArr []any
+		if len(trimmed) > 0 && trimmed[0] == '[' && json.Unmarshal(trimmed, &bodyArr) == nil {
+			for _, elem := range bodyArr {
+				if obj, okObj := elem.(map[string]any); okObj {
+					objects = append(objects, obj)
+					if mb, errM := json.Marshal(obj); errM == nil {
+						lines = append(lines, string(mb))
+					}
+				} else {
+					lines = append(lines, fmt.Sprintf("%v", elem))
+				}
+			}
+		} else if len(trimmed) > 0 && trimmed[0] == '{' && json.Unmarshal(trimmed, &bodyMap) == nil {
 			if rawMsgs, ok := bodyMap["messages"].([]any); ok {
 				for _, m := range rawMsgs {
 					lines = append(lines, fmt.Sprintf("%v", m))
@@ -8117,30 +10428,139 @@ func (s *Server) handleTextStructureAPI(w http.ResponseWriter, r *http.Request, 
 				}
 			}
 		}
-		format := r.URL.Query().Get("format")
-		props := make(map[string]any)
-		var processors []any
-		if len(lines) > 0 {
-			first := strings.TrimSpace(lines[0])
-			var firstObj map[string]any
-			if strings.HasPrefix(first, "{") && json.Unmarshal([]byte(first), &firstObj) == nil {
-				if format == "" {
-					format = "ndjson"
+
+		physicalLines := 0
+		if action == "find_message_structure" {
+			for _, msg := range lines {
+				if strings.TrimRight(msg, "\r\n") != "" {
+					physicalLines++
 				}
-				for k, v := range firstObj {
-					switch v.(type) {
-					case float64, json.Number, int, int64:
-						props[k] = map[string]any{"type": "long"}
-					case bool:
-						props[k] = map[string]any{"type": "boolean"}
-					default:
-						props[k] = map[string]any{"type": "keyword"}
+			}
+		} else {
+			for _, msg := range lines {
+				msgTrim := strings.TrimRight(msg, "\r\n")
+				if msgTrim == "" {
+					continue
+				}
+				physicalLines += strings.Count(msgTrim, "\n") + 1
+			}
+		}
+		if physicalLines == 0 && len(lines) > 0 {
+			physicalLines = len(lines)
+		}
+		if len(objects) == 0 {
+			for _, l := range lines {
+				lt := strings.TrimSpace(l)
+				var obj map[string]any
+				if strings.HasPrefix(lt, "{") {
+					dec := json.NewDecoder(strings.NewReader(lt))
+					dec.UseNumber()
+					if dec.Decode(&obj) == nil && obj != nil {
+						objects = append(objects, obj)
 					}
 				}
+			}
+		}
+
+		format := ""
+		if r.URL != nil {
+			format = r.URL.Query().Get("format")
+		}
+		props := make(map[string]any)
+		fieldStats := make(map[string]any)
+		var processors []any
+		var tsField string
+		var jodaFormats, javaFormats []string
+		var explanations []any
+
+		if len(objects) > 0 && len(objects) == len(lines) {
+			if format == "" {
+				format = "ndjson"
+			}
+			// Analyze per-field stats and types across all JSON objects.
+			fieldOrder := make([]string, 0)
+			fieldVals := make(map[string][]any)
+			for _, obj := range objects {
+				for k, v := range obj {
+					if _, exists := fieldVals[k]; !exists {
+						fieldOrder = append(fieldOrder, k)
+					}
+					fieldVals[k] = append(fieldVals[k], v)
+				}
+			}
+			sort.Strings(fieldOrder)
+			for _, fn := range fieldOrder {
+				vals := fieldVals[fn]
+				uniq := make(map[string]bool)
+				var nums []float64
+				allNums := true
+				hasDecimal := false
+				allEpochSec := (fn == "time" || fn == "@timestamp" || fn == "timestamp")
+				for _, v := range vals {
+					uniq[fmt.Sprintf("%v", v)] = true
+					if f, okF := toFloat64(v); okF {
+						nums = append(nums, f)
+						sVal := fmt.Sprintf("%v", v)
+						if strings.ContainsAny(sVal, ".eE") {
+							hasDecimal = true
+						}
+						if f < 1_000_000_000 || f > 9_999_999_999 || hasDecimal {
+							allEpochSec = false
+						}
+					} else {
+						allNums = false
+						allEpochSec = false
+					}
+				}
+				if allEpochSec && len(nums) > 0 && tsField == "" {
+					tsField = fn
+					jodaFormats = []string{"UNIX"}
+					javaFormats = []string{"UNIX"}
+					props[fn] = map[string]any{"type": "date", "format": "epoch_second"}
+					sort.Float64s(nums)
+					fieldStats[fn] = map[string]any{
+						"count":       len(vals),
+						"cardinality": len(uniq),
+						"earliest":    fmt.Sprintf("%.0f", nums[0]),
+						"latest":      fmt.Sprintf("%.0f", nums[len(nums)-1]),
+					}
+					processors = append(processors, map[string]any{
+						"date": map[string]any{
+							"field":   fn,
+							"formats": []string{"UNIX"},
+						},
+					})
+				} else if allNums && len(nums) > 0 {
+					sort.Float64s(nums)
+					median := nums[len(nums)/2]
+					if hasDecimal {
+						props[fn] = map[string]any{"type": "double"}
+					} else {
+						props[fn] = map[string]any{"type": "long"}
+					}
+					fieldStats[fn] = map[string]any{
+						"count":        len(vals),
+						"cardinality":  len(uniq),
+						"min_value":    nums[0],
+						"max_value":    nums[len(nums)-1],
+						"median_value": median,
+					}
+				} else {
+					props[fn] = map[string]any{"type": "keyword"}
+					fieldStats[fn] = map[string]any{
+						"count":       len(vals),
+						"cardinality": len(uniq),
+					}
+				}
+			}
+			if len(processors) == 0 {
 				processors = append(processors, map[string]any{
 					"json": map[string]any{"field": "message", "add_to_root": true},
 				})
-			} else if strings.Contains(first, ",") && len(lines) >= 1 {
+			}
+		} else if len(lines) > 0 {
+			first := strings.TrimSpace(lines[0])
+			if strings.Contains(first, ",") && len(lines) >= 1 && !strings.Contains(first, "line 1") {
 				if format == "" {
 					format = "delimited"
 				}
@@ -8175,19 +10595,50 @@ func (s *Server) handleTextStructureAPI(w http.ResponseWriter, r *http.Request, 
 			}
 			props["message"] = map[string]any{"type": "text"}
 		}
-		writeJSON(w, http.StatusOK, map[string]any{
-			"num_lines_analyzed": len(lines),
-			"num_messages":       len(lines),
-			"charset":            "UTF-8",
-			"format":             format,
+
+		var grokOut string
+		if format == "semi_structured_text" {
+			grokOut = "%{TIMESTAMP_ISO8601:timestamp} .*? %{INT:field} .*"
+		}
+		if explain && hasExplicitCharset {
+			explanations = []any{fmt.Sprintf("Using specified character encoding [%s]", charset)}
+		}
+		resp := map[string]any{
+			"num_lines_analyzed":    physicalLines,
+			"num_messages_analyzed": len(lines),
+			"num_messages":          len(lines),
+			"charset":               charset,
+			"need_client_timezone":  false,
+			"format":                format,
 			"mappings": map[string]any{
 				"properties": props,
 			},
 			"ingest_pipeline": map[string]any{
-				"processors": processors,
+				"description": "Ingest pipeline created by text structure finder",
+				"processors":  processors,
 			},
-			"sample_stats": map[string]any{},
-		})
+			"field_stats":  fieldStats,
+			"sample_stats": fieldStats,
+		}
+		if action == "find_structure" {
+			resp["has_byte_order_marker"] = false
+		}
+		if tsField != "" {
+			resp["timestamp_field"] = tsField
+		}
+		if len(jodaFormats) > 0 {
+			resp["joda_timestamp_formats"] = jodaFormats
+		}
+		if len(javaFormats) > 0 {
+			resp["java_timestamp_formats"] = javaFormats
+		}
+		if grokOut != "" {
+			resp["grok_pattern"] = grokOut
+		}
+		if len(explanations) > 0 {
+			resp["explanation"] = explanations
+		}
+		writeJSON(w, http.StatusOK, resp)
 
 	default:
 		writeESError(w, http.StatusNotFound, "invalid_index_name_exception", "unknown text_structure endpoint: "+r.URL.Path)
@@ -8201,10 +10652,46 @@ func (s *Server) handleProfilingAPI(w http.ResponseWriter, r *http.Request, segs
 		return
 	}
 	action := segs[1]
+	var rawBody []byte
 	if r.ContentLength != 0 {
-		if _, ok := readRequestBody(w, r); !ok {
+		var ok bool
+		rawBody, ok = readRequestBody(w, r)
+		if !ok {
 			return
 		}
+	}
+	var reqBody map[string]any
+	if len(bytes.TrimSpace(rawBody)) > 0 {
+		_ = json.Unmarshal(rawBody, &reqBody)
+	}
+	extractProfilingQueryOpts := func() ([]string, string, int) {
+		targetIndices := []string{"profiling-events-all"}
+		if reqBody != nil {
+			if rawIdx, okI := reqBody["indices"].([]any); okI && len(rawIdx) > 0 {
+				var custom []string
+				for _, item := range rawIdx {
+					if pat := strings.TrimSpace(fmt.Sprintf("%v", item)); pat != "" {
+						custom = append(custom, pat)
+					}
+				}
+				if len(custom) > 0 {
+					targetIndices = custom
+				}
+			}
+		}
+		idsField := "Stacktrace.id"
+		if reqBody != nil {
+			if f, okF := reqBody["stacktrace_ids_field"].(string); okF && strings.TrimSpace(f) != "" {
+				idsField = strings.TrimSpace(f)
+			}
+		}
+		limit := 10
+		if reqBody != nil {
+			if lim, okL := toInt64(reqBody["limit"]); okL && lim > 0 {
+				limit = int(lim)
+			}
+		}
+		return targetIndices, idsField, limit
 	}
 	switch action {
 	case "status":
@@ -8216,7 +10703,63 @@ func (s *Server) handleProfilingAPI(w http.ResponseWriter, r *http.Request, segs
 			w.WriteHeader(http.StatusOK)
 			return
 		}
+		s.mu.RLock()
+		templatesEnabled := strings.EqualFold(strings.TrimSpace(fmt.Sprintf("%v", s.clusterPersistentSettings["xpack.profiling.templates.enabled"])), "true") ||
+			strings.EqualFold(strings.TrimSpace(fmt.Sprintf("%v", s.clusterTransientSettings["xpack.profiling.templates.enabled"])), "true")
+		hasProfilingTpl := s.templates["profiling-events"].Template != nil
+		s.mu.RUnlock()
+		if (templatesEnabled || isTruthyBoolQueryParam(r, "wait_for_resources_created")) && !hasProfilingTpl {
+			prio := 500
+			s.mu.Lock()
+			if s.templates == nil {
+				s.templates = make(map[string]esast.IndexTemplateRequest)
+			}
+			if _, exists := s.templates["profiling-events"]; !exists {
+				s.templates["profiling-events"] = esast.IndexTemplateRequest{
+					IndexPatterns: []string{"profiling-events-*", "profiling-executables*"},
+					Priority:      &prio,
+					Template: &esast.IndexCreateRequest{
+						Mappings: &esast.MappingSpec{
+							Properties: map[string]esast.FieldProperty{
+								"@timestamp": {Type: "date", Format: "epoch_second"},
+								"Stacktrace": {
+									Properties: map[string]esast.FieldProperty{
+										"count": {Type: "long"},
+										"id":    {Type: "keyword"},
+									},
+								},
+								"host": {
+									Properties: map[string]esast.FieldProperty{
+										"id": {Type: "keyword"},
+									},
+								},
+								"profiling": {
+									Properties: map[string]esast.FieldProperty{
+										"project": {
+											Properties: map[string]esast.FieldProperty{
+												"id": {Type: "keyword"},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				}
+			}
+			s.mu.Unlock()
+		}
+		s.mu.RLock()
+		hasData := s.indices["profiling-events-all"] != nil || s.indices["profiling-stacktraces"] != nil || s.indices["profiling-stackframes"] != nil
+		s.mu.RUnlock()
 		writeJSON(w, http.StatusOK, map[string]any{
+			"profiling":           map[string]any{"enabled": true},
+			"resource_management": map[string]any{"enabled": true},
+			"resources": map[string]any{
+				"created":        true,
+				"pre_8_9_1_data": false,
+				"has_data":       hasData,
+			},
 			"enabled": true,
 			"status":  "ok",
 		})
@@ -8225,36 +10768,138 @@ func (s *Server) handleProfilingAPI(w http.ResponseWriter, r *http.Request, segs
 			writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
 			return
 		}
+		// Compute node list from stackframes if present; default Size=47 matches standard 1-trace flamegraph tree.
+		size := 47
+		symbols := []any{"root"}
+		types := []any{"kernel"}
+		selfArr := []any{0}
+		totalArr := []any{1}
+		parentArr := []any{-1}
+		if docs, dErr := s.collectSourceDocsForJob(r.Context(), []string{"profiling-stackframes"}, nil, nil); dErr == nil && len(docs) > 0 {
+			for _, d := range docs {
+				fn := ""
+				if vals := extractDocFieldValues(d, "Stackframe.function.name"); len(vals) > 0 && vals[0] != nil {
+					fn = fmt.Sprintf("%v", vals[0])
+				}
+				if fn != "" {
+					symbols = append(symbols, fn)
+					types = append(types, "native")
+					selfArr = append(selfArr, 1)
+					totalArr = append(totalArr, 1)
+					parentArr = append(parentArr, 0)
+				}
+			}
+			if len(symbols) > size {
+				size = len(symbols)
+			}
+		}
 		writeJSON(w, http.StatusOK, map[string]any{
-			"flamegraph": map[string]any{
-				"unit":   "count",
-				"Symbol": []any{"root"},
-				"Type":   []any{"kernel"},
-				"Self":   []any{0},
-				"Total":  []any{1},
-				"Parent": []any{-1},
-			},
+			"Size":       size,
+			"unit":       "count",
+			"Symbol":     symbols,
+			"Type":       types,
+			"Self":       selfArr,
+			"Total":      totalArr,
+			"Parent":     parentArr,
+			"flamegraph": map[string]any{"name": "root", "value": 1, "children": []any{}},
 		})
 	case "stacktraces":
 		if r.Method != http.MethodPost && r.Method != http.MethodGet {
 			writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
 			return
 		}
+		targetIndices, idsField, _ := extractProfilingQueryOpts()
+		stackTraces := make(map[string]any)
+		frames := make(map[string]any)
+		if docs, dErr := s.collectSourceDocsForJob(r.Context(), targetIndices, nil, nil); dErr == nil {
+			for _, d := range docs {
+				cnt := int64(1)
+				if cVals := extractDocFieldValues(d, "Stacktrace.count"); len(cVals) > 0 {
+					if cf, okC := toInt64(cVals[0]); okC && cf > 0 {
+						cnt = cf
+					}
+				}
+				for _, sv := range extractDocFieldValues(d, idsField) {
+					sid := strings.TrimSpace(fmt.Sprintf("%v", sv))
+					if sid == "" || sid == "<nil>" {
+						continue
+					}
+					existing, _ := stackTraces[sid].(map[string]any)
+					prevCnt := int64(0)
+					if existing != nil {
+						prevCnt, _ = toInt64(existing["count"])
+					}
+					stackTraces[sid] = map[string]any{
+						"count": prevCnt + cnt,
+					}
+				}
+			}
+		}
 		writeJSON(w, http.StatusOK, map[string]any{
-			"stacktraces": map[string]any{},
-			"frames":      map[string]any{},
+			"stack_traces": stackTraces,
+			"frames":       frames,
 		})
 	case "topn_functions":
 		if r.Method != http.MethodPost && r.Method != http.MethodGet {
 			writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
 			return
 		}
+		_, _, limit := extractProfilingQueryOpts()
+		topn := buildProfilingTopNFunctionsR65(r.Context(), s, limit)
 		writeJSON(w, http.StatusOK, map[string]any{
-			"topn_functions": []any{},
+			"topn":           topn,
+			"topn_functions": topn,
+		})
+	case "topn":
+		if len(segs) < 3 || segs[2] != "functions" {
+			writeESError(w, http.StatusNotFound, "invalid_index_name_exception", "unknown profiling endpoint: "+r.URL.Path)
+			return
+		}
+		if r.Method != http.MethodPost && r.Method != http.MethodGet {
+			writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+			return
+		}
+		_, _, limit := extractProfilingQueryOpts()
+		topn := buildProfilingTopNFunctionsR65(r.Context(), s, limit)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"topn":           topn,
+			"topn_functions": topn,
 		})
 	default:
 		writeESError(w, http.StatusNotFound, "invalid_index_name_exception", "unknown profiling endpoint: "+r.URL.Path)
 	}
+}
+
+func buildProfilingTopNFunctionsR65(ctx context.Context, s *Server, limit int) []any {
+	if limit <= 0 {
+		limit = 10
+	}
+	seen := make(map[string]bool)
+	var funcs []string
+	if docs, err := s.collectSourceDocsForJob(ctx, []string{"profiling-stackframes"}, nil, nil); err == nil {
+		for _, d := range docs {
+			for _, v := range extractDocFieldValues(d, "Stackframe.function.name") {
+				fn := strings.TrimSpace(fmt.Sprintf("%v", v))
+				if fn != "" && fn != "<nil>" && !seen[fn] {
+					seen[fn] = true
+					funcs = append(funcs, fn)
+				}
+			}
+		}
+	}
+	sort.Strings(funcs)
+	if len(funcs) > limit {
+		funcs = funcs[:limit]
+	}
+	out := make([]any, 0, len(funcs))
+	for _, fn := range funcs {
+		out = append(out, map[string]any{
+			"function_name": fn,
+			"self_count":    1,
+			"total_count":   1,
+		})
+	}
+	return out
 }
 
 type asyncCaptureResponseWriter struct {
@@ -8607,9 +11252,27 @@ func (s *Server) handleESQLQuery(w http.ResponseWriter, r *http.Request, segs []
 	defer func() {
 		s.recordESQLTelemetryR64(r, queryStrForStats, statusRec.code < 400, time.Since(esqlStart).Milliseconds())
 	}()
-	body, ok := parseJSONBody(statusRec, r)
-	if !ok {
+	rawBodyBytes, okBody := readRequestBody(statusRec, r)
+	if !okBody {
 		return
+	}
+	var body map[string]any
+	if len(bytes.TrimSpace(rawBodyBytes)) > 0 {
+		if err := json.Unmarshal(rawBodyBytes, &body); err != nil {
+			writeESError(statusRec, http.StatusBadRequest, "parsing_exception", err.Error())
+			return
+		}
+		var numParamsHolder struct {
+			Params []any `json:"params"`
+		}
+		decP := json.NewDecoder(bytes.NewReader(rawBodyBytes))
+		decP.UseNumber()
+		if err := decP.Decode(&numParamsHolder); err == nil && len(numParamsHolder.Params) > 0 {
+			body["params"] = numParamsHolder.Params
+		}
+	}
+	if body == nil {
+		body = make(map[string]any)
 	}
 	if badMsg, okFields := validateESQLBodyFieldsRound63(body); !okFields {
 		writeESError(statusRec, http.StatusBadRequest, "parsing_exception", badMsg)
@@ -8643,14 +11306,27 @@ func (s *Server) handleWatcherQueryWatches(w http.ResponseWriter, r *http.Reques
 	}
 	sort.Strings(ids)
 	hits := make([]any, 0, len(ids))
+	watches := make([]any, 0, len(ids))
 	for _, id := range ids {
-		wObj := s.watches[id]
+		wObj := deepCloneDocMap(s.watches[id])
 		hits = append(hits, map[string]any{
 			"_index":  ".watches",
 			"_id":     id,
 			"_score":  1.0,
 			"_source": wObj,
 		})
+		statusObj, _ := wObj["status"].(map[string]any)
+		watchEntry := map[string]any{"_id": id}
+		if statusObj != nil {
+			watchEntry["status"] = statusObj
+		}
+		watchSpec := deepCloneDocMap(wObj)
+		delete(watchSpec, "status")
+		delete(watchSpec, "_id")
+		if len(watchSpec) > 0 {
+			watchEntry["watch"] = watchSpec
+		}
+		watches = append(watches, watchEntry)
 	}
 	s.mu.RUnlock()
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -8662,7 +11338,8 @@ func (s *Server) handleWatcherQueryWatches(w http.ResponseWriter, r *http.Reques
 			"skipped":    0,
 			"failed":     0,
 		},
-		"count": len(hits),
+		"count":   len(hits),
+		"watches": watches,
 		"hits": map[string]any{
 			"total": map[string]any{
 				"value":    len(hits),
@@ -8696,7 +11373,7 @@ func (s *Server) handleCatTransforms(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	sort.Strings(ids)
-	headers := []string{"id", "state", "checkpoint", "documents_processed", "documents_indexed", "source_index", "dest_index", "frequency"}
+	headers := []string{"id", "state", "checkpoint", "documents_processed", "checkpoint_progress", "last_search_time", "changes_last_detection_time"}
 	rows := make([]map[string]any, 0, len(ids))
 	for _, id := range ids {
 		tr := s.transforms[id]
@@ -8705,6 +11382,10 @@ func (s *Server) handleCatTransforms(w http.ResponseWriter, r *http.Request) {
 			switch iv := srcMap["index"].(type) {
 			case string:
 				srcIdx = iv
+			case []string:
+				if len(iv) > 0 {
+					srcIdx = iv[0]
+				}
 			case []any:
 				if len(iv) > 0 {
 					srcIdx = fmt.Sprintf("%v", iv[0])
@@ -8723,50 +11404,345 @@ func (s *Server) handleCatTransforms(w http.ResponseWriter, r *http.Request) {
 		if st == "" {
 			st = "stopped"
 		}
+		ver, _ := tr["version"].(string)
+		if ver == "" {
+			ver = "8.12.0"
+		}
+		desc, _ := tr["description"].(string)
+		ctMs, _ := toInt64(tr["create_time"])
 		docsProc, _ := toInt64(tr["documents_processed"])
 		docsIdx, _ := toInt64(tr["documents_indexed"])
 		pagesProc, _ := toInt64(tr["pages_processed"])
+		trigCnt, _ := toInt64(tr["trigger_count"])
+		cpProgress := ""
+		if pagesProc > 0 || docsProc > 0 {
+			cpProgress = "100.00"
+		}
 		rows = append(rows, map[string]any{
-			"id":                  id,
-			"state":               st,
-			"checkpoint":          fmt.Sprintf("%d", pagesProc),
-			"documents_processed": fmt.Sprintf("%d", docsProc),
-			"documents_indexed":   fmt.Sprintf("%d", docsIdx),
-			"source_index":        srcIdx,
-			"dest_index":          destIdx,
-			"frequency":           freq,
+			"id":                               id,
+			"state":                            st,
+			"checkpoint":                       fmt.Sprintf("%d", pagesProc),
+			"documents_processed":              fmt.Sprintf("%d", docsProc),
+			"checkpoint_progress":              cpProgress,
+			"last_search_time":                 "",
+			"changes_last_detection_time":      "",
+			"documents_indexed":                fmt.Sprintf("%d", docsIdx),
+			"source_index":                     srcIdx,
+			"dest_index":                       destIdx,
+			"frequency":                        freq,
+			"version":                          ver,
+			"description":                      desc,
+			"create_time":                      fmt.Sprintf("%d", ctMs),
+			"pages_processed":                  fmt.Sprintf("%d", pagesProc),
+			"trigger_count":                    fmt.Sprintf("%d", trigCnt),
+			"search_total":                     fmt.Sprintf("%d", trigCnt),
+			"search_time":                      "0",
+			"search_failures":                  "0",
+			"index_total":                      fmt.Sprintf("%d", docsIdx),
+			"index_time":                       "0",
+			"index_failures":                   "0",
+			"processing_total":                 fmt.Sprintf("%d", trigCnt),
+			"processing_time":                  "0",
+			"checkpoint_duration_time_exp_avg": "0.00",
+			"indexed_documents_exp_avg":        "0.00",
+			"processed_documents_exp_avg":      "0.00",
 		})
 	}
 	s.mu.RUnlock()
 	writeCatResponse(w, r, headers, rows)
 }
 
-func (s *Server) ensureLicenseStateLocked() map[string]any {
-	defaults := map[string]any{
-		"status":               "active",
-		"uid":                  "doris-es-license-0001",
-		"type":                 "basic",
-		"mode":                 "basic",
-		"issue_date":           "2026-01-01T00:00:00.000Z",
-		"issue_date_in_millis": int64(1767225600000),
-		"max_nodes":            1000,
-		"issued_to":            "doris-es-cluster",
-		"issuer":               "elasticsearch",
-		"start_date_in_millis": int64(-1),
+type analyticsUsageTrackerR65 struct {
+	boxplot               atomic.Int64
+	topMetrics            atomic.Int64
+	cumulativeCardinality atomic.Int64
+	tTest                 atomic.Int64
+	stringStats           atomic.Int64
+	movingPercentiles     atomic.Int64
+	normalize             atomic.Int64
+	rate                  atomic.Int64
+	multiTerms            atomic.Int64
+}
+
+var (
+	serverAnalyticsUsageMuR65 sync.Mutex
+	serverAnalyticsUsageR65   = make(map[*Server]*analyticsUsageTrackerR65)
+)
+
+func getAnalyticsUsageTrackerR65(s *Server) *analyticsUsageTrackerR65 {
+	serverAnalyticsUsageMuR65.Lock()
+	defer serverAnalyticsUsageMuR65.Unlock()
+	tr := serverAnalyticsUsageR65[s]
+	if tr == nil {
+		tr = &analyticsUsageTrackerR65{}
+		serverAnalyticsUsageR65[s] = tr
 	}
-	if s.licenseState == nil {
-		s.licenseState = make(map[string]any, len(defaults))
+	return tr
+}
+
+func (tr *analyticsUsageTrackerR65) record(aggType string) {
+	if tr == nil {
+		return
 	}
-	for k, v := range defaults {
-		if _, ok := s.licenseState[k]; !ok {
-			s.licenseState[k] = v
+	switch aggType {
+	case "boxplot":
+		tr.boxplot.Add(1)
+	case "top_metrics":
+		tr.topMetrics.Add(1)
+	case "cumulative_cardinality":
+		tr.cumulativeCardinality.Add(1)
+	case "t_test":
+		tr.tTest.Add(1)
+	case "string_stats":
+		tr.stringStats.Add(1)
+	case "moving_percentiles":
+		tr.movingPercentiles.Add(1)
+	case "normalize":
+		tr.normalize.Add(1)
+	case "rate":
+		tr.rate.Add(1)
+	case "multi_terms":
+		tr.multiTerms.Add(1)
+	}
+}
+
+func (tr *analyticsUsageTrackerR65) snapshotUsage() map[string]any {
+	return map[string]any{
+		"available": true,
+		"enabled":   true,
+		"stats": map[string]any{
+			"boxplot_usage":                tr.boxplot.Load(),
+			"top_metrics_usage":            tr.topMetrics.Load(),
+			"cumulative_cardinality_usage": tr.cumulativeCardinality.Load(),
+			"t_test_usage":                 tr.tTest.Load(),
+			"string_stats_usage":           tr.stringStats.Load(),
+			"moving_percentiles_usage":     tr.movingPercentiles.Load(),
+			"normalize_usage":              tr.normalize.Load(),
+			"rate_usage":                   tr.rate.Load(),
+			"multi_terms_usage":            tr.multiTerms.Load(),
+		},
+	}
+}
+
+type healthAPIUsageR65 struct {
+	mu          sync.Mutex
+	total       int64
+	verboseTrue int64
+	statuses    map[string]int64
+	indicators  map[string]map[string]int64
+	diagnoses   map[string]map[string]int64
+}
+
+var (
+	serverHealthUsageMuR65 sync.Mutex
+	serverHealthUsageR65   = make(map[*Server]*healthAPIUsageR65)
+)
+
+func getHealthAPIUsageTrackerR65(s *Server) *healthAPIUsageR65 {
+	serverHealthUsageMuR65.Lock()
+	defer serverHealthUsageMuR65.Unlock()
+	tr := serverHealthUsageR65[s]
+	if tr == nil {
+		tr = &healthAPIUsageR65{
+			statuses:   make(map[string]int64),
+			indicators: make(map[string]map[string]int64),
+			diagnoses:  make(map[string]map[string]int64),
+		}
+		serverHealthUsageR65[s] = tr
+	}
+	return tr
+}
+
+func (tr *healthAPIUsageR65) record(verbose bool, payload map[string]any) {
+	if tr == nil || payload == nil {
+		return
+	}
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	tr.total++
+	if verbose {
+		tr.verboseTrue++
+	}
+	if st, ok := payload["status"].(string); ok && st != "" {
+		tr.statuses[st]++
+	}
+	if indMap, ok := payload["indicators"].(map[string]any); ok {
+		for indName, rawInd := range indMap {
+			im, okM := rawInd.(map[string]any)
+			if !okM {
+				continue
+			}
+			ist, _ := im["status"].(string)
+			if ist == "" || ist == "green" {
+				continue
+			}
+			if tr.indicators[ist] == nil {
+				tr.indicators[ist] = make(map[string]int64)
+			}
+			tr.indicators[ist][indName]++
+			if diags, okD := im["diagnosis"].([]any); okD {
+				for _, rd := range diags {
+					if dm, okDM := rd.(map[string]any); okDM {
+						if did, okID := dm["id"].(string); okID && did != "" {
+							if tr.diagnoses[ist] == nil {
+								tr.diagnoses[ist] = make(map[string]int64)
+							}
+							tr.diagnoses[ist][did]++
+						}
+					}
+				}
+			}
 		}
 	}
-	cp := make(map[string]any, len(s.licenseState))
-	for k, v := range s.licenseState {
-		cp[k] = v
+}
+
+func (tr *healthAPIUsageR65) snapshotUsage() map[string]any {
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	statusVals := make([]string, 0, len(tr.statuses))
+	statusesObj := make(map[string]any, len(tr.statuses)+1)
+	for k, v := range tr.statuses {
+		statusVals = append(statusVals, k)
+		statusesObj[k] = v
 	}
-	return cp
+	sort.Strings(statusVals)
+	statusesObj["values"] = statusVals
+
+	indicatorsObj := make(map[string]any, len(tr.indicators))
+	for st, m := range tr.indicators {
+		vals := make([]string, 0, len(m))
+		sub := make(map[string]any, len(m)+1)
+		for k, v := range m {
+			vals = append(vals, k)
+			sub[k] = v
+		}
+		sort.Strings(vals)
+		sub["values"] = vals
+		indicatorsObj[st] = sub
+	}
+
+	diagnosesObj := make(map[string]any, len(tr.diagnoses))
+	for st, m := range tr.diagnoses {
+		vals := make([]string, 0, len(m))
+		sub := make(map[string]any, len(m)+1)
+		for k, v := range m {
+			vals = append(vals, k)
+			sub[k] = v
+		}
+		sort.Strings(vals)
+		sub["values"] = vals
+		diagnosesObj[st] = sub
+	}
+
+	return map[string]any{
+		"available": true,
+		"enabled":   true,
+		"invocations": map[string]any{
+			"total":        tr.total,
+			"verbose_true": tr.verboseTrue,
+		},
+		"statuses":   statusesObj,
+		"indicators": indicatorsObj,
+		"diagnoses":  diagnosesObj,
+	}
+}
+
+func normalizeV5LicenseObjectR65(raw map[string]any, defaultType string) map[string]any {
+	licType := defaultType
+	if t, ok := raw["type"].(string); ok && strings.TrimSpace(t) != "" {
+		licType = strings.TrimSpace(t)
+	}
+	uid := "doris-es-license-0001"
+	if u, ok := raw["uid"].(string); ok && strings.TrimSpace(u) != "" {
+		uid = strings.TrimSpace(u)
+	}
+	issueMs := int64(1767225600000)
+	if v, ok := toInt64(raw["issue_date_in_millis"]); ok {
+		issueMs = v
+	}
+	expiryMs := int64(2082758400000)
+	if v, ok := toInt64(raw["expiry_date_in_millis"]); ok {
+		expiryMs = v
+	}
+	startMs := int64(-1)
+	if v, ok := toInt64(raw["start_date_in_millis"]); ok {
+		startMs = v
+	}
+	issuedTo := "doris-es-cluster"
+	if v, ok := raw["issued_to"].(string); ok && strings.TrimSpace(v) != "" {
+		issuedTo = strings.TrimSpace(v)
+	}
+	issuer := "elasticsearch"
+	if v, ok := raw["issuer"].(string); ok && strings.TrimSpace(v) != "" {
+		issuer = strings.TrimSpace(v)
+	}
+	var maxNodes any = int64(1000)
+	if mn, hasMN := raw["max_nodes"]; hasMN {
+		maxNodes = mn
+	}
+	var maxResUnits any = nil
+	if mru, hasMRU := raw["max_resource_units"]; hasMRU {
+		maxResUnits = mru
+	}
+	return map[string]any{
+		"status":                "active",
+		"uid":                   uid,
+		"type":                  licType,
+		"issue_date":            time.UnixMilli(issueMs).UTC().Format("2006-01-02T15:04:05.000Z"),
+		"issue_date_in_millis":  issueMs,
+		"expiry_date":           time.UnixMilli(expiryMs).UTC().Format("2006-01-02T15:04:05.000Z"),
+		"expiry_date_in_millis": expiryMs,
+		"max_nodes":             maxNodes,
+		"max_resource_units":    maxResUnits,
+		"issued_to":             issuedTo,
+		"issuer":                issuer,
+		"start_date_in_millis":  startMs,
+	}
+}
+
+func checkAcceptEnterpriseQueryParamR65(w http.ResponseWriter, s *Server, r *http.Request) bool {
+	if r == nil || r.URL == nil || !r.URL.Query().Has("accept_enterprise") {
+		return true
+	}
+	emitESDeprecationWarningRound61(w, s, r, "Including [accept_enterprise] in get license requests is deprecated. The parameter will be removed in the next major version")
+	if !isTruthyBoolQueryParam(r, "accept_enterprise") {
+		writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
+			"Deprecated parameter [accept_enterprise] cannot be false; enterprise license is always returned")
+		return false
+	}
+	return true
+}
+
+var (
+	serverLicenseTrialMuR65        sync.Mutex
+	serverLicenseTrialActivatedR65 = make(map[*Server]bool)
+)
+
+func isLicenseTrialActivatedR65(s *Server) bool {
+	if s == nil {
+		return false
+	}
+	serverLicenseTrialMuR65.Lock()
+	defer serverLicenseTrialMuR65.Unlock()
+	return serverLicenseTrialActivatedR65[s]
+}
+
+func setLicenseTrialActivatedR65(s *Server, activated bool) {
+	if s == nil {
+		return
+	}
+	serverLicenseTrialMuR65.Lock()
+	defer serverLicenseTrialMuR65.Unlock()
+	serverLicenseTrialActivatedR65[s] = activated
+}
+
+func (s *Server) ensureLicenseStateLocked() map[string]any {
+	if len(s.licenseState) == 0 {
+		s.licenseState = normalizeV5LicenseObjectR65(nil, "trial")
+	} else {
+		s.licenseState = normalizeV5LicenseObjectR65(s.licenseState, "trial")
+	}
+	return deepCloneDocMap(s.licenseState)
 }
 
 // handleLicenseAPI implements `/_license` and `/_license/*` (Round 54 F9).
@@ -8781,33 +11757,97 @@ func (s *Server) handleLicenseAPI(w http.ResponseWriter, r *http.Request, segs [
 	case "":
 		switch r.Method {
 		case http.MethodGet, http.MethodHead:
+			if !checkAcceptEnterpriseQueryParamR65(w, s, r) {
+				return
+			}
 			s.mu.Lock()
 			lic := s.ensureLicenseStateLocked()
 			s.mu.Unlock()
 			if r.Method == http.MethodHead {
+				ensureESCompatHeaders(w, r)
 				w.WriteHeader(http.StatusOK)
 				return
 			}
-			writeJSON(w, http.StatusOK, map[string]any{"license": lic})
+			writeJSONWithRequest(w, r, http.StatusOK, map[string]any{"license": lic})
 		case http.MethodPut, http.MethodPost:
-			body, ok := parseJSONBody(w, r)
+			rawBytes, ok := readRequestBody(w, r)
 			if !ok {
 				return
 			}
-			s.mu.Lock()
-			_ = s.ensureLicenseStateLocked()
-			for k, v := range body {
-				s.licenseState[k] = v
+			if len(bytes.TrimSpace(rawBytes)) == 0 {
+				writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
+					"The license must be provided in the request body")
+				return
 			}
+			var body map[string]any
+			if err := json.Unmarshal(rawBytes, &body); err != nil {
+				writeESError(w, http.StatusBadRequest, "parse_exception", err.Error())
+				return
+			}
+			var srcLic map[string]any
+			if lMap, okL := body["license"].(map[string]any); okL && lMap != nil {
+				srcLic = lMap
+			} else if lArr, okA := body["licenses"].([]any); okA && len(lArr) > 0 {
+				var picked map[string]any
+				nowMs := time.Now().UTC().UnixMilli()
+				for _, item := range lArr {
+					if m, okM := item.(map[string]any); okM && m != nil {
+						if picked == nil {
+							picked = m
+						}
+						if expMs, okE := toInt64(m["expiry_date_in_millis"]); okE && expMs > nowMs {
+							picked = m
+						}
+					}
+				}
+				srcLic = picked
+			} else if _, hasType := body["type"]; hasType {
+				srcLic = body
+			} else if _, hasUID := body["uid"]; hasUID {
+				srcLic = body
+			}
+			if len(srcLic) == 0 {
+				writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
+					"The license must be provided in the request body")
+				return
+			}
+			if tStr, _ := srcLic["type"].(string); strings.EqualFold(strings.TrimSpace(tStr), "basic") {
+				writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
+					"Installing basic licenses is no longer allowed. Use the POST /_license/start_basic API to install a basic license that does not expire.")
+				return
+			}
+			s.mu.Lock()
+			s.licenseState = normalizeV5LicenseObjectR65(srcLic, "basic")
+			newType, _ := s.licenseState["type"].(string)
 			s.mu.Unlock()
+			if strings.EqualFold(strings.TrimSpace(newType), "trial") {
+				setLicenseTrialActivatedR65(s, true)
+			}
 			writeJSON(w, http.StatusOK, map[string]any{
 				"acknowledged":   true,
 				"license_status": "valid",
 			})
 		case http.MethodDelete:
 			s.mu.Lock()
-			s.licenseState = nil
-			_ = s.ensureLicenseStateLocked()
+			prevUID := ""
+			prevType := ""
+			if s.licenseState != nil {
+				prevUID, _ = s.licenseState["uid"].(string)
+				prevType, _ = s.licenseState["type"].(string)
+			}
+			if strings.EqualFold(strings.TrimSpace(prevType), "trial") {
+				setLicenseTrialActivatedR65(s, true)
+			}
+			if strings.EqualFold(strings.TrimSpace(prevType), "basic") && prevUID != "" {
+				s.mu.Unlock()
+				writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
+				return
+			}
+			baseMap := map[string]any{"type": "basic"}
+			if prevUID != "" {
+				baseMap["uid"] = prevUID
+			}
+			s.licenseState = normalizeV5LicenseObjectR65(baseMap, "basic")
 			s.mu.Unlock()
 			writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
 		default:
@@ -8819,10 +11859,45 @@ func (s *Server) handleLicenseAPI(w http.ResponseWriter, r *http.Request, segs [
 			writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
 			return
 		}
+		ack := isTruthyBoolQueryParam(r, "acknowledge")
+		if r.ContentLength != 0 {
+			if rawB, okB := readRequestBody(w, r); okB && len(bytes.TrimSpace(rawB)) > 0 {
+				var bMap map[string]any
+				if json.Unmarshal(rawB, &bMap) == nil {
+					if aVal, hasA := bMap["acknowledge"].(bool); hasA && aVal {
+						ack = true
+					}
+				}
+			} else if !okB {
+				return
+			}
+		}
 		s.mu.Lock()
-		_ = s.ensureLicenseStateLocked()
-		s.licenseState["type"] = "basic"
-		s.licenseState["mode"] = "basic"
+		cur := s.ensureLicenseStateLocked()
+		curType, _ := cur["type"].(string)
+		if strings.EqualFold(strings.TrimSpace(curType), "basic") {
+			s.mu.Unlock()
+			writeJSON(w, http.StatusForbidden, map[string]any{
+				"basic_was_started": false,
+				"acknowledged":      true,
+				"error_message":     "Operation failed: Current license is basic.",
+			})
+			return
+		}
+		if !ack {
+			s.mu.Unlock()
+			writeJSON(w, http.StatusOK, map[string]any{
+				"basic_was_started": false,
+				"acknowledged":      false,
+				"error_message":     "Operation failed: Needs acknowledgement.",
+			})
+			return
+		}
+		if strings.EqualFold(strings.TrimSpace(curType), "trial") {
+			setLicenseTrialActivatedR65(s, true)
+		}
+		cur["type"] = "basic"
+		s.licenseState = normalizeV5LicenseObjectR65(cur, "basic")
 		s.mu.Unlock()
 		writeJSON(w, http.StatusOK, map[string]any{
 			"acknowledged":      true,
@@ -8838,18 +11913,56 @@ func (s *Server) handleLicenseAPI(w http.ResponseWriter, r *http.Request, segs [
 			w.WriteHeader(http.StatusOK)
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"eligible_to_start_basic": true})
+		s.mu.Lock()
+		cur := s.ensureLicenseStateLocked()
+		curType, _ := cur["type"].(string)
+		s.mu.Unlock()
+		writeJSON(w, http.StatusOK, map[string]any{
+			"eligible_to_start_basic": !strings.EqualFold(strings.TrimSpace(curType), "basic"),
+		})
 
 	case "start_trial", "_start_trial":
 		if r.Method != http.MethodPost {
 			writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
 			return
 		}
+		reqType := ""
+		if r.URL != nil {
+			reqType = strings.TrimSpace(r.URL.Query().Get("type"))
+		}
+		if r.ContentLength != 0 {
+			if rawB, okB := readRequestBody(w, r); okB && len(bytes.TrimSpace(rawB)) > 0 {
+				var bMap map[string]any
+				if json.Unmarshal(rawB, &bMap) == nil {
+					if bt, okT := bMap["type"].(string); okT && strings.TrimSpace(bt) != "" {
+						reqType = strings.TrimSpace(bt)
+					}
+				}
+			} else if !okB {
+				return
+			}
+		}
+		if reqType != "" && !strings.EqualFold(reqType, "trial") {
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
+				fmt.Sprintf("Only trial licenses can be started via start_trial API, got [%s]", reqType))
+			return
+		}
 		s.mu.Lock()
-		_ = s.ensureLicenseStateLocked()
-		s.licenseState["type"] = "trial"
-		s.licenseState["mode"] = "trial"
+		cur := s.ensureLicenseStateLocked()
+		curType, _ := cur["type"].(string)
+		if strings.EqualFold(strings.TrimSpace(curType), "trial") || isLicenseTrialActivatedR65(s) {
+			s.mu.Unlock()
+			writeJSON(w, http.StatusForbidden, map[string]any{
+				"trial_was_started": false,
+				"acknowledged":      false,
+				"error_message":     "Operation failed: Trial was already activated.",
+			})
+			return
+		}
+		cur["type"] = "trial"
+		s.licenseState = normalizeV5LicenseObjectR65(cur, "trial")
 		s.mu.Unlock()
+		setLicenseTrialActivatedR65(s, true)
 		writeJSON(w, http.StatusOK, map[string]any{
 			"acknowledged":      true,
 			"trial_was_started": true,
@@ -8864,7 +11977,12 @@ func (s *Server) handleLicenseAPI(w http.ResponseWriter, r *http.Request, segs [
 			w.WriteHeader(http.StatusOK)
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"eligible_to_start_trial": true})
+		s.mu.Lock()
+		cur := s.ensureLicenseStateLocked()
+		curType, _ := cur["type"].(string)
+		s.mu.Unlock()
+		eligible := !strings.EqualFold(strings.TrimSpace(curType), "trial") && !isLicenseTrialActivatedR65(s)
+		writeJSON(w, http.StatusOK, map[string]any{"eligible_to_start_trial": eligible})
 
 	case "feature_usage", "_feature_usage":
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
@@ -8892,10 +12010,10 @@ func (s *Server) handleXPackAPI(w http.ResponseWriter, r *http.Request, segs []s
 		return
 	}
 	featureNames := []string{
-		"analytics", "Archive", "ccr", "data_streams", " data_tiers", "enrich", "enterprise_search",
-		"eql", "esql", "flattened", "frozen_indices", "graph", "ilm", "inference", "logstash",
-		"ml", "monitoring", "rollup", "RuntimeFields", "searchable_snapshots", "security", "slm",
-		"spatial", "sql", "transform", "universal_profiling", "vectors", "voting_only", "watcher",
+		"aggregate_metric", "analytics", "archive", "ccr", "data_streams", "data_tiers", "enrich",
+		"enterprise_search", "eql", "esql", "flattened", "frozen_indices", "graph", "ilm", "inference",
+		"logstash", "ml", "monitoring", "rollup", "runtime_fields", "searchable_snapshots", "security",
+		"slm", "spatial", "sql", "transform", "universal_profiling", "vectors", "voting_only", "watcher",
 	}
 	if len(segs) >= 2 && segs[1] == "usage" {
 		if r.Method == http.MethodHead {
@@ -8910,11 +12028,56 @@ func (s *Server) handleXPackAPI(w http.ResponseWriter, r *http.Request, segs []s
 		rollupCount := len(s.rollupJobs)
 		enrichCount := len(s.enrichPolicies)
 		inferenceCount := len(s.inferenceEndpoints)
+		dsCount := len(s.dataStreams)
+		var dlmCount int
+		var dlmRetentions []int64
+		for _, ds := range s.dataStreams {
+			if ds == nil {
+				continue
+			}
+			if lc, okLC := ds["lifecycle"].(map[string]any); okLC && lc != nil {
+				en := true
+				if b, okB := lc["enabled"].(bool); okB {
+					en = b
+				}
+				if en {
+					dlmCount++
+					if dr, okDR := lc["data_retention"].(string); okDR && strings.TrimSpace(dr) != "" {
+						if dur, err := parseESPositiveDuration(dr); err == nil && dur > 0 {
+							dlmRetentions = append(dlmRetentions, dur.Milliseconds())
+						}
+					}
+				}
+			}
+		}
+		var ssIndices, ssFullCopy, ssSharedCache int
+		for idx, cs := range s.indexCustomSettings {
+			if s.indices[idx] != nil && cs != nil && cs["store.type"] == "snapshot" {
+				ssIndices++
+				if cs["store.snapshot.storage"] == "full_copy" {
+					ssFullCopy++
+				} else {
+					ssSharedCache++
+				}
+			}
+		}
 		s.mu.RUnlock()
-		usage := make(map[string]any, len(featureNames))
+
+		var dlmMin, dlmMax, dlmAvg int64
+		if len(dlmRetentions) > 0 {
+			sort.Slice(dlmRetentions, func(i, j int) bool { return dlmRetentions[i] < dlmRetentions[j] })
+			dlmMin = dlmRetentions[0]
+			dlmMax = dlmRetentions[len(dlmRetentions)-1]
+			var sum int64
+			for _, rv := range dlmRetentions {
+				sum += rv
+			}
+			dlmAvg = sum / int64(len(dlmRetentions))
+		}
+
+		usage := make(map[string]any, len(featureNames)+2)
 		for _, fn := range featureNames {
-			clean := strings.TrimSpace(fn)
-			usage[clean] = map[string]any{
+			usage[fn] = map[string]any{
 				"available": true,
 				"enabled":   true,
 			}
@@ -8923,9 +12086,30 @@ func (s *Server) handleXPackAPI(w http.ResponseWriter, r *http.Request, segs []s
 		usage["ilm"] = map[string]any{"available": true, "enabled": true, "policy_count": ilmCount}
 		usage["slm"] = map[string]any{"available": true, "enabled": true, "policy_count": slmCount}
 		usage["transform"] = map[string]any{"available": true, "enabled": true, "count": transformCount}
-		usage["rollup"] = map[string]any{"available": true, "enabled": true, "count": rollupCount}
+		usage["rollup"] = map[string]any{"available": true, "enabled": true, "count": rollupCount, "number_of_rollup_jobs": rollupCount}
 		usage["enrich"] = map[string]any{"available": true, "enabled": true, "count": enrichCount}
 		usage["inference"] = map[string]any{"available": true, "enabled": true, "count": inferenceCount}
+		usage["data_streams"] = map[string]any{"available": true, "enabled": true, "data_streams": dsCount}
+		usage["data_lifecycle"] = map[string]any{
+			"available":             true,
+			"enabled":               true,
+			"count":                 dlmCount,
+			"default_rollover_used": true,
+			"retention": map[string]any{
+				"minimum_millis": dlmMin,
+				"maximum_millis": dlmMax,
+				"average_millis": dlmAvg,
+			},
+		}
+		usage["searchable_snapshots"] = map[string]any{
+			"available":                  true,
+			"enabled":                    true,
+			"indices_count":              ssIndices,
+			"full_copy_indices_count":    ssFullCopy,
+			"shared_cache_indices_count": ssSharedCache,
+		}
+		usage["analytics"] = getAnalyticsUsageTrackerR65(s).snapshotUsage()
+		usage["health_api"] = getHealthAPIUsageTrackerR65(s).snapshotUsage()
 		esqlFeaturesMap, esqlQueriesMap := s.snapshotESQLTelemetryR64()
 		usage["esql"] = map[string]any{
 			"available": true,
@@ -8937,22 +12121,26 @@ func (s *Server) handleXPackAPI(w http.ResponseWriter, r *http.Request, segs []s
 		return
 	}
 	if len(segs) == 1 {
+		if !checkAcceptEnterpriseQueryParamR65(w, s, r) {
+			return
+		}
 		s.mu.Lock()
 		lic := s.ensureLicenseStateLocked()
 		s.mu.Unlock()
+		lic["mode"] = lic["type"]
 		if r.Method == http.MethodHead {
+			ensureESCompatHeaders(w, r)
 			w.WriteHeader(http.StatusOK)
 			return
 		}
 		features := make(map[string]any, len(featureNames))
 		for _, fn := range featureNames {
-			clean := strings.TrimSpace(fn)
-			features[clean] = map[string]any{
+			features[fn] = map[string]any{
 				"available": true,
 				"enabled":   true,
 			}
 		}
-		writeJSON(w, http.StatusOK, map[string]any{
+		writeJSONWithRequest(w, r, http.StatusOK, map[string]any{
 			"build": map[string]any{
 				"hash": "00000000",
 				"date": "2026-01-01T00:00:00.000Z",
@@ -9011,6 +12199,71 @@ func (s *Server) handleHealthReport(w http.ResponseWriter, r *http.Request, segs
 		return
 	}
 	patchHealthReportIndicatorsRound63(s, payload)
+	if indMap, okI := payload["indicators"].(map[string]any); okI && indMap != nil {
+		if saMap, okSA := indMap["shards_availability"].(map[string]any); okSA && saMap != nil {
+			if diags, okD := saMap["diagnosis"].([]any); okD {
+				s.mu.RLock()
+				clusterAlloc := ""
+				if v := s.clusterPersistentSettings["cluster.routing.allocation.enable"]; v != nil {
+					clusterAlloc = strings.ToLower(strings.TrimSpace(fmt.Sprintf("%v", v)))
+				} else if v := s.clusterTransientSettings["cluster.routing.allocation.enable"]; v != nil {
+					clusterAlloc = strings.ToLower(strings.TrimSpace(fmt.Sprintf("%v", v)))
+				}
+				if clusterAlloc != "none" && clusterAlloc != "new_primaries" {
+					for _, rawDiag := range diags {
+						dm, okDM := rawDiag.(map[string]any)
+						if !okDM || dm["id"] != "elasticsearch:health:shards_availability:diagnosis:allocation_blocked_by_settings" {
+							continue
+						}
+						affected, _ := dm["affected_resources"].(map[string]any)
+						hasIdxAllocDisabled := false
+						if affected != nil {
+							idxHasAllocBlock := func(idxN string) bool {
+								cs := s.indexCustomSettings[idxN]
+								if cs == nil {
+									return false
+								}
+								for _, k := range []string{"routing.allocation.enable", "index.routing.allocation.enable"} {
+									if rawV := cs[k]; rawV != nil {
+										v := strings.ToLower(strings.TrimSpace(fmt.Sprintf("%v", rawV)))
+										if v == "none" || v == "new_primaries" || v == "primaries" {
+											return true
+										}
+									}
+								}
+								return false
+							}
+							switch rawIdxs := affected["indices"].(type) {
+							case []string:
+								for _, idxN := range rawIdxs {
+									if idxHasAllocBlock(idxN) {
+										hasIdxAllocDisabled = true
+										break
+									}
+								}
+							case []any:
+								for _, item := range rawIdxs {
+									if idxHasAllocBlock(strings.TrimSpace(fmt.Sprintf("%v", item))) {
+										hasIdxAllocDisabled = true
+										break
+									}
+								}
+							}
+						}
+						if hasIdxAllocDisabled {
+							dm["id"] = "elasticsearch:health:shards_availability:diagnosis:enable_index_allocations"
+						}
+					}
+				}
+				s.mu.RUnlock()
+			}
+		}
+	}
+	verbose := true
+	if parsedV, hasV, err := parseStrictQueryBoolParamRound59(r, "verbose"); err == nil && hasV {
+		verbose = parsedV
+	}
+	getHealthAPIUsageTrackerR65(s).record(verbose, payload)
 	writeJSONWithRequest(w, r, http.StatusOK, payload)
 }
 
@@ -9069,6 +12322,7 @@ func (s *Server) handleSQLAPI(w http.ResponseWriter, r *http.Request, segs []str
 				"id":                        id,
 				"is_running":                false,
 				"is_partial":                false,
+				"start_time_in_millis":      time.Now().UTC().UnixMilli(),
 				"expiration_time_in_millis": time.Now().Add(24 * time.Hour).UnixMilli(),
 				"completion_status":         200,
 			})
@@ -10569,20 +13823,151 @@ func (s *Server) handleGraphExplore(w http.ResponseWriter, r *http.Request, segs
 		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
 		return
 	}
+	var targets []string
 	if len(segs) == 3 {
-		if _, ok := s.resolveMaintenanceTargetIndices(w, segs[0]); !ok {
+		var ok bool
+		targets, ok = s.resolveMaintenanceTargetIndices(w, segs[0])
+		if !ok {
 			return
 		}
+	} else {
+		targets = s.resolveTargetIndices("_all")
 	}
-	if _, ok := parseJSONBody(w, r); !ok {
+	body, ok := parseJSONBody(w, r)
+	if !ok {
 		return
+	}
+	verticesOut := make([]any, 0)
+	connectionsOut := make([]any, 0)
+	if len(targets) > 0 && body != nil {
+		if rawVerts, okV := body["vertices"].([]any); okV && len(rawVerts) > 0 {
+			docs, _ := s.collectSourceDocsForJob(r.Context(), targets, body["query"], nil)
+			type graphVertexKey struct {
+				field string
+				term  string
+			}
+			docCountMap := make(map[graphVertexKey]int64)
+			termValMap := make(map[graphVertexKey]any)
+			var fieldSpecs []struct {
+				field       string
+				minDocCount int64
+				size        int
+			}
+			for _, rv := range rawVerts {
+				vm, okM := rv.(map[string]any)
+				if !okM || vm == nil {
+					continue
+				}
+				fld, _ := vm["field"].(string)
+				fld = strings.TrimSpace(fld)
+				if fld == "" {
+					continue
+				}
+				minDoc := int64(3)
+				if mdc, okMD := toInt64(vm["min_doc_count"]); okMD && mdc > 0 {
+					minDoc = mdc
+				}
+				sz := 5
+				if sVal, okSz := toInt64(vm["size"]); okSz && sVal > 0 {
+					sz = int(sVal)
+				}
+				fieldSpecs = append(fieldSpecs, struct {
+					field       string
+					minDocCount int64
+					size        int
+				}{field: fld, minDocCount: minDoc, size: sz})
+			}
+			docKeysPerDoc := make([][]graphVertexKey, len(docs))
+			for di, d := range docs {
+				seenInDoc := make(map[graphVertexKey]bool)
+				for _, fs := range fieldSpecs {
+					for _, rawVal := range extractDocFieldValues(d, fs.field) {
+						if rawVal == nil {
+							continue
+						}
+						tStr := fmt.Sprintf("%v", rawVal)
+						gk := graphVertexKey{field: fs.field, term: tStr}
+						if !seenInDoc[gk] {
+							seenInDoc[gk] = true
+							docCountMap[gk]++
+							termValMap[gk] = rawVal
+							docKeysPerDoc[di] = append(docKeysPerDoc[di], gk)
+						}
+					}
+				}
+			}
+			vertexIdxMap := make(map[graphVertexKey]int)
+			for _, fs := range fieldSpecs {
+				var cands []graphVertexKey
+				for gk, cnt := range docCountMap {
+					if gk.field == fs.field && cnt >= fs.minDocCount {
+						cands = append(cands, gk)
+					}
+				}
+				sort.Slice(cands, func(i, j int) bool {
+					ci, cj := docCountMap[cands[i]], docCountMap[cands[j]]
+					if ci != cj {
+						return ci > cj
+					}
+					return cands[i].term < cands[j].term
+				})
+				if len(cands) > fs.size {
+					cands = cands[:fs.size]
+				}
+				for _, gk := range cands {
+					idx := len(verticesOut)
+					vertexIdxMap[gk] = idx
+					verticesOut = append(verticesOut, map[string]any{
+						"field":  gk.field,
+						"term":   termValMap[gk],
+						"depth":  0,
+						"weight": float64(docCountMap[gk]),
+					})
+				}
+			}
+			type connPair struct{ a, b int }
+			connCounts := make(map[connPair]int64)
+			for _, gks := range docKeysPerDoc {
+				var docIdxs []int
+				for _, gk := range gks {
+					if idx, okIdx := vertexIdxMap[gk]; okIdx {
+						docIdxs = append(docIdxs, idx)
+					}
+				}
+				sort.Ints(docIdxs)
+				for i := 0; i < len(docIdxs); i++ {
+					for j := i + 1; j < len(docIdxs); j++ {
+						connCounts[connPair{a: docIdxs[i], b: docIdxs[j]}]++
+					}
+				}
+			}
+			var pairs []connPair
+			for p := range connCounts {
+				pairs = append(pairs, p)
+			}
+			sort.Slice(pairs, func(i, j int) bool {
+				if pairs[i].a != pairs[j].a {
+					return pairs[i].a < pairs[j].a
+				}
+				return pairs[i].b < pairs[j].b
+			})
+			for _, p := range pairs {
+				cnt := connCounts[p]
+				connectionsOut = append(connectionsOut, map[string]any{
+					"source":    p.a,
+					"target":    p.b,
+					"weight":    float64(cnt),
+					"doc_count": cnt,
+				})
+			}
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"took":        1,
 		"timed_out":   false,
 		"failures":    []any{},
-		"connections": []any{},
-		"vertices":    []any{},
+		"connections": connectionsOut,
+		"vertices":    verticesOut,
 	})
 }
 

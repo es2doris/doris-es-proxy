@@ -28,8 +28,10 @@ import (
 	"html"
 	"io"
 	"math"
+	"math/big"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"regexp"
 	"sort"
@@ -698,6 +700,9 @@ func (s *Server) syncCatalogFromBackend(ctx context.Context) error {
 				compiled.TimeSeriesStartTime = prevSchema.TimeSeriesStartTime
 				compiled.TimeSeriesEndTime = prevSchema.TimeSeriesEndTime
 				compiled.SyntheticSource = prevSchema.SyntheticSource
+				if prevSchema.AnalysisConfig != nil {
+					compiled.AnalysisConfig = prevSchema.AnalysisConfig
+				}
 				if len(prevSchema.FieldAddedAtSeqNo) > 0 {
 					compiled.FieldAddedAtSeqNo = make(map[string]int64, len(prevSchema.FieldAddedAtSeqNo))
 					for k, v := range prevSchema.FieldAddedAtSeqNo {
@@ -750,6 +755,9 @@ func (s *Server) syncCatalogFromBackend(ctx context.Context) error {
 				}
 				s.indexCustomSettings[e.EntityKey] = metaEnv.CustomSettings
 				_ = parseAndApplyIndexMappingSettingsRound59(metaEnv.CustomSettings, compiled)
+				if compiled.AnalysisConfig == nil {
+					_ = compiled.SetAnalysisSettings(normalizeJSONNumbersForAnalysisR65(metaEnv.CustomSettings))
+				}
 				tsMode, tsRoutingPath, tsStart, tsEnd, tsErr := schema.ExtractTSDBSettings(metaEnv.CustomSettings)
 				if tsErr == nil && tsMode == "time_series" {
 					compiled.IndexMode = "time_series"
@@ -1192,7 +1200,7 @@ func (s *Server) Handler() http.Handler {
 		case segs[0] == "_features":
 			s.handleFeatures(w, r, segs)
 			return
-		case len(segs) == 2 && segs[0] == "_cluster" && segs[1] == "voting_config_exclusions":
+		case (len(segs) == 2 || len(segs) == 3) && segs[0] == "_cluster" && segs[1] == "voting_config_exclusions":
 			s.handleVotingConfigExclusions(w, r)
 			return
 		case len(segs) == 2 && segs[0] == "_migration" && segs[1] == "deprecations":
@@ -1203,6 +1211,13 @@ func (s *Server) Handler() http.Handler {
 			return
 		case len(segs) == 3 && segs[1] == "_migration" && segs[2] == "deprecations":
 			s.handleMigrationDeprecations(w, r, segs[0])
+			return
+		case len(segs) == 2 && segs[0] == "_monitoring" && segs[1] == "bulk":
+			s.handleMonitoringBulkR65(w, r)
+			return
+		case len(segs) == 3 && segs[0] == "_monitoring" && segs[2] == "bulk":
+			r.SetPathValue("type", segs[1])
+			s.handleMonitoringBulkR65(w, r)
 			return
 		case len(segs) == 2 && segs[0] == "_nodes" && segs[1] == "shutdown":
 			s.handleNodesShutdown(w, r, "")
@@ -1282,6 +1297,15 @@ func (s *Server) Handler() http.Handler {
 			s.handleSSLCertificates(w, r)
 			return
 		case segs[0] == "_license" || segs[0] == "_xpack":
+			if len(segs) == 3 && segs[0] == "_xpack" && segs[1] == "monitoring" && segs[2] == "bulk" {
+				s.handleMonitoringBulkR65(w, r)
+				return
+			}
+			if len(segs) == 4 && segs[0] == "_xpack" && segs[1] == "monitoring" && segs[3] == "bulk" {
+				r.SetPathValue("type", segs[2])
+				s.handleMonitoringBulkR65(w, r)
+				return
+			}
 			if segs[0] == "_license" || (len(segs) >= 2 && segs[1] == "license") {
 				s.handleLicenseAPI(w, r, segs)
 			} else {
@@ -1321,8 +1345,17 @@ func (s *Server) Handler() http.Handler {
 		case len(segs) >= 2 && segs[0] == "_cluster" && segs[1] == "info":
 			s.handleClusterInfo(w, r, segs)
 			return
-		case len(segs) >= 2 && segs[0] == "_nodes" && (segs[1] == "repositories_metering" || (len(segs) >= 3 && segs[2] == "repositories_metering") || segs[1] == "clear_repositories_metering_archive" || (len(segs) >= 3 && segs[2] == "clear_repositories_metering_archive")):
-			s.handleNodesRepositoriesMetering(w, r, segs)
+		case len(segs) >= 2 && segs[0] == "_nodes" && (segs[1] == "repositories_metering" || segs[1] == "_repositories_metering" || (len(segs) >= 3 && (segs[2] == "repositories_metering" || segs[2] == "_repositories_metering")) || segs[1] == "clear_repositories_metering_archive" || segs[1] == "_clear_repositories_metering_archive" || (len(segs) >= 3 && (segs[2] == "clear_repositories_metering_archive" || segs[2] == "_clear_repositories_metering_archive"))):
+			normSegs := append([]string(nil), segs...)
+			for i := 1; i < len(normSegs); i++ {
+				switch normSegs[i] {
+				case "_repositories_metering":
+					normSegs[i] = "repositories_metering"
+				case "_clear_repositories_metering_archive":
+					normSegs[i] = "clear_repositories_metering_archive"
+				}
+			}
+			s.handleNodesRepositoriesMetering(w, r, normSegs)
 			return
 		case len(segs) >= 2 && segs[0] == "_cat" && segs[1] == "component_templates":
 			s.handleCatComponentTemplates(w, r, segs)
@@ -2679,7 +2712,9 @@ func (s *Server) handleIndexSettings(w http.ResponseWriter, r *http.Request) {
 		}
 		if len(bytes.TrimSpace(bodyBytes)) > 0 {
 			var settings map[string]any
-			if err := json.Unmarshal(bodyBytes, &settings); err != nil {
+			dec := json.NewDecoder(bytes.NewReader(bodyBytes))
+			dec.UseNumber()
+			if err := dec.Decode(&settings); err != nil {
 				writeESError(w, http.StatusBadRequest, "parse_exception", "Failed to parse content to map")
 				return
 			}
@@ -2734,8 +2769,134 @@ func (s *Server) handleIndexSettings(w http.ResponseWriter, r *http.Request) {
 					writeESError(w, http.StatusBadRequest, "illegal_argument_exception", err.Error())
 					return
 				}
+				if rawTM, hasTM := customFlat["top_metrics_max_size"]; hasTM && rawTM != nil {
+					if _, err := parseSettingStrictIntRound59(rawTM, "index.top_metrics_max_size", 1); err != nil {
+						writeESError(w, http.StatusBadRequest, "illegal_argument_exception", err.Error())
+						return
+					}
+				}
 			}
 			preserveExisting := isTruthyBoolQueryParam(r, "preserve_existing")
+			type tsdbUpdateInfo struct {
+				hasEndTime bool
+				endTime    string
+			}
+			tsdbUpdates := make(map[string]tsdbUpdateInfo, len(validTargets))
+			if len(customFlat) > 0 {
+				s.mu.RLock()
+				for _, indexName := range validTargets {
+					idxSchema := s.indices[indexName]
+					curCustom := s.indexCustomSettings[indexName]
+					isClosed := s.closedIndices[indexName]
+					for _, nonDyn := range []string{"mode", "routing_path", "time_series.start_time"} {
+						val, touched := customFlat[nonDyn]
+						if !touched || val == nil {
+							continue
+						}
+						if preserveExisting {
+							if _, hasExisting := curCustom[nonDyn]; hasExisting {
+								continue
+							}
+						}
+						s.mu.RUnlock()
+						if isClosed {
+							writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
+								fmt.Sprintf("final %s setting [index.%s], not updateable", indexName, nonDyn))
+						} else {
+							writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
+								fmt.Sprintf("Can't update non dynamic settings [[index.%s]] for open indices [[%s/%s]]", nonDyn, indexName, indexName))
+						}
+						return
+					}
+					preview := make(map[string]any, len(curCustom)+len(customFlat)+4)
+					for k, v := range curCustom {
+						preview[k] = v
+					}
+					effMode := "standard"
+					if idxSchema != nil && idxSchema.IndexMode != "" {
+						effMode = idxSchema.IndexMode
+					} else if curMode, okM := curCustom["mode"]; okM && curMode != nil {
+						if ms := strings.ToLower(strings.TrimSpace(fmt.Sprintf("%v", curMode))); ms != "" {
+							effMode = ms
+						}
+					}
+					if _, hasMode := preview["mode"]; !hasMode && effMode != "" && effMode != "standard" {
+						preview["mode"] = effMode
+					}
+					if idxSchema != nil {
+						if _, hasRP := preview["routing_path"]; !hasRP && len(idxSchema.RoutingPath) > 0 {
+							preview["routing_path"] = append([]string(nil), idxSchema.RoutingPath...)
+						}
+						if _, hasST := preview["time_series.start_time"]; !hasST && idxSchema.TimeSeriesStartTime != "" {
+							preview["time_series.start_time"] = idxSchema.TimeSeriesStartTime
+						}
+						if _, hasET := preview["time_series.end_time"]; !hasET && idxSchema.TimeSeriesEndTime != "" {
+							preview["time_series.end_time"] = idxSchema.TimeSeriesEndTime
+						}
+					}
+					for k, v := range customFlat {
+						if k == "default_pipeline" || k == "final_pipeline" {
+							continue
+						}
+						if preserveExisting {
+							if _, hasExisting := preview[k]; hasExisting || k == "number_of_replicas" || k == "number_of_shards" {
+								continue
+							}
+						}
+						if v == nil {
+							delete(preview, k)
+						} else {
+							preview[k] = normalizeCustomSettingValue(v)
+						}
+					}
+					if pm, okPM := preview["mode"]; okPM && pm != nil {
+						if pms := strings.ToLower(strings.TrimSpace(fmt.Sprintf("%v", pm))); pms != "" {
+							effMode = pms
+						}
+					}
+					if err := schema.ValidateIndexModeSettings(effMode, preview); err != nil {
+						s.mu.RUnlock()
+						et, er := splitSchemaErrorPrefixR61CRUD(err, "illegal_argument_exception")
+						writeESError(w, http.StatusBadRequest, et, er)
+						return
+					}
+					if effMode == "time_series" {
+						if nextET, hasET := customFlat["time_series.end_time"]; hasET {
+							skipPreserve := false
+							if preserveExisting {
+								if _, hasExisting := curCustom["time_series.end_time"]; hasExisting {
+									skipPreserve = true
+								} else if idxSchema != nil && idxSchema.TimeSeriesEndTime != "" {
+									skipPreserve = true
+								}
+							}
+							if !skipPreserve {
+								if nextET != nil {
+									curET := any("")
+									if idxSchema != nil && idxSchema.TimeSeriesEndTime != "" {
+										curET = idxSchema.TimeSeriesEndTime
+									} else if ce, okCE := curCustom["time_series.end_time"]; okCE && ce != nil {
+										curET = ce
+									}
+									if err := schema.ValidateTSDBEndTimeUpdate(curET, nextET); err != nil {
+										s.mu.RUnlock()
+										et, er := splitSchemaErrorPrefixR61CRUD(err, "illegal_argument_exception")
+										writeESError(w, http.StatusBadRequest, et, er)
+										return
+									}
+									tsdbUpdates[indexName] = tsdbUpdateInfo{
+										hasEndTime: true,
+										endTime:    strings.TrimSpace(fmt.Sprintf("%v", normalizeCustomSettingValue(nextET))),
+									}
+								} else {
+									tsdbUpdates[indexName] = tsdbUpdateInfo{hasEndTime: true, endTime: ""}
+								}
+							}
+						}
+					}
+				}
+				s.mu.RUnlock()
+			}
 			for _, indexName := range validTargets {
 				s.mu.Lock()
 				if s.indexCustomSettings == nil {
@@ -2785,6 +2946,9 @@ func (s *Server) handleIndexSettings(w http.ResponseWriter, r *http.Request) {
 					cloned := idxSchema.CloneIndexSchema()
 					cloned.CopyIndexMappingSettingsFrom(freshDefaults)
 					_ = parseAndApplyIndexMappingSettingsRound59(s.indexCustomSettings[indexName], cloned)
+					if tsInfo, okTS := tsdbUpdates[indexName]; okTS && tsInfo.hasEndTime {
+						cloned.TimeSeriesEndTime = tsInfo.endTime
+					}
 					updatedSchema = cloned
 					s.indices[indexName] = updatedSchema
 				}
@@ -4280,7 +4444,9 @@ func (s *Server) handleCreateIndex(w http.ResponseWriter, r *http.Request) {
 	}
 	bodyBytes = s.rewriteSearchBodyQueryRules(rewrittenBody)
 	if len(bytes.TrimSpace(bodyBytes)) > 0 {
-		if err := json.Unmarshal(bodyBytes, &req); err != nil {
+		dec := json.NewDecoder(bytes.NewReader(bodyBytes))
+		dec.UseNumber()
+		if err := dec.Decode(&req); err != nil {
 			writeESError(w, http.StatusBadRequest, "mapper_parsing_exception", err.Error())
 			return
 		}
@@ -4439,13 +4605,18 @@ func (s *Server) handleCreateIndex(w http.ResponseWriter, r *http.Request) {
 		writeESError(w, http.StatusBadRequest, et, er)
 		return
 	} else if mode == "time_series" {
+		if effectiveMappings != nil && effectiveMappings.Routing != nil {
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
+				"routing is forbidden on CRUD operations that target indices in [index.mode=time_series]")
+			return
+		}
 		if effectiveMappings != nil && effectiveMappings.Source != nil {
 			sm, _ := effectiveMappings.Source["mode"].(string)
 			sm = strings.ToLower(strings.TrimSpace(sm))
 			en, hasEn := parseOptionalBoolAny(effectiveMappings.Source["enabled"])
 			if (sm != "" && sm != "synthetic") || (hasEn && !en) {
 				writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
-					"Indices with with index mode [time_series] only support synthetic source")
+					"Indices with with index mode [time_series] only support synthetic source (time series indices only support synthetic source)")
 				return
 			}
 		}
@@ -4454,6 +4625,13 @@ func (s *Server) handleCreateIndex(w http.ResponseWriter, r *http.Request) {
 		compiled.TimeSeriesStartTime = startTime
 		compiled.TimeSeriesEndTime = endTime
 		compiled.SyntheticSource = true
+		if effectiveMappings != nil && len(effectiveMappings.Runtime) > 0 {
+			if rtErr := schema.ValidateTSDBRuntimeFieldsRoutingPath(routingPath, effectiveMappings.Runtime); rtErr != nil {
+				et, er := splitSchemaErrorPrefixR61CRUD(rtErr, "illegal_argument_exception")
+				writeESError(w, http.StatusBadRequest, et, er)
+				return
+			}
+		}
 		if err := schema.ValidateTSDBMapping(effectiveMappings, routingPath); err != nil {
 			et, er := splitSchemaErrorPrefixR61CRUD(err, "illegal_argument_exception")
 			writeESError(w, http.StatusBadRequest, et, er)
@@ -4488,7 +4666,26 @@ func (s *Server) handleCreateIndex(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	if effectiveMappings != nil && len(effectiveMappings.Runtime) > 0 {
+		if rtErr := schema.ValidateTSDBRuntimeShadowing(compiled, effectiveMappings.Runtime); rtErr != nil {
+			et, er := splitSchemaErrorPrefixR61CRUD(rtErr, "illegal_argument_exception")
+			writeESError(w, http.StatusBadRequest, et, er)
+			return
+		}
+	}
 	schema.ApplyIndexModeDefaults(compiled)
+	if compiled.IndexMode == "time_series" {
+		if compiled.RawMapping == nil {
+			compiled.RawMapping = &esast.MappingSpec{}
+		}
+		if compiled.RawMapping.Source == nil {
+			compiled.RawMapping.Source = map[string]any{"mode": "synthetic"}
+		}
+	}
+	if err := compiled.SetAnalysisSettings(normalizeJSONNumbersForAnalysisR65(mergedSettings)); err != nil {
+		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", err.Error())
+		return
+	}
 	if err := schema.ValidateIndexSortFields(compiled, mergedSettings); err != nil {
 		et, er := splitSchemaErrorPrefixR61CRUD(err, "illegal_argument_exception")
 		writeESError(w, http.StatusBadRequest, et, er)
@@ -5237,6 +5434,20 @@ func (s *Server) handlePutDoc(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.recordMaxDataStreamTimestampR62Search(effRawIndex, tsMs)
+	}
+	if len(ingRes.DynamicTemplates) > 0 {
+		baseSc := roSchema
+		if baseSc == nil {
+			baseSc = s.ensureIndexSchema(r.Context(), indexName)
+		}
+		updatedSc, dtSt, dtET, dtER := s.applyBulkActionDynamicTemplatesR62Search(r.Context(), indexName, docID, baseSc, ingRes.DynamicTemplates, docPayload)
+		if dtSt != 0 {
+			writeESError(w, dtSt, dtET, dtER)
+			return
+		}
+		if updatedSc != nil {
+			roSchema = updatedSc
+		}
 	}
 	var idxSchema *schema.IndexSchema
 	isTSDBWrite := roSchema != nil && roSchema.IndexMode == "time_series"
@@ -8380,6 +8591,19 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 			pipedOps[idx] = true
 			pipeRoutings[idx] = ingRes.Routing
 			op.Source = ingRes.Doc
+			if len(ingRes.DynamicTemplates) > 0 {
+				for len(extBulkMetas) <= idx {
+					extBulkMetas = append(extBulkMetas, bulkItemPreMetaR62Search{})
+				}
+				mergedDT := make(map[string]string, len(extBulkMetas[idx].dynamicTemplates)+len(ingRes.DynamicTemplates))
+				for fk, tv := range ingRes.DynamicTemplates {
+					mergedDT[fk] = tv
+				}
+				for fk, tv := range extBulkMetas[idx].dynamicTemplates {
+					mergedDT[fk] = tv
+				}
+				extBulkMetas[idx].dynamicTemplates = mergedDT
+			}
 			if reqAlias {
 				if st, et, er := s.validateRequireAliasForWriteRound60(r.Context(), op.Index); st != 0 {
 					opErrStatus[idx] = st
@@ -8620,7 +8844,7 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 				"type":   eType,
 				"reason": eReason,
 			}
-			if eType == "mapper_parsing_exception" && strings.Contains(eReason, "cannot be stored in nanosecond resolution") {
+			if (eType == "mapper_parsing_exception" || eType == "document_parsing_exception") && strings.Contains(eReason, "cannot be stored in nanosecond resolution") {
 				if idx := strings.Index(eReason, "date["); idx >= 0 {
 					errObj["caused_by"] = map[string]any{
 						"type":   "illegal_argument_exception",
@@ -9756,11 +9980,17 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			errMsg = strings.ReplaceAll(errMsg, "numberOfSignificantValueDigits must be", "[numberOfSignificantValueDigits] must be")
-			if bytes.Contains(bodyBytes, []byte("median_absolute_deviation")) {
+			if bytes.Contains(bodyBytes, []byte("median_absolute_deviation")) || bytes.Contains(bodyBytes, []byte("boxplot")) {
 				errMsg = strings.ReplaceAll(errMsg, "Invalid execution mode for cardinality aggregation: [", "Invalid execution_hint [")
+			}
+			if bytes.Contains(bodyBytes, []byte("boxplot")) {
+				errMsg = strings.ReplaceAll(errMsg, "[compression] must be greater than 0. Found [", "[compression] must be greater than or equal to 0. Found [")
 			}
 			if s.isES8Mode(r) {
 				errMsg = strings.ReplaceAll(errMsg, "[from] parameter cannot be negative, found [", "[from] parameter cannot be negative but was [")
+			}
+			if s.hasExplicitTargetESVersion() && strings.HasPrefix(s.getTargetESVersion(), "8.") && strings.Contains(errMsg, "[cutoff_frequency] not allowed for type [bool_prefix]") {
+				errMsg = "illegal_argument_exception: cutoff_freqency is not supported. The [multi_match] query can skip block of documents efficiently if the total number of hits is not tracked"
 			}
 			errType := "parsing_exception"
 			switch {
@@ -9769,7 +9999,7 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 			case strings.HasPrefix(errMsg, "illegal_argument_exception: "):
 				errType = "illegal_argument_exception"
 				errMsg = strings.TrimPrefix(errMsg, "illegal_argument_exception: ")
-				if !s.isES8Mode(r) && strings.Contains(errMsg, "[collapse] second level of collapsing") {
+				if strings.Contains(errMsg, "[collapse] second level of collapsing") {
 					errType = "parse_exception"
 				}
 			case strings.HasPrefix(errMsg, "parse_exception: "):
@@ -9793,7 +10023,7 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 				}
 			case strings.HasPrefix(errMsg, "parsing_exception: "):
 				errMsg = strings.TrimPrefix(errMsg, "parsing_exception: ")
-				if !s.isES8Mode(r) && strings.Contains(errMsg, "[collapse] unknown field [collapse]") {
+				if strings.Contains(errMsg, "[collapse] unknown field [collapse]") {
 					errType = "parse_exception"
 				}
 			}
@@ -9821,6 +10051,11 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", uriErr)
 		return
 	}
+	if rrfErr := req.ValidateRRFWindowSize(10); rrfErr != nil {
+		eType, eReason := splitESExceptionErrorR61Search(rrfErr, "illegal_argument_exception")
+		writeESError(w, http.StatusBadRequest, eType, eReason)
+		return
+	}
 	if !s.isES8Mode(r) {
 		for _, dv := range req.DocvalueFields {
 			if strings.EqualFold(strings.TrimSpace(dv.Format), "use_field_mapping") {
@@ -9829,9 +10064,17 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	if s.hasExplicitTargetESVersion() && req.Collapse != nil && len(req.Rescore) > 0 {
+	if s.hasExplicitTargetESVersion() && !s.isES8Mode(r) && req.Collapse != nil && len(req.Rescore) > 0 {
 		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "cannot use `collapse` in conjunction with `rescore`")
 		return
+	}
+	if s.hasExplicitTargetESVersion() && s.isES8Mode(r) && req.Collapse != nil {
+		for _, ih := range req.Collapse.InnerHits {
+			if strings.TrimSpace(ih.Name) == "" {
+				writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "[inner_hits] requires a [name] when collapsing")
+				return
+			}
+		}
 	}
 	if knnSt, knnType, knnReason := validateSearchKNNRequestR61Search(r, &req); knnSt != 0 {
 		writeESError(w, knnSt, knnType, knnReason)
@@ -10164,11 +10407,17 @@ func (s *Server) handleDorisExplain(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			errMsg = strings.ReplaceAll(errMsg, "numberOfSignificantValueDigits must be", "[numberOfSignificantValueDigits] must be")
-			if bytes.Contains(bodyBytes, []byte("median_absolute_deviation")) {
+			if bytes.Contains(bodyBytes, []byte("median_absolute_deviation")) || bytes.Contains(bodyBytes, []byte("boxplot")) {
 				errMsg = strings.ReplaceAll(errMsg, "Invalid execution mode for cardinality aggregation: [", "Invalid execution_hint [")
+			}
+			if bytes.Contains(bodyBytes, []byte("boxplot")) {
+				errMsg = strings.ReplaceAll(errMsg, "[compression] must be greater than 0. Found [", "[compression] must be greater than or equal to 0. Found [")
 			}
 			if s.isES8Mode(r) {
 				errMsg = strings.ReplaceAll(errMsg, "[from] parameter cannot be negative, found [", "[from] parameter cannot be negative but was [")
+			}
+			if s.hasExplicitTargetESVersion() && strings.HasPrefix(s.getTargetESVersion(), "8.") && strings.Contains(errMsg, "[cutoff_frequency] not allowed for type [bool_prefix]") {
+				errMsg = "illegal_argument_exception: cutoff_freqency is not supported. The [multi_match] query can skip block of documents efficiently if the total number of hits is not tracked"
 			}
 			errType := "parsing_exception"
 			switch {
@@ -10177,7 +10426,7 @@ func (s *Server) handleDorisExplain(w http.ResponseWriter, r *http.Request) {
 			case strings.HasPrefix(errMsg, "illegal_argument_exception: "):
 				errType = "illegal_argument_exception"
 				errMsg = strings.TrimPrefix(errMsg, "illegal_argument_exception: ")
-				if !s.isES8Mode(r) && strings.Contains(errMsg, "[collapse] second level of collapsing") {
+				if strings.Contains(errMsg, "[collapse] second level of collapsing") {
 					errType = "parse_exception"
 				}
 			case strings.HasPrefix(errMsg, "parse_exception: "):
@@ -10201,7 +10450,7 @@ func (s *Server) handleDorisExplain(w http.ResponseWriter, r *http.Request) {
 				}
 			case strings.HasPrefix(errMsg, "parsing_exception: "):
 				errMsg = strings.TrimPrefix(errMsg, "parsing_exception: ")
-				if !s.isES8Mode(r) && strings.Contains(errMsg, "[collapse] unknown field [collapse]") {
+				if strings.Contains(errMsg, "[collapse] unknown field [collapse]") {
 					errType = "parse_exception"
 				}
 			}
@@ -10229,6 +10478,11 @@ func (s *Server) handleDorisExplain(w http.ResponseWriter, r *http.Request) {
 		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", uriErr)
 		return
 	}
+	if rrfErr := req.ValidateRRFWindowSize(10); rrfErr != nil {
+		eType, eReason := splitESExceptionErrorR61Search(rrfErr, "illegal_argument_exception")
+		writeESError(w, http.StatusBadRequest, eType, eReason)
+		return
+	}
 	if !s.isES8Mode(r) {
 		for _, dv := range req.DocvalueFields {
 			if strings.EqualFold(strings.TrimSpace(dv.Format), "use_field_mapping") {
@@ -10237,9 +10491,17 @@ func (s *Server) handleDorisExplain(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	if s.hasExplicitTargetESVersion() && req.Collapse != nil && len(req.Rescore) > 0 {
+	if s.hasExplicitTargetESVersion() && !s.isES8Mode(r) && req.Collapse != nil && len(req.Rescore) > 0 {
 		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "cannot use `collapse` in conjunction with `rescore`")
 		return
+	}
+	if s.hasExplicitTargetESVersion() && s.isES8Mode(r) && req.Collapse != nil {
+		for _, ih := range req.Collapse.InnerHits {
+			if strings.TrimSpace(ih.Name) == "" {
+				writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "[inner_hits] requires a [name] when collapsing")
+				return
+			}
+		}
 	}
 	writeJSON(w, http.StatusOK, s.buildDorisExplainObject(r.Context(), r.PathValue("index"), &req))
 }
@@ -10500,6 +10762,11 @@ func (s *Server) handleMSearch(w http.ResponseWriter, r *http.Request) {
 				req.TrackTotalHits = true
 			}
 		}
+		if rrfErr := req.ValidateRRFWindowSize(10); rrfErr != nil {
+			eType, eReason := splitESExceptionErrorR61Search(rrfErr, "illegal_argument_exception")
+			responses = append(responses, buildMSearchErrItem(http.StatusBadRequest, eType, eReason, targetIdx))
+			continue
+		}
 		if hdr.TerminateAfter != nil {
 			if *hdr.TerminateAfter <= 0 {
 				responses = append(responses, buildMSearchErrItem(http.StatusBadRequest, "illegal_argument_exception", fmt.Sprintf("[terminate_after] must be greater than 0, got [%d]", *hdr.TerminateAfter), ""))
@@ -10665,8 +10932,18 @@ func (s *Server) executeSearchRequest(
 		targets = openTargets
 	}
 	if len(targets) == 0 {
-		// If wildcard/all/empty pattern or ignore_unavailable matched nothing, return empty 200 search response with 0 shards.
+		// If wildcard/all/empty pattern or ignore_unavailable matched nothing, still enforce search request parameter/ES8 construct validation before returning 200.
 		if ignoreUnavailSearch || hasExclusionOrWildcard(rawIndexPattern) || rawIndexPattern == "" || rawIndexPattern == "_all" || s.hasAuthoritativeIndexCatalog() {
+			if req != nil {
+				var httpReqEarly *http.Request
+				if execMetaEarly != nil {
+					httpReqEarly = execMetaEarly.httpReq
+				}
+				hasScrollEarly := httpReqEarly != nil && httpReqEarly.URL != nil && httpReqEarly.URL.Query().Has("scroll")
+				if limSt, limType, limReason := s.validateSearchLimitsAndParamsR62Search(ctx, httpReqEarly, req, nil, nil, hasScrollEarly); limSt != 0 {
+					return nil, limSt, limType, limReason
+				}
+			}
 			emptyResp := buildESResponse(rawIndexPattern, nil, req, nil, nil, 1, nil)
 			emptyResp["_shards"] = map[string]any{"total": 0, "successful": 0, "skipped": 0, "failed": 0}
 			return emptyResp, http.StatusOK, "", ""
@@ -10933,6 +11210,11 @@ func (s *Server) executeSearchRequest(
 	if req != nil && req.Rank != nil && req.Rank.RRF != nil {
 		return s.executeRRFSearchR62Search(ctx, httpReq, rawIndexPattern, targets, req, start)
 	}
+	if req != nil && len(req.EffectiveAggs()) > 0 {
+		if eType, eReason, hasErr := validateTermsOrderPathsR65(s, req.EffectiveAggs()); hasErr {
+			return nil, http.StatusBadRequest, eType, eReason
+		}
+	}
 
 	from := 0
 	if req.From != nil && *req.From > 0 && len(req.SearchAfter) == 0 {
@@ -10951,7 +11233,7 @@ func (s *Server) executeSearchRequest(
 			}
 		}
 	}
-	needsRuntimeScriptEval := req.Slice != nil || reqHasRuntimeMappings || queryHasRuntimeScript(req.Query) || aliasFiltersHaveRuntimeScript(aliasFilters) || queryHasRuntimeScript(req.PostFilter) || sortsHaveScript(req.Sort) || aggsHaveRuntimeScript(req.EffectiveAggs()) || aggsHaveAutoDateOrSignificantTextR62Search(req.EffectiveAggs()) || aggsHaveHDRPercentilesRound60(req.EffectiveAggs()) || (schemasHaveDocCountFieldR63(rawSchemasForVal) && len(req.EffectiveAggs()) > 0) || searchReqNeedsSpatialEvalR64(targets, rawSchemasForVal, req, aliasFilters) || queryHasMinScore(req.Query) || aliasFiltersHaveMinScore(aliasFilters) || (req.MinScore != nil && (size == 0 || queryHasRuntimeScript(req.Query) || aliasFiltersHaveRuntimeScript(aliasFilters) || queryHasNestedScoring(req.Query) || len(req.IndicesBoost) > 0)) || (queryHasNestedScoring(req.Query) && (req.Collapse != nil || len(req.SearchAfter) > 0))
+	needsRuntimeScriptEval := req.Slice != nil || reqHasRuntimeMappings || queryHasRuntimeScript(req.Query) || aliasFiltersHaveRuntimeScript(aliasFilters) || queryHasRuntimeScript(req.PostFilter) || sortsHaveScript(req.Sort) || aggsHaveRuntimeScript(req.EffectiveAggs()) || aggsHaveAutoDateOrSignificantTextR62Search(req.EffectiveAggs()) || aggsHaveStringStatsR65(req.EffectiveAggs()) || aggsHaveHDRPercentilesRound60(req.EffectiveAggs()) || aggsHaveCumulativeCardinalityR65(req.EffectiveAggs()) || (schemasHaveDocCountFieldR63(rawSchemasForVal) && len(req.EffectiveAggs()) > 0) || searchReqNeedsSpatialEvalR64(targets, rawSchemasForVal, req, aliasFilters) || queryHasMinScore(req.Query) || aliasFiltersHaveMinScore(aliasFilters) || (req.MinScore != nil && (size == 0 || queryHasRuntimeScript(req.Query) || aliasFiltersHaveRuntimeScript(aliasFilters) || queryHasNestedScoring(req.Query) || len(req.IndicesBoost) > 0)) || (queryHasNestedScoring(req.Query) && (req.Collapse != nil || len(req.SearchAfter) > 0))
 
 	var allHits []HitRow
 	var allFetchedHits []HitRow
@@ -10968,12 +11250,29 @@ func (s *Server) executeSearchRequest(
 	var allUnindexedFields []string
 	seenUnindexed := make(map[string]struct{})
 	rescoreWin := maxRescoreWindow(req, from+size)
+	rawSchemasByIdxR65 := make(map[string]*schema.IndexSchema, len(targets))
+	for _, tName := range targets {
+		rawSchemasByIdxR65[tName] = s.getOrCompileReadOnlySchema(ctx, tName)
+	}
+	vtFailedMapR65 := detectCrossIndexTermsValueTypeShardFailureMapR65(targets, rawSchemasByIdxR65, req.EffectiveAggs())
 
 	for _, indexName := range targets {
 		rawIdxSchema := s.getOrCompileReadOnlySchema(ctx, indexName)
 		if req != nil && req.Source != nil && !req.Source.Disabled && isIndexSourceDisabledRound59(rawIdxSchema) {
 			return nil, http.StatusBadRequest, "illegal_argument_exception",
 				fmt.Sprintf("unable to fetch fields from _source field: _source is disabled in the mappings for index [%s]", indexName)
+		}
+		if len(req.RuntimeMappings) > 0 && rawIdxSchema != nil {
+			if rawIdxSchema.IndexMode == "time_series" {
+				if tsRPErr := schema.ValidateTSDBRuntimeFieldsRoutingPath(rawIdxSchema.RoutingPath, req.RuntimeMappings); tsRPErr != nil {
+					eType, eReason := splitESExceptionErrorR61Search(tsRPErr, "illegal_argument_exception")
+					return nil, http.StatusBadRequest, eType, eReason
+				}
+			}
+			if tsShErr := schema.ValidateTSDBRuntimeShadowing(rawIdxSchema, req.RuntimeMappings); tsShErr != nil {
+				eType, eReason := splitESExceptionErrorR61Search(tsShErr, "illegal_argument_exception")
+				return nil, http.StatusBadRequest, eType, eReason
+			}
 		}
 		if rtValErr := ValidateRuntimeMappingsPainlessRound61(rawIdxSchema, req.RuntimeMappings); rtValErr != nil {
 			var compErr *painless.ScriptCompileError
@@ -10990,6 +11289,9 @@ func (s *Server) executeSearchRequest(
 		idxSchema := s.augmentSchemaWithRuntimeMappings(rawIdxSchema, req.RuntimeMappings)
 		hasRuntimeMappings := len(effectiveRuntimeMappings(rawIdxSchema, req.RuntimeMappings)) > 0
 		schemasByIndex[indexName] = idxSchema
+		if vtFailedMapR65[indexName] != "" {
+			continue
+		}
 		if primarySchema == nil {
 			primarySchema = idxSchema
 		}
@@ -11024,6 +11326,17 @@ func (s *Server) executeSearchRequest(
 			subReq.PostFilter = nil
 			subReq.MinScore = nil
 			if hasRuntimeMappings {
+				if aggsHaveTopMetricsR65(req.EffectiveAggs()) {
+					valAggReq := esast.SearchRequest{
+						Aggs:            req.EffectiveAggs(),
+						RuntimeMappings: req.RuntimeMappings,
+					}
+					valTr := transpiler.NewTranspiler(rawIdxSchema, s.effectiveTranspileOptsForIndexR62Search(httpReq, indexName, rawIdxSchema, req.RuntimeMappings))
+					if _, valErr := valTr.BuildSearchPlan(&valAggReq); valErr != nil {
+						eType, eReason := splitESExceptionErrorR61Search(valErr, "illegal_argument_exception")
+						return nil, http.StatusBadRequest, "search_phase_execution_exception", "all_shards_failed|" + eType + "|" + eReason
+					}
+				}
 				subReq.Query = nil
 				subReq.Sort = nil
 				subReq.Aggs = nil
@@ -11032,7 +11345,12 @@ func (s *Server) executeSearchRequest(
 				valReq := applyIndexAliasFilter(&subReq, aliasFilters[indexName])
 				valTr := transpiler.NewTranspiler(idxSchema, s.effectiveTranspileOptsForIndexR62Search(httpReq, indexName, idxSchema, req.RuntimeMappings))
 				if _, valErr := valTr.BuildSearchPlan(valReq); valErr != nil {
-					return nil, http.StatusBadRequest, "search_phase_execution_exception", rewriteTranspilerMaxRegexLengthErrorR63(valErr.Error())
+					msg := rewriteTranspilerMaxRegexLengthErrorR63(valErr.Error())
+					if msg != valErr.Error() || strings.HasPrefix(msg, "all_shards_failed|") {
+						return nil, http.StatusBadRequest, "search_phase_execution_exception", msg
+					}
+					eType, eReason := splitESExceptionErrorR61Search(valErr, "illegal_argument_exception")
+					return nil, http.StatusBadRequest, "search_phase_execution_exception", "all_shards_failed|" + eType + "|" + eReason
 				}
 				subReq.Query = nil
 				subReq.PostFilter = nil
@@ -11103,6 +11421,9 @@ func (s *Server) executeSearchRequest(
 		}
 		trOpts := s.effectiveTranspileOptsForIndexR62Search(httpReq, indexName, sqlSchema, req.RuntimeMappings)
 		trOpts.CallerSize = size
+		if searchScope != nil && len(searchScope.rawBody) > 0 {
+			trOpts.RawHistBounds = extractRawHistBoundsFromBodyR65(searchScope.rawBody)
+		}
 		if subReqPtr != nil && subReqPtr.Size != nil && *subReqPtr.Size > maxWin {
 			if sqlSchema != nil && sqlSchema.MaxResultWindow > 0 {
 				schemaCopy := *sqlSchema
@@ -11116,7 +11437,12 @@ func (s *Server) executeSearchRequest(
 		tr := transpiler.NewTranspiler(sqlSchema, trOpts)
 		plan, err := tr.BuildSearchPlan(subReqPtr)
 		if err != nil {
-			return nil, http.StatusBadRequest, "search_phase_execution_exception", rewriteTranspilerMaxRegexLengthErrorR63(err.Error())
+			msg := rewriteTranspilerMaxRegexLengthErrorR63(err.Error())
+			if msg != err.Error() || strings.HasPrefix(msg, "all_shards_failed|") {
+				return nil, http.StatusBadRequest, "search_phase_execution_exception", msg
+			}
+			eType, eReason := splitESExceptionErrorR61Search(err, "illegal_argument_exception")
+			return nil, http.StatusBadRequest, "search_phase_execution_exception", "all_shards_failed|" + eType + "|" + eReason
 		}
 		unindexedFieldsForPlan := plan.UnindexedVariantFields
 		if hasRuntimeMappings && req != nil {
@@ -11261,7 +11587,7 @@ func (s *Server) executeSearchRequest(
 					}
 					globalHits = append(globalHits, gh)
 				}
-			} else if (req.Query != nil && globalAggsHaveRuntimeScript(req.EffectiveAggs())) || aggsHaveSignificantTextR63(req.EffectiveAggs()) || ((queryHasRuntimeScript(aliasFilters[indexName]) || queryHasMinScore(aliasFilters[indexName])) && aggsHaveGlobalAgg(req.EffectiveAggs())) {
+			} else if (req.Query != nil && globalAggsHaveRuntimeScript(req.EffectiveAggs())) || aggsHaveSignificantTextR63(req.EffectiveAggs()) || (req.Query != nil && aggsHaveChildrenOrParentR65(req.EffectiveAggs())) || ((queryHasRuntimeScript(aliasFilters[indexName]) || queryHasMinScore(aliasFilters[indexName])) && aggsHaveGlobalAgg(req.EffectiveAggs())) {
 				zero := 0
 				fetchAll := 10000
 				gReq := esast.SearchRequest{
@@ -11679,7 +12005,8 @@ func (s *Server) executeSearchRequest(
 			}
 			return allHits[i].ID < allHits[j].ID
 		})
-		if rescoreWin > 0 && len(allHits) > 0 {
+		collapseBeforeRescore := isES8 && s.hasExplicitTargetESVersion()
+		if !collapseBeforeRescore && rescoreWin > 0 && len(allHits) > 0 {
 			allHits = s.applyRescoreToHits(req, allHits, schemasByIndex, primarySchema, from+size)
 			allPostFilterHits = append([]HitRow(nil), allHits...)
 			if req.PostFilter == nil {
@@ -11687,6 +12014,12 @@ func (s *Server) executeSearchRequest(
 			}
 		}
 		if req.Collapse != nil && req.Collapse.Field != "" && len(allHits) > 0 {
+			if collapseBeforeRescore || rescoreWin == 0 {
+				allPostFilterHits = append([]HitRow(nil), allHits...)
+				if req.PostFilter == nil {
+					allFetchedHits = append([]HitRow(nil), allHits...)
+				}
+			}
 			seenCollapse := make(map[string]struct{}, len(allHits))
 			deduped := make([]HitRow, 0, len(allHits))
 			collapseSort := []esast.SortSpec{{Entry: esast.SortEntry{Field: req.Collapse.Field}}}
@@ -11703,13 +12036,20 @@ func (s *Server) executeSearchRequest(
 					}
 					seenCollapse[ck] = struct{}{}
 				}
-				if len(req.SearchAfter) > 0 && !hitIsAfterSearchAfter(h, effSorts, req.SearchAfter, hSchema) {
-					continue
-				}
 				deduped = append(deduped, h)
 			}
 			allHits = deduped
-		} else if len(req.SearchAfter) > 0 && (needsRuntimeScriptEval || rescoreWin > 0) && len(allHits) > 0 {
+		}
+		if collapseBeforeRescore && rescoreWin > 0 && len(allHits) > 0 {
+			allHits = s.applyRescoreToHits(req, allHits, schemasByIndex, primarySchema, from+size)
+			if req.Collapse == nil || req.Collapse.Field == "" {
+				allPostFilterHits = append([]HitRow(nil), allHits...)
+				if req.PostFilter == nil {
+					allFetchedHits = append([]HitRow(nil), allHits...)
+				}
+			}
+		}
+		if len(req.SearchAfter) > 0 && ((req.Collapse != nil && req.Collapse.Field != "") || needsRuntimeScriptEval || rescoreWin > 0) && len(allHits) > 0 {
 			afterFiltered := make([]HitRow, 0, len(allHits))
 			for _, h := range allHits {
 				hSchema := schemasByIndex[h.Index]
@@ -11739,10 +12079,17 @@ func (s *Server) executeSearchRequest(
 			allAggRows = replaceAutoDateAggRowsAcrossIndicesR62Search(allAggRows, req.EffectiveAggs(), allFetchedHits, schemasByIndex, primarySchema)
 		}
 	} else if rescoreWin > 0 && len(allHits) > 0 {
-		allHits = s.applyRescoreToHits(req, allHits, schemasByIndex, primarySchema, from+size)
+		collapseBeforeRescore := isES8 && s.hasExplicitTargetESVersion()
 		allPostFilterHits = append([]HitRow(nil), allHits...)
 		if req.PostFilter == nil {
 			allFetchedHits = append([]HitRow(nil), allHits...)
+		}
+		if !collapseBeforeRescore {
+			allHits = s.applyRescoreToHits(req, allHits, schemasByIndex, primarySchema, from+size)
+			allPostFilterHits = append([]HitRow(nil), allHits...)
+			if req.PostFilter == nil {
+				allFetchedHits = append([]HitRow(nil), allHits...)
+			}
 		}
 		if req.Collapse != nil && req.Collapse.Field != "" && len(allHits) > 0 {
 			seenCollapse := make(map[string]struct{}, len(allHits))
@@ -11757,13 +12104,20 @@ func (s *Server) executeSearchRequest(
 					}
 					seenCollapse[ck] = struct{}{}
 				}
-				if len(req.SearchAfter) > 0 && !hitIsAfterSearchAfter(h, effSorts, req.SearchAfter, primarySchema) {
-					continue
-				}
 				deduped = append(deduped, h)
 			}
 			allHits = deduped
-		} else if len(req.SearchAfter) > 0 && len(allHits) > 0 {
+		}
+		if collapseBeforeRescore && len(allHits) > 0 {
+			allHits = s.applyRescoreToHits(req, allHits, schemasByIndex, primarySchema, from+size)
+			if req.Collapse == nil || req.Collapse.Field == "" {
+				allPostFilterHits = append([]HitRow(nil), allHits...)
+				if req.PostFilter == nil {
+					allFetchedHits = append([]HitRow(nil), allHits...)
+				}
+			}
+		}
+		if len(req.SearchAfter) > 0 && len(allHits) > 0 {
 			afterFiltered := make([]HitRow, 0, len(allHits))
 			for _, h := range allHits {
 				if hitIsAfterSearchAfter(h, effSorts, req.SearchAfter, primarySchema) {
@@ -11996,9 +12350,13 @@ func (s *Server) executeSearchRequest(
 		if len(targets) > 1 {
 			allAggRows = recomputeMultiIndexMatrixStatsRowsWave3R63(s, req.EffectiveAggs(), allFetchedHits, schemasByIndex, primarySchema, allAggRows)
 			allAggRows = recomputeMultiIndexSpatialAggsR64(req.EffectiveAggs(), allFetchedHits, schemasByIndex, primarySchema, allAggRows)
+			allAggRows = recomputeMultiIndexMultiTermsR65(req.EffectiveAggs(), allFetchedHits, schemasByIndex, primarySchema, allAggRows)
 		}
 		if hasIdxTermsZero {
 			allAggRows = injectZeroIndexTermsAggRowsR64("", req.EffectiveAggs(), targets, perIdxHasDocs, allAggRows)
+		}
+		if s.hasExplicitTargetESVersion() && req.Query != nil {
+			allAggRows = s.injectZeroFieldTermsAggRowsR65(ctx, req, targets, aliasFilters, allAggRows)
 		}
 		if waErr := checkWeightedAvgMultiWeightOnDocsR63(req.EffectiveAggs(), allFetchedHits, schemasByIndex, primarySchema); waErr != nil {
 			eType, eReason := splitESExceptionErrorR61Search(waErr, "illegal_argument_exception")
@@ -12035,12 +12393,26 @@ func (s *Server) executeSearchRequest(
 				}
 			}
 			applyNestedTopHitsInAggsTreeR61Search(req.Query, req.EffectiveAggs(), aggsOut, allFetchedHits, primarySchema)
+			if aggsHaveCumulativeCardinalityR65(req.EffectiveAggs()) {
+				applyTrueCumulativeCardinalityWithHitsR65(req.EffectiveAggs(), aggsOut, allFetchedHits, primarySchema)
+			}
 			if pipeErr := reEvaluatePipelineAggsTreeR61Search(req.EffectiveAggs(), aggsOut); pipeErr != nil {
 				eType, eReason := splitESExceptionErrorR61Search(pipeErr, "script_exception")
 				return nil, http.StatusBadRequest, "search_phase_execution_exception", "all_shards_failed|" + eType + "|" + eReason
 			}
+			if stErr := validateStatsDateFormattingOverflowR65(aggsOut, req.EffectiveAggs(), schemasByIndex, primarySchema, isES8); stErr != nil {
+				eType, eReason := splitESExceptionErrorR61Search(stErr, "illegal_argument_exception")
+				return nil, http.StatusBadRequest, "search_phase_execution_exception", "all_shards_failed|" + eType + "|" + eReason
+			}
 			if s.hasExplicitTargetESVersion() {
+				if pipeValErr := validateTopHitsAndPipelineScriptErrorsR65(req.EffectiveAggs(), allAggRows, aggsOut, docLookup); pipeValErr != nil {
+					eType, eReason := splitESExceptionErrorR61Search(pipeValErr, "script_exception")
+					return nil, http.StatusBadRequest, "search_phase_execution_exception", "all_shards_failed|" + eType + "|" + eReason
+				}
 				reEvaluatePercentilesBucketWithScopeR63(searchScope, req.EffectiveAggs(), aggsOut)
+				if isES8 {
+					reEvaluateES8NormalizeInAggsTreeR65(req.EffectiveAggs(), aggsOut)
+				}
 			}
 		}
 	}
@@ -13564,8 +13936,10 @@ func aggTypePrefix(spec esast.AggSpec) string {
 		return "derivative"
 	case spec.CumulativeCardinality != nil:
 		return "cumulative_cardinality"
-	case spec.EffectiveCumulative() != nil:
+	case spec.EffectiveCumulativeSum() != nil:
 		return "cumulative_sum"
+	case spec.MovingPercentiles != nil:
+		return "moving_percentiles"
 	case spec.MovingAvg != nil:
 		return "moving_avg"
 	case spec.EffectiveMovingAvg() != nil:
@@ -14257,7 +14631,7 @@ func buildESResponseWithSchemas(indexName string, idxSchema *schema.IndexSchema,
 					}
 					fm["_percolator_document_slot"] = slotAny
 					for mqKey, mqVals := range collectPercolateMultiDocMatchedQueriesMapR63(hitSchema, getDoc(), req.Query) {
-						fm[mqKey] = orderMatchedQueriesByRawSourceR63(h.EffectiveSource(), mqVals)
+						fm[mqKey] = mqVals
 					}
 					hitMap["fields"] = fm
 				}
@@ -14271,7 +14645,7 @@ func buildESResponseWithSchemas(indexName string, idxSchema *schema.IndexSchema,
 						fm["_percolator_document_slot"] = []any{0}
 					}
 					for mqKey, mqVals := range slotMQ {
-						fm[mqKey] = orderMatchedQueriesByRawSourceR63(h.EffectiveSource(), mqVals)
+						fm[mqKey] = mqVals
 					}
 					hitMap["fields"] = fm
 				}
@@ -15383,7 +15757,7 @@ func (s *Server) populateCollapseInnerHits(
 			return uncollapsed[i].ID < uncollapsed[j].ID
 		})
 	}
-	if len(req.Rescore) > 0 && len(uncollapsed) > 0 {
+	if (!s.hasExplicitTargetESVersion() || !strings.HasPrefix(s.getTargetESVersion(), "8.")) && len(req.Rescore) > 0 && len(uncollapsed) > 0 {
 		defaultWin := 10
 		if req.Size != nil {
 			from := 0
@@ -15394,7 +15768,6 @@ func (s *Server) populateCollapseInnerHits(
 		}
 		uncollapsed = s.applyRescoreToHits(req, uncollapsed, schemasByIndex, primarySchema, defaultWin)
 	}
-
 	collapseSort := []esast.SortSpec{{Entry: esast.SortEntry{Field: req.Collapse.Field}}}
 	byGroup := make(map[string][]HitRow)
 	for _, cand := range uncollapsed {
@@ -15552,17 +15925,17 @@ func buildAggsMapWithSchema(
 			b := make([]map[string]any, 0, len(rows))
 			sigTotal := totalHits
 			sigBGTotal := totalHits
-			if isSigText {
-				if bgRows := bucketsByAgg[fullKey+".__sig_bg"]; len(bgRows) > 0 {
-					sigBGTotal = bgRows[0].effectiveCount()
-				}
+			bgRows := bucketsByAgg[fullKey+".__sig_bg"]
+			hasSigBG := len(bgRows) > 0
+			if hasSigBG {
+				sigBGTotal = bgRows[0].effectiveCount()
 			}
 			for _, r := range rows {
 				if dc := r.effectiveCount(); dc > sigTotal {
 					sigTotal = dc
 				}
 			}
-			if !isSigText {
+			if !isSigText && !hasSigBG {
 				sigBGTotal = sigTotal
 			}
 			bgDenom := float64(sigBGTotal)
@@ -15579,9 +15952,9 @@ func buildAggsMapWithSchema(
 				if hasKeyAsStr {
 					bucketMap["key_as_string"] = keyAsStr
 				}
-				if isSigText {
+				if isSigText || hasSigBG {
 					bgCnt := int64(r.Weight)
-					if bgCnt <= 0 {
+					if !hasSigBG && bgCnt <= 0 {
 						bgCnt = docCnt
 					}
 					bucketMap["score"] = r.Value
@@ -15841,8 +16214,8 @@ func buildAggsMapWithSchema(
 			case spec.Max != nil:
 				mSpec = spec.Max
 			}
-			if mSpec != nil && idxSchema != nil && mSpec.Field != "" {
-				b := idxSchema.ResolveField(mSpec.Field)
+			if mSpec != nil && mSpec.Field != "" {
+				b := resolveFieldAcrossDocLookupAndSchemaR65(mSpec.Field, idxSchema, docLookup)
 				if b.ESType == "date" || b.ESType == "date_nanos" {
 					fmtS := mSpec.Format
 					if fmtS == "" {
@@ -15875,36 +16248,58 @@ func buildAggsMapWithSchema(
 		case spec.StringStats != nil:
 			var cntVal int64
 			var minLen, maxLen, avgLen, entropyVal float64
+			var totalChars int64
+			charCounts := make(map[string]int64)
 			for _, r := range rows {
-				switch r.BucketKey {
-				case "_stats_count", "_sstats_count":
+				switch {
+				case r.BucketKey == "_stats_count" || r.BucketKey == "_sstats_count":
 					cntVal = r.effectiveCount()
-				case "_stats_min", "_sstats_min":
+				case r.BucketKey == "_stats_min" || r.BucketKey == "_sstats_min":
 					minLen = r.effectiveValue()
-				case "_stats_max", "_sstats_max":
+				case r.BucketKey == "_stats_max" || r.BucketKey == "_sstats_max":
 					maxLen = r.effectiveValue()
-				case "_stats_avg", "_sstats_avg":
+				case r.BucketKey == "_stats_avg" || r.BucketKey == "_sstats_avg":
 					avgLen = r.effectiveValue()
-				case "_stats_entropy", "_sstats_entropy":
+				case r.BucketKey == "_stats_entropy" || r.BucketKey == "_sstats_entropy":
 					entropyVal = r.effectiveValue()
+				case r.BucketKey == "_sstats_total_chars":
+					totalChars = r.effectiveCount()
+				case strings.HasPrefix(r.BucketKey, "_sstats_dist:"):
+					ch := strings.TrimPrefix(r.BucketKey, "_sstats_dist:")
+					charCounts[ch] = r.effectiveCount()
 				}
 			}
+			showDist := aggHasShowDistributionFromRawR65(scopeRawBodyR63(scopeFromDocLookupR63(docLookup)), fullKey)
 			if cntVal == 0 {
-				aggsOut[aggName] = map[string]any{
+				ssObj := map[string]any{
 					"count":      int64(0),
 					"min_length": nil,
 					"max_length": nil,
 					"avg_length": nil,
 					"entropy":    0.0,
 				}
+				if showDist {
+					ssObj["distribution"] = map[string]any{}
+				}
+				aggsOut[aggName] = ssObj
 			} else {
-				aggsOut[aggName] = map[string]any{
+				ssObj := map[string]any{
 					"count":      cntVal,
 					"min_length": int64(minLen),
 					"max_length": int64(maxLen),
 					"avg_length": avgLen,
 					"entropy":    entropyVal,
 				}
+				if showDist {
+					distMap := make(map[string]any, len(charCounts))
+					if totalChars > 0 {
+						for ch, c := range charCounts {
+							distMap[ch] = float64(c) / float64(totalChars)
+						}
+					}
+					ssObj["distribution"] = distMap
+				}
+				aggsOut[aggName] = ssObj
 			}
 		case spec.Boxplot != nil:
 			hasValidBox := false
@@ -16021,7 +16416,8 @@ func buildAggsMapWithSchema(
 				aggsOut[aggName] = map[string]any{"values": valuesMap}
 			}
 		case spec.DateHistogram != nil:
-			rows = synthesizeDateHistogramBuckets(rows, spec.DateHistogram)
+			dhEff := resolveDateHistogramWithSchemaFormatR65(spec.DateHistogram, idxSchema, docLookup)
+			rows = synthesizeDateHistogramBuckets(rows, dhEff)
 			if len(rows) > 1 {
 				sort.SliceStable(rows, func(i, j int) bool {
 					ki, _ := strconv.ParseInt(rows[i].BucketKey, 10, 64)
@@ -16033,7 +16429,7 @@ func buildAggsMapWithSchema(
 			subAggs := spec.SubAggs()
 			for _, r := range rows {
 				epochMs, _ := strconv.ParseInt(r.BucketKey, 10, 64)
-				keyStr := formatDateHistogramKeyAsStringRound59(epochMs, spec.DateHistogram)
+				keyStr := formatDateHistogramKeyAsStringRound59(epochMs, dhEff)
 				bucketMap := map[string]any{
 					"key_as_string": keyStr,
 					"key":           epochMs,
@@ -16069,7 +16465,7 @@ func buildAggsMapWithSchema(
 			for _, r := range rows {
 				numKey, _ := parseFiniteFloat(r.BucketKey)
 				bucketMap := map[string]any{
-					"key":       numKey,
+					"key":       formatHistogramBucketKeyAnyR65(r.BucketKey, numKey, spec.Histogram, idxSchema),
 					"doc_count": r.effectiveCount(),
 				}
 				if spec.Histogram.Format != "" {
@@ -16959,11 +17355,35 @@ func buildTopMetricsObject(rows []AggRow, spec *esast.TopMetricsAggSpec, docLook
 							v = fv
 						}
 					}
+					if v != nil && c.hit.Schema != nil {
+						b := c.hit.Schema.ResolveField(mf)
+						if b.ESType == "date" || b.ESType == "date_nanos" {
+							if ms, okMs := parseAnyDateValueMillisR65(v, b.Format); okMs {
+								v = formatDateHistogramKeyAsStringRound59(ms, &esast.DateHistogramAggSpec{Format: b.Format})
+							}
+						}
+					}
 					metricsMap[mf] = v
 				}
 			}
 			if len(spec.Sort) > 0 {
 				sortVals = extractHitSortValues(*c.hit, spec.Sort, c.hit.Schema)
+				for idx, sp := range spec.Sort {
+					if idx >= len(sortVals) || sortVals[idx] == nil || c.hit.Schema == nil {
+						continue
+					}
+					sf := resolveSortEntryField(sp, c.hit.Schema)
+					if sf == "" || sf == "_score" || sf == "_id" || sf == "_index" || sf == "_script" || sf == "_geo_distance" {
+						continue
+					}
+					b := c.hit.Schema.ResolveField(sf)
+					nt := strings.ToLower(strings.TrimSpace(sp.Entry.NumericType))
+					if (b.ESType == "date" || b.ESType == "date_nanos") && nt != "long" && nt != "double" {
+						if ms, okMs := toInt64(sortVals[idx]); okMs {
+							sortVals[idx] = formatDateHistogramKeyAsStringRound59(ms, &esast.DateHistogramAggSpec{Format: b.Format})
+						}
+					}
+				}
 			}
 		}
 		entry := map[string]any{
@@ -17034,9 +17454,11 @@ func filterAndSortTermsRowsWithSubAggs(
 		})
 	}
 	type termsOrderCriterion struct {
-		field       string
-		desc        bool
-		metricByKey map[string]float64
+		field          string
+		desc           bool
+		metricByKey    map[string]float64
+		metricAnyByKey map[string]any
+		isAnyMetric    bool
 	}
 	var criteria []termsOrderCriterion
 	var lazyTmpBuckets []map[string]any
@@ -17044,7 +17466,10 @@ func filterAndSortTermsRowsWithSubAggs(
 		dirStr := extractCompositeSourceOrder(v)
 		desc := !strings.EqualFold(dirStr, "asc")
 		var metricByKey map[string]float64
+		var metricAnyByKey map[string]any
+		var isAnyMetric bool
 		if field != "_count" && field != "_key" && field != "_term" {
+			_, _, targetIsTopMetrics, resolvedTarget := resolveTermsOrderTargetSubAggR65(subAggs, field)
 			normField := strings.ReplaceAll(strings.TrimSpace(field), ">", ".")
 			var keyedBucketKey string
 			for {
@@ -17232,90 +17657,92 @@ func filterAndSortTermsRowsWithSubAggs(
 				return m
 			}
 			basePath := fullKey + "." + subName
-			switch prop {
-			case "variance", "variance_population":
-				stds := readSubSeries(basePath+"._stats_std", false)
-				metricByKey = make(map[string]float64, len(stds))
-				for k, std := range stds {
-					metricByKey[k] = std * std
-				}
-			case "variance_sampling", "std_deviation_sampling":
-				stds := readSubSeries(basePath+"._stats_std", false)
-				cnts := readSubSeries(basePath+"._stats_count", true)
-				metricByKey = make(map[string]float64, len(stds))
-				for k, std := range stds {
-					if cnt := cnts[k]; cnt > 1 {
-						vs := (std * std * cnt) / (cnt - 1.0)
-						if prop == "std_deviation_sampling" {
-							metricByKey[k] = math.Sqrt(vs)
-						} else {
-							metricByKey[k] = vs
-						}
+			if !resolvedTarget || !targetIsTopMetrics {
+				switch prop {
+				case "variance", "variance_population":
+					stds := readSubSeries(basePath+"._stats_std", false)
+					metricByKey = make(map[string]float64, len(stds))
+					for k, std := range stds {
+						metricByKey[k] = std * std
 					}
-				}
-			case "std_deviation_bounds.upper", "std_deviation_bounds.lower", "std_deviation_bounds.upper_sampling", "std_deviation_bounds.lower_sampling":
-				sigma := 2.0
-				if subSpec, ok := subAggs[subName]; ok {
-					if st := subSpec.EffectiveStats(); st != nil {
-						sigma = st.EffectiveSigma()
-					}
-				}
-				stds := readSubSeries(basePath+"._stats_std", false)
-				avgs := readSubSeries(basePath+"._stats_avg", false)
-				isSampling := strings.HasSuffix(prop, "_sampling")
-				var cnts map[string]float64
-				if isSampling {
-					cnts = readSubSeries(basePath+"._stats_count", true)
-				}
-				isUpper := strings.Contains(prop, ".upper")
-				metricByKey = make(map[string]float64, len(avgs))
-				for k, avg := range avgs {
-					std := stds[k]
-					if isSampling {
+				case "variance_sampling", "std_deviation_sampling":
+					stds := readSubSeries(basePath+"._stats_std", false)
+					cnts := readSubSeries(basePath+"._stats_count", true)
+					metricByKey = make(map[string]float64, len(stds))
+					for k, std := range stds {
 						if cnt := cnts[k]; cnt > 1 {
-							std = math.Sqrt((std * std * cnt) / (cnt - 1.0))
-						} else {
-							std = 0
+							vs := (std * std * cnt) / (cnt - 1.0)
+							if prop == "std_deviation_sampling" {
+								metricByKey[k] = math.Sqrt(vs)
+							} else {
+								metricByKey[k] = vs
+							}
 						}
 					}
-					if isUpper {
-						metricByKey[k] = avg + sigma*std
-					} else {
-						metricByKey[k] = avg - sigma*std
+				case "std_deviation_bounds.upper", "std_deviation_bounds.lower", "std_deviation_bounds.upper_sampling", "std_deviation_bounds.lower_sampling":
+					sigma := 2.0
+					if subSpec, ok := subAggs[subName]; ok {
+						if st := subSpec.EffectiveStats(); st != nil {
+							sigma = st.EffectiveSigma()
+						}
 					}
-				}
-			case "sum_of_squares":
-				metricByKey = readSubSeries(rowKey, false)
-				if len(metricByKey) == 0 {
 					stds := readSubSeries(basePath+"._stats_std", false)
 					avgs := readSubSeries(basePath+"._stats_avg", false)
-					cnts := readSubSeries(basePath+"._stats_count", true)
-					metricByKey = make(map[string]float64, len(cnts))
-					for k, cnt := range cnts {
-						avg := avgs[k]
+					isSampling := strings.HasSuffix(prop, "_sampling")
+					var cnts map[string]float64
+					if isSampling {
+						cnts = readSubSeries(basePath+"._stats_count", true)
+					}
+					isUpper := strings.Contains(prop, ".upper")
+					metricByKey = make(map[string]float64, len(avgs))
+					for k, avg := range avgs {
 						std := stds[k]
-						metricByKey[k] = cnt * (std*std + avg*avg)
+						if isSampling {
+							if cnt := cnts[k]; cnt > 1 {
+								std = math.Sqrt((std * std * cnt) / (cnt - 1.0))
+							} else {
+								std = 0
+							}
+						}
+						if isUpper {
+							metricByKey[k] = avg + sigma*std
+						} else {
+							metricByKey[k] = avg - sigma*std
+						}
 					}
-				}
-			case "lower", "upper":
-				mins := readSubSeries(basePath+".0.0", false)
-				maxs := readSubSeries(basePath+".100.0", false)
-				q1s := readSubSeries(basePath+".25.0", false)
-				q3s := readSubSeries(basePath+".75.0", false)
-				metricByKey = make(map[string]float64, len(q1s))
-				for k, q1 := range q1s {
-					q3 := q3s[k]
-					iqr := q3 - q1
-					if prop == "lower" {
-						metricByKey[k] = math.Max(mins[k], q1-1.5*iqr)
-					} else {
-						metricByKey[k] = math.Min(maxs[k], q3+1.5*iqr)
+				case "sum_of_squares":
+					metricByKey = readSubSeries(rowKey, false)
+					if len(metricByKey) == 0 {
+						stds := readSubSeries(basePath+"._stats_std", false)
+						avgs := readSubSeries(basePath+"._stats_avg", false)
+						cnts := readSubSeries(basePath+"._stats_count", true)
+						metricByKey = make(map[string]float64, len(cnts))
+						for k, cnt := range cnts {
+							avg := avgs[k]
+							std := stds[k]
+							metricByKey[k] = cnt * (std*std + avg*avg)
+						}
 					}
+				case "lower", "upper":
+					mins := readSubSeries(basePath+".0.0", false)
+					maxs := readSubSeries(basePath+".100.0", false)
+					q1s := readSubSeries(basePath+".25.0", false)
+					q3s := readSubSeries(basePath+".75.0", false)
+					metricByKey = make(map[string]float64, len(q1s))
+					for k, q1 := range q1s {
+						q3 := q3s[k]
+						iqr := q3 - q1
+						if prop == "lower" {
+							metricByKey[k] = math.Max(mins[k], q1-1.5*iqr)
+						} else {
+							metricByKey[k] = math.Min(maxs[k], q3+1.5*iqr)
+						}
+					}
+				default:
+					metricByKey = readSubSeries(rowKey, prop == "_count" || prop == "doc_count" || prop == "count")
 				}
-			default:
-				metricByKey = readSubSeries(rowKey, prop == "_count" || prop == "doc_count" || prop == "count")
 			}
-			if len(metricByKey) == 0 && len(subAggs) > 0 {
+			if (len(metricByKey) == 0 || (resolvedTarget && targetIsTopMetrics)) && len(subAggs) > 0 {
 				if lazyTmpBuckets == nil {
 					lazyTmpBuckets = make([]map[string]any, 0, len(cpRows))
 					for _, r := range cpRows {
@@ -17333,17 +17760,36 @@ func filterAndSortTermsRowsWithSubAggs(
 					}
 					lazyTmpBuckets = evaluateChildPipelineAggsWithoutBucketSort(lazyTmpBuckets, subAggs)
 				}
-				metricByKey = make(map[string]float64, len(cpRows))
-				for i, r := range cpRows {
-					if i < len(lazyTmpBuckets) {
-						if fv, okF := extractBucketMetricByPath(lazyTmpBuckets[i], field); okF && !math.IsNaN(fv) && !math.IsInf(fv, 0) {
-							metricByKey[r.BucketKey] = fv
+				if resolvedTarget && targetIsTopMetrics {
+					isAnyMetric = true
+					metricAnyByKey = make(map[string]any, len(cpRows))
+					segs := normalizeBucketsPath(field)
+					for i, r := range cpRows {
+						if i < len(lazyTmpBuckets) {
+							if av, okA := extractBucketAnyValueBySegsR65(lazyTmpBuckets[i], segs); okA && av != nil {
+								metricAnyByKey[r.BucketKey] = av
+							}
+						}
+					}
+				} else {
+					metricByKey = make(map[string]float64, len(cpRows))
+					for i, r := range cpRows {
+						if i < len(lazyTmpBuckets) {
+							if fv, okF := extractBucketMetricByPath(lazyTmpBuckets[i], field); okF && !math.IsNaN(fv) && !math.IsInf(fv, 0) {
+								metricByKey[r.BucketKey] = fv
+							}
 						}
 					}
 				}
 			}
 		}
-		criteria = append(criteria, termsOrderCriterion{field: field, desc: desc, metricByKey: metricByKey})
+		criteria = append(criteria, termsOrderCriterion{
+			field:          field,
+			desc:           desc,
+			metricByKey:    metricByKey,
+			metricAnyByKey: metricAnyByKey,
+			isAnyMetric:    isAnyMetric,
+		})
 	}
 	if spec.Order != nil {
 		switch ov := spec.Order.(type) {
@@ -17435,16 +17881,32 @@ func filterAndSortTermsRowsWithSubAggs(
 						return ci < cj
 					}
 				default:
-					vi, okI := c.metricByKey[cpRows[i].BucketKey]
-					vj, okJ := c.metricByKey[cpRows[j].BucketKey]
-					if okI != okJ {
-						return okI
-					}
-					if okI && vi != vj {
-						if c.desc {
-							return vi > vj
+					if c.isAnyMetric {
+						vi, okI := c.metricAnyByKey[cpRows[i].BucketKey]
+						vj, okJ := c.metricAnyByKey[cpRows[j].BucketKey]
+						if okI != okJ {
+							return okI
 						}
-						return vi < vj
+						if okI {
+							if cmp := compareTermsAnyOrderValR65(vi, vj); cmp != 0 {
+								if c.desc {
+									return cmp > 0
+								}
+								return cmp < 0
+							}
+						}
+					} else {
+						vi, okI := c.metricByKey[cpRows[i].BucketKey]
+						vj, okJ := c.metricByKey[cpRows[j].BucketKey]
+						if okI != okJ {
+							return okI
+						}
+						if okI && vi != vj {
+							if c.desc {
+								return vi > vj
+							}
+							return vi < vj
+						}
 					}
 				}
 			}
@@ -17775,6 +18237,21 @@ func validateChildBucketMetricDep(parentAggName, childAggName, pathStr string, s
 		}
 		if !exists {
 			if i > 0 && !isBucketAggSpec(lastSpec) {
+				if lastSpec.TopMetrics != nil {
+					remProp := strings.Join(segs[i:], ".")
+					if !topMetricsHasMetricFieldR65(lastSpec.TopMetrics, strings.TrimPrefix(remProp, "metrics.")) {
+						return fmt.Sprintf("path not supported for [%s]: [%s].", segs[i-1], remProp)
+					}
+				}
+				if lastSpec.TopHits != nil {
+					if lastSpec.TopHits.EffectiveSize() != 1 {
+						return fmt.Sprintf("property paths for top_hits [%s] require configuring it with size to 1", segs[i-1])
+					}
+					remProp := strings.Join(segs[i:], ".")
+					if remProp != "_sort" && remProp != "_score" && remProp != "_count" && remProp != "doc_count" && !strings.HasPrefix(remProp, "_source.") {
+						return fmt.Sprintf("path not supported for [%s]: [%s].", segs[i-1], remProp)
+					}
+				}
 				// Property access on a multi-value or single-value metric (e.g. the_stats.avg, v.v.value, top_hits._count)
 				return ""
 			}
@@ -17835,8 +18312,12 @@ func validatePipelineAggs(aggs map[string]esast.AggSpec) string {
 				GapPolicy:   spec.PercentilesBucket.GapPolicy,
 				Format:      spec.PercentilesBucket.Format,
 			}
-		case spec.EffectiveCumulative() != nil:
-			if errMsg := validateChildBucketMetricDep("root", aggName, spec.EffectiveCumulative().EffectivePath(), aggs); errMsg != "" {
+		case spec.EffectiveCumulativeSum() != nil:
+			if errMsg := validateChildBucketMetricDep("root", aggName, spec.EffectiveCumulativeSum().EffectivePath(), aggs); errMsg != "" {
+				return errMsg
+			}
+		case spec.IsCumulativeCardinality():
+			if errMsg := validateChildBucketMetricDep("root", aggName, spec.EffectiveCumulativeCardinality().EffectivePath(), aggs); errMsg != "" {
 				return errMsg
 			}
 		case spec.Derivative != nil:
@@ -17845,6 +18326,10 @@ func validatePipelineAggs(aggs map[string]esast.AggSpec) string {
 			}
 		case spec.EffectiveMovingAvg() != nil:
 			if errMsg := validateChildBucketMetricDep("root", aggName, spec.EffectiveMovingAvg().EffectivePath(), aggs); errMsg != "" {
+				return errMsg
+			}
+		case spec.MovingPercentiles != nil:
+			if errMsg := validateChildBucketMetricDep("root", aggName, spec.MovingPercentiles.EffectivePath(), aggs); errMsg != "" {
 				return errMsg
 			}
 		case spec.SerialDiff != nil:
@@ -17962,8 +18447,14 @@ func validatePipelineAggs(aggs map[string]esast.AggSpec) string {
 			childDeps := make(map[string][]string)
 			for subName, subSpec := range subAggs {
 				switch {
-				case subSpec.EffectiveCumulative() != nil:
-					p := subSpec.EffectiveCumulative().EffectivePath()
+				case subSpec.EffectiveCumulativeSum() != nil:
+					p := subSpec.EffectiveCumulativeSum().EffectivePath()
+					if errMsg := validateChildBucketMetricDep(aggName, subName, p, subAggs); errMsg != "" {
+						return errMsg
+					}
+					childDeps[subName] = []string{firstBucketsPathSeg(p)}
+				case subSpec.IsCumulativeCardinality():
+					p := subSpec.EffectiveCumulativeCardinality().EffectivePath()
 					if errMsg := validateChildBucketMetricDep(aggName, subName, p, subAggs); errMsg != "" {
 						return errMsg
 					}
@@ -17976,6 +18467,12 @@ func validatePipelineAggs(aggs map[string]esast.AggSpec) string {
 					childDeps[subName] = []string{firstBucketsPathSeg(p)}
 				case subSpec.EffectiveMovingAvg() != nil:
 					p := subSpec.EffectiveMovingAvg().EffectivePath()
+					if errMsg := validateChildBucketMetricDep(aggName, subName, p, subAggs); errMsg != "" {
+						return errMsg
+					}
+					childDeps[subName] = []string{firstBucketsPathSeg(p)}
+				case subSpec.MovingPercentiles != nil:
+					p := subSpec.MovingPercentiles.EffectivePath()
 					if errMsg := validateChildBucketMetricDep(aggName, subName, p, subAggs); errMsg != "" {
 						return errMsg
 					}
@@ -17993,7 +18490,7 @@ func validatePipelineAggs(aggs map[string]esast.AggSpec) string {
 					}
 					method := strings.ToLower(strings.TrimSpace(subSpec.Normalize.Method))
 					switch method {
-					case "", "percent_of_sum", "rescale_0_1", "rescale_0_100", "mean", "z-score", "z_score", "atan":
+					case "", "percent_of_sum", "rescale_0_1", "rescale_0_100", "mean", "z-score", "z_score", "softmax", "atan":
 					default:
 						return fmt.Sprintf("unknown normalize method [%s] for pipeline aggregation [%s] under [%s]", subSpec.Normalize.Method, subName, aggName)
 					}
@@ -18068,17 +18565,22 @@ func evaluateChildPipelineAggsWithoutBucketSort(buckets []map[string]any, subAgg
 	sort.Strings(subNames)
 
 	isChildMetricPipeline := func(spec esast.AggSpec) bool {
-		return spec.EffectiveCumulative() != nil || spec.Derivative != nil || spec.EffectiveMovingAvg() != nil ||
+		return spec.EffectiveCumulativeSum() != nil || spec.IsCumulativeCardinality() ||
+			spec.Derivative != nil || spec.EffectiveMovingAvg() != nil || spec.MovingPercentiles != nil ||
 			spec.SerialDiff != nil || spec.Normalize != nil || spec.BucketScript != nil
 	}
 	depsForSpec := func(spec esast.AggSpec) []string {
 		switch {
-		case spec.EffectiveCumulative() != nil:
-			return []string{firstBucketsPathSeg(spec.EffectiveCumulative().EffectivePath())}
+		case spec.EffectiveCumulativeSum() != nil:
+			return []string{firstBucketsPathSeg(spec.EffectiveCumulativeSum().EffectivePath())}
+		case spec.IsCumulativeCardinality():
+			return []string{firstBucketsPathSeg(spec.EffectiveCumulativeCardinality().EffectivePath())}
 		case spec.Derivative != nil:
 			return []string{firstBucketsPathSeg(spec.Derivative.EffectivePath())}
 		case spec.EffectiveMovingAvg() != nil:
 			return []string{firstBucketsPathSeg(spec.EffectiveMovingAvg().EffectivePath())}
+		case spec.MovingPercentiles != nil:
+			return []string{firstBucketsPathSeg(spec.MovingPercentiles.EffectivePath())}
 		case spec.SerialDiff != nil:
 			return []string{firstBucketsPathSeg(spec.SerialDiff.EffectivePath())}
 		case spec.Normalize != nil:
@@ -18118,8 +18620,8 @@ func evaluateChildPipelineAggsWithoutBucketSort(buckets []map[string]any, subAgg
 				}
 			}
 			switch {
-			case spec.EffectiveCumulative() != nil:
-				cumSpec := spec.EffectiveCumulative()
+			case spec.EffectiveCumulativeSum() != nil:
+				cumSpec := spec.EffectiveCumulativeSum()
 				pathStr := cumSpec.EffectivePath()
 				insertZeros := strings.EqualFold(cumSpec.GapPolicy, "insert_zeros")
 				keepValues := strings.EqualFold(cumSpec.GapPolicy, "keep_values")
@@ -18140,6 +18642,51 @@ func evaluateChildPipelineAggsWithoutBucketSort(buckets []map[string]any, subAgg
 					hasAny = true
 					running += v
 					b[subName] = makePipelineMetricObj(running, cumSpec.Format)
+				}
+			case spec.IsCumulativeCardinality():
+				cumSpec := spec.EffectiveCumulativeCardinality()
+				hasPrecomputed := false
+				for _, b := range buckets {
+					if _, exists := b[subName]; exists {
+						hasPrecomputed = true
+						break
+					}
+				}
+				if !hasPrecomputed {
+					pathStr := cumSpec.EffectivePath()
+					insertZeros := strings.EqualFold(cumSpec.GapPolicy, "insert_zeros")
+					keepValues := strings.EqualFold(cumSpec.GapPolicy, "keep_values")
+					var running float64
+					hasAny := false
+					for _, b := range buckets {
+						v, ok := extractBucketMetricByPath(b, pathStr)
+						if !ok {
+							if insertZeros {
+								v = 0
+							} else if keepValues && hasAny {
+								b[subName] = makePipelineMetricObj(running, cumSpec.Format)
+								continue
+							} else {
+								continue
+							}
+						}
+						hasAny = true
+						running += v
+						b[subName] = makePipelineMetricObj(running, cumSpec.Format)
+					}
+				}
+			case spec.MovingPercentiles != nil:
+				mp := spec.MovingPercentiles
+				hasPrecomputed := false
+				for _, b := range buckets {
+					if _, exists := b[subName]; exists {
+						hasPrecomputed = true
+						break
+					}
+				}
+				if !hasPrecomputed {
+					targetName := firstBucketsPathSeg(mp.EffectivePath())
+					evalMovingPercentilesFallbackWithTargetR65(buckets, subName, mp, subAggs[targetName].Percentiles)
 				}
 			case spec.Derivative != nil:
 				pathStr := spec.Derivative.EffectivePath()
@@ -18861,9 +19408,9 @@ func evaluateSiblingPipelineAggsWithStrict(strictConformance bool, aggs map[stri
 					frac := pos - float64(lo)
 					return sortedVals[lo] + frac*(sortedVals[hi]-sortedVals[lo])
 				}
-				// ES `percentiles_bucket` ALWAYS uses nearest-rank empirical CDF (`SimplePercentile`):
-				// `ceil((p / 100.0) * N) - 1`, clamped to `[0, N-1]`.
-				rank := int(math.Ceil((p/100.0)*float64(len(sortedVals)))) - 1
+				// ES `percentiles_bucket` uses nearest-rank empirical index:
+				// round((p / 100.0) * (N - 1)), clamped to `[0, N-1]`.
+				rank := int(math.Floor((p/100.0)*float64(len(sortedVals)-1) + 0.5))
 				if rank < 0 {
 					rank = 0
 				}
@@ -18927,25 +19474,37 @@ func evaluateSiblingPipelineAggsWithStrict(strictConformance bool, aggs map[stri
 }
 
 func formatPipelineMetricValue(val float64, format string) string {
+	return formatPipelineMetricValueWithMode(val, format, false)
+}
+
+func formatPipelineMetricValueWithMode(val float64, format string, es8DecimalPercent bool) string {
 	format = strings.TrimSpace(format)
 	if format == "" {
 		return ""
 	}
-	if strings.HasSuffix(format, "%") {
+	if !es8DecimalPercent && strings.HasSuffix(format, "%") {
 		return fmt.Sprintf("%.2f%%", val)
 	}
 	return formatNumericWithDecimalPatternR61Search(val, format)
 }
 
 func makePipelineMetricObj(val float64, format string) map[string]any {
+	return makePipelineMetricObjWithMode(val, format, false)
+}
+
+func makePipelineMetricObjWithMode(val float64, format string, es8DecimalPercent bool) map[string]any {
 	out := map[string]any{"value": val}
-	if s := formatPipelineMetricValue(val, format); s != "" {
+	if s := formatPipelineMetricValueWithMode(val, format, es8DecimalPercent); s != "" {
 		out["value_as_string"] = s
 	}
 	return out
 }
 
 func evalNormalizeOnBuckets(buckets []map[string]any, subName string, normSpec *esast.NormalizeAggSpec) {
+	evalNormalizeOnBucketsWithMode(buckets, subName, normSpec, false)
+}
+
+func evalNormalizeOnBucketsWithMode(buckets []map[string]any, subName string, normSpec *esast.NormalizeAggSpec, es8FractionMode bool) {
 	if normSpec == nil || len(buckets) == 0 {
 		return
 	}
@@ -18986,7 +19545,15 @@ func evalNormalizeOnBuckets(buckets []map[string]any, subName string, normSpec *
 		}
 	}
 	stdPop := math.Sqrt(sqDiffSum / float64(validCount))
+	var softmaxDenom float64
 	method := strings.ToLower(strings.TrimSpace(normSpec.Method))
+	if method == "softmax" {
+		for i := range buckets {
+			if valid[i] {
+				softmaxDenom += math.Exp(vals[i] - maxVal)
+			}
+		}
+	}
 	for i, b := range buckets {
 		if !valid[i] {
 			continue
@@ -18996,7 +19563,11 @@ func evalNormalizeOnBuckets(buckets []map[string]any, subName string, normSpec *
 		switch method {
 		case "", "percent_of_sum":
 			if sumVal != 0 {
-				normVal = (v / sumVal) * 100.0
+				if es8FractionMode {
+					normVal = v / sumVal
+				} else {
+					normVal = (v / sumVal) * 100.0
+				}
 			}
 		case "rescale_0_1":
 			if maxVal > minVal {
@@ -19007,15 +19578,69 @@ func evalNormalizeOnBuckets(buckets []map[string]any, subName string, normSpec *
 				normVal = ((v - minVal) / (maxVal - minVal)) * 100.0
 			}
 		case "mean":
-			normVal = v - meanVal
+			if maxVal > minVal {
+				normVal = (v - meanVal) / (maxVal - minVal)
+			}
 		case "z-score", "z_score":
 			if stdPop > 0 {
 				normVal = (v - meanVal) / stdPop
 			}
+		case "softmax":
+			if softmaxDenom > 0 {
+				normVal = math.Exp(v-maxVal) / softmaxDenom
+			}
 		case "atan":
 			normVal = math.Atan(v)
 		}
-		b[subName] = makePipelineMetricObj(normVal, normSpec.Format)
+		b[subName] = makePipelineMetricObjWithMode(normVal, normSpec.Format, es8FractionMode)
+	}
+}
+
+func reEvaluateES8NormalizeInAggsTreeR65(aggs map[string]esast.AggSpec, container map[string]any) {
+	if len(aggs) == 0 || len(container) == 0 {
+		return
+	}
+	for aggName, spec := range aggs {
+		subAggs := spec.SubAggs()
+		if len(subAggs) == 0 {
+			continue
+		}
+		_, aggObj, ok := lookupBuiltAggEntryR61Search(container, aggName)
+		if !ok {
+			continue
+		}
+		switch rawB := aggObj["buckets"].(type) {
+		case []map[string]any:
+			for _, b := range rawB {
+				reEvaluateES8NormalizeInAggsTreeR65(subAggs, b)
+			}
+			for subName, ss := range subAggs {
+				if ss.Normalize != nil {
+					evalNormalizeOnBucketsWithMode(rawB, subName, ss.Normalize, true)
+				}
+			}
+		case []any:
+			conv := make([]map[string]any, 0, len(rawB))
+			for _, item := range rawB {
+				if m, okM := item.(map[string]any); okM {
+					reEvaluateES8NormalizeInAggsTreeR65(subAggs, m)
+					conv = append(conv, m)
+				}
+			}
+			for subName, ss := range subAggs {
+				if ss.Normalize != nil {
+					evalNormalizeOnBucketsWithMode(conv, subName, ss.Normalize, true)
+				}
+			}
+		case map[string]any:
+			for _, item := range rawB {
+				if m, okM := item.(map[string]any); okM {
+					reEvaluateES8NormalizeInAggsTreeR65(subAggs, m)
+				}
+			}
+		default:
+			reEvaluateES8NormalizeInAggsTreeR65(subAggs, aggObj)
+		}
 	}
 }
 
@@ -19027,7 +19652,8 @@ func isChildPipelineTargetInAggs(aggs map[string]esast.AggSpec, bucketsPath stri
 		if !ok {
 			continue
 		}
-		if spec.EffectiveCumulative() != nil || spec.Derivative != nil || spec.EffectiveMovingAvg() != nil ||
+		if spec.EffectiveCumulativeSum() != nil || spec.IsCumulativeCardinality() ||
+			spec.Derivative != nil || spec.EffectiveMovingAvg() != nil || spec.MovingPercentiles != nil ||
 			spec.SerialDiff != nil || spec.Normalize != nil || spec.BucketScript != nil {
 			return true
 		}
@@ -19431,6 +20057,9 @@ func extractBucketMetricBySegs(b map[string]any, segs []string) (float64, bool) 
 		}
 	}
 	if v, okV := extractTopHitsSourceMetricR63(subMap, tail); okV {
+		return v, true
+	}
+	if v, okV := extractTopMetricsNumericMetricR65(subMap, tail); okV {
 		return v, true
 	}
 	if valMap, okVM := subMap["value"].(map[string]any); okVM {
@@ -20103,8 +20732,11 @@ func synthesizeHistogramBuckets(rows []AggRow, spec *esast.HistogramAggSpec) []A
 		}
 	}
 	for i := range rows {
+		if isExactLargeHistIntR65(rows[i].BucketKey) {
+			continue
+		}
 		if k, ok := parseFiniteFloat(rows[i].BucketKey); ok {
-			k = math.Round(k*1e12) / 1e12
+			k = roundHistFloatKeyR65(k)
 			rows[i].BucketKey = strconv.FormatFloat(k, 'f', -1, 64)
 		}
 	}
@@ -20136,14 +20768,48 @@ func synthesizeHistogramBuckets(rows []AggRow, spec *esast.HistogramAggSpec) []A
 	}
 
 	byKey := make(map[string]AggRow, len(rows))
+	byStep := make(map[int64]AggRow, len(rows))
 	var minKey, maxKey float64
 	hasMin, hasMax := false, false
+	var exactMinStep, exactMaxStep int64
+	hasExactSteps := false
+	isIntStep := interval == math.Trunc(interval) && offset == math.Trunc(offset)
+	var bigInterval, bigOffset *big.Int
+	if isIntStep {
+		if bi, okBI := new(big.Int).SetString(strconv.FormatFloat(interval, 'f', 0, 64), 10); okBI {
+			bigInterval = bi
+		}
+		if bo, okBO := new(big.Int).SetString(strconv.FormatFloat(offset, 'f', 0, 64), 10); okBO {
+			bigOffset = bo
+		}
+	}
 	for _, r := range rows {
 		if k, ok := parseFiniteFloat(r.BucketKey); ok {
-			k = math.Round(k*1e12) / 1e12
-			normKey := strconv.FormatFloat(k, 'f', -1, 64)
-			r.BucketKey = normKey
+			normKey := r.BucketKey
+			if !isExactLargeHistIntR65(r.BucketKey) {
+				k = roundHistFloatKeyR65(k)
+				normKey = strconv.FormatFloat(k, 'f', -1, 64)
+				r.BucketKey = normKey
+			}
 			byKey[normKey] = r
+			step := int64(math.Round((k - offset) / interval))
+			if bigInterval != nil && bigOffset != nil && isExactLargeHistIntR65(r.BucketKey) && interval < 9007199254740992 {
+				if bkBig, okBK := new(big.Int).SetString(strings.TrimSpace(r.BucketKey), 10); okBK {
+					num := new(big.Int).Sub(bkBig, bigOffset)
+					stepBig := new(big.Int).Div(num, bigInterval)
+					if stepBig.IsInt64() {
+						step = stepBig.Int64()
+						if !hasExactSteps || step < exactMinStep {
+							exactMinStep = step
+						}
+						if !hasExactSteps || step > exactMaxStep {
+							exactMaxStep = step
+						}
+						hasExactSteps = true
+					}
+				}
+			}
+			byStep[step] = r
 			if !hasMin || k < minKey {
 				minKey = k
 				hasMin = true
@@ -20157,7 +20823,7 @@ func synthesizeHistogramBuckets(rows []AggRow, spec *esast.HistogramAggSpec) []A
 	if spec.ExtendedBounds != nil {
 		if spec.ExtendedBounds.Min != nil {
 			if f, ok := parseFiniteFloat(fmt.Sprintf("%v", spec.ExtendedBounds.Min)); ok {
-				extMin := math.Round((math.Floor((f-offset)/interval+1e-9)*interval+offset)*1e12) / 1e12
+				extMin := roundHistFloatKeyR65(math.Floor((f-offset)/interval+1e-9)*interval + offset)
 				if !hasMin || extMin < minKey {
 					minKey = extMin
 					hasMin = true
@@ -20166,7 +20832,7 @@ func synthesizeHistogramBuckets(rows []AggRow, spec *esast.HistogramAggSpec) []A
 		}
 		if spec.ExtendedBounds.Max != nil {
 			if f, ok := parseFiniteFloat(fmt.Sprintf("%v", spec.ExtendedBounds.Max)); ok {
-				extMax := math.Round((math.Floor((f-offset)/interval+1e-9)*interval+offset)*1e12) / 1e12
+				extMax := roundHistFloatKeyR65(math.Floor((f-offset)/interval+1e-9)*interval + offset)
 				if !hasMax || extMax > maxKey {
 					maxKey = extMax
 					hasMax = true
@@ -20191,11 +20857,28 @@ func synthesizeHistogramBuckets(rows []AggRow, spec *esast.HistogramAggSpec) []A
 
 	startStep := int64(math.Round((minKey - offset) / interval))
 	endStep := int64(math.Round((maxKey - offset) / interval))
+	if hasExactSteps {
+		if exactMinStep < startStep {
+			startStep = exactMinStep
+		}
+		if exactMaxStep > endStep {
+			endStep = exactMaxStep
+		}
+	}
 	const maxSynthesizedBuckets = 100001
 	var out []AggRow
 	for step := startStep; step <= endStep && len(out) < maxSynthesizedBuckets; step++ {
-		k := math.Round((float64(step)*interval+offset)*1e12) / 1e12
+		if existing, ok := byStep[step]; ok {
+			out = append(out, existing)
+			continue
+		}
+		k := roundHistFloatKeyR65(float64(step)*interval + offset)
 		normKey := strconv.FormatFloat(k, 'f', -1, 64)
+		if bigInterval != nil && bigOffset != nil && math.Abs(float64(step)*interval+offset) >= 9007199254740992 {
+			val := new(big.Int).Mul(big.NewInt(step), bigInterval)
+			val.Add(val, bigOffset)
+			normKey = val.String()
+		}
 		if existing, ok := byKey[normKey]; ok {
 			out = append(out, existing)
 		} else {
@@ -20494,6 +21177,9 @@ func buildTopHitsList(
 					hitMap["fields"] = fm
 				}
 			}
+			if igFields := extractHitIgnoredFieldsR61Search(*c.hit, cSchema); len(igFields) > 0 {
+				hitMap["_ignored"] = igFields
+			}
 			if spec.Highlight != nil && len(spec.Highlight.Fields) > 0 {
 				if hl := buildHighlightMapWithSchema(c.hit.EffectiveSource(), &esast.SearchRequest{Query: searchQuery, Highlight: spec.Highlight}, cSchema); len(hl) > 0 {
 					hitMap["highlight"] = hl
@@ -20557,8 +21243,8 @@ func attachSubAggsToBucketWithSchema(
 			case subSpec.Max != nil:
 				subMSpec = subSpec.Max
 			}
-			if subMSpec != nil && idxSchema != nil && subMSpec.Field != "" {
-				b := idxSchema.ResolveField(subMSpec.Field)
+			if subMSpec != nil && subMSpec.Field != "" {
+				b := resolveFieldAcrossDocLookupAndSchemaR65(subMSpec.Field, idxSchema, docLookup)
 				if b.ESType == "date" || b.ESType == "date_nanos" {
 					fmtS := subMSpec.Format
 					if fmtS == "" {
@@ -20776,7 +21462,7 @@ func attachSubAggsToBucketWithSchema(
 					matchingRows = append(matchingRows, cp)
 				}
 			}
-			for _, statKey := range []string{"_stats_count", "_stats_min", "_stats_max", "_stats_avg", "_stats_entropy", "_sstats_count", "_sstats_min", "_sstats_max", "_sstats_avg", "_sstats_entropy"} {
+			for _, statKey := range []string{"_stats_count", "_stats_min", "_stats_max", "_stats_avg", "_stats_entropy", "_sstats_count", "_sstats_min", "_sstats_max", "_sstats_avg", "_sstats_entropy", "_sstats_total_chars"} {
 				for _, r := range bucketsByAgg[subFullKey+"."+statKey] {
 					if r.BucketKey == parentBucketKey {
 						cp := r
@@ -20785,38 +21471,71 @@ func attachSubAggsToBucketWithSchema(
 					}
 				}
 			}
-			var cntVal int64
-			var minVal, maxVal, avgVal, entropyVal float64
-			for _, r := range matchingRows {
-				switch r.BucketKey {
-				case "_stats_count", "_sstats_count":
-					cntVal = r.effectiveCount()
-				case "_stats_min", "_sstats_min":
-					minVal = r.effectiveValue()
-				case "_stats_max", "_sstats_max":
-					maxVal = r.effectiveValue()
-				case "_stats_avg", "_sstats_avg":
-					avgVal = r.effectiveValue()
-				case "_stats_entropy", "_sstats_entropy":
-					entropyVal = r.effectiveValue()
+			distPrefix := subFullKey + "._sstats_dist:"
+			charCounts := make(map[string]int64)
+			for k, rs := range bucketsByAgg {
+				if strings.HasPrefix(k, distPrefix) {
+					ch := strings.TrimPrefix(k, distPrefix)
+					for _, r := range rs {
+						if r.BucketKey == parentBucketKey {
+							charCounts[ch] = r.effectiveCount()
+						}
+					}
 				}
 			}
+			var cntVal int64
+			var minVal, maxVal, avgVal, entropyVal float64
+			var totalChars int64
+			for _, r := range matchingRows {
+				switch {
+				case r.BucketKey == "_stats_count" || r.BucketKey == "_sstats_count":
+					cntVal = r.effectiveCount()
+				case r.BucketKey == "_stats_min" || r.BucketKey == "_sstats_min":
+					minVal = r.effectiveValue()
+				case r.BucketKey == "_stats_max" || r.BucketKey == "_sstats_max":
+					maxVal = r.effectiveValue()
+				case r.BucketKey == "_stats_avg" || r.BucketKey == "_sstats_avg":
+					avgVal = r.effectiveValue()
+				case r.BucketKey == "_stats_entropy" || r.BucketKey == "_sstats_entropy":
+					entropyVal = r.effectiveValue()
+				case r.BucketKey == "_sstats_total_chars":
+					totalChars = r.effectiveCount()
+				case strings.HasPrefix(r.BucketKey, "_sstats_dist:"):
+					ch := strings.TrimPrefix(r.BucketKey, "_sstats_dist:")
+					charCounts[ch] = r.effectiveCount()
+				}
+			}
+			showDist := aggHasShowDistributionFromRawR65(scopeRawBodyR63(scopeFromDocLookupR63(docLookup)), subFullKey)
 			if cntVal == 0 {
-				bucketMap[subName] = map[string]any{
+				ssObj := map[string]any{
 					"count":      int64(0),
 					"min_length": nil,
 					"max_length": nil,
 					"avg_length": nil,
 					"entropy":    0.0,
 				}
+				if showDist {
+					ssObj["distribution"] = map[string]any{}
+				}
+				bucketMap[subName] = ssObj
 			} else {
-				bucketMap[subName] = map[string]any{
+				ssObj := map[string]any{
 					"count":      cntVal,
 					"min_length": int64(minVal),
 					"max_length": int64(maxVal),
 					"avg_length": avgVal,
 					"entropy":    entropyVal,
 				}
+				if showDist {
+					distMap := make(map[string]any, len(charCounts))
+					if totalChars > 0 {
+						for ch, c := range charCounts {
+							distMap[ch] = float64(c) / float64(totalChars)
+						}
+					}
+					ssObj["distribution"] = distMap
+				}
+				bucketMap[subName] = ssObj
 			}
 		case subSpec.Filter != nil || subSpec.Missing != nil || subSpec.EffectiveSampler() != nil || subSpec.RandomSampler != nil || subSpec.Children != nil || subSpec.Parent != nil || subSpec.ReverseNested != nil || subSpec.Nested != nil:
 			var cnt int64
@@ -20842,7 +21561,8 @@ func attachSubAggsToBucketWithSchema(
 					matchingRows = append(matchingRows, cp)
 				}
 			}
-			matchingRows = synthesizeDateHistogramBuckets(matchingRows, subSpec.DateHistogram)
+			subDHEff := resolveDateHistogramWithSchemaFormatR65(subSpec.DateHistogram, idxSchema, docLookup)
+			matchingRows = synthesizeDateHistogramBuckets(matchingRows, subDHEff)
 			if len(matchingRows) > 1 {
 				sort.SliceStable(matchingRows, func(i, j int) bool {
 					ki, _ := strconv.ParseInt(matchingRows[i].BucketKey, 10, 64)
@@ -20854,7 +21574,7 @@ func attachSubAggsToBucketWithSchema(
 			grandSubAggs := subSpec.SubAggs()
 			for _, r := range matchingRows {
 				epochMs, _ := strconv.ParseInt(r.BucketKey, 10, 64)
-				keyStr := formatDateHistogramKeyAsString(epochMs, subSpec.DateHistogram)
+				keyStr := formatDateHistogramKeyAsString(epochMs, subDHEff)
 				cb := map[string]any{
 					"key_as_string": keyStr,
 					"key":           epochMs,
@@ -20898,7 +21618,7 @@ func attachSubAggsToBucketWithSchema(
 			for _, r := range matchingRows {
 				numKey, _ := parseFiniteFloat(r.BucketKey)
 				cb := map[string]any{
-					"key":       numKey,
+					"key":       formatHistogramBucketKeyAnyR65(r.BucketKey, numKey, subSpec.Histogram, idxSchema),
 					"doc_count": r.effectiveCount(),
 				}
 				if subSpec.Histogram.Format != "" {
@@ -21153,8 +21873,10 @@ func attachSubAggsToBucketWithSchema(
 			}
 			parentCount := bucketDocCount
 			sigBGCount := parentCount
-			if isSigText {
-				for _, bgR := range bucketsByAgg[subFullKey+".__sig_bg"] {
+			bgRows := bucketsByAgg[subFullKey+".__sig_bg"]
+			hasSigBG := len(bgRows) > 0
+			if hasSigBG {
+				for _, bgR := range bgRows {
 					if parentBucketKey == "" || bgR.BucketKey == parentBucketKey {
 						sigBGCount = bgR.effectiveCount()
 						break
@@ -21166,7 +21888,7 @@ func attachSubAggsToBucketWithSchema(
 					parentCount = dc
 				}
 			}
-			if !isSigText {
+			if !isSigText && !hasSigBG {
 				sigBGCount = parentCount
 			}
 			bgDenom := float64(sigBGCount)
@@ -21184,9 +21906,9 @@ func attachSubAggsToBucketWithSchema(
 				if hasKeyAsStr {
 					cb["key_as_string"] = keyAsStr
 				}
-				if isSigText {
+				if isSigText || hasSigBG {
 					bgCnt := int64(r.Weight)
-					if bgCnt <= 0 {
+					if !hasSigBG && bgCnt <= 0 {
 						bgCnt = docCnt
 					}
 					cb["score"] = r.Value
@@ -21858,6 +22580,16 @@ func extractHitSortValues(h HitRow, sorts []esast.SortSpec, idxSchema *schema.In
 			out = append(out, h.Index)
 		case "_id", "_doc", "_shard_doc":
 			out = append(out, h.ID)
+		case "_tsid":
+			var tsidVal any
+			if idxSchema != nil && strings.EqualFold(idxSchema.IndexMode, "time_series") {
+				tmpRow := map[string]any{}
+				schema.PopulateTSDBColumnsForShred(idxSchema, doc, tmpRow)
+				if ts, _ := tmpRow["__tsid"].(string); ts != "" {
+					tsidVal = ts
+				}
+			}
+			out = append(out, tsidVal)
 		case "_script":
 			var val any
 			srcStr, params := extractScriptSourceAndParams(s.Entry.Script)
@@ -22472,6 +23204,28 @@ func sortHistogramBuckets(buckets []map[string]any, order any) []map[string]any 
 	return buckets
 }
 
+func (s *Server) isHighlightWeightMatchesDisabledR65(indexName string) bool {
+	if s == nil || indexName == "" {
+		return false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	cs := s.indexCustomSettings[indexName]
+	if cs == nil {
+		return false
+	}
+	for _, k := range []string{"index.highlight.weight_matches_mode.enabled", "highlight.weight_matches_mode.enabled"} {
+		if v, ok := cs[k]; ok && v != nil {
+			if b, isB := v.(bool); isB {
+				return !b
+			}
+			sVal := strings.ToLower(strings.TrimSpace(fmt.Sprintf("%v", v)))
+			return sVal == "false" || sVal == "0" || sVal == "off" || sVal == "no"
+		}
+	}
+	return false
+}
+
 func buildHighlightMapWithSchema(raw json.RawMessage, req *esast.SearchRequest, hitSchema *schema.IndexSchema) map[string][]string {
 	var idxName string
 	if hitSchema != nil {
@@ -22622,7 +23376,7 @@ func buildHighlightMapWithSchemaAndServerWave3R63(srv *Server, indexName string,
 			sort.Strings(leafKeys)
 			queryHasNested := queryContainsNested(effQuery)
 			effectiveHLMode := effHLType
-			if effHLType == "unified" && (len(req.KNN) > 0 || queryHasNested) {
+			if effHLType == "unified" && (len(req.KNN) > 0 || queryHasNested || (srv != nil && srv.isHighlightWeightMatchesDisabledR65(indexName))) {
 				effectiveHLMode = "plain"
 			}
 			for _, leafPath := range leafKeys {
@@ -22674,7 +23428,7 @@ func buildHighlightMapWithSchemaAndServerWave3R63(srv *Server, indexName string,
 			continue
 		}
 		effectiveHLMode := effHLType
-		if effHLType == "unified" && (len(req.KNN) > 0 || queryContainsNested(effQuery)) {
+		if effHLType == "unified" && (len(req.KNN) > 0 || queryContainsNested(effQuery) || (srv != nil && srv.isHighlightWeightMatchesDisabledR65(indexName))) {
 			effectiveHLMode = "plain"
 		}
 		if effectiveHLMode == "annotated" {
@@ -24526,7 +25280,7 @@ func (s *Server) evalRuntimeMappingsOnHitRows(idxSchema *schema.IndexSchema, req
 		} else {
 			doc["__meta_version"] = int64(1)
 		}
-		evalDoc := prepareDocForRuntimeScript(idxSchema, doc)
+		evalDoc := PrepareDocForRuntimeScriptRound61(idxSchema, doc, resolveRuntimeScriptES8ModeR61Search(idxSchema, doc))
 		modified := false
 		for _, fName := range rtNames {
 			prop := rtMap[fName]
@@ -26240,7 +26994,7 @@ func pinnedRankForDoc(idxSchema *schema.IndexSchema, doc map[string]any, p *esas
 	} else if s, ok := doc["_index"].(string); ok && s != "" {
 		targetIdx = s
 	}
-	if len(p.Docs) > 0 && targetIdx != "" {
+	if len(p.Docs) > 0 {
 		rank := 0
 		for _, id := range p.IDs {
 			if id != "" && id == docID {
@@ -26250,7 +27004,12 @@ func pinnedRankForDoc(idxSchema *schema.IndexSchema, doc map[string]any, p *esas
 		}
 		for _, d := range p.Docs {
 			idxVal, okIdx := d["_index"]
-			if okIdx && idxVal != nil && strings.TrimSpace(fmt.Sprintf("%v", idxVal)) == targetIdx {
+			docIdx := ""
+			if okIdx && idxVal != nil {
+				docIdx = strings.TrimSpace(fmt.Sprintf("%v", idxVal))
+			}
+			idxMatches := docIdx == "" || (targetIdx != "" && docIdx == targetIdx)
+			if idxMatches {
 				if idVal, okID := d["_id"]; okID && idVal != nil {
 					if s := strings.TrimSpace(fmt.Sprintf("%v", idVal)); s != "" && s == docID {
 						return rank, true
@@ -27021,7 +27780,7 @@ func extractDocRawValuesForMetric(md runtimeMatchedDoc, mSpec *esast.MetricAggSp
 					pathSegs = b.SourceJSONPath
 				}
 			}
-			rawVals := collectSchemaAwareScalarValues(md.doc, mSpec.Field, pathSegs, effSchema)
+			rawVals := collectMetricRawValuesOrHistogramR65(effSchema, md.doc, mSpec.Field, pathSegs)
 			if len(rawVals) == 0 && mSpec.Missing != nil {
 				rawVals = []any{mSpec.Missing}
 			}
@@ -27081,6 +27840,16 @@ func extractDocRawValuesForMetric(md runtimeMatchedDoc, mSpec *esast.MetricAggSp
 	if mSpec.Field == "" {
 		return nil
 	}
+	if mSpec.Field == "_tsid" {
+		if effSchema != nil && strings.EqualFold(effSchema.IndexMode, "time_series") {
+			tmpRow := map[string]any{}
+			schema.PopulateTSDBColumnsForShred(effSchema, md.doc, tmpRow)
+			if ts, _ := tmpRow["__tsid"].(string); ts != "" {
+				return []any{ts}
+			}
+		}
+		return nil
+	}
 	clean := strings.TrimSuffix(strings.TrimSuffix(mSpec.Field, ".keyword"), ".ngram")
 	pathSegs := strings.Split(clean, ".")
 	if effSchema != nil {
@@ -27088,11 +27857,37 @@ func extractDocRawValuesForMetric(md runtimeMatchedDoc, mSpec *esast.MetricAggSp
 			pathSegs = b.SourceJSONPath
 		}
 	}
-	rawVals := collectSchemaAwareScalarValues(md.doc, mSpec.Field, pathSegs, effSchema)
+	rawVals := collectMetricRawValuesOrHistogramR65(effSchema, md.doc, mSpec.Field, pathSegs)
 	if len(rawVals) == 0 && mSpec.Missing != nil {
 		rawVals = []any{mSpec.Missing}
 	}
 	return rawVals
+}
+
+func collectMetricRawValuesOrHistogramR65(effSchema *schema.IndexSchema, doc map[string]any, field string, pathSegs []string) []any {
+	if effSchema != nil && isHistogramFieldInSchemaRound58(effSchema, field) {
+		vs, cs := extractHistogramBinsFromDocRound58(doc, pathSegs)
+		if len(vs) > 0 {
+			var expanded []any
+			for i, v := range vs {
+				cnt := cs[i]
+				if cnt <= 0 {
+					continue
+				}
+				if int64(len(expanded))+cnt > 100000 {
+					cnt = 100000 - int64(len(expanded))
+				}
+				for j := int64(0); j < cnt; j++ {
+					expanded = append(expanded, v)
+				}
+				if len(expanded) >= 100000 {
+					break
+				}
+			}
+			return expanded
+		}
+	}
+	return collectSchemaAwareScalarValues(doc, field, pathSegs, effSchema)
 }
 
 func extractDocNumericValuesForMetric(md runtimeMatchedDoc, mSpec *esast.MetricAggSpec) []float64 {
@@ -27377,73 +28172,7 @@ func emitRuntimeMetricAggRows(
 			}
 		}
 	case subSpec.StringStats != nil:
-		mSpec := &esast.MetricAggSpec{
-			Field:   subSpec.StringStats.Field,
-			Missing: subSpec.StringStats.Missing,
-			Script:  subSpec.StringStats.Script,
-		}
-		var strs []string
-		for _, d := range bDocs {
-			for _, rv := range extractDocRawValuesForMetric(d, mSpec) {
-				if rv != nil {
-					strs = append(strs, fmt.Sprintf("%v", rv))
-				}
-			}
-		}
-		sCnt := int64(len(strs))
-		w := sCnt
-		if sCnt == 0 {
-			w = -1
-		}
-		var minLen, maxLen, avgLen, entropy float64
-		if sCnt > 0 {
-			firstLen := float64(len([]rune(strs[0])))
-			minLen, maxLen = firstLen, firstLen
-			var sumLen float64
-			charCounts := make(map[rune]int64)
-			var totalChars int64
-			for _, s := range strs {
-				runes := []rune(s)
-				l := float64(len(runes))
-				if l < minLen {
-					minLen = l
-				}
-				if l > maxLen {
-					maxLen = l
-				}
-				sumLen += l
-				for _, ch := range runes {
-					charCounts[ch]++
-					totalChars++
-				}
-			}
-			avgLen = sumLen / float64(sCnt)
-			if totalChars > 0 {
-				for _, c := range charCounts {
-					p := float64(c) / float64(totalChars)
-					if p > 0 {
-						entropy -= p * math.Log2(p)
-					}
-				}
-			}
-		}
-		if parentBucketKey == "" {
-			*out = append(*out,
-				AggRow{AggName: fullAggName, BucketKey: "_sstats_count", DocCount: sCnt, Value: float64(sCnt)},
-				AggRow{AggName: fullAggName, BucketKey: "_sstats_min", DocCount: int64(minLen), Value: minLen, Weight: w},
-				AggRow{AggName: fullAggName, BucketKey: "_sstats_max", DocCount: int64(maxLen), Value: maxLen, Weight: w},
-				AggRow{AggName: fullAggName, BucketKey: "_sstats_avg", DocCount: int64(avgLen), Value: avgLen, Weight: w},
-				AggRow{AggName: fullAggName, BucketKey: "_sstats_entropy", DocCount: int64(entropy), Value: entropy, Weight: w},
-			)
-		} else {
-			*out = append(*out,
-				AggRow{AggName: fullAggName + "._sstats_count", BucketKey: parentBucketKey, DocCount: sCnt, Value: float64(sCnt)},
-				AggRow{AggName: fullAggName + "._sstats_min", BucketKey: parentBucketKey, DocCount: int64(minLen), Value: minLen, Weight: w},
-				AggRow{AggName: fullAggName + "._sstats_max", BucketKey: parentBucketKey, DocCount: int64(maxLen), Value: maxLen, Weight: w},
-				AggRow{AggName: fullAggName + "._sstats_avg", BucketKey: parentBucketKey, DocCount: int64(avgLen), Value: avgLen, Weight: w},
-				AggRow{AggName: fullAggName + "._sstats_entropy", BucketKey: parentBucketKey, DocCount: int64(entropy), Value: entropy, Weight: w},
-			)
-		}
+		emitRuntimeStringStatsAggRowsR65(fullAggName, parentBucketKey, subSpec.StringStats, bDocs, out)
 	case subSpec.Rate != nil:
 		var res float64
 		isValCount := strings.EqualFold(strings.TrimSpace(subSpec.Rate.Mode), "value_count")
@@ -27934,19 +28663,84 @@ func emitRuntimeTTestAggRows(fullAggName, metricBucketKey string, spec *esast.TT
 
 func approximateTwoSidedTTestPValue(tStat, df float64) float64 {
 	x := math.Abs(tStat)
-	if df > 0 {
-		// Cornwallis-Peizer-Pratt normal approximation for Student's t tail
-		z := x * (1.0 - 1.0/(4.0*df)) / math.Sqrt(1.0+(x*x)/(2.0*df))
-		p := math.Erfc(z / math.Sqrt2)
-		if p < 0 {
-			return 0
-		}
-		if p > 1 {
-			return 1
-		}
-		return p
+	if df <= 0 || math.IsNaN(df) || math.IsInf(df, 0) {
+		return math.Erfc(x / math.Sqrt2)
 	}
-	return math.Erfc(x / math.Sqrt2)
+	if x == 0 {
+		return 1.0
+	}
+	// Exact two-sided Student's t p-value: I_{df / (df + t^2)}(df / 2, 0.5)
+	p := regularizedBetaR65(df/(df+x*x), 0.5*df, 0.5)
+	if math.IsNaN(p) {
+		return 0
+	}
+	if p < 0 {
+		return 0
+	}
+	if p > 1 {
+		return 1
+	}
+	return p
+}
+
+func regularizedBetaR65(x, a, b float64) float64 {
+	if x <= 0 {
+		return 0
+	}
+	if x >= 1 {
+		return 1
+	}
+	if x > (a+1.0)/(a+b+2.0) {
+		return 1.0 - regularizedBetaR65(1.0-x, b, a)
+	}
+	lgA, _ := math.Lgamma(a)
+	lgB, _ := math.Lgamma(b)
+	lgAB, _ := math.Lgamma(a + b)
+	bt := math.Exp(lgAB - lgA - lgB + a*math.Log(x) + b*math.Log(1.0-x))
+	const maxIter = 1000
+	const eps = 1e-15
+	const tiny = 1e-300
+	qab := a + b
+	qap := a + 1.0
+	qam := a - 1.0
+	c := 1.0
+	d := 1.0 - qab*x/qap
+	if math.Abs(d) < tiny {
+		d = tiny
+	}
+	d = 1.0 / d
+	h := d
+	for m := 1; m <= maxIter; m++ {
+		mf := float64(m)
+		m2 := 2.0 * mf
+		aa := mf * (b - mf) * x / ((qam + m2) * (a + m2))
+		d = 1.0 + aa*d
+		if math.Abs(d) < tiny {
+			d = tiny
+		}
+		c = 1.0 + aa/c
+		if math.Abs(c) < tiny {
+			c = tiny
+		}
+		d = 1.0 / d
+		h *= d * c
+		aa = -(a + mf) * (qab + mf) * x / ((a + m2) * (qap + m2))
+		d = 1.0 + aa*d
+		if math.Abs(d) < tiny {
+			d = tiny
+		}
+		c = 1.0 + aa/c
+		if math.Abs(c) < tiny {
+			c = tiny
+		}
+		d = 1.0 / d
+		delta := d * c
+		h *= delta
+		if math.Abs(delta-1.0) <= eps {
+			break
+		}
+	}
+	return bt * h / a
 }
 
 func formatTermsNumericPattern(fv float64, fmtPattern string) string {
@@ -28079,13 +28873,15 @@ func formatTermsBucketKeyAndString(rawKey string, termsSpec *esast.TermsAggSpec,
 	return rawKey, "", false
 }
 
-func emitRuntimeMultiTermsAggRows(
+func emitRuntimeMultiTermsAggRowsWithOptionsR65(
 	fullAggName string,
 	parentBucketKey string,
 	aggSpec esast.AggSpec,
 	docs []runtimeMatchedDoc,
+	globalDocs []runtimeMatchedDoc,
 	out *[]AggRow,
 	idxSchema *schema.IndexSchema,
+	unifiedFieldTypes map[string]string,
 ) {
 	mt := aggSpec.MultiTerms
 	if mt == nil || len(mt.Terms) == 0 {
@@ -28137,13 +28933,34 @@ func emitRuntimeMultiTermsAggRows(
 			strParts := make([]string, len(tup))
 			normParts := make([]any, len(tup))
 			for i, v := range tup {
-				rawStr := fmt.Sprintf("%v", v)
 				ts := mt.Terms[i]
-				kv, kas, hasKAS := formatTermsBucketKeyAndString(rawStr, &esast.TermsAggSpec{
+				uType := ""
+				if unifiedFieldTypes != nil {
+					uType = unifiedFieldTypes[ts.Field]
+				}
+				if uType == "double" {
+					if fv, okF := toFloat64(v); okF {
+						normParts[i] = fv
+						strParts[i] = formatJavaDoubleRound60(fv)
+						continue
+					}
+				} else if uType == "long" {
+					if iv, okI := toInt64(v); okI {
+						normParts[i] = iv
+						strParts[i] = strconv.FormatInt(iv, 10)
+						continue
+					}
+				}
+				rawStr := fmt.Sprintf("%v", v)
+				effTermsSpec := &esast.TermsAggSpec{
 					Field:     ts.Field,
 					ValueType: ts.ValueType,
 					Format:    ts.Format,
-				}, effSchema)
+				}
+				if effTermsSpec.ValueType == "" && uType != "" {
+					effTermsSpec.ValueType = uType
+				}
+				kv, kas, hasKAS := formatTermsBucketKeyAndString(rawStr, effTermsSpec, effSchema)
 				if hasKAS && kas != "" {
 					strParts[i] = kas
 				} else {
@@ -28204,14 +29021,22 @@ func emitRuntimeMultiTermsAggRows(
 		}
 	}
 
-	minCount := 1
-	if mt.MinDocCount != nil && *mt.MinDocCount >= 0 {
-		minCount = *mt.MinDocCount
+	shardMinCount := 1
+	if mt.ShardMinDocCount != nil && *mt.ShardMinDocCount >= 1 {
+		shardMinCount = *mt.ShardMinDocCount
 	}
 	var filtered []string
 	for _, tid := range tupleOrder {
-		if len(byTuple[tid].matchedDoc) >= minCount {
+		if len(byTuple[tid].matchedDoc) >= shardMinCount {
 			filtered = append(filtered, tid)
+		}
+	}
+	termTypes := make([]string, len(mt.Terms))
+	for i, ts := range mt.Terms {
+		if unifiedFieldTypes != nil && unifiedFieldTypes[ts.Field] != "" {
+			termTypes[i] = unifiedFieldTypes[ts.Field]
+		} else {
+			termTypes[i] = resolveMultiTermsFieldTypeR65(ts, idxSchema, nil)
 		}
 	}
 	sort.Slice(filtered, func(i, j int) bool {
@@ -28220,16 +29045,36 @@ func emitRuntimeMultiTermsAggRows(
 		if ci != cj {
 			return ci > cj
 		}
+		if c := compareMultiTermsTuplesWithTypesR65(bi.keyTuple, bj.keyTuple, bi.keyAsStr, bj.keyAsStr, termTypes); c != 0 {
+			return c < 0
+		}
 		return bi.keyAsStr < bj.keyAsStr
 	})
-	sizeLimit := mt.Size
-	if sizeLimit <= 0 {
-		sizeLimit = 10
+	const maxRuntimeMultiTermsBuckets = 10000
+	shardLimit := maxRuntimeMultiTermsBuckets
+	if mt.ShardSize > 0 && mt.Order == nil {
+		shardLimit = mt.ShardSize
 	}
-	if len(filtered) > sizeLimit {
-		filtered = filtered[:sizeLimit]
+	if len(filtered) > shardLimit {
+		var droppedSum int64
+		for _, remTID := range filtered[shardLimit:] {
+			droppedSum += int64(len(byTuple[remTID].matchedDoc))
+		}
+		if droppedSum > 0 {
+			*out = append(*out, AggRow{
+				AggName:   fullAggName + ".__mt_shard_other",
+				BucketKey: parentBucketKey,
+				DocCount:  droppedSum,
+				Value:     float64(droppedSum),
+			})
+		}
+		filtered = filtered[:shardLimit]
 	}
 	subAggs := aggSpec.SubAggs()
+	corpus := globalDocs
+	if len(corpus) == 0 {
+		corpus = docs
+	}
 	for _, tid := range filtered {
 		tb := byTuple[tid]
 		rowKey := tid
@@ -28244,7 +29089,7 @@ func emitRuntimeMultiTermsAggRows(
 			Value:     float64(cnt),
 		})
 		if len(subAggs) > 0 {
-			emitRuntimeAllSubAggRows(fullAggName, rowKey, subAggs, tb.matchedDoc, out, idxSchema)
+			emitRuntimeAllSubAggRowsWithGlobal(fullAggName, rowKey, subAggs, tb.matchedDoc, corpus, out, idxSchema)
 		}
 	}
 }
@@ -28664,7 +29509,7 @@ func formatRuntimeBucketAggObjectWithSchema(
 			"doc_count": r.DocCount,
 		}
 		switch {
-		case aggSpec.VariableWidthHistogram != nil || aggSpec.MultiTerms != nil:
+		case aggSpec.VariableWidthHistogram != nil:
 			if idx := strings.IndexByte(leafKey, '\x00'); idx >= 0 {
 				var meta map[string]any
 				if err := json.Unmarshal([]byte(leafKey[idx+1:]), &meta); err == nil {
@@ -28672,6 +29517,50 @@ func formatRuntimeBucketAggObjectWithSchema(
 						bObj[mk] = mv
 					}
 				}
+			}
+		case aggSpec.MultiTerms != nil:
+			mt := aggSpec.MultiTerms
+			if idx := strings.IndexByte(leafKey, '\x00'); idx >= 0 {
+				var meta map[string]any
+				dec := json.NewDecoder(strings.NewReader(leafKey[idx+1:]))
+				dec.UseNumber()
+				if err := dec.Decode(&meta); err == nil {
+					for mk, mv := range meta {
+						bObj[mk] = mv
+					}
+				}
+			} else if len(mt.Terms) > 0 {
+				var parts []string
+				if len(mt.Terms) == 1 {
+					parts = []string{leafKey}
+				} else {
+					parts = strings.SplitN(leafKey, "|", len(mt.Terms))
+				}
+				keys := make([]any, len(mt.Terms))
+				strParts := make([]string, len(mt.Terms))
+				scope := scopeFromDocLookupR63(docLookup)
+				for i, ts := range mt.Terms {
+					rawPart := ""
+					if i < len(parts) {
+						rawPart = parts[i]
+					}
+					kv, kas, hasKAS := formatTermsBucketKeyAndStringWithScopeR63(scope, rawPart, &esast.TermsAggSpec{
+						Field:     ts.Field,
+						ValueType: ts.ValueType,
+						Format:    ts.Format,
+					}, idxSchema)
+					keys[i] = kv
+					if hasKAS && kas != "" {
+						strParts[i] = kas
+					} else {
+						strParts[i] = fmt.Sprintf("%v", kv)
+					}
+				}
+				bObj["key"] = keys
+				bObj["key_as_string"] = strings.Join(strParts, "|")
+			}
+			if mt.ShowTermDocCountErr != nil && *mt.ShowTermDocCountErr {
+				bObj["doc_count_error_upper_bound"] = 0
 			}
 		case aggSpec.AutoDateHistogram != nil:
 			ts, _ := strconv.ParseInt(leafKey, 10, 64)
@@ -28729,12 +29618,57 @@ func formatRuntimeBucketAggObjectWithSchema(
 	if aggSpec.AdjacencyMatrix != nil && aggSpec.AdjacencyMatrix.Keyed {
 		return formatKeyedBuckets(buckets, true, "key")
 	}
+	var mtSumOther int64
+	if aggSpec.MultiTerms != nil {
+		mt := aggSpec.MultiTerms
+		minCount := 1
+		if mt.MinDocCount != nil && *mt.MinDocCount >= 0 {
+			minCount = *mt.MinDocCount
+		}
+		if minCount > 1 && len(buckets) > 0 {
+			kept := make([]map[string]any, 0, len(buckets))
+			for _, b := range buckets {
+				if dc, okDC := toFloat64(b["doc_count"]); okDC && int(dc) >= minCount {
+					kept = append(kept, b)
+				}
+			}
+			buckets = kept
+		}
+		if len(buckets) > 1 {
+			var scopeSchemas map[string]*schema.IndexSchema
+			if sc := scopeFromDocLookupR63(docLookup); sc != nil {
+				scopeSchemas = sc.schemasByIndex
+			}
+			effOrder := mt.Order
+			if effOrder == nil {
+				effOrder = []any{map[string]any{"_count": "desc"}, map[string]any{"_key": "asc"}}
+			}
+			buckets = sortMultiTermsBucketsWithSchemaR65(buckets, effOrder, mt, idxSchema, scopeSchemas)
+		}
+		sizeLimit := mt.Size
+		if sizeLimit <= 0 {
+			sizeLimit = 10
+		}
+		if len(buckets) > sizeLimit {
+			for _, rem := range buckets[sizeLimit:] {
+				if dc, okDC := toFloat64(rem["doc_count"]); okDC {
+					mtSumOther += int64(dc)
+				}
+			}
+			buckets = buckets[:sizeLimit]
+		}
+		for _, r := range bucketsByAgg[fullKey+".__mt_shard_other"] {
+			if r.BucketKey == parentBucketKey {
+				mtSumOther += r.effectiveCount()
+			}
+		}
+	}
 	out := map[string]any{
 		"buckets": buckets,
 	}
 	if aggSpec.MultiTerms != nil {
 		out["doc_count_error_upper_bound"] = 0
-		out["sum_other_doc_count"] = 0
+		out["sum_other_doc_count"] = mtSumOther
 	}
 	if aggSpec.AutoDateHistogram != nil {
 		adh := aggSpec.AutoDateHistogram
@@ -28801,7 +29735,7 @@ func evalScriptedMetricCombineAndReduce(sm *esast.ScriptedMetricAggSpec, bDocs [
 		if mapSrc != "" {
 			for _, md := range bDocs {
 				effSchema := md.EffectiveSchema(nil)
-				evalDoc := prepareDocForRuntimeScript(effSchema, md.doc)
+				evalDoc := PrepareDocForRuntimeScriptRound61(effSchema, md.doc, resolveRuntimeScriptES8ModeR61Search(effSchema, md.doc))
 				p := buildParams(mapP)
 				p["_score"] = md.hit.Score
 				_, _ = painless.Eval(evalDoc, mapSrc, p)
@@ -29321,7 +30255,7 @@ func emitRuntimeAllSubAggRowsWithGlobal(
 			subFullKey = parentFullKey + "." + subName
 		}
 		switch {
-		case subSpec.SignificantText != nil:
+		case subSpec.SignificantText != nil || (subSpec.IsSignificantTerms() && subSpec.EffectiveTerms() != nil && subSpec.EffectiveTerms().BackgroundFilter != nil):
 			bgCorpus := globalDocs
 			if len(bgCorpus) == 0 {
 				bgCorpus = bDocs
@@ -29334,7 +30268,45 @@ func emitRuntimeAllSubAggRowsWithGlobal(
 		case subSpec.RareTerms != nil:
 			emitRuntimeRareTermsAggRows(subFullKey, parentBucketKey, subSpec, bDocs, out, idxSchema)
 		case subSpec.MultiTerms != nil:
-			emitRuntimeMultiTermsAggRows(subFullKey, parentBucketKey, subSpec, bDocs, out, idxSchema)
+			emitRuntimeMultiTermsAggRowsWithOptionsR65(subFullKey, parentBucketKey, subSpec, bDocs, globalDocs, out, idxSchema, nil)
+		case subSpec.Children != nil:
+			corpus := globalDocs
+			if len(corpus) == 0 {
+				corpus = bDocs
+			}
+			cDocs := runtimeChildrenMatchedDocsR65(idxSchema, bDocs, corpus, subSpec.Children.Type)
+			cBucketKey := "_children"
+			if parentBucketKey != "" {
+				cBucketKey = parentBucketKey
+			}
+			*out = append(*out, AggRow{
+				AggName:   subFullKey,
+				BucketKey: cBucketKey,
+				DocCount:  int64(len(cDocs)),
+				Value:     float64(len(cDocs)),
+			})
+			if len(subSpec.SubAggs()) > 0 {
+				emitRuntimeAllSubAggRowsWithGlobal(subFullKey, parentBucketKey, subSpec.SubAggs(), cDocs, globalDocs, out, idxSchema)
+			}
+		case subSpec.Parent != nil:
+			corpus := globalDocs
+			if len(corpus) == 0 {
+				corpus = bDocs
+			}
+			pDocs := runtimeParentMatchedDocsR65(idxSchema, bDocs, corpus, subSpec.Parent.Type)
+			pBucketKey := "_parent"
+			if parentBucketKey != "" {
+				pBucketKey = parentBucketKey
+			}
+			*out = append(*out, AggRow{
+				AggName:   subFullKey,
+				BucketKey: pBucketKey,
+				DocCount:  int64(len(pDocs)),
+				Value:     float64(len(pDocs)),
+			})
+			if len(subSpec.SubAggs()) > 0 {
+				emitRuntimeAllSubAggRowsWithGlobal(subFullKey, parentBucketKey, subSpec.SubAggs(), pDocs, globalDocs, out, idxSchema)
+			}
 		case subSpec.Histogram != nil:
 			emitRuntimeHistogramAggRows(subFullKey, parentBucketKey, subSpec, bDocs, out, idxSchema)
 		case subSpec.DateHistogram != nil:
@@ -29992,6 +30964,233 @@ func partitionDocsByParentBucket(idxSchema *schema.IndexSchema, docs []runtimeMa
 	return docs
 }
 
+func aggsHaveStringStatsR65(aggs map[string]esast.AggSpec) bool {
+	for _, spec := range aggs {
+		if spec.StringStats != nil {
+			return true
+		}
+		if len(spec.SubAggs()) > 0 && aggsHaveStringStatsR65(spec.SubAggs()) {
+			return true
+		}
+	}
+	return false
+}
+
+func resolveFieldAcrossDocLookupAndSchemaR65(field string, idxSchema *schema.IndexSchema, docLookup func(string) *HitRow) schema.FieldBinding {
+	var b schema.FieldBinding
+	if idxSchema != nil {
+		b = idxSchema.ResolveField(field)
+	}
+	if b.ESType != "" {
+		return b
+	}
+	if scope := scopeFromDocLookupR63(docLookup); scope != nil && len(scope.schemasByIndex) > 0 {
+		names := make([]string, 0, len(scope.schemasByIndex))
+		for n := range scope.schemasByIndex {
+			names = append(names, n)
+		}
+		sort.Strings(names)
+		for _, n := range names {
+			sc := scope.schemasByIndex[n]
+			if sc == nil {
+				continue
+			}
+			cand := sc.ResolveField(field)
+			if cand.ESType != "" {
+				return cand
+			}
+		}
+	}
+	return b
+}
+
+func validateStatsDateFormattingOverflowR65(
+	aggsOut map[string]any,
+	aggs map[string]esast.AggSpec,
+	schemasByIndex map[string]*schema.IndexSchema,
+	primarySchema *schema.IndexSchema,
+	isES8 bool,
+) error {
+	if !isES8 || len(aggsOut) == 0 || len(aggs) == 0 {
+		return nil
+	}
+	resolveDateFmt := func(field, specFmt string) (bool, string) {
+		var b schema.FieldBinding
+		if primarySchema != nil {
+			b = primarySchema.ResolveField(field)
+		}
+		if b.ESType == "" && len(schemasByIndex) > 0 {
+			for _, sc := range schemasByIndex {
+				if sc == nil {
+					continue
+				}
+				if cand := sc.ResolveField(field); cand.ESType != "" {
+					b = cand
+					break
+				}
+			}
+		}
+		if b.ESType != "date" && b.ESType != "date_nanos" {
+			return false, ""
+		}
+		eff := strings.TrimSpace(specFmt)
+		if eff == "" {
+			eff = strings.TrimSpace(strings.Split(b.Format, "||")[0])
+		}
+		switch strings.ToLower(eff) {
+		case "epoch_millis", "epoch_second", "epoch_nanos":
+			return false, ""
+		case "":
+			eff = "date_hour_minute_second_millis"
+		}
+		return true, eff
+	}
+	var walk func(mOut map[string]any, mSpec map[string]esast.AggSpec) error
+	walk = func(mOut map[string]any, mSpec map[string]esast.AggSpec) error {
+		for aggName, spec := range mSpec {
+			rawObj := mOut[aggName]
+			if rawObj == nil {
+				for k, v := range mOut {
+					if strings.HasSuffix(k, "#"+aggName) {
+						rawObj = v
+						break
+					}
+				}
+			}
+			obj, _ := rawObj.(map[string]any)
+			if obj == nil {
+				continue
+			}
+			if statsSpec := spec.EffectiveStats(); statsSpec != nil && statsSpec.Field != "" {
+				if isDate, fmtName := resolveDateFmt(statsSpec.Field, statsSpec.Format); isDate {
+					if cnt, _ := toFloat64(obj["count"]); cnt > 0 {
+						for _, statKey := range []string{"min", "max", "avg", "sum"} {
+							if v, okV := toFloat64(obj[statKey]); okV {
+								if v > 253402300799999.0 || v < -62167219200000.0 {
+									return fmt.Errorf("Cannot format stat [%s] with format [DocValueFormat.DateTime(format[%s] locale[], Z, MILLISECONDS)]", statKey, fmtName) //nolint:staticcheck // Exact Elasticsearch error message
+								}
+							}
+						}
+					}
+				}
+			}
+			if subAggs := spec.SubAggs(); len(subAggs) > 0 {
+				if err := walk(obj, subAggs); err != nil {
+					return err
+				}
+				switch bs := obj["buckets"].(type) {
+				case []map[string]any:
+					for _, bm := range bs {
+						if err := walk(bm, subAggs); err != nil {
+							return err
+						}
+					}
+				case []any:
+					for _, item := range bs {
+						if bm, ok := item.(map[string]any); ok {
+							if err := walk(bm, subAggs); err != nil {
+								return err
+							}
+						}
+					}
+				case map[string]any:
+					for _, item := range bs {
+						if bm, ok := item.(map[string]any); ok {
+							if err := walk(bm, subAggs); err != nil {
+								return err
+							}
+						}
+					}
+				}
+			}
+		}
+		return nil
+	}
+	return walk(aggsOut, aggs)
+}
+
+func emitRuntimeStringStatsAggRowsR65(fullAggName, parentBucketKey string, ssSpec *esast.MetricAggSpec, bDocs []runtimeMatchedDoc, out *[]AggRow) {
+	if ssSpec == nil {
+		return
+	}
+	mSpec := &esast.MetricAggSpec{
+		Field:   ssSpec.Field,
+		Missing: ssSpec.Missing,
+		Script:  ssSpec.Script,
+	}
+	var strs []string
+	for _, d := range bDocs {
+		for _, rv := range extractDocRawValuesForMetric(d, mSpec) {
+			if rv != nil {
+				strs = append(strs, fmt.Sprintf("%v", rv))
+			}
+		}
+	}
+	sCnt := int64(len(strs))
+	w := sCnt
+	if sCnt == 0 {
+		w = -1
+	}
+	var minLen, maxLen, avgLen, entropy float64
+	var charCounts map[rune]int64
+	var totalChars int64
+	if sCnt > 0 {
+		firstLen := float64(len([]rune(strs[0])))
+		minLen, maxLen = firstLen, firstLen
+		var sumLen float64
+		charCounts = make(map[rune]int64)
+		for _, s := range strs {
+			runes := []rune(s)
+			l := float64(len(runes))
+			if l < minLen {
+				minLen = l
+			}
+			if l > maxLen {
+				maxLen = l
+			}
+			sumLen += l
+			for _, ch := range runes {
+				charCounts[ch]++
+				totalChars++
+			}
+		}
+		avgLen = sumLen / float64(sCnt)
+		if totalChars > 0 {
+			for _, c := range charCounts {
+				p := float64(c) / float64(totalChars)
+				if p > 0 {
+					entropy -= p * math.Log2(p)
+				}
+			}
+		}
+	}
+	if parentBucketKey == "" {
+		*out = append(*out,
+			AggRow{AggName: fullAggName, BucketKey: "_sstats_count", DocCount: sCnt, Value: float64(sCnt)},
+			AggRow{AggName: fullAggName, BucketKey: "_sstats_min", DocCount: int64(minLen), Value: minLen, Weight: w},
+			AggRow{AggName: fullAggName, BucketKey: "_sstats_max", DocCount: int64(maxLen), Value: maxLen, Weight: w},
+			AggRow{AggName: fullAggName, BucketKey: "_sstats_avg", DocCount: int64(avgLen), Value: avgLen, Weight: w},
+			AggRow{AggName: fullAggName, BucketKey: "_sstats_entropy", DocCount: int64(entropy), Value: entropy, Weight: w},
+			AggRow{AggName: fullAggName, BucketKey: "_sstats_total_chars", DocCount: totalChars, Value: float64(totalChars)},
+		)
+		for ch, c := range charCounts {
+			*out = append(*out, AggRow{AggName: fullAggName, BucketKey: "_sstats_dist:" + string(ch), DocCount: c, Value: float64(c)})
+		}
+	} else {
+		*out = append(*out,
+			AggRow{AggName: fullAggName + "._sstats_count", BucketKey: parentBucketKey, DocCount: sCnt, Value: float64(sCnt)},
+			AggRow{AggName: fullAggName + "._sstats_min", BucketKey: parentBucketKey, DocCount: int64(minLen), Value: minLen, Weight: w},
+			AggRow{AggName: fullAggName + "._sstats_max", BucketKey: parentBucketKey, DocCount: int64(maxLen), Value: maxLen, Weight: w},
+			AggRow{AggName: fullAggName + "._sstats_avg", BucketKey: parentBucketKey, DocCount: int64(avgLen), Value: avgLen, Weight: w},
+			AggRow{AggName: fullAggName + "._sstats_entropy", BucketKey: parentBucketKey, DocCount: int64(entropy), Value: entropy, Weight: w},
+			AggRow{AggName: fullAggName + "._sstats_total_chars", BucketKey: parentBucketKey, DocCount: totalChars, Value: float64(totalChars)},
+		)
+		for ch, c := range charCounts {
+			*out = append(*out, AggRow{AggName: fullAggName + "._sstats_dist:" + string(ch), BucketKey: parentBucketKey, DocCount: c, Value: float64(c)})
+		}
+	}
+}
+
 func applyRuntimeScriptAggsForMap(
 	prefix string,
 	parentBucketKey string,
@@ -30007,9 +31206,12 @@ func applyRuntimeScriptAggsForMap(
 			fullKey = prefix + "." + aggName
 		}
 		switch {
-		case spec.SignificantText != nil:
+		case spec.SignificantText != nil || (spec.IsSignificantTerms() && spec.EffectiveTerms() != nil && spec.EffectiveTerms().BackgroundFilter != nil):
 			aggRows = dropRuntimeAggRows(aggRows, fullKey, parentBucketKey)
 			emitRuntimeSignificantTextAggRowsR62Search(fullKey, parentBucketKey, spec, docs, globalDocs, &aggRows, idxSchema)
+		case spec.StringStats != nil:
+			aggRows = dropRuntimeAggRows(aggRows, fullKey, parentBucketKey)
+			emitRuntimeStringStatsAggRowsR65(fullKey, parentBucketKey, spec.StringStats, docs, &aggRows)
 		case spec.EffectiveTerms() != nil && spec.EffectiveTerms().Script != nil:
 			aggRows = dropRuntimeAggRows(aggRows, fullKey, parentBucketKey)
 			emitRuntimeTermsScriptAggRowsWithSchema(fullKey, parentBucketKey, spec, docs, &aggRows, idxSchema)
@@ -30021,7 +31223,11 @@ func applyRuntimeScriptAggsForMap(
 			emitRuntimeRareTermsAggRows(fullKey, parentBucketKey, spec, docs, &aggRows, idxSchema)
 		case spec.MultiTerms != nil:
 			aggRows = dropRuntimeAggRows(aggRows, fullKey, parentBucketKey)
-			emitRuntimeMultiTermsAggRows(fullKey, parentBucketKey, spec, docs, &aggRows, idxSchema)
+			corpus := globalDocs
+			if len(corpus) == 0 {
+				corpus = docs
+			}
+			emitRuntimeMultiTermsAggRowsWithOptionsR65(fullKey, parentBucketKey, spec, docs, corpus, &aggRows, idxSchema, nil)
 		case spec.Histogram != nil && spec.Histogram.Script != nil:
 			aggRows = dropRuntimeAggRows(aggRows, fullKey, parentBucketKey)
 			emitRuntimeHistogramAggRows(fullKey, parentBucketKey, spec, docs, &aggRows, idxSchema)
@@ -30169,10 +31375,12 @@ func applyRuntimeScriptAggsForMap(
 			if len(spec.SubAggs()) > 0 {
 				emitRuntimeAllSubAggRowsWithGlobal(fullKey, parentBucketKey, spec.SubAggs(), sampledDocs, globalDocs, &aggRows, idxSchema)
 			}
+		case spec.Percentiles != nil && spec.Percentiles.HDR != nil && idxSchema != nil && isHistogramFieldInSchemaRound58(idxSchema, spec.Percentiles.Field):
+			aggRows = emitRuntimeHistogramFieldHDRRawRowsR65(fullKey, parentBucketKey, spec.Percentiles, docs, aggRows)
 		case aggSpecHasDirectRuntimeScript(spec):
 			aggRows = dropRuntimeAggRows(aggRows, fullKey, parentBucketKey)
 			emitRuntimeMetricAggRows(fullKey, parentBucketKey, spec, docs, &aggRows)
-		case aggsHaveRuntimeScript(spec.SubAggs()):
+		case aggsHaveRuntimeEvalR65(spec.SubAggs()):
 			switch {
 			case spec.Global != nil:
 				gDocs := globalDocs
@@ -30359,7 +31567,7 @@ func applyRuntimeScriptAggsOnlyWithGlobal(matchedQueryHits []HitRow, globalHits 
 			}
 		}
 	}
-	if !aggsHaveRuntimeScript(effAggs) && !hasRuntimeMappings {
+	if !aggsHaveRuntimeEvalR65(effAggs) && !hasRuntimeMappings {
 		return aggRows
 	}
 	matchedDocs := hitsToRuntimeMatchedDocs(matchedQueryHits, idxSchema)
@@ -30382,9 +31590,13 @@ func applyRuntimeScriptAggsOnlyWithGlobal(matchedQueryHits []HitRow, globalHits 
 				if len(gDocs) == 0 {
 					gDocs = matchedDocs
 				}
-				emitRuntimeAllSubAggRows("", "", single, gDocs, &aggRows, idxSchema)
+				emitRuntimeAllSubAggRowsWithGlobal("", "", single, gDocs, gDocs, &aggRows, idxSchema)
 			} else {
-				emitRuntimeAllSubAggRows("", "", single, matchedDocs, &aggRows, idxSchema)
+				gDocs := globalDocs
+				if len(gDocs) == 0 {
+					gDocs = matchedDocs
+				}
+				emitRuntimeAllSubAggRowsWithGlobal("", "", single, matchedDocs, gDocs, &aggRows, idxSchema)
 			}
 		}
 		return aggRows
@@ -30891,4 +32103,1975 @@ func evalHitScriptFields(h HitRow, scriptFields map[string]any, idxSchema *schem
 		}
 	}
 	return out
+}
+
+func roundHistFloatKeyR65(k float64) float64 {
+	ak := math.Abs(k)
+	switch {
+	case ak < 1e3:
+		return math.Round(k*1e12) / 1e12
+	case ak < 1e9:
+		return math.Round(k*1e6) / 1e6
+	default:
+		return math.Round(k)
+	}
+}
+
+func isExactLargeHistIntR65(raw string) bool {
+	s := strings.TrimSpace(raw)
+	if s == "" || strings.ContainsAny(s, ".eE") {
+		return false
+	}
+	f, err := strconv.ParseFloat(s, 64)
+	if err != nil || math.IsNaN(f) || math.IsInf(f, 0) {
+		return false
+	}
+	return math.Abs(f) >= 9007199254740992
+}
+
+func formatHistogramBucketKeyAnyR65(rawKey string, fallbackFloat float64, hist *esast.HistogramAggSpec, idxSchema *schema.IndexSchema) any {
+	trim := strings.TrimSpace(rawKey)
+	isUnsignedLong := false
+	if hist != nil && idxSchema != nil && hist.Field != "" {
+		if b := idxSchema.ResolveField(hist.Field); b.ESType == "unsigned_long" {
+			isUnsignedLong = true
+		}
+	}
+	if !strings.ContainsAny(trim, ".eE") && (isUnsignedLong || isExactLargeHistIntR65(trim)) {
+		if u, err := strconv.ParseUint(trim, 10, 64); err == nil {
+			if u > 9007199254740992 || (isUnsignedLong && hist != nil && hist.Interval >= 9007199254740992) {
+				return u
+			}
+		} else if i, errI := strconv.ParseInt(trim, 10, 64); errI == nil && (i > 9007199254740992 || i < -9007199254740992) {
+			return i
+		}
+	}
+	return fallbackFloat
+}
+
+func evalMovingPercentilesFallbackR65(buckets []map[string]any, subName string, mp *esast.MovingPercentilesAggSpec) {
+	evalMovingPercentilesFallbackWithTargetR65(buckets, subName, mp, nil)
+}
+
+func evalMovingPercentilesFallbackWithTargetR65(buckets []map[string]any, subName string, mp *esast.MovingPercentilesAggSpec, targetPct *esast.PercentilesAggSpec) {
+	if mp == nil || len(buckets) == 0 {
+		return
+	}
+	pathStr := mp.EffectivePath()
+	baseAgg := firstBucketsPathSeg(pathStr)
+	win := mp.EffectiveWindow()
+	shift := mp.EffectiveShift()
+	pcts := mp.EffectivePercents()
+	targetHasExplicitPercents := len(pcts) > 0
+	if !targetHasExplicitPercents && targetPct != nil && len(targetPct.Percents) > 0 {
+		pcts = targetPct.EffectivePercents()
+		targetHasExplicitPercents = true
+	}
+	insertZeros := strings.EqualFold(mp.GapPolicy, "insert_zeros")
+
+	targetSawUnkeyed := false
+	readTargetValues := func(rawTarget map[string]any) (map[string]float64, []float64) {
+		if rawTarget == nil {
+			return nil, nil
+		}
+		valsByKey := make(map[string]float64)
+		var discovered []float64
+		switch tv := rawTarget["values"].(type) {
+		case map[string]any:
+			for k, rawV := range tv {
+				if rawV == nil {
+					continue
+				}
+				if fv, okF := toFloat64(rawV); okF {
+					valsByKey[k] = fv
+					if pkF, okP := parseFiniteFloat(k); okP {
+						valsByKey[formatPercentileKeyStringR61Search(pkF)] = fv
+						discovered = append(discovered, pkF)
+					}
+				}
+			}
+		case []map[string]any:
+			targetSawUnkeyed = true
+			for _, item := range tv {
+				kf, okK := toFloat64(item["key"])
+				if !okK {
+					continue
+				}
+				discovered = append(discovered, kf)
+				if item["value"] != nil {
+					if fv, okF := toFloat64(item["value"]); okF {
+						valsByKey[formatPercentileKeyStringR61Search(kf)] = fv
+					}
+				}
+			}
+		case []any:
+			targetSawUnkeyed = true
+			for _, rawItem := range tv {
+				item, okM := rawItem.(map[string]any)
+				if !okM {
+					continue
+				}
+				kf, okK := toFloat64(item["key"])
+				if !okK {
+					continue
+				}
+				discovered = append(discovered, kf)
+				if item["value"] != nil {
+					if fv, okF := toFloat64(item["value"]); okF {
+						valsByKey[formatPercentileKeyStringR61Search(kf)] = fv
+					}
+				}
+			}
+		}
+		if len(discovered) > 1 {
+			sort.Float64s(discovered)
+		}
+		return valsByKey, discovered
+	}
+
+	if !targetHasExplicitPercents {
+		for _, b := range buckets {
+			if rawTarget, okT := b[baseAgg].(map[string]any); okT && rawTarget != nil {
+				if _, disc := readTargetValues(rawTarget); len(disc) > 0 {
+					pcts = disc
+					break
+				}
+			}
+		}
+		if len(pcts) == 0 {
+			pcts = mp.EffectivePercents()
+		}
+	}
+
+	type pctSample struct {
+		valid bool
+		vals  map[string]float64
+	}
+	var history []pctSample
+	for _, b := range buckets {
+		rawTarget, okTarget := b[baseAgg].(map[string]any)
+		var valuesMap map[string]float64
+		if okTarget && rawTarget != nil {
+			valuesMap, _ = readTargetValues(rawTarget)
+		}
+		sampleVals := make(map[string]float64, len(pcts))
+		hasValid := false
+		for _, p := range pcts {
+			pk := formatPercentileKeyStringR61Search(p)
+			if v, okV := valuesMap[pk]; okV {
+				sampleVals[pk] = v
+				hasValid = true
+				continue
+			}
+			if insertZeros {
+				sampleVals[pk] = 0
+				hasValid = true
+			}
+		}
+		if !hasValid && !insertZeros {
+			continue
+		}
+		history = append(history, pctSample{valid: true, vals: sampleVals})
+		endIdx := len(history) - 2 + shift
+		if endIdx >= len(history) {
+			endIdx = len(history) - 1
+		}
+		if endIdx < 0 {
+			continue
+		}
+		start := 0
+		if endIdx+1 > win {
+			start = endIdx + 1 - win
+		}
+		keyed := true
+		if mp.Keyed != nil {
+			keyed = *mp.Keyed
+		} else if targetPct != nil && targetPct.Keyed != nil {
+			keyed = *targetPct.Keyed
+		} else if targetSawUnkeyed {
+			keyed = false
+		}
+		if !keyed {
+			arr := make([]map[string]any, 0, len(pcts))
+			for _, p := range pcts {
+				pk := formatPercentileKeyStringR61Search(p)
+				var sum float64
+				var cnt int
+				for idx := start; idx <= endIdx; idx++ {
+					if v, ok := history[idx].vals[pk]; ok {
+						sum += v
+						cnt++
+					}
+				}
+				var valAny any
+				if cnt > 0 {
+					valAny = sum / float64(cnt)
+				}
+				entry := map[string]any{"key": p, "value": valAny}
+				if mp.Format != "" && valAny != nil {
+					if fv, okF := toFloat64(valAny); okF {
+						entry["value_as_string"] = formatNumericWithDecimalPatternR61Search(fv, mp.Format)
+					}
+				}
+				arr = append(arr, entry)
+			}
+			b[subName] = map[string]any{"values": arr}
+			continue
+		}
+		outValues := make(map[string]any, len(pcts))
+		for _, p := range pcts {
+			pk := formatPercentileKeyStringR61Search(p)
+			var sum float64
+			var cnt int
+			for idx := start; idx <= endIdx; idx++ {
+				if v, ok := history[idx].vals[pk]; ok {
+					sum += v
+					cnt++
+				}
+			}
+			if cnt > 0 {
+				outValues[pk] = sum / float64(cnt)
+			} else {
+				outValues[pk] = nil
+			}
+		}
+		if mp.Format != "" {
+			strMap := make(map[string]any, len(outValues))
+			for k, v := range outValues {
+				if fv, okF := toFloat64(v); okF {
+					strMap[k] = formatNumericWithDecimalPatternR61Search(fv, mp.Format)
+				} else {
+					strMap[k] = nil
+				}
+			}
+			b[subName] = map[string]any{"values": outValues, "values_as_string": strMap}
+		} else {
+			b[subName] = map[string]any{"values": outValues}
+		}
+	}
+}
+
+func aggsHaveTopMetricsR65(aggs map[string]esast.AggSpec) bool {
+	for _, spec := range aggs {
+		if spec.TopMetrics != nil {
+			return true
+		}
+		if len(spec.SubAggs()) > 0 && aggsHaveTopMetricsR65(spec.SubAggs()) {
+			return true
+		}
+	}
+	return false
+}
+
+func aggsHaveCumulativeCardinalityR65(aggs map[string]esast.AggSpec) bool {
+	for _, spec := range aggs {
+		if spec.IsCumulativeCardinality() {
+			return true
+		}
+		if len(spec.SubAggs()) > 0 && aggsHaveCumulativeCardinalityR65(spec.SubAggs()) {
+			return true
+		}
+	}
+	return false
+}
+
+func canonicalCumCardKeyR65(v any) string {
+	switch tv := v.(type) {
+	case string:
+		return "s:" + tv
+	case bool:
+		if tv {
+			return "b:1"
+		}
+		return "b:0"
+	case json.Number:
+		if f, err := tv.Float64(); err == nil {
+			return fmt.Sprintf("n:%.15g", f)
+		}
+		return "s:" + tv.String()
+	default:
+		if f, ok := toFloat64(v); ok {
+			return fmt.Sprintf("n:%.15g", f)
+		}
+		return "s:" + fmt.Sprintf("%v", v)
+	}
+}
+
+func applyTrueCumulativeCardinalityWithHitsR65(
+	aggs map[string]esast.AggSpec,
+	aggsOut map[string]any,
+	hits []HitRow,
+	primarySchema *schema.IndexSchema,
+) {
+	if len(aggs) == 0 || len(aggsOut) == 0 || !aggsHaveCumulativeCardinalityR65(aggs) {
+		return
+	}
+	runtimeDocs := make([]runtimeMatchedDoc, 0, len(hits))
+	for _, h := range hits {
+		var doc map[string]any
+		src := h.EffectiveSource()
+		if len(src) > 0 {
+			dec := json.NewDecoder(bytes.NewReader(src))
+			dec.UseNumber()
+			_ = dec.Decode(&doc)
+		}
+		if doc == nil {
+			doc = make(map[string]any)
+		}
+		doc["__meta_id"] = h.ID
+		if h.Index != "" {
+			doc["__meta_index"] = h.Index
+		} else if primarySchema != nil && primarySchema.IndexName != "" {
+			doc["__meta_index"] = primarySchema.IndexName
+		}
+		if h.Version > 0 {
+			doc["__meta_version"] = h.Version
+		} else {
+			doc["__meta_version"] = int64(1)
+		}
+		effSchema := primarySchema
+		if h.Schema != nil {
+			effSchema = h.Schema
+		}
+		runtimeDocs = append(runtimeDocs, runtimeMatchedDoc{
+			hit:        h,
+			doc:        doc,
+			rootDoc:    doc,
+			rootSchema: effSchema,
+		})
+	}
+
+	nowUTC := time.Now().UTC()
+	var walk func(curAggs map[string]esast.AggSpec, curOut map[string]any, curDocs []runtimeMatchedDoc)
+	walk = func(curAggs map[string]esast.AggSpec, curOut map[string]any, curDocs []runtimeMatchedDoc) {
+		for aggName, spec := range curAggs {
+			subAggs := spec.SubAggs()
+			if len(subAggs) == 0 || !aggsHaveCumulativeCardinalityR65(subAggs) {
+				continue
+			}
+			aggMap, ok := curOut[aggName].(map[string]any)
+			if !ok || aggMap == nil {
+				continue
+			}
+			rawBuckets, hasBuckets := aggMap["buckets"]
+			if !hasBuckets {
+				walk(subAggs, aggMap, curDocs)
+				continue
+			}
+			var orderedBuckets []map[string]any
+			switch bv := rawBuckets.(type) {
+			case []map[string]any:
+				orderedBuckets = bv
+			case []any:
+				for _, item := range bv {
+					if m, okM := item.(map[string]any); okM {
+						orderedBuckets = append(orderedBuckets, m)
+					}
+				}
+			case map[string]any:
+				keys := make([]string, 0, len(bv))
+				for k := range bv {
+					keys = append(keys, k)
+				}
+				sort.Slice(keys, func(i, j int) bool {
+					fi, okI := parseFiniteFloat(keys[i])
+					fj, okJ := parseFiniteFloat(keys[j])
+					if okI && okJ {
+						return fi < fj
+					}
+					if bi, okMI := bv[keys[i]].(map[string]any); okMI {
+						if bj, okMJ := bv[keys[j]].(map[string]any); okMJ {
+							ki, okKI := toFloat64(bi["key"])
+							kj, okKJ := toFloat64(bj["key"])
+							if okKI && okKJ {
+								return ki < kj
+							}
+						}
+					}
+					return keys[i] < keys[j]
+				})
+				for _, k := range keys {
+					if m, okM := bv[k].(map[string]any); okM {
+						orderedBuckets = append(orderedBuckets, m)
+					}
+				}
+			}
+			if len(orderedBuckets) == 0 {
+				continue
+			}
+
+			bucketDocsList := make([][]runtimeMatchedDoc, len(orderedBuckets))
+			for i, b := range orderedBuckets {
+				if spec.AutoDateHistogram != nil {
+					adh := spec.AutoDateHistogram
+					curMs, okCur := toFloat64(b["key"])
+					if okCur {
+						nextMs := math.Inf(1)
+						if i+1 < len(orderedBuckets) {
+							if nm, okN := toFloat64(orderedBuckets[i+1]["key"]); okN {
+								nextMs = nm
+							}
+						} else if i > 0 {
+							if pm, okP := toFloat64(orderedBuckets[i-1]["key"]); okP && curMs > pm {
+								nextMs = curMs + (curMs - pm)
+							}
+						}
+						var matched []runtimeMatchedDoc
+						for _, md := range curDocs {
+							tsList := extractDocDateMillisForBucket(primarySchema, md, adh.Field, adh.Missing, adh.Script, nowUTC)
+							for _, ts := range tsList {
+								if float64(ts) >= curMs && float64(ts) < nextMs {
+									matched = append(matched, md)
+									break
+								}
+							}
+						}
+						bucketDocsList[i] = matched
+					}
+				} else {
+					var bKeyStr string
+					if spec.DateHistogram != nil {
+						if ms, okMS := toFloat64(b["key"]); okMS {
+							bKeyStr = strconv.FormatInt(int64(ms), 10)
+						}
+					} else if rawK, okK := b["key"]; okK && rawK != nil {
+						bKeyStr = fmt.Sprintf("%v", rawK)
+					} else if rawKS, okKS := b["key_as_string"]; okKS && rawKS != nil {
+						bKeyStr = fmt.Sprintf("%v", rawKS)
+					}
+					if bKeyStr != "" {
+						bucketDocsList[i] = partitionDocsByParentBucket(primarySchema, curDocs, spec, bKeyStr)
+					}
+				}
+			}
+
+			subNames := make([]string, 0, len(subAggs))
+			for sn := range subAggs {
+				subNames = append(subNames, sn)
+			}
+			sort.Strings(subNames)
+			for _, subName := range subNames {
+				subSpec := subAggs[subName]
+				if !subSpec.IsCumulativeCardinality() {
+					continue
+				}
+				cumSpec := subSpec.EffectiveCumulativeCardinality()
+				targetSeg := firstBucketsPathSeg(cumSpec.EffectivePath())
+				targetAggSpec, existsTarget := subAggs[targetSeg]
+				if !existsTarget || targetAggSpec.Cardinality == nil {
+					continue
+				}
+				cardSpec := targetAggSpec.Cardinality
+				seen := make(map[string]struct{})
+				hasAny := false
+				insertZeros := strings.EqualFold(cumSpec.GapPolicy, "insert_zeros")
+				keepValues := strings.EqualFold(cumSpec.GapPolicy, "keep_values")
+				for i, b := range orderedBuckets {
+					dc, _ := toFloat64(b["doc_count"])
+					bDocs := bucketDocsList[i]
+					added := false
+					for _, md := range bDocs {
+						vals := extractDocRawValuesForMetric(md, &esast.MetricAggSpec{
+							Field:   cardSpec.Field,
+							Missing: cardSpec.Missing,
+							Script:  cardSpec.Script,
+						})
+						for _, v := range vals {
+							seen[canonicalCumCardKeyR65(v)] = struct{}{}
+							added = true
+						}
+					}
+					if int64(dc) == 0 && !added {
+						if insertZeros {
+							b[subName] = makePipelineMetricObj(float64(len(seen)), cumSpec.Format)
+						} else if keepValues && hasAny {
+							b[subName] = makePipelineMetricObj(float64(len(seen)), cumSpec.Format)
+						} else {
+							delete(b, subName)
+						}
+						continue
+					}
+					hasAny = true
+					b[subName] = makePipelineMetricObj(float64(len(seen)), cumSpec.Format)
+				}
+			}
+			for i, b := range orderedBuckets {
+				walk(subAggs, b, bucketDocsList[i])
+			}
+		}
+	}
+	walk(aggs, aggsOut, runtimeDocs)
+}
+
+func aggsHaveChildrenOrParentR65(aggs map[string]esast.AggSpec) bool {
+	for _, spec := range aggs {
+		if spec.Children != nil || spec.Parent != nil {
+			return true
+		}
+		if sub := spec.SubAggs(); len(sub) > 0 && aggsHaveChildrenOrParentR65(sub) {
+			return true
+		}
+	}
+	return false
+}
+
+func isNumericESTypeR65(esType string) bool {
+	switch esType {
+	case "byte", "short", "integer", "long", "unsigned_long", "float", "double", "half_float", "scaled_float":
+		return true
+	default:
+		return false
+	}
+}
+
+func isFloatESTypeR65(esType string) bool {
+	switch esType {
+	case "float", "double", "half_float", "scaled_float":
+		return true
+	default:
+		return false
+	}
+}
+
+func resolveMultiTermsFieldTypeR65(ts esast.MultiTermTermSpec, idxSchema *schema.IndexSchema, schemasByIndex map[string]*schema.IndexSchema) string {
+	if vt := strings.ToLower(strings.TrimSpace(ts.ValueType)); vt != "" {
+		return vt
+	}
+	seen := make(map[string]bool)
+	addSchema := func(sc *schema.IndexSchema) {
+		if sc == nil || ts.Field == "" {
+			return
+		}
+		b := sc.ResolveField(ts.Field)
+		if b.ESType != "" {
+			seen[b.ESType] = true
+		} else {
+			switch b.DorisType {
+			case schema.DorisLargeInt:
+				seen["unsigned_long"] = true
+			case schema.DorisBigInt, schema.DorisInt:
+				seen["long"] = true
+			case schema.DorisDouble:
+				seen["double"] = true
+			case schema.DorisBoolean:
+				seen["boolean"] = true
+			}
+		}
+	}
+	addSchema(idxSchema)
+	for _, sc := range schemasByIndex {
+		addSchema(sc)
+	}
+	if len(seen) == 0 {
+		return ""
+	}
+	if len(seen) == 1 {
+		for k := range seen {
+			return k
+		}
+	}
+	hasNumeric := false
+	hasFloat := false
+	hasUnsigned := false
+	hasSigned := false
+	hasIP := false
+	hasDate := false
+	for k := range seen {
+		if isNumericESTypeR65(k) {
+			hasNumeric = true
+			if isFloatESTypeR65(k) {
+				hasFloat = true
+			} else if k == "unsigned_long" {
+				hasUnsigned = true
+			} else {
+				hasSigned = true
+			}
+		} else if k == "ip" {
+			hasIP = true
+		} else if k == "date" || k == "date_nanos" {
+			hasDate = true
+		}
+	}
+	if hasFloat || (hasUnsigned && hasSigned) {
+		return "double"
+	}
+	if hasNumeric {
+		if hasUnsigned && !hasSigned {
+			return "unsigned_long"
+		}
+		return "long"
+	}
+	if hasIP {
+		return "ip"
+	}
+	if hasDate {
+		return "date"
+	}
+	for k := range seen {
+		return k
+	}
+	return ""
+}
+
+func computeMultiTermsUnifiedTypesR65(mt *esast.MultiTermsAggSpec, schemasByIndex map[string]*schema.IndexSchema) (map[string]string, bool) {
+	if mt == nil || len(mt.Terms) == 0 || len(schemasByIndex) <= 1 {
+		return nil, false
+	}
+	unified := make(map[string]string, len(mt.Terms))
+	hasConflict := false
+	for _, ts := range mt.Terms {
+		perIndex := make(map[string]bool)
+		for _, sc := range schemasByIndex {
+			if sc == nil {
+				continue
+			}
+			b := sc.ResolveField(ts.Field)
+			if b.ESType != "" {
+				perIndex[b.ESType] = true
+			}
+		}
+		if len(perIndex) > 1 {
+			ut := resolveMultiTermsFieldTypeR65(ts, nil, schemasByIndex)
+			if ut != "" {
+				unified[ts.Field] = ut
+				hasConflict = true
+			}
+		}
+	}
+	if !hasConflict {
+		return nil, false
+	}
+	return unified, true
+}
+
+func recomputeMultiIndexMultiTermsR65(
+	aggs map[string]esast.AggSpec,
+	fetchedHits []HitRow,
+	schemasByIndex map[string]*schema.IndexSchema,
+	primarySchema *schema.IndexSchema,
+	aggRows []AggRow,
+) []AggRow {
+	if len(aggs) == 0 || len(schemasByIndex) <= 1 || len(fetchedHits) == 0 {
+		return aggRows
+	}
+	byIndex := make(map[string][]HitRow)
+	var idxOrder []string
+	for _, h := range fetchedHits {
+		idx := h.Index
+		if _, ok := byIndex[idx]; !ok {
+			idxOrder = append(idxOrder, idx)
+		}
+		byIndex[idx] = append(byIndex[idx], h)
+	}
+	for aggName, spec := range aggs {
+		if spec.MultiTerms == nil {
+			continue
+		}
+		unifiedTypes, hasConflict := computeMultiTermsUnifiedTypesR65(spec.MultiTerms, schemasByIndex)
+		if !hasConflict {
+			continue
+		}
+		filtered := make([]AggRow, 0, len(aggRows))
+		for _, r := range aggRows {
+			if r.AggName == aggName || strings.HasPrefix(r.AggName, aggName+".") {
+				continue
+			}
+			filtered = append(filtered, r)
+		}
+		var shardRows []AggRow
+		for _, idxName := range idxOrder {
+			sc := schemasByIndex[idxName]
+			if sc == nil {
+				sc = primarySchema
+			}
+			docs := hitsToRuntimeMatchedDocs(byIndex[idxName], sc)
+			emitRuntimeMultiTermsAggRowsWithOptionsR65(aggName, "", spec, docs, docs, &shardRows, sc, unifiedTypes)
+		}
+		merged := mergeMultiIndexAggRows(shardRows, 0, 0, map[string]esast.AggSpec{aggName: spec})
+		for _, r := range merged {
+			if r.AggName == "__meta_total" || r.AggName == "__meta_query_total" {
+				continue
+			}
+			filtered = append(filtered, r)
+		}
+		aggRows = filtered
+	}
+	return aggRows
+}
+
+func runtimeJoinFieldHasChildR65(fb schema.FieldBinding, childType string) bool {
+	if len(fb.Relations) == 0 {
+		return true
+	}
+	for _, v := range fb.Relations {
+		switch cv := v.(type) {
+		case string:
+			if cv == childType {
+				return true
+			}
+		case []string:
+			for _, s := range cv {
+				if s == childType {
+					return true
+				}
+			}
+		case []any:
+			for _, elem := range cv {
+				if s, ok := elem.(string); ok && s == childType {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func runtimeJoinParentRolesR65(fb schema.FieldBinding, childType string) map[string]bool {
+	roles := make(map[string]bool)
+	for pName, v := range fb.Relations {
+		switch cv := v.(type) {
+		case string:
+			if cv == childType {
+				roles[pName] = true
+			}
+		case []string:
+			for _, s := range cv {
+				if s == childType {
+					roles[pName] = true
+					break
+				}
+			}
+		case []any:
+			for _, elem := range cv {
+				if s, ok := elem.(string); ok && s == childType {
+					roles[pName] = true
+					break
+				}
+			}
+		}
+	}
+	return roles
+}
+
+func extractRuntimeJoinNameParentR65(doc map[string]any, jf string) (string, string) {
+	if doc == nil || jf == "" {
+		return "", ""
+	}
+	vals := collectNestedOrArrayValsRound63(doc, strings.Split(jf, "."))
+	for _, v := range vals {
+		switch tv := v.(type) {
+		case string:
+			if tv != "" {
+				return tv, ""
+			}
+		case map[string]any:
+			name, _ := tv["name"].(string)
+			parent := ""
+			if pv, ok := tv["parent"]; ok && pv != nil {
+				parent = fmt.Sprintf("%v", pv)
+			}
+			return name, parent
+		}
+	}
+	return "", ""
+}
+
+func runtimeChildrenMatchedDocsR65(idxSchema *schema.IndexSchema, parentDocs, corpus []runtimeMatchedDoc, childType string) []runtimeMatchedDoc {
+	if idxSchema == nil || childType == "" || len(parentDocs) == 0 || len(corpus) == 0 {
+		return nil
+	}
+	var joinFields []string
+	for fname, fb := range idxSchema.Fields {
+		if fb.ESType == "join" && runtimeJoinFieldHasChildR65(fb, childType) {
+			joinFields = append(joinFields, fname)
+		}
+	}
+	if len(joinFields) == 0 {
+		return nil
+	}
+	sort.Strings(joinFields)
+	var out []runtimeMatchedDoc
+	seen := make(map[string]bool)
+	for _, jf := range joinFields {
+		fb := idxSchema.Fields[jf]
+		parentRoles := runtimeJoinParentRolesR65(fb, childType)
+		parentIDs := make(map[string]bool, len(parentDocs))
+		for _, pd := range parentDocs {
+			id := pd.hit.ID
+			if id == "" {
+				id, _ = pd.doc["__meta_id"].(string)
+			}
+			if id == "" {
+				continue
+			}
+			if len(parentRoles) > 0 {
+				pName, _ := extractRuntimeJoinNameParentR65(pd.doc, jf)
+				if !parentRoles[pName] {
+					continue
+				}
+			}
+			parentIDs[id] = true
+		}
+		if len(parentIDs) == 0 {
+			continue
+		}
+		for _, cd := range corpus {
+			cName, cParent := extractRuntimeJoinNameParentR65(cd.doc, jf)
+			if cName == childType && cParent != "" && parentIDs[cParent] {
+				key := cd.hit.Index + "\x00" + cd.hit.ID
+				if cd.hit.ID == "" || !seen[key] {
+					if cd.hit.ID != "" {
+						seen[key] = true
+					}
+					out = append(out, cd)
+				}
+			}
+		}
+	}
+	return out
+}
+
+func runtimeParentMatchedDocsR65(idxSchema *schema.IndexSchema, childDocs, corpus []runtimeMatchedDoc, childType string) []runtimeMatchedDoc {
+	if idxSchema == nil || childType == "" || len(childDocs) == 0 || len(corpus) == 0 {
+		return nil
+	}
+	var joinFields []string
+	for fname, fb := range idxSchema.Fields {
+		if fb.ESType == "join" && runtimeJoinFieldHasChildR65(fb, childType) {
+			joinFields = append(joinFields, fname)
+		}
+	}
+	if len(joinFields) == 0 {
+		return nil
+	}
+	sort.Strings(joinFields)
+	var out []runtimeMatchedDoc
+	seen := make(map[string]bool)
+	for _, jf := range joinFields {
+		fb := idxSchema.Fields[jf]
+		parentRoles := runtimeJoinParentRolesR65(fb, childType)
+		parentIDs := make(map[string]bool)
+		for _, cd := range childDocs {
+			cName, cParent := extractRuntimeJoinNameParentR65(cd.doc, jf)
+			if cName == childType && cParent != "" {
+				parentIDs[cParent] = true
+			}
+		}
+		if len(parentIDs) == 0 {
+			continue
+		}
+		for _, pd := range corpus {
+			id := pd.hit.ID
+			if id == "" {
+				id, _ = pd.doc["__meta_id"].(string)
+			}
+			if id == "" || !parentIDs[id] {
+				continue
+			}
+			if len(parentRoles) > 0 {
+				pName, _ := extractRuntimeJoinNameParentR65(pd.doc, jf)
+				if !parentRoles[pName] {
+					continue
+				}
+			}
+			key := pd.hit.Index + "\x00" + id
+			if !seen[key] {
+				seen[key] = true
+				out = append(out, pd)
+			}
+		}
+	}
+	return out
+}
+
+func parseExactNumberForMultiTermsR65(v any) (isNum bool, isU64 bool, u64 uint64, isI64 bool, i64 int64, f64 float64) {
+	switch tv := v.(type) {
+	case int:
+		return true, false, 0, true, int64(tv), float64(tv)
+	case int64:
+		return true, false, 0, true, tv, float64(tv)
+	case uint64:
+		return true, true, tv, false, 0, float64(tv)
+	case float64:
+		return true, false, 0, false, 0, tv
+	case float32:
+		return true, false, 0, false, 0, float64(tv)
+	case json.Number:
+		s := tv.String()
+		if iv, err := strconv.ParseInt(s, 10, 64); err == nil {
+			return true, false, 0, true, iv, float64(iv)
+		}
+		if uv, err := strconv.ParseUint(s, 10, 64); err == nil {
+			return true, true, uv, false, 0, float64(uv)
+		}
+		if fv, err := strconv.ParseFloat(s, 64); err == nil {
+			return true, false, 0, false, 0, fv
+		}
+	}
+	return false, false, 0, false, 0, 0
+}
+
+func compareMultiTermsTupleElemR65(a, b any, fieldType string) int {
+	if fieldType == "ip" {
+		sa := strings.TrimSpace(fmt.Sprintf("%v", a))
+		sb := strings.TrimSpace(fmt.Sprintf("%v", b))
+		if ipa, errA := netip.ParseAddr(sa); errA == nil {
+			if ipb, errB := netip.ParseAddr(sb); errB == nil {
+				return ipa.Compare(ipb)
+			}
+		}
+	}
+	numA, uA, uvA, iA, ivA, fvA := parseExactNumberForMultiTermsR65(a)
+	numB, uB, uvB, iB, ivB, fvB := parseExactNumberForMultiTermsR65(b)
+	if numA && numB {
+		if uA && uB {
+			if uvA < uvB {
+				return -1
+			}
+			if uvA > uvB {
+				return 1
+			}
+			return 0
+		}
+		if iA && iB {
+			if ivA < ivB {
+				return -1
+			}
+			if ivA > ivB {
+				return 1
+			}
+			return 0
+		}
+		if (uA && iB) || (iA && uB) {
+			if uA && iB {
+				if ivB < 0 || uvA > uint64(ivB) {
+					return 1
+				}
+				if uvA < uint64(ivB) {
+					return -1
+				}
+				return 0
+			}
+			if ivA < 0 || uint64(ivA) < uvB {
+				return -1
+			}
+			if uint64(ivA) > uvB {
+				return 1
+			}
+			return 0
+		}
+		if fvA < fvB {
+			return -1
+		}
+		if fvA > fvB {
+			return 1
+		}
+		return 0
+	}
+	return compareAny(a, b)
+}
+
+func compareMultiTermsTuplesWithTypesR65(ki, kj []any, si, sj string, termTypes []string) int {
+	n := len(ki)
+	if len(kj) < n {
+		n = len(kj)
+	}
+	for idx := 0; idx < n; idx++ {
+		ft := ""
+		if idx < len(termTypes) {
+			ft = termTypes[idx]
+		}
+		if c := compareMultiTermsTupleElemR65(ki[idx], kj[idx], ft); c != 0 {
+			return c
+		}
+	}
+	if len(ki) != len(kj) {
+		if len(ki) < len(kj) {
+			return -1
+		}
+		return 1
+	}
+	return strings.Compare(si, sj)
+}
+
+func sortMultiTermsBucketsR65(buckets []map[string]any, order any) []map[string]any {
+	return sortMultiTermsBucketsWithSchemaR65(buckets, order, nil, nil, nil)
+}
+
+func sortMultiTermsBucketsWithSchemaR65(
+	buckets []map[string]any,
+	order any,
+	mt *esast.MultiTermsAggSpec,
+	idxSchema *schema.IndexSchema,
+	schemasByIndex map[string]*schema.IndexSchema,
+) []map[string]any {
+	type mtSortSpec struct {
+		target string
+		desc   bool
+	}
+	var specs []mtSortSpec
+	parseMap := func(m map[string]any) {
+		for _, k := range sortedOrderMapKeys(m) {
+			if dir := extractCompositeSourceOrder(m[k]); dir != "" {
+				specs = append(specs, mtSortSpec{
+					target: strings.TrimSpace(k),
+					desc:   strings.EqualFold(strings.TrimSpace(dir), "desc"),
+				})
+			}
+		}
+	}
+	switch ov := order.(type) {
+	case map[string]any:
+		parseMap(ov)
+	case []map[string]any:
+		for _, m := range ov {
+			parseMap(m)
+		}
+	case []any:
+		for _, item := range ov {
+			if m, ok := item.(map[string]any); ok {
+				parseMap(m)
+			}
+		}
+	}
+	if len(specs) == 0 || len(buckets) <= 1 {
+		return buckets
+	}
+	var termTypes []string
+	if mt != nil && len(mt.Terms) > 0 {
+		termTypes = make([]string, len(mt.Terms))
+		for i, ts := range mt.Terms {
+			termTypes[i] = resolveMultiTermsFieldTypeR65(ts, idxSchema, schemasByIndex)
+		}
+	}
+	cmpKeyTuples := func(bi, bj map[string]any) int {
+		ki, _ := bi["key"].([]any)
+		kj, _ := bj["key"].([]any)
+		si, _ := bi["key_as_string"].(string)
+		sj, _ := bj["key_as_string"].(string)
+		return compareMultiTermsTuplesWithTypesR65(ki, kj, si, sj, termTypes)
+	}
+	sort.SliceStable(buckets, func(i, j int) bool {
+		for _, sp := range specs {
+			switch sp.target {
+			case "_key", "_term", "key":
+				if c := cmpKeyTuples(buckets[i], buckets[j]); c != 0 {
+					if sp.desc {
+						return c > 0
+					}
+					return c < 0
+				}
+			case "_count", "doc_count":
+				vi, okI := toFloat64(buckets[i]["doc_count"])
+				vj, okJ := toFloat64(buckets[j]["doc_count"])
+				if okI != okJ {
+					return okI
+				}
+				if vi != vj {
+					if sp.desc {
+						return vi > vj
+					}
+					return vi < vj
+				}
+			default:
+				vi, okI := extractBucketMetricByPath(buckets[i], sp.target)
+				vj, okJ := extractBucketMetricByPath(buckets[j], sp.target)
+				if !okI && !okJ {
+					continue
+				}
+				if !okI {
+					return false
+				}
+				if !okJ {
+					return true
+				}
+				if vi != vj {
+					if sp.desc {
+						return vi > vj
+					}
+					return vi < vj
+				}
+			}
+		}
+		return cmpKeyTuples(buckets[i], buckets[j]) < 0
+	})
+	return buckets
+}
+
+func parseAnyDateValueMillisR65(v any, fmtHint string) (int64, bool) {
+	switch tv := v.(type) {
+	case int64:
+		return tv, true
+	case uint64:
+		if tv <= math.MaxInt64 {
+			return int64(tv), true // #nosec G115 -- bounds-checked against math.MaxInt64
+		}
+		return 0, false
+	case int:
+		return int64(tv), true
+	case float64:
+		if !math.IsNaN(tv) && !math.IsInf(tv, 0) {
+			return int64(tv), true
+		}
+	case json.Number:
+		if iv, err := tv.Int64(); err == nil {
+			return iv, true
+		}
+		if fv, err := tv.Float64(); err == nil && !math.IsNaN(fv) && !math.IsInf(fv, 0) {
+			return int64(fv), true
+		}
+	case string:
+		trim := strings.TrimSpace(tv)
+		if trim == "" {
+			return 0, false
+		}
+		nowUTC := time.Now().UTC()
+		if fmtHint != "" {
+			if ms, ok := schema.ParseESDateWithFormatToEpochMillis(trim, fmtHint, nowUTC); ok {
+				return ms, true
+			}
+		}
+		if ms, ok := schema.ParseESDateToEpochMillis(trim, nowUTC); ok {
+			return ms, true
+		}
+	}
+	return 0, false
+}
+
+func resolveTermsOrderTargetSubAggWithNameR65(subAggs map[string]esast.AggSpec, rawField string) (aggName string, subSpec esast.AggSpec, prop string, isTopMetrics bool, ok bool) {
+	segs := normalizeBucketsPath(rawField)
+	if len(segs) == 0 || len(subAggs) == 0 {
+		return "", esast.AggSpec{}, "", false, false
+	}
+	currMap := subAggs
+	for i := 0; i < len(segs); i++ {
+		if len(currMap) == 0 {
+			return "", esast.AggSpec{}, "", false, false
+		}
+		seg := segs[i]
+		targetSpec, exists := currMap[seg]
+		if !exists {
+			if greedyKey, greedySpec, newIdx, okG := resolveGreedyAggInMapR63(currMap, segs, i); okG {
+				seg = greedyKey
+				targetSpec = greedySpec
+				i = newIdx
+				exists = true
+			}
+		}
+		if !exists {
+			return "", esast.AggSpec{}, "", false, false
+		}
+		if targetSpec.TopMetrics != nil {
+			remProp := strings.Join(segs[i+1:], ".")
+			remProp = strings.TrimPrefix(remProp, "metrics.")
+			return seg, targetSpec, remProp, true, true
+		}
+		isSingleWrapper := targetSpec.Filter != nil || targetSpec.Global != nil || targetSpec.Nested != nil ||
+			targetSpec.ReverseNested != nil || targetSpec.EffectiveSampler() != nil || targetSpec.RandomSampler != nil ||
+			targetSpec.Children != nil || targetSpec.Parent != nil || targetSpec.Missing != nil
+		if isSingleWrapper {
+			currMap = targetSpec.SubAggs()
+			continue
+		}
+		if isKeyedBucketAggSpec(targetSpec) {
+			if i+1 < len(segs) {
+				if _, isDirectSub := targetSpec.SubAggs()[segs[i+1]]; !isDirectSub {
+					i++
+				}
+			}
+			currMap = targetSpec.SubAggs()
+			continue
+		}
+		return seg, targetSpec, strings.Join(segs[i+1:], "."), false, true
+	}
+	return "", esast.AggSpec{}, "", false, false
+}
+
+func resolveTermsOrderTargetSubAggR65(subAggs map[string]esast.AggSpec, rawField string) (subSpec esast.AggSpec, prop string, isTopMetrics bool, ok bool) {
+	_, subSpec, prop, isTopMetrics, ok = resolveTermsOrderTargetSubAggWithNameR65(subAggs, rawField)
+	return subSpec, prop, isTopMetrics, ok
+}
+
+func topMetricsHasMetricFieldR65(tm *esast.TopMetricsAggSpec, metricProp string) bool {
+	if tm == nil {
+		return false
+	}
+	prop := strings.TrimPrefix(strings.TrimSpace(metricProp), "metrics.")
+	if prop == "" {
+		return false
+	}
+	for _, mf := range tm.EffectiveMetricFields() {
+		if mf == prop {
+			return true
+		}
+	}
+	return false
+}
+
+func extractBucketAnyValueBySegsR65(b map[string]any, segs []string) (any, bool) {
+	if b == nil || len(segs) == 0 {
+		return nil, false
+	}
+	matchedIdx := -1
+	var matchedVal any
+	for end := len(segs); end >= 1; end-- {
+		cand := strings.Join(segs[:end], ".")
+		if v, exists := b[cand]; exists {
+			matchedIdx = end
+			matchedVal = v
+			break
+		}
+	}
+	if matchedIdx >= 1 {
+		rem := segs[matchedIdx:]
+		if subMap, ok := matchedVal.(map[string]any); ok {
+			if rawTop, hasTop := subMap["top"]; hasTop {
+				var firstTop map[string]any
+				switch ts := rawTop.(type) {
+				case []map[string]any:
+					if len(ts) > 0 {
+						firstTop = ts[0]
+					}
+				case []any:
+					if len(ts) > 0 {
+						firstTop, _ = ts[0].(map[string]any)
+					}
+				}
+				if firstTop == nil {
+					return nil, false
+				}
+				metricsMap, _ := firstTop["metrics"].(map[string]any)
+				if metricsMap == nil || len(rem) == 0 {
+					return nil, false
+				}
+				remProp := strings.TrimPrefix(strings.Join(rem, "."), "metrics.")
+				if mv, okMV := metricsMap[remProp]; okMV && mv != nil {
+					return mv, true
+				}
+				if mv, okMV := lookupRawPathValueRound61(metricsMap, strings.Split(remProp, ".")); okMV && mv != nil {
+					return mv, true
+				}
+				return nil, false
+			}
+			if rawB, hasB := subMap["buckets"]; hasB && len(rem) >= 2 {
+				if bm, okBM := rawB.(map[string]any); okBM {
+					if keyB, okKB := bm[rem[0]].(map[string]any); okKB {
+						if av, okAV := extractBucketAnyValueBySegsR65(keyB, rem[1:]); okAV {
+							return av, true
+						}
+					}
+				}
+			}
+			if len(rem) > 0 {
+				if av, okAV := extractBucketAnyValueBySegsR65(subMap, rem); okAV {
+					return av, true
+				}
+			}
+		}
+	}
+	if fv, okF := extractBucketMetricBySegs(b, segs); okF {
+		return fv, true
+	}
+	return nil, false
+}
+
+func compareTermsAnyOrderValR65(a, b any) int {
+	if fa, okA := toFloat64(a); okA {
+		if fb, okB := toFloat64(b); okB {
+			if fa < fb {
+				return -1
+			}
+			if fa > fb {
+				return 1
+			}
+			return 0
+		}
+	}
+	sa := fmt.Sprint(a)
+	sb := fmt.Sprint(b)
+	return strings.Compare(sa, sb)
+}
+
+func extractTopMetricsNumericMetricR65(subMap map[string]any, tail []string) (float64, bool) {
+	if subMap == nil || len(tail) == 0 {
+		return 0, false
+	}
+	rawTop, hasTop := subMap["top"]
+	if !hasTop {
+		return 0, false
+	}
+	var firstTop map[string]any
+	switch ts := rawTop.(type) {
+	case []map[string]any:
+		if len(ts) > 0 {
+			firstTop = ts[0]
+		}
+	case []any:
+		if len(ts) > 0 {
+			firstTop, _ = ts[0].(map[string]any)
+		}
+	}
+	if firstTop == nil {
+		return 0, false
+	}
+	metricsMap, _ := firstTop["metrics"].(map[string]any)
+	if metricsMap == nil {
+		return 0, false
+	}
+	remProp := strings.TrimPrefix(strings.Join(tail, "."), "metrics.")
+	if mv, okMV := metricsMap[remProp]; okMV && mv != nil {
+		return toFloat64(mv)
+	}
+	if mv, okMV := lookupRawPathValueRound61(metricsMap, strings.Split(remProp, ".")); okMV && mv != nil {
+		return toFloat64(mv)
+	}
+	return 0, false
+}
+
+func validateTermsOrderPathsR65(s *Server, aggs map[string]esast.AggSpec) (string, string, bool) {
+	if len(aggs) == 0 {
+		return "", "", false
+	}
+	rewriteToFilter := true
+	if s != nil {
+		s.mu.RLock()
+		if v, exists := s.clusterTransientSettings["search.aggs.rewrite_to_filter_by_filter"]; exists && v != nil {
+			if b, okB := v.(bool); okB {
+				rewriteToFilter = b
+			} else if sv, okS := v.(string); okS {
+				rewriteToFilter = !strings.EqualFold(strings.TrimSpace(sv), "false")
+			}
+		} else if v, exists := s.clusterPersistentSettings["search.aggs.rewrite_to_filter_by_filter"]; exists && v != nil {
+			if b, okB := v.(bool); okB {
+				rewriteToFilter = b
+			} else if sv, okS := v.(string); okS {
+				rewriteToFilter = !strings.EqualFold(strings.TrimSpace(sv), "false")
+			}
+		}
+		s.mu.RUnlock()
+	}
+
+	var walk func(m map[string]esast.AggSpec) (string, string, bool)
+	walk = func(m map[string]esast.AggSpec) (string, string, bool) {
+		names := make([]string, 0, len(m))
+		for k := range m {
+			names = append(names, k)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			spec := m[name]
+			if spec.Terms != nil && spec.Terms.Order != nil && len(spec.SubAggs()) > 0 {
+				checkKey := func(orderKey string) (string, string, bool) {
+					trimKey := strings.TrimSpace(orderKey)
+					if trimKey == "" || trimKey == "_count" || trimKey == "_key" || trimKey == "_term" {
+						return "", "", false
+					}
+					tmName, tmSpec, prop, isTM, ok := resolveTermsOrderTargetSubAggWithNameR65(spec.SubAggs(), trimKey)
+					if ok && isTM && !topMetricsHasMetricFieldR65(tmSpec.TopMetrics, prop) {
+						if !rewriteToFilter {
+							return "action_request_validation_exception",
+								fmt.Sprintf("Invalid aggregation order path [%s]. Unknown metric name [%s] on multi-value metrics aggregation [%s]", trimKey, prop, tmName),
+								true
+						}
+						return "illegal_argument_exception",
+							fmt.Sprintf("Invalid aggregation order path [%s]. unknown metric [%s]", trimKey, prop),
+							true
+					}
+					return "", "", false
+				}
+				switch ov := spec.Terms.Order.(type) {
+				case map[string]any:
+					for _, k := range sortedOrderMapKeys(ov) {
+						if et, er, has := checkKey(k); has {
+							return et, er, true
+						}
+					}
+				case []map[string]any:
+					for _, om := range ov {
+						for _, k := range sortedOrderMapKeys(om) {
+							if et, er, has := checkKey(k); has {
+								return et, er, true
+							}
+						}
+					}
+				case []any:
+					for _, item := range ov {
+						if om, okM := item.(map[string]any); okM {
+							for _, k := range sortedOrderMapKeys(om) {
+								if et, er, has := checkKey(k); has {
+									return et, er, true
+								}
+							}
+						}
+					}
+				}
+			}
+			if sub := spec.SubAggs(); len(sub) > 0 {
+				if et, er, has := walk(sub); has {
+					return et, er, true
+				}
+			}
+		}
+		return "", "", false
+	}
+	return walk(aggs)
+}
+
+func unboundNullParamInBucketScriptR65(src string, p map[string]any) bool {
+	if src == "" {
+		return false
+	}
+	isIdentStart := func(ch byte) bool {
+		return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || ch == '_'
+	}
+	isIdentChar := func(ch byte) bool {
+		return isIdentStart(ch) || (ch >= '0' && ch <= '9')
+	}
+	isNullComparisonAround := func(startIdx, endIdx int) bool {
+		right := strings.TrimSpace(src[endIdx:])
+		if strings.HasPrefix(right, "== null") || strings.HasPrefix(right, "!= null") ||
+			strings.HasPrefix(right, "==null") || strings.HasPrefix(right, "!=null") {
+			return true
+		}
+		left := strings.TrimSpace(src[:startIdx])
+		if strings.HasSuffix(left, "null ==") || strings.HasSuffix(left, "null !=") ||
+			strings.HasSuffix(left, "null==") || strings.HasSuffix(left, "null!=") {
+			return true
+		}
+		return false
+	}
+	for i := 0; i < len(src); i++ {
+		if strings.HasPrefix(src[i:], "params.") {
+			if i > 0 && isIdentChar(src[i-1]) {
+				continue
+			}
+			j := i + len("params.")
+			kStart := j
+			for j < len(src) && isIdentChar(src[j]) {
+				j++
+			}
+			if j > kStart {
+				key := src[kStart:j]
+				if key != "_source" {
+					val, exists := p[key]
+					if !exists || val == nil {
+						if !isNullComparisonAround(i, j) {
+							return true
+						}
+					}
+				}
+			}
+		}
+	}
+	return false
+}
+
+func validateTopHitsAndPipelineScriptErrorsR65(
+	aggs map[string]esast.AggSpec,
+	allAggRows []AggRow,
+	aggsOut map[string]any,
+	docLookup func(string) *HitRow,
+) error {
+	if len(aggs) == 0 || len(aggsOut) == 0 {
+		return nil
+	}
+	rowsByAgg := make(map[string][]AggRow)
+	for _, r := range allAggRows {
+		rowsByAgg[r.AggName] = append(rowsByAgg[r.AggName], r)
+	}
+	aggHasBucketRows := func(fullPath string) bool {
+		for _, r := range rowsByAgg[fullPath] {
+			if !strings.HasPrefix(r.BucketKey, "__agg_") {
+				return true
+			}
+		}
+		return false
+	}
+	decodeSourceMap := func(raw any) map[string]any {
+		switch sv := raw.(type) {
+		case map[string]any:
+			return sv
+		case json.RawMessage:
+			var m map[string]any
+			dec := json.NewDecoder(bytes.NewReader(sv))
+			dec.UseNumber()
+			_ = dec.Decode(&m)
+			return m
+		case []byte:
+			var m map[string]any
+			dec := json.NewDecoder(bytes.NewReader(sv))
+			dec.UseNumber()
+			_ = dec.Decode(&m)
+			return m
+		}
+		return nil
+	}
+	checkHitHasSourcePath := func(hitMap map[string]any, thName, bpVal string) error {
+		segs := normalizeBucketsPath(bpVal)
+		if len(segs) < 2 || segs[0] != thName {
+			return nil
+		}
+		tail := segs[1:]
+		var fieldSegs []string
+		var rawField string
+		if len(tail) == 1 && strings.HasPrefix(tail[0], "_source.") {
+			rawField = strings.TrimPrefix(tail[0], "_source.")
+			fieldSegs = strings.Split(rawField, ".")
+		} else if len(tail) >= 2 && tail[0] == "_source" {
+			rawField = strings.Join(tail[1:], ".")
+			fieldSegs = tail[1:]
+		} else {
+			return nil
+		}
+		srcMap := decodeSourceMap(hitMap["_source"])
+		if srcMap == nil {
+			return fmt.Errorf("illegal_argument_exception: path not supported for [%s]: [_source.%s].", thName, rawField) //nolint:staticcheck // Exact Elasticsearch error message
+		}
+		val, found := lookupRawPathValueRound61(srcMap, fieldSegs)
+		if !found || val == nil {
+			return fmt.Errorf("illegal_argument_exception: path not supported for [%s]: [_source.%s].", thName, rawField) //nolint:staticcheck // Exact Elasticsearch error message
+		}
+		return nil
+	}
+	validateTopHitsBucket := func(b map[string]any, subAggs map[string]esast.AggSpec, bucketsPath map[string]string) error {
+		for _, bpVal := range bucketsPath {
+			segs := normalizeBucketsPath(bpVal)
+			if len(segs) < 2 {
+				continue
+			}
+			thName := segs[0]
+			thSpec, okTH := subAggs[thName]
+			if !okTH || thSpec.TopHits == nil {
+				continue
+			}
+			thObj, okObj := b[thName].(map[string]any)
+			if !okObj {
+				continue
+			}
+			hitsEnv, _ := thObj["hits"].(map[string]any)
+			if hitsEnv == nil {
+				continue
+			}
+			var firstHit map[string]any
+			switch hs := hitsEnv["hits"].(type) {
+			case []map[string]any:
+				if len(hs) > 0 {
+					firstHit = hs[0]
+				}
+			case []any:
+				if len(hs) > 0 {
+					firstHit, _ = hs[0].(map[string]any)
+				}
+			}
+			if firstHit == nil {
+				continue
+			}
+			if err := checkHitHasSourcePath(firstHit, thName, bpVal); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	validatePrunedTopHitsFromRows := func(fullParentPath string, subAggs map[string]esast.AggSpec, bucketsPath map[string]string) error {
+		for _, bpVal := range bucketsPath {
+			segs := normalizeBucketsPath(bpVal)
+			if len(segs) < 2 {
+				continue
+			}
+			thName := segs[0]
+			thSpec, okTH := subAggs[thName]
+			if !okTH || thSpec.TopHits == nil {
+				continue
+			}
+			thRows := rowsByAgg[fullParentPath+"."+thName]
+			if len(thRows) == 0 {
+				continue
+			}
+			grouped := make(map[string][]AggRow)
+			for _, r := range thRows {
+				if strings.HasPrefix(r.BucketKey, "__agg_") {
+					continue
+				}
+				pKey := ""
+				cp := r
+				if sep := strings.LastIndex(r.BucketKey, "\x1f"); sep >= 0 {
+					pKey = r.BucketKey[:sep]
+					cp.BucketKey = r.BucketKey[sep+1:]
+				}
+				grouped[pKey] = append(grouped[pKey], cp)
+			}
+			for _, grpRows := range grouped {
+				thList := buildTopHitsList("", grpRows, thSpec.TopHits, docLookup)
+				if len(thList) == 0 {
+					continue
+				}
+				if err := checkHitHasSourcePath(thList[0], thName, bpVal); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+	validateScriptSpecOnBuckets := func(fullParentPath string, buckets []map[string]any, subAggs map[string]esast.AggSpec, spec esast.AggSpec) error {
+		var pSpec *esast.BucketSelectorAggSpec
+		isSelector := false
+		if spec.BucketScript != nil {
+			pSpec = spec.BucketScript
+		} else if spec.BucketSelector != nil {
+			pSpec = spec.BucketSelector
+			isSelector = true
+		} else {
+			return nil
+		}
+		if err := validatePrunedTopHitsFromRows(fullParentPath, subAggs, pSpec.BucketsPath); err != nil {
+			return err
+		}
+		src, scriptParams := extractScriptSourceAndParams(pSpec.Script)
+		if src == "" {
+			return nil
+		}
+		insertZeros := strings.EqualFold(pSpec.GapPolicy, "insert_zeros")
+		keepValues := strings.EqualFold(pSpec.GapPolicy, "keep_values")
+		if len(buckets) == 0 {
+			if isSelector && aggHasBucketRows(fullParentPath) {
+				dummyParams := make(map[string]any, len(pSpec.BucketsPath)+len(scriptParams))
+				for k, v := range scriptParams {
+					bindNestedPainlessParam(dummyParams, k, v)
+				}
+				for k := range pSpec.BucketsPath {
+					bindNestedPainlessParam(dummyParams, k, 0.0)
+				}
+				if unboundNullParamInBucketScriptR65(src, dummyParams) {
+					return fmt.Errorf("script_exception: NullPointerException: cannot access null property")
+				}
+				if _, err := painless.EvalFilter(map[string]any{}, src, dummyParams); err != nil {
+					return fmt.Errorf("script_exception: %w", err)
+				}
+			}
+			return nil
+		}
+		for _, b := range buckets {
+			if err := validateTopHitsBucket(b, subAggs, pSpec.BucketsPath); err != nil {
+				return err
+			}
+			painlessParams := make(map[string]any, len(pSpec.BucketsPath)+len(scriptParams))
+			for k, v := range scriptParams {
+				bindNestedPainlessParam(painlessParams, k, v)
+			}
+			hasSkippedGap := false
+			for k, bpVal := range pSpec.BucketsPath {
+				if val, ok := extractBucketMetricByPath(b, bpVal); ok {
+					bindNestedPainlessParam(painlessParams, k, val)
+					continue
+				}
+				if mVal, okMap := extractBucketMetricMapByPath(b, bpVal); okMap {
+					bindNestedPainlessParam(painlessParams, k, mVal)
+					continue
+				}
+				if insertZeros {
+					bindNestedPainlessParam(painlessParams, k, 0.0)
+				} else if keepValues {
+					bindNestedPainlessParam(painlessParams, k, nil)
+				} else {
+					hasSkippedGap = true
+					break
+				}
+			}
+			if hasSkippedGap {
+				continue
+			}
+			if unboundNullParamInBucketScriptR65(src, painlessParams) {
+				return fmt.Errorf("script_exception: NullPointerException: cannot access null property")
+			}
+			if isSelector {
+				if _, err := painless.EvalFilter(map[string]any{}, src, painlessParams); err != nil {
+					return fmt.Errorf("script_exception: %w", err)
+				}
+			} else if !strings.ContainsAny(src, ";{}") && !strings.Contains(src, "def ") && !strings.Contains(src, "if ") && !strings.Contains(src, "if(") {
+				// Arithmetic expressions may use painless.Eval or evalBucketArithmeticExprDepth.
+				if _, err := painless.Eval(map[string]any{}, src, painlessParams); err != nil {
+					return fmt.Errorf("script_exception: %w", err)
+				}
+			} else {
+				if _, err := painless.Eval(map[string]any{}, src, painlessParams); err != nil {
+					return fmt.Errorf("script_exception: %w", err)
+				}
+			}
+		}
+		return nil
+	}
+
+	var walk func(prefix string, currAggs map[string]esast.AggSpec, currOut map[string]any) error
+	walk = func(prefix string, currAggs map[string]esast.AggSpec, currOut map[string]any) error {
+		for aggName, spec := range currAggs {
+			subAggs := spec.SubAggs()
+			if len(subAggs) == 0 {
+				continue
+			}
+			subMap, ok := currOut[aggName].(map[string]any)
+			if !ok {
+				continue
+			}
+			fullPath := aggName
+			if prefix != "" {
+				fullPath = prefix + "." + aggName
+			}
+			switch rawB := subMap["buckets"].(type) {
+			case []map[string]any:
+				for _, ss := range subAggs {
+					if err := validateScriptSpecOnBuckets(fullPath, rawB, subAggs, ss); err != nil {
+						return err
+					}
+				}
+				for _, b := range rawB {
+					if err := walk(fullPath, subAggs, b); err != nil {
+						return err
+					}
+				}
+			case []any:
+				conv := make([]map[string]any, 0, len(rawB))
+				for _, item := range rawB {
+					if m, okM := item.(map[string]any); okM {
+						conv = append(conv, m)
+					}
+				}
+				for _, ss := range subAggs {
+					if err := validateScriptSpecOnBuckets(fullPath, conv, subAggs, ss); err != nil {
+						return err
+					}
+				}
+				for _, m := range conv {
+					if err := walk(fullPath, subAggs, m); err != nil {
+						return err
+					}
+				}
+			case map[string]any:
+				for _, item := range rawB {
+					if m, okM := item.(map[string]any); okM {
+						if err := walk(fullPath, subAggs, m); err != nil {
+							return err
+						}
+					}
+				}
+			default:
+				if err := walk(fullPath, subAggs, subMap); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+	return walk("", aggs, aggsOut)
+}
+
+func aggsHaveRuntimeEvalR65(aggs map[string]esast.AggSpec) bool {
+	return aggsHaveRuntimeScript(aggs) ||
+		aggsHaveStringStatsR65(aggs) ||
+		aggsHaveSignificantTextR63(aggs) ||
+		aggsHaveHDRPercentilesRound60(aggs)
+}
+
+func emitRuntimeHistogramFieldHDRRawRowsR65(
+	fullKey string,
+	parentBucketKey string,
+	pSpec *esast.PercentilesAggSpec,
+	docs []runtimeMatchedDoc,
+	aggRows []AggRow,
+) []AggRow {
+	if pSpec == nil {
+		return aggRows
+	}
+	rawKey := transpiler.RawValuesAggPrefix + fullKey
+	kept := make([]AggRow, 0, len(aggRows))
+	for _, r := range aggRows {
+		if r.AggName == rawKey && (parentBucketKey == "" || r.BucketKey == parentBucketKey || strings.HasPrefix(r.BucketKey, parentBucketKey+"\x1f") || strings.HasPrefix(r.BucketKey, parentBucketKey+"\x00")) {
+			continue
+		}
+		kept = append(kept, r)
+	}
+	mSpec := &esast.MetricAggSpec{
+		Field:   pSpec.Field,
+		Missing: pSpec.Missing,
+		Script:  pSpec.Script,
+	}
+	var vals []float64
+	for _, d := range docs {
+		vals = append(vals, extractDocNumericValuesForMetric(d, mSpec)...)
+	}
+	if len(vals) == 0 {
+		return kept
+	}
+	parts := make([]string, len(vals))
+	for i, v := range vals {
+		parts[i] = strconv.FormatFloat(v, 'g', -1, 64)
+	}
+	bKey := "_vals:" + strings.Join(parts, ",")
+	if parentBucketKey != "" {
+		bKey = parentBucketKey + "\x1f" + bKey
+	}
+	kept = append(kept, AggRow{
+		AggName:   rawKey,
+		BucketKey: bKey,
+		DocCount:  int64(len(vals)),
+	})
+	return kept
+}
+
+func resolveDateHistogramWithSchemaFormatR65(dh *esast.DateHistogramAggSpec, idxSchema *schema.IndexSchema, docLookup func(string) *HitRow) *esast.DateHistogramAggSpec {
+	if dh == nil || dh.Format != "" || dh.Field == "" {
+		return dh
+	}
+	b := resolveFieldAcrossDocLookupAndSchemaR65(dh.Field, idxSchema, docLookup)
+	if b.Format == "" {
+		return dh
+	}
+	firstFmt := strings.TrimSpace(strings.Split(b.Format, "||")[0])
+	if firstFmt == "" || firstFmt == "strict_date_optional_time" || firstFmt == "date_optional_time" || firstFmt == "epoch_millis" || firstFmt == "epoch_second" {
+		return dh
+	}
+	cp := *dh
+	cp.Format = firstFmt
+	return &cp
+}
+
+func extractRawHistBoundsFromBodyR65(rawBody []byte) map[string]transpiler.RawHistParamStrings {
+	if len(bytes.TrimSpace(rawBody)) == 0 {
+		return nil
+	}
+	var root map[string]any
+	dec := json.NewDecoder(bytes.NewReader(rawBody))
+	dec.UseNumber()
+	if err := dec.Decode(&root); err != nil || root == nil {
+		return nil
+	}
+	out := make(map[string]transpiler.RawHistParamStrings)
+	var walk func(prefix string, aggs map[string]any)
+	walk = func(prefix string, aggs map[string]any) {
+		for name, rawSpec := range aggs {
+			specMap, ok := rawSpec.(map[string]any)
+			if !ok {
+				continue
+			}
+			fullKey := name
+			if prefix != "" {
+				fullKey = prefix + "." + name
+			}
+			if histMap, okH := specMap["histogram"].(map[string]any); okH {
+				var p transpiler.RawHistParamStrings
+				if jn, okI := histMap["interval"].(json.Number); okI {
+					p.Interval = jn.String()
+				}
+				if jn, okO := histMap["offset"].(json.Number); okO {
+					p.Offset = jn.String()
+				}
+				if p.Interval != "" || p.Offset != "" {
+					out[fullKey] = p
+				}
+			}
+			if compMap, okC := specMap["composite"].(map[string]any); okC {
+				if srcs, okS := compMap["sources"].([]any); okS {
+					for _, srcAny := range srcs {
+						srcMap, okSM := srcAny.(map[string]any)
+						if !okSM {
+							continue
+						}
+						for srcName, srcSpecAny := range srcMap {
+							if srcSpecMap, okSS := srcSpecAny.(map[string]any); okSS {
+								if histMap, okH := srcSpecMap["histogram"].(map[string]any); okH {
+									var p transpiler.RawHistParamStrings
+									if jn, okI := histMap["interval"].(json.Number); okI {
+										p.Interval = jn.String()
+									}
+									if jn, okO := histMap["offset"].(json.Number); okO {
+										p.Offset = jn.String()
+									}
+									if p.Interval != "" || p.Offset != "" {
+										out[fullKey+"."+srcName] = p
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+			if subAggs, okA := specMap["aggs"].(map[string]any); okA {
+				walk(fullKey, subAggs)
+			}
+			if subAggs, okA := specMap["aggregations"].(map[string]any); okA {
+				walk(fullKey, subAggs)
+			}
+		}
+	}
+	if a, okA := root["aggs"].(map[string]any); okA {
+		walk("", a)
+	}
+	if a, okA := root["aggregations"].(map[string]any); okA {
+		walk("", a)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func (s *Server) injectZeroFieldTermsAggRowsR65(
+	ctx context.Context,
+	req *esast.SearchRequest,
+	targets []string,
+	aliasFilters map[string]*esast.Query,
+	allAggRows []AggRow,
+) []AggRow {
+	if s == nil || req == nil {
+		return allAggRows
+	}
+	effAggs := req.EffectiveAggs()
+	if len(effAggs) == 0 {
+		return allAggRows
+	}
+	for aggName, spec := range effAggs {
+		t := spec.EffectiveTerms()
+		if t == nil || t.Field == "" || t.Field == "_index" || t.Script != nil || t.MinDocCount == nil || *t.MinDocCount != 0 || t.Include != nil || t.Exclude != nil || strings.HasPrefix(t.Field, "_") {
+			continue
+		}
+		existing := make(map[string]bool)
+		for _, r := range allAggRows {
+			if r.AggName == aggName {
+				existing[r.BucketKey] = true
+			}
+		}
+		clean := strings.TrimSuffix(strings.TrimSuffix(t.Field, ".keyword"), ".ngram")
+		for _, idxName := range targets {
+			sc := s.getOrCompileReadOnlySchema(ctx, idxName)
+			if sc == nil || !indexSchemaHasField(sc, t.Field) {
+				continue
+			}
+			b := sc.ResolveField(t.Field)
+			if b.NestedPath != "" {
+				continue
+			}
+			pathSegs := strings.Split(clean, ".")
+			if len(b.SourceJSONPath) > 0 {
+				pathSegs = b.SourceJSONPath
+			}
+			docs := s.collectIndexedDocsWithIDsRound61(ctx, idxName, aliasFilters[idxName])
+			for _, d := range docs {
+				for _, rv := range collectSchemaAwareScalarValues(d.Source, t.Field, pathSegs, sc) {
+					if rv == nil {
+						continue
+					}
+					key := fmt.Sprintf("%v", rv)
+					if key == "" || existing[key] {
+						continue
+					}
+					existing[key] = true
+					allAggRows = append(allAggRows, AggRow{
+						AggName:   aggName,
+						BucketKey: key,
+						DocCount:  0,
+					})
+				}
+			}
+		}
+	}
+	return allAggRows
 }

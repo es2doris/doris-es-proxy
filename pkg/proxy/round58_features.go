@@ -21,6 +21,49 @@ import (
 	"github.com/es2doris/doris-es-proxy/pkg/schema"
 )
 
+func parsePreferredAcceptCompatMediaTypeR65(acceptHeader string) (mediaType, compatWith string, found bool) {
+	bestQ := -1.0
+	for _, rawRange := range strings.Split(acceptHeader, ",") {
+		part := strings.TrimSpace(rawRange)
+		if part == "" {
+			continue
+		}
+		semi := strings.Split(part, ";")
+		mt := strings.ToLower(strings.TrimSpace(semi[0]))
+		if mt == "" {
+			continue
+		}
+		q := parseMediaQualityWeightR63(semi[1:])
+		if q <= 0 {
+			continue
+		}
+		if mt != "application/vnd.opensearch+json" && mt != "application/vnd.elasticsearch+json" && mt != "application/json" {
+			continue
+		}
+		cw, hasCW := extractCompatibleWithParam(part)
+		if mt == "application/json" {
+			if q > bestQ {
+				bestQ = q
+				mediaType = mt
+				compatWith = ""
+				found = true
+			}
+			continue
+		}
+		if q > bestQ {
+			bestQ = q
+			mediaType = mt
+			if hasCW {
+				compatWith = cw
+			} else {
+				compatWith = ""
+			}
+			found = true
+		}
+	}
+	return mediaType, compatWith, found
+}
+
 func ensureESCompatHeaders(w http.ResponseWriter, r *http.Request) {
 	if w == nil {
 		return
@@ -39,17 +82,26 @@ func ensureESCompatHeaders(w http.ResponseWriter, r *http.Request) {
 		if w.Header().Get("Content-Type") == "" {
 			accept := strings.ToLower(strings.Join(r.Header.Values("Accept"), ", "))
 			reqCT := strings.ToLower(strings.Join(r.Header.Values("Content-Type"), ", "))
-			switch {
-			case strings.Contains(accept, "application/vnd.opensearch+json"):
-				if cw, hasCW := extractCompatibleWithParam(accept); hasCW && cw != "" {
-					w.Header().Set("Content-Type", "application/vnd.opensearch+json; compatible-with="+cw)
-				} else {
-					w.Header().Set("Content-Type", "application/vnd.opensearch+json; charset=UTF-8")
+			if mt, cw, ok := parsePreferredAcceptCompatMediaTypeR65(accept); ok {
+				switch mt {
+				case "application/vnd.opensearch+json":
+					if cw != "" {
+						w.Header().Set("Content-Type", "application/vnd.opensearch+json; compatible-with="+cw)
+					} else {
+						w.Header().Set("Content-Type", "application/vnd.opensearch+json; charset=UTF-8")
+					}
+					return
+				case "application/vnd.elasticsearch+json":
+					if cw == "8" || cw == "7" {
+						w.Header().Set("Content-Type", "application/vnd.elasticsearch+json; compatible-with="+cw)
+						return
+					}
+				case "application/json":
+					w.Header().Set("Content-Type", "application/json; charset=UTF-8")
+					return
 				}
-			case strings.Contains(accept, "compatible-with=8"):
-				w.Header().Set("Content-Type", "application/vnd.elasticsearch+json; compatible-with=8")
-			case strings.Contains(accept, "compatible-with=7"):
-				w.Header().Set("Content-Type", "application/vnd.elasticsearch+json; compatible-with=7")
+			}
+			switch {
 			case strings.Contains(reqCT, "application/vnd.opensearch+"):
 				if cw, hasCW := extractCompatibleWithParam(reqCT); hasCW && cw != "" {
 					w.Header().Set("Content-Type", "application/vnd.opensearch+json; compatible-with="+cw)
@@ -73,13 +125,27 @@ func writeJSONWithRequest(w http.ResponseWriter, r *http.Request, status int, v 
 				v = applyFilterPathRound61(v, opts.filterPaths)
 				opts.filterPaths = nil
 			}
-			targetW := w
-			if gw, okG := targetW.(*gzipResponseWriter); okG {
-				targetW = gw.ResponseWriter
+			foundFW := false
+			for targetW := w; targetW != nil; {
+				if fw, okF := targetW.(*esFormatResponseWriter); okF {
+					fw.opts = opts
+					foundFW = true
+					break
+				}
+				switch tw := targetW.(type) {
+				case *gzipResponseWriter:
+					targetW = tw.ResponseWriter
+				case *headResponseWriterR64:
+					targetW = tw.ResponseWriter
+				default:
+					if uw, okU := targetW.(interface{ Unwrap() http.ResponseWriter }); okU {
+						targetW = uw.Unwrap()
+					} else {
+						targetW = nil
+					}
+				}
 			}
-			if fw, okF := targetW.(*esFormatResponseWriter); okF {
-				fw.opts = opts
-			} else if opts.pretty || opts.errorTrace {
+			if !foundFW && (opts.pretty || opts.errorTrace) {
 				w = &esFormatResponseWriter{ResponseWriter: w, opts: opts}
 			}
 		}
@@ -1171,6 +1237,25 @@ func (s *Server) handleComposableOrLegacyTemplateRound58(w http.ResponseWriter, 
 		if !ok {
 			return
 		}
+		if isLegacyEndpoint {
+			if paramPat := strings.TrimSpace(r.URL.Query().Get("template")); paramPat != "" {
+				emitESDeprecationWarningRound61(w, s, r, "Deprecated parameter [template] used, replaced by [index_patterns]")
+				for _, p := range strings.Split(paramPat, ",") {
+					if pt := strings.TrimSpace(p); pt != "" {
+						tpl.IndexPatterns = append(tpl.IndexPatterns, pt)
+					}
+				}
+			}
+			var rawPreMap map[string]any
+			if len(bytes.TrimSpace(bodyBytes)) > 0 && json.Unmarshal(bodyBytes, &rawPreMap) == nil && rawPreMap != nil {
+				if rawTplVal, hasLegacyTplField := rawPreMap["template"]; hasLegacyTplField {
+					if _, isObj := rawTplVal.(map[string]any); !isObj {
+						emitESDeprecationWarningRound61(w, s, r, "Deprecated field [template] used, replaced by [index_patterns]")
+					}
+				}
+			}
+		}
+		paramPatterns := append([]string(nil), tpl.IndexPatterns...)
 		bodyBytes = normalizeTemplateBodyIndexPatternsRound60(bodyBytes)
 		if len(bytes.TrimSpace(bodyBytes)) > 0 {
 			var rawTplMap map[string]any
@@ -1198,6 +1283,9 @@ func (s *Server) handleComposableOrLegacyTemplateRound58(w http.ResponseWriter, 
 			if err := json.Unmarshal(bodyBytes, &tpl); err != nil {
 				writeESError(w, http.StatusBadRequest, "mapper_parsing_exception", err.Error())
 				return
+			}
+			if len(tpl.IndexPatterns) == 0 && len(tpl.Patterns) == 0 && len(paramPatterns) > 0 {
+				tpl.IndexPatterns = paramPatterns
 			}
 			if rawTplMap != nil {
 				if innerTpl, okT := rawTplMap["template"].(map[string]any); okT {
@@ -2380,6 +2468,10 @@ var catColumnShortAliases = map[string][]string{
 	"g":               {"generation"},
 	"gen":             {"generation"},
 	"seg":             {"segment"},
+	"docp":            {"documents_processed"},
+	"cdtea":           {"checkpoint_duration_time_exp_avg"},
+	"idea":            {"indexed_documents_exp_avg"},
+	"pdea":            {"processed_documents_exp_avg"},
 }
 
 func catWildcardColumnRank(col string) int {
@@ -3303,9 +3395,14 @@ type transformMaterializedDoc struct {
 }
 
 func (s *Server) collectSourceDocsForJob(ctx context.Context, srcIndices []string, rawQuery any, runtimeMappings map[string]esast.FieldProperty) ([]map[string]any, error) {
+	evalDocs, _, err := s.collectSourceDocsWithRuntimeForJob(ctx, srcIndices, rawQuery, runtimeMappings)
+	return evalDocs, err
+}
+
+func (s *Server) collectSourceDocsWithRuntimeForJob(ctx context.Context, srcIndices []string, rawQuery any, runtimeMappings map[string]esast.FieldProperty) ([]map[string]any, []map[string]any, error) {
 	pattern := strings.Join(srcIndices, ",")
 	if pattern == "" {
-		return nil, nil
+		return nil, nil, nil
 	}
 	var parsedQuery *esast.Query
 	if rawQuery != nil {
@@ -3316,12 +3413,28 @@ func (s *Server) collectSourceDocsForJob(ctx context.Context, srcIndices []strin
 			}
 		}
 	}
+	var reqFields []esast.FieldRequestSpec
+	if len(runtimeMappings) > 0 {
+		rtNames := make([]string, 0, len(runtimeMappings))
+		for k := range runtimeMappings {
+			rtNames = append(rtNames, k)
+		}
+		sort.Strings(rtNames)
+		for _, k := range rtNames {
+			spec := esast.FieldRequestSpec{Field: k}
+			if strings.EqualFold(strings.TrimSpace(runtimeMappings[k].Type), "date") {
+				spec.Format = "epoch_millis"
+			}
+			reqFields = append(reqFields, spec)
+		}
+	}
 	fetchSize := 10000
 	zero := 0
 	sReq := &esast.SearchRequest{
 		From:            &zero,
 		Size:            &fetchSize,
 		Query:           parsedQuery,
+		Fields:          reqFields,
 		RuntimeMappings: runtimeMappings,
 		Sort: esast.SortSlice{
 			{Entry: esast.SortFieldSpec{Field: "_id", Order: "asc"}},
@@ -3329,9 +3442,10 @@ func (s *Server) collectSourceDocsForJob(ctx context.Context, srcIndices []strin
 	}
 	resp, status, _, reason := s.executeSearchRequest(ctx, pattern, sReq)
 	if status >= 400 && status != http.StatusNotFound {
-		return nil, fmt.Errorf("source search failed (%d): %s", status, reason)
+		return nil, nil, fmt.Errorf("source search failed (%d): %s", status, reason)
 	}
-	var docs []map[string]any
+	var evalDocs []map[string]any
+	var srcOnlyDocs []map[string]any
 	hitsOuter, _ := resp["hits"].(map[string]any)
 	appendHitMap := func(hm map[string]any) {
 		if hm == nil {
@@ -3349,9 +3463,42 @@ func (s *Server) collectSourceDocsForJob(ctx context.Context, srcIndices []strin
 			rawBytes, _ := json.Marshal(src)
 			_ = json.Unmarshal(rawBytes, &docMap)
 		}
-		if docMap != nil {
-			docs = append(docs, docMap)
+		if docMap == nil {
+			return
 		}
+		srcOnly := deepCloneDocMap(docMap)
+		evalDoc := docMap
+		if len(runtimeMappings) > 0 {
+			switch fieldsMap := hm["fields"].(type) {
+			case map[string]any:
+				for rtName := range runtimeMappings {
+					if rawVals, has := fieldsMap[rtName]; has && rawVals != nil {
+						switch rv := rawVals.(type) {
+						case []any:
+							if len(rv) == 1 {
+								evalDoc[rtName] = rv[0]
+							} else if len(rv) > 1 {
+								evalDoc[rtName] = rv
+							}
+						default:
+							evalDoc[rtName] = rawVals
+						}
+					}
+				}
+			case map[string][]any:
+				for rtName := range runtimeMappings {
+					if rv := fieldsMap[rtName]; len(rv) > 0 {
+						if len(rv) == 1 {
+							evalDoc[rtName] = rv[0]
+						} else {
+							evalDoc[rtName] = rv
+						}
+					}
+				}
+			}
+		}
+		evalDocs = append(evalDocs, evalDoc)
+		srcOnlyDocs = append(srcOnlyDocs, srcOnly)
 	}
 	switch hitsList := hitsOuter["hits"].(type) {
 	case []map[string]any:
@@ -3365,7 +3512,7 @@ func (s *Server) collectSourceDocsForJob(ctx context.Context, srcIndices []strin
 			}
 		}
 	}
-	return docs, nil
+	return evalDocs, srcOnlyDocs, nil
 }
 
 func extractTransformSourceIndices(srcMap map[string]any) []string {
@@ -3507,20 +3654,45 @@ func parseCalendarOrFixedIntervalMillis(spec map[string]any) int64 {
 	return 3600_000
 }
 
+func parseESSignedOffsetMillisR65(raw string) int64 {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return 0
+	}
+	sign := int64(1)
+	if strings.HasPrefix(s, "-") {
+		sign = -1
+		s = strings.TrimSpace(s[1:])
+	} else if strings.HasPrefix(s, "+") {
+		s = strings.TrimSpace(s[1:])
+	}
+	if dur, err := parseESPositiveDuration(s); err == nil {
+		return sign * dur.Milliseconds()
+	}
+	return 0
+}
+
 func bucketDateMillis(ms int64, spec map[string]any) string {
+	offsetMs := int64(0)
+	if offRaw, ok := spec["offset"].(string); ok {
+		offsetMs = parseESSignedOffsetMillisR65(offRaw)
+	}
+	shifted := ms - offsetMs
 	rawCal, _ := spec["calendar_interval"].(string)
-	t := time.UnixMilli(ms).UTC()
+	t := time.UnixMilli(shifted).UTC()
 	switch strings.TrimSpace(rawCal) {
 	case "month", "1M":
-		return time.Date(t.Year(), t.Month(), 1, 0, 0, 0, 0, time.UTC).Format("2006-01-02T15:04:05.000Z")
+		base := time.Date(t.Year(), t.Month(), 1, 0, 0, 0, 0, time.UTC).UnixMilli() + offsetMs
+		return time.UnixMilli(base).UTC().Format("2006-01-02T15:04:05.000Z")
 	case "year", "1y":
-		return time.Date(t.Year(), 1, 1, 0, 0, 0, 0, time.UTC).Format("2006-01-02T15:04:05.000Z")
+		base := time.Date(t.Year(), 1, 1, 0, 0, 0, 0, time.UTC).UnixMilli() + offsetMs
+		return time.UnixMilli(base).UTC().Format("2006-01-02T15:04:05.000Z")
 	}
 	iv := parseCalendarOrFixedIntervalMillis(spec)
 	if iv <= 0 {
 		iv = 3600_000
 	}
-	floored := ms - ((ms%iv)+iv)%iv
+	floored := shifted - ((shifted%iv)+iv)%iv + offsetMs
 	return time.UnixMilli(floored).UTC().Format("2006-01-02T15:04:05.000Z")
 }
 
@@ -3577,14 +3749,41 @@ func compareAnyDocValues(a, b any) int {
 	return 0
 }
 
+func stripLeadingUnderscoreKeysR65(m map[string]any) {
+	for k, v := range m {
+		if strings.HasPrefix(k, "_") {
+			delete(m, k)
+			continue
+		}
+		switch sub := v.(type) {
+		case map[string]any:
+			stripLeadingUnderscoreKeysR65(sub)
+		case []any:
+			for _, elem := range sub {
+				if em, okE := elem.(map[string]any); okE && em != nil {
+					stripLeadingUnderscoreKeysR65(em)
+				}
+			}
+		}
+	}
+}
+
 func (s *Server) materializeTransformConfig(ctx context.Context, cfg map[string]any) ([]transformMaterializedDoc, map[string]any, int, error) {
 	srcMap, _ := cfg["source"].(map[string]any)
 	srcIndices := extractTransformSourceIndices(srcMap)
 	var srcQuery any
+	var rtMappings map[string]esast.FieldProperty
 	if srcMap != nil {
 		srcQuery = srcMap["query"]
+		if rtRaw, hasRT := srcMap["runtime_mappings"]; hasRT && rtRaw != nil {
+			if rtBytes, mErr := json.Marshal(rtRaw); mErr == nil {
+				if uErr := json.Unmarshal(rtBytes, &rtMappings); uErr == nil && len(rtMappings) > 0 {
+					normalizeFieldPropsScriptsR62Search(rtMappings)
+				}
+			}
+		}
 	}
-	docs, err := s.collectSourceDocsForJob(ctx, srcIndices, srcQuery, nil)
+	docs, srcOnlyDocs, err := s.collectSourceDocsWithRuntimeForJob(ctx, srcIndices, srcQuery, rtMappings)
 	if err != nil {
 		return nil, nil, 0, err
 	}
@@ -3610,13 +3809,13 @@ func (s *Server) materializeTransformConfig(ctx context.Context, cfg map[string]
 
 		type latestGroup struct {
 			keyParts []string
-			bestDoc  map[string]any
+			bestIdx  int
 			bestSort any
 		}
 		groups := make(map[string]*latestGroup)
 		var groupOrder []string
 
-		for _, doc := range docs {
+		for docIdx, doc := range docs {
 			keyParts := make([]string, 0, len(uniqueKeys))
 			missingKey := false
 			for _, uk := range uniqueKeys {
@@ -3639,10 +3838,10 @@ func (s *Server) materializeTransformConfig(ctx context.Context, cfg map[string]
 			}
 			existing, ok := groups[gKey]
 			if !ok {
-				groups[gKey] = &latestGroup{keyParts: keyParts, bestDoc: doc, bestSort: sVal}
+				groups[gKey] = &latestGroup{keyParts: keyParts, bestIdx: docIdx, bestSort: sVal}
 				groupOrder = append(groupOrder, gKey)
 			} else if sortField == "" || compareAnyDocValues(sVal, existing.bestSort) >= 0 {
-				existing.bestDoc = doc
+				existing.bestIdx = docIdx
 				existing.bestSort = sVal
 			}
 		}
@@ -3651,28 +3850,24 @@ func (s *Server) materializeTransformConfig(ctx context.Context, cfg map[string]
 		out := make([]transformMaterializedDoc, 0, len(groupOrder))
 		for _, gk := range groupOrder {
 			grp := groups[gk]
-			cpBytes, _ := json.Marshal(grp.bestDoc)
-			var cpMap map[string]any
-			_ = json.Unmarshal(cpBytes, &cpMap)
+			cpMap := deepCloneDocMap(srcOnlyDocs[grp.bestIdx])
+			stripLeadingUnderscoreKeysR65(cpMap)
 			out = append(out, transformMaterializedDoc{
 				ID:     deterministicBucketDocID(grp.keyParts),
 				Source: cpMap,
 			})
 		}
 
-		inferredProps := map[string]any{}
-		for _, srcIdx := range srcIndices {
-			sc := s.getOrCompileReadOnlySchema(ctx, srcIdx)
-			if sc != nil && sc.RawMapping != nil {
-				rawB, _ := json.Marshal(sc.RawMapping.Properties)
-				_ = json.Unmarshal(rawB, &inferredProps)
-				break
-			}
-		}
-		return out, inferredProps, docsProcessed, nil
+		return out, map[string]any{}, docsProcessed, nil
 	}
 
 	// Mode 2: pivot transform (group_by + aggregations)
+	deduceMappings := true
+	if settingsMap, okSet := cfg["settings"].(map[string]any); okSet && settingsMap != nil {
+		if dm, hasDM := settingsMap["deduce_mappings"].(bool); hasDM {
+			deduceMappings = dm
+		}
+	}
 	pivotCfg, _ := cfg["pivot"].(map[string]any)
 	if pivotCfg == nil {
 		return []transformMaterializedDoc{}, map[string]any{}, docsProcessed, nil
@@ -3683,6 +3878,23 @@ func (s *Server) materializeTransformConfig(ctx context.Context, cfg map[string]
 		aggsMap = a
 	} else if a, ok := pivotCfg["aggs"].(map[string]any); ok {
 		aggsMap = a
+	}
+
+	srcDateFields := make(map[string]bool)
+	for rtName, rtProp := range rtMappings {
+		if strings.EqualFold(strings.TrimSpace(rtProp.Type), "date") {
+			srcDateFields[rtName] = true
+		}
+	}
+	for _, srcIdx := range srcIndices {
+		sc := s.getOrCompileReadOnlySchema(ctx, srcIdx)
+		if sc != nil {
+			for fName, fMeta := range sc.Fields {
+				if strings.EqualFold(fMeta.ESType, "date") {
+					srcDateFields[fName] = true
+				}
+			}
+		}
 	}
 
 	var groupNames []string
@@ -3696,11 +3908,11 @@ func (s *Server) materializeTransformConfig(ctx context.Context, cfg map[string]
 		gSpec, _ := groupByMap[gn].(map[string]any)
 		switch {
 		case gSpec["date_histogram"] != nil:
-			setNestedMapField(inferredProps, gn, map[string]any{"type": "date"})
+			inferredProps[gn] = map[string]any{"type": "date"}
 		case gSpec["histogram"] != nil:
-			setNestedMapField(inferredProps, gn, map[string]any{"type": "double"})
+			inferredProps[gn] = map[string]any{"type": "double"}
 		default:
-			setNestedMapField(inferredProps, gn, map[string]any{"type": "keyword"})
+			inferredProps[gn] = map[string]any{"type": "keyword"}
 		}
 	}
 	var aggNames []string
@@ -3712,9 +3924,9 @@ func (s *Server) materializeTransformConfig(ctx context.Context, cfg map[string]
 		aSpec, _ := aggsMap[an].(map[string]any)
 		switch {
 		case aSpec["value_count"] != nil || aSpec["cardinality"] != nil:
-			setNestedMapField(inferredProps, an, map[string]any{"type": "long"})
+			inferredProps[an] = map[string]any{"type": "long"}
 		case aSpec["stats"] != nil:
-			setNestedMapField(inferredProps, an, map[string]any{
+			inferredProps[an] = map[string]any{
 				"properties": map[string]any{
 					"count": map[string]any{"type": "long"},
 					"min":   map[string]any{"type": "double"},
@@ -3722,11 +3934,22 @@ func (s *Server) materializeTransformConfig(ctx context.Context, cfg map[string]
 					"avg":   map[string]any{"type": "double"},
 					"sum":   map[string]any{"type": "double"},
 				},
-			})
-		case aSpec["sum"] != nil || aSpec["avg"] != nil || aSpec["min"] != nil || aSpec["max"] != nil || aSpec["weighted_avg"] != nil:
-			setNestedMapField(inferredProps, an, map[string]any{"type": "double"})
+			}
+		case aSpec["min"] != nil || aSpec["max"] != nil:
+			metricSpec, _ := aSpec["min"].(map[string]any)
+			if metricSpec == nil {
+				metricSpec, _ = aSpec["max"].(map[string]any)
+			}
+			fName, _ := metricSpec["field"].(string)
+			if srcDateFields[strings.TrimSpace(fName)] {
+				inferredProps[an] = map[string]any{"type": "date"}
+			} else {
+				inferredProps[an] = map[string]any{"type": "double"}
+			}
+		case aSpec["sum"] != nil || aSpec["avg"] != nil || aSpec["weighted_avg"] != nil:
+			inferredProps[an] = map[string]any{"type": "double"}
 		default:
-			setNestedMapField(inferredProps, an, map[string]any{"type": "object"})
+			inferredProps[an] = map[string]any{"type": "object"}
 		}
 	}
 
@@ -3820,7 +4043,6 @@ func (s *Server) materializeTransformConfig(ctx context.Context, cfg map[string]
 		expand(0, make(map[string]any, len(groupNames)), nil)
 	}
 
-	sort.Strings(bucketOrder)
 	out := make([]transformMaterializedDoc, 0, len(bucketOrder))
 	for _, bk := range bucketOrder {
 		b := buckets[bk]
@@ -3830,7 +4052,7 @@ func (s *Server) materializeTransformConfig(ctx context.Context, cfg map[string]
 		}
 		for _, an := range aggNames {
 			aSpec, _ := aggsMap[an].(map[string]any)
-			val := computeTransformMetricAgg(b.docs, aSpec)
+			val := computeTransformMetricAgg(b.docs, aSpec, srcDateFields)
 			setNestedMapField(row, an, val)
 		}
 		out = append(out, transformMaterializedDoc{
@@ -3838,10 +4060,36 @@ func (s *Server) materializeTransformConfig(ctx context.Context, cfg map[string]
 			Source: row,
 		})
 	}
+	if !deduceMappings {
+		inferredProps = map[string]any{}
+	}
 	return out, inferredProps, docsProcessed, nil
 }
 
-func computeTransformMetricAgg(docs []map[string]any, aSpec map[string]any) any {
+func computeTransformMetricAgg(docs []map[string]any, aSpec map[string]any, dateFields ...map[string]bool) any {
+	var isDateField map[string]bool
+	if len(dateFields) > 0 {
+		isDateField = dateFields[0]
+	}
+	collectDateMillis := func(field string) ([]int64, bool) {
+		var out []int64
+		for _, d := range docs {
+			for _, v := range extractDocFieldValues(d, field) {
+				if v == nil {
+					continue
+				}
+				if _, isNum := toFloat64(v); isNum && !isDateField[strings.TrimSpace(field)] {
+					return nil, false
+				}
+				if ms, okTS := parseAnyTimestampMillis(v); okTS {
+					out = append(out, ms)
+				} else if !isDateField[strings.TrimSpace(field)] {
+					return nil, false
+				}
+			}
+		}
+		return out, len(out) > 0 && (isDateField[strings.TrimSpace(field)] || len(out) > 0)
+	}
 	collectFloats := func(field string) []float64 {
 		var nums []float64
 		for _, d := range docs {
@@ -3875,6 +4123,15 @@ func computeTransformMetricAgg(docs []map[string]any, aSpec map[string]any) any 
 	}
 	if minSpec, ok := aSpec["min"].(map[string]any); ok {
 		field, _ := minSpec["field"].(string)
+		if tsVals, okTS := collectDateMillis(field); okTS {
+			m := tsVals[0]
+			for _, v := range tsVals[1:] {
+				if v < m {
+					m = v
+				}
+			}
+			return time.UnixMilli(m).UTC().Format("2006-01-02T15:04:05.000Z")
+		}
 		nums := collectFloats(field)
 		if len(nums) == 0 {
 			return nil
@@ -3889,6 +4146,15 @@ func computeTransformMetricAgg(docs []map[string]any, aSpec map[string]any) any 
 	}
 	if maxSpec, ok := aSpec["max"].(map[string]any); ok {
 		field, _ := maxSpec["field"].(string)
+		if tsVals, okTS := collectDateMillis(field); okTS {
+			m := tsVals[0]
+			for _, v := range tsVals[1:] {
+				if v > m {
+					m = v
+				}
+			}
+			return time.UnixMilli(m).UTC().Format("2006-01-02T15:04:05.000Z")
+		}
 		nums := collectFloats(field)
 		if len(nums) == 0 {
 			return nil
@@ -4054,7 +4320,31 @@ func (s *Server) executeTransformStartRound58(ctx context.Context, transformID s
 		prepared = append(prepared, preparedDoc{id: curID, idx: curIdx, route: curRoute, rawSrc: curRaw})
 	}
 
-	if mappingSpec != nil {
+	deduceMappings := true
+	if settingsMap, okSet := cfgCopy["settings"].(map[string]any); okSet && settingsMap != nil {
+		if dm, hasDM := settingsMap["deduce_mappings"].(bool); hasDM {
+			deduceMappings = dm
+		}
+	}
+	if !deduceMappings {
+		s.mu.Lock()
+		if _, exists := s.indices[destIdx]; !exists {
+			compiled := schema.CompileIndexSchema(s.dorisDB, destIdx, &esast.MappingSpec{})
+			ddl := schema.GenerateCreateTableDDL(compiled)
+			s.mu.Unlock()
+			if err := s.backend.ExecDDL(ctx, ddl); err != nil {
+				return err
+			}
+			s.mu.Lock()
+			if _, exists2 := s.indices[destIdx]; !exists2 {
+				s.indices[destIdx] = compiled
+			}
+			s.mu.Unlock()
+			s.persistIndex(ctx, destIdx, compiled)
+		} else {
+			s.mu.Unlock()
+		}
+	} else if mappingSpec != nil {
 		s.mu.Lock()
 		if _, exists := s.indices[destIdx]; !exists {
 			compiled := schema.CompileIndexSchema(s.dorisDB, destIdx, mappingSpec)
@@ -4073,7 +4363,15 @@ func (s *Server) executeTransformStartRound58(ctx context.Context, transformID s
 			s.mu.Unlock()
 		}
 	}
-	idxSchema := s.ensureWritableIndexSchemaWithDocs(ctx, destIdx, sampleRaws)
+	var idxSchema *schema.IndexSchema
+	if !deduceMappings {
+		s.mu.RLock()
+		idxSchema = s.indices[destIdx]
+		s.mu.RUnlock()
+	}
+	if idxSchema == nil {
+		idxSchema = s.ensureWritableIndexSchemaWithDocs(ctx, destIdx, sampleRaws)
+	}
 
 	var ndjson bytes.Buffer
 	docsIndexed := 0
@@ -4139,26 +4437,25 @@ func buildRollupCapabilitiesFields(cfg map[string]any) map[string]any {
 	if groups, ok := cfg["groups"].(map[string]any); ok {
 		if dh, ok := groups["date_histogram"].(map[string]any); ok {
 			f, _ := dh["field"].(string)
-			iv := ""
-			for _, k := range []string{"fixed_interval", "calendar_interval", "interval"} {
-				if sv, okS := dh[k].(string); okS && sv != "" {
-					iv = sv
-					break
-				}
-			}
-			if iv == "" {
-				iv = "1h"
-			}
 			tz, _ := dh["time_zone"].(string)
 			if tz == "" {
 				tz = "UTC"
 			}
-			appendCap(f, map[string]any{
-				"agg":               "date_histogram",
-				"calendar_interval": iv,
-				"fixed_interval":    iv,
-				"time_zone":         tz,
-			})
+			capEntry := map[string]any{
+				"agg":       "date_histogram",
+				"time_zone": tz,
+			}
+			switch {
+			case fmt.Sprintf("%v", dh["fixed_interval"]) != "" && dh["fixed_interval"] != nil:
+				capEntry["fixed_interval"] = dh["fixed_interval"]
+			case fmt.Sprintf("%v", dh["calendar_interval"]) != "" && dh["calendar_interval"] != nil:
+				capEntry["calendar_interval"] = dh["calendar_interval"]
+			case fmt.Sprintf("%v", dh["interval"]) != "" && dh["interval"] != nil:
+				capEntry["fixed_interval"] = dh["interval"]
+			default:
+				capEntry["calendar_interval"] = "1h"
+			}
+			appendCap(f, capEntry)
 		}
 		if hist, ok := groups["histogram"].(map[string]any); ok {
 			iv := hist["interval"]
@@ -4473,8 +4770,21 @@ func (s *Server) executeRollupStartRound58(ctx context.Context, jobID string) er
 
 // tryEvaluateRollupSearchAggs evaluates _rollup_search aggregations against
 // materialized rollup bucket documents when targeting or covering a rollup_index.
+func isRollupDocR65(doc map[string]any) bool {
+	if doc == nil {
+		return false
+	}
+	if _, hasMeta := doc["_rollup"]; hasMeta {
+		return true
+	}
+	if len(extractDocFieldValues(doc, "_rollup.id")) > 0 || len(extractDocFieldValues(doc, "_rollup.version")) > 0 {
+		return true
+	}
+	return false
+}
+
 func (s *Server) tryEvaluateRollupSearchAggs(ctx context.Context, rawIndex string, sReq *esast.SearchRequest) (map[string]any, bool) {
-	if sReq == nil || len(sReq.EffectiveAggs()) == 0 {
+	if sReq == nil {
 		return nil, false
 	}
 	targets := s.resolveTargetIndices(rawIndex)
@@ -4484,6 +4794,12 @@ func (s *Server) tryEvaluateRollupSearchAggs(ctx context.Context, rawIndex strin
 	targetSet := make(map[string]bool, len(targets))
 	for _, t := range targets {
 		targetSet[t] = true
+		if sc := s.indices[t]; sc != nil && sc.RawMapping != nil && sc.RawMapping.Meta != nil {
+			if _, hasRM := sc.RawMapping.Meta["_rollup"]; hasRM && !seenRollup[t] {
+				seenRollup[t] = true
+				rollupIndices = append(rollupIndices, t)
+			}
+		}
 	}
 	for _, job := range s.rollupJobs {
 		cfg, _ := job["config"].(map[string]any)
@@ -4508,29 +4824,39 @@ func (s *Server) tryEvaluateRollupSearchAggs(ctx context.Context, rawIndex strin
 	if len(rollupIndices) == 0 {
 		return nil, false
 	}
+	if len(sReq.EffectiveAggs()) == 0 {
+		return map[string]any{
+			"took":      1,
+			"timed_out": false,
+			"_shards": map[string]any{
+				"total":      len(rollupIndices),
+				"successful": len(rollupIndices),
+				"skipped":    0,
+				"failed":     0,
+			},
+			"hits": map[string]any{
+				"total": map[string]any{
+					"value":    0,
+					"relation": "eq",
+				},
+				"max_score": nil,
+				"hits":      []any{},
+			},
+		}, true
+	}
 	// Check if rollupIndices actually contain _rollup bucket docs.
 	docs, err := s.collectSourceDocsForJob(ctx, rollupIndices, nil, nil)
 	if err != nil || len(docs) == 0 {
 		return nil, false
 	}
-	var rollupDocs []map[string]any
-	for _, d := range docs {
-		if _, hasMeta := d["_rollup"]; hasMeta {
-			if matchesRollupBucketQuery(d, sReq.Query) {
-				rollupDocs = append(rollupDocs, d)
-			}
-		}
+	selectedRollupDocs := s.selectSingleRollupJobDocsR65(docs, sReq.Query, sReq.EffectiveAggs())
+	if len(selectedRollupDocs) == 0 {
+		return nil, false
 	}
-	if len(rollupDocs) == 0 && len(docs) > 0 {
-		hasAnyRollup := false
-		for _, d := range docs {
-			if _, ok := d["_rollup"]; ok {
-				hasAnyRollup = true
-				break
-			}
-		}
-		if !hasAnyRollup {
-			return nil, false
+	var rollupDocs []map[string]any
+	for _, d := range selectedRollupDocs {
+		if matchesRollupBucketQuery(d, sReq.Query) {
+			rollupDocs = append(rollupDocs, d)
 		}
 	}
 
@@ -4559,15 +4885,21 @@ func (s *Server) tryEvaluateRollupSearchAggs(ctx context.Context, rawIndex strin
 func extractRollupDimValue(doc map[string]any, field string) (any, int64, bool) {
 	field = strings.TrimSuffix(field, ".keyword")
 	for _, kind := range []string{"terms", "date_histogram", "histogram"} {
-		vals := extractDocFieldValues(doc, field+"."+kind+".value")
-		if len(vals) > 0 && vals[0] != nil {
-			cnt := int64(1)
-			if cVals := extractDocFieldValues(doc, field+"."+kind+"._count"); len(cVals) > 0 {
-				if cf, ok := toFloat64(cVals[0]); ok && int64(cf) > 0 {
-					cnt = int64(cf)
+		suffixes := []string{".value"}
+		if kind == "date_histogram" {
+			suffixes = []string{".value", ".timestamp"}
+		}
+		for _, suf := range suffixes {
+			vals := extractDocFieldValues(doc, field+"."+kind+suf)
+			if len(vals) > 0 && vals[0] != nil {
+				cnt := int64(1)
+				if cVals := extractDocFieldValues(doc, field+"."+kind+"._count"); len(cVals) > 0 {
+					if cf, ok := toFloat64(cVals[0]); ok && int64(cf) > 0 {
+						cnt = int64(cf)
+					}
 				}
+				return vals[0], cnt, true
 			}
-			return vals[0], cnt, true
 		}
 	}
 	return nil, 0, false
@@ -4636,6 +4968,290 @@ func matchesRollupBucketQuery(doc map[string]any, q *esast.Query) bool {
 		}
 	}
 	return true
+}
+
+func collectRollupQueryFieldsR65(q *esast.Query, out map[string]bool) {
+	if q == nil {
+		return
+	}
+	for f := range q.Term {
+		out[strings.TrimSuffix(f, ".keyword")] = true
+	}
+	if q.Terms != nil {
+		for f := range q.Terms.Fields {
+			out[strings.TrimSuffix(f, ".keyword")] = true
+		}
+	}
+	for f := range q.Match {
+		out[strings.TrimSuffix(f, ".keyword")] = true
+	}
+	for f := range q.Range {
+		out[strings.TrimSuffix(f, ".keyword")] = true
+	}
+	if q.Bool != nil {
+		for i := range q.Bool.Must {
+			collectRollupQueryFieldsR65(&q.Bool.Must[i], out)
+		}
+		for i := range q.Bool.Filter {
+			collectRollupQueryFieldsR65(&q.Bool.Filter[i], out)
+		}
+		for i := range q.Bool.Should {
+			collectRollupQueryFieldsR65(&q.Bool.Should[i], out)
+		}
+	}
+}
+
+func collectRollupAggIntervalsAndFieldsR65(aggs map[string]esast.AggSpec, dims map[string]bool, intervals *[]int64) {
+	for _, sp := range aggs {
+		switch {
+		case sp.DateHistogram != nil:
+			dims[strings.TrimSuffix(sp.DateHistogram.Field, ".keyword")] = true
+			dhM := map[string]any{
+				"fixed_interval":    sp.DateHistogram.FixedInterval,
+				"calendar_interval": sp.DateHistogram.CalendarInterval,
+				"interval":          sp.DateHistogram.Interval,
+			}
+			*intervals = append(*intervals, parseCalendarOrFixedIntervalMillis(dhM))
+		case sp.Terms != nil:
+			dims[strings.TrimSuffix(sp.Terms.Field, ".keyword")] = true
+		case sp.Histogram != nil:
+			dims[strings.TrimSuffix(sp.Histogram.Field, ".keyword")] = true
+		}
+		if sub := sp.SubAggs(); len(sub) > 0 {
+			collectRollupAggIntervalsAndFieldsR65(sub, dims, intervals)
+		}
+	}
+}
+
+func (s *Server) selectSingleRollupJobDocsR65(docs []map[string]any, query *esast.Query, aggs map[string]esast.AggSpec) []map[string]any {
+	var allRollup []map[string]any
+	byJob := make(map[string][]map[string]any)
+	for _, d := range docs {
+		if !isRollupDocR65(d) {
+			continue
+		}
+		allRollup = append(allRollup, d)
+		jid := ""
+		if vals := extractDocFieldValues(d, "_rollup.id"); len(vals) > 0 && vals[0] != nil {
+			jid = strings.TrimSpace(fmt.Sprintf("%v", vals[0]))
+		}
+		if jid != "" {
+			byJob[jid] = append(byJob[jid], d)
+		}
+	}
+	if len(byJob) <= 1 {
+		return allRollup
+	}
+	reqDims := make(map[string]bool)
+	collectRollupQueryFieldsR65(query, reqDims)
+	var reqIntervals []int64
+	collectRollupAggIntervalsAndFieldsR65(aggs, reqDims, &reqIntervals)
+	reqIv := int64(0)
+	if len(reqIntervals) > 0 {
+		reqIv = reqIntervals[0]
+	}
+
+	s.mu.RLock()
+	jobIntervals := make(map[string]int64, len(byJob))
+	for jid := range byJob {
+		if jObj, ok := s.rollupJobs[jid]; ok && jObj != nil {
+			if cfg, okC := jObj["config"].(map[string]any); okC && cfg != nil {
+				if grp, okG := cfg["groups"].(map[string]any); okG && grp != nil {
+					if dh, okDH := grp["date_histogram"].(map[string]any); okDH && dh != nil {
+						jobIntervals[jid] = parseCalendarOrFixedIntervalMillis(dh)
+					}
+				}
+			}
+		}
+	}
+	s.mu.RUnlock()
+
+	jobCoversDims := func(jDocs []map[string]any) bool {
+		if len(reqDims) == 0 {
+			return true
+		}
+		for f := range reqDims {
+			found := false
+			for _, d := range jDocs {
+				if _, _, ok := extractRollupDimValue(d, f); ok {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return false
+			}
+		}
+		return true
+	}
+
+	var jids []string
+	for jid := range byJob {
+		jids = append(jids, jid)
+	}
+	sort.Strings(jids)
+
+	type jobCandidate struct {
+		jid     string
+		covers  bool
+		exactIv bool
+		ivMs    int64
+	}
+	var best jobCandidate
+	for i, jid := range jids {
+		ivMs := jobIntervals[jid]
+		cand := jobCandidate{
+			jid:     jid,
+			covers:  jobCoversDims(byJob[jid]),
+			exactIv: reqIv > 0 && ivMs == reqIv,
+			ivMs:    ivMs,
+		}
+		if i == 0 {
+			best = cand
+			continue
+		}
+		if cand.covers != best.covers {
+			if cand.covers {
+				best = cand
+			}
+			continue
+		}
+		if cand.exactIv != best.exactIv {
+			if cand.exactIv {
+				best = cand
+			}
+			continue
+		}
+		if reqIv > 0 && cand.ivMs > 0 && best.ivMs > 0 && cand.ivMs != best.ivMs {
+			candLE := cand.ivMs <= reqIv
+			bestLE := best.ivMs <= reqIv
+			if candLE != bestLE {
+				if candLE {
+					best = cand
+				}
+				continue
+			}
+			if cand.ivMs < best.ivMs {
+				best = cand
+				continue
+			}
+		}
+	}
+	return byJob[best.jid]
+}
+
+var rollupObsoleteTZAliasesR65 = map[string]string{
+	"Canada/Mountain": "America/Edmonton",
+	"Canada/Central":  "America/Winnipeg",
+	"Canada/Eastern":  "America/Toronto",
+	"Canada/Pacific":  "America/Vancouver",
+	"US/Mountain":     "America/Denver",
+	"US/Central":      "America/Chicago",
+	"US/Eastern":      "America/New_York",
+	"US/Pacific":      "America/Los_Angeles",
+}
+
+func loadRollupTimeZoneR65(rawTZ string) *time.Location {
+	tz := strings.TrimSpace(rawTZ)
+	if tz == "" || strings.EqualFold(tz, "UTC") || strings.EqualFold(tz, "Z") {
+		return time.UTC
+	}
+	if loc, err := time.LoadLocation(tz); err == nil && loc != nil {
+		return loc
+	}
+	if alias, ok := rollupObsoleteTZAliasesR65[tz]; ok {
+		if loc, err := time.LoadLocation(alias); err == nil && loc != nil {
+			return loc
+		}
+	}
+	if loc, ok := parseFixedOffsetTZR62Search(tz); ok && loc != nil {
+		return loc
+	}
+	return time.UTC
+}
+
+func floorRollupDateMillisR65(ms int64, dhSpec map[string]any, loc *time.Location) int64 {
+	offsetMs := int64(0)
+	if offRaw, ok := dhSpec["offset"].(string); ok && strings.TrimSpace(offRaw) != "" {
+		offsetMs = parseESSignedOffsetMillisR65(offRaw)
+	}
+	shifted := ms - offsetMs
+	rawUnit := ""
+	for _, k := range []string{"calendar_interval", "interval", "fixed_interval"} {
+		if sv, ok := dhSpec[k].(string); ok && strings.TrimSpace(sv) != "" {
+			rawUnit = strings.TrimSpace(sv)
+			break
+		}
+	}
+	t := time.UnixMilli(shifted).In(loc)
+	switch rawUnit {
+	case "year", "1y":
+		return time.Date(t.Year(), 1, 1, 0, 0, 0, 0, loc).UnixMilli() + offsetMs
+	case "month", "1M":
+		return time.Date(t.Year(), t.Month(), 1, 0, 0, 0, 0, loc).UnixMilli() + offsetMs
+	case "week", "1w":
+		wdOffset := (int(t.Weekday()) + 6) % 7
+		return time.Date(t.Year(), t.Month(), t.Day()-wdOffset, 0, 0, 0, 0, loc).UnixMilli() + offsetMs
+	case "day", "1d":
+		return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, loc).UnixMilli() + offsetMs
+	}
+	iv := parseCalendarOrFixedIntervalMillis(dhSpec)
+	if iv <= 0 {
+		iv = 3600_000
+	}
+	if iv <= 86400_000 && loc != time.UTC {
+		dayStart := time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, loc).UnixMilli()
+		rel := shifted - dayStart
+		return dayStart + (rel - ((rel%iv)+iv)%iv) + offsetMs
+	}
+	return shifted - ((shifted%iv)+iv)%iv + offsetMs
+}
+
+func nextRollupDateBucketMillisR65(curMs int64, dhSpec map[string]any, loc *time.Location) int64 {
+	rawUnit := ""
+	for _, k := range []string{"calendar_interval", "interval", "fixed_interval"} {
+		if sv, ok := dhSpec[k].(string); ok && strings.TrimSpace(sv) != "" {
+			rawUnit = strings.TrimSpace(sv)
+			break
+		}
+	}
+	t := time.UnixMilli(curMs).In(loc)
+	switch rawUnit {
+	case "year", "1y":
+		return t.AddDate(1, 0, 0).UnixMilli()
+	case "month", "1M":
+		return t.AddDate(0, 1, 0).UnixMilli()
+	case "week", "1w":
+		return t.AddDate(0, 0, 7).UnixMilli()
+	case "day", "1d":
+		return t.AddDate(0, 0, 1).UnixMilli()
+	}
+	iv := parseCalendarOrFixedIntervalMillis(dhSpec)
+	if iv <= 0 {
+		iv = 3600_000
+	}
+	return curMs + iv
+}
+
+func formatRollupDateBucketKeyR65(ms int64, formatStr, tzStr string, loc *time.Location) string {
+	t := time.UnixMilli(ms).In(loc)
+	fTrim := strings.TrimSpace(formatStr)
+	if fTrim != "" {
+		switch strings.ToLower(fTrim) {
+		case "epoch_millis":
+			return fmt.Sprintf("%d", ms)
+		case "epoch_second":
+			return fmt.Sprintf("%d", ms/1000)
+		}
+		if goLayout := schema.ESDateFormatToGoLayout(fTrim); goLayout != "" {
+			return t.Format(goLayout)
+		}
+	}
+	tzTrim := strings.TrimSpace(tzStr)
+	if tzTrim == "" || strings.EqualFold(tzTrim, "UTC") || strings.EqualFold(tzTrim, "Z") {
+		return t.UTC().Format("2006-01-02T15:04:05.000Z")
+	}
+	return t.Format("2006-01-02T15:04:05.000Z07:00")
 }
 
 func evalRollupAggMap(docs []map[string]any, aggs map[string]esast.AggSpec) map[string]any {
@@ -4788,14 +5404,18 @@ func evalRollupAggMap(docs []map[string]any, aggs map[string]esast.AggSpec) map[
 				"fixed_interval":    spec.DateHistogram.FixedInterval,
 				"calendar_interval": spec.DateHistogram.CalendarInterval,
 				"interval":          spec.DateHistogram.Interval,
+				"time_zone":         spec.DateHistogram.TimeZone,
+				"offset":            spec.DateHistogram.Offset,
+				"format":            spec.DateHistogram.Format,
 			}
+			loc := loadRollupTimeZoneR65(spec.DateHistogram.TimeZone)
 			type dhGroup struct {
 				iso   string
 				ms    int64
 				count int64
 				docs  []map[string]any
 			}
-			groups := make(map[string]*dhGroup)
+			groups := make(map[int64]*dhGroup)
 			for _, d := range docs {
 				dv, cnt, ok := extractRollupDimValue(d, spec.DateHistogram.Field)
 				if !ok {
@@ -4805,24 +5425,58 @@ func evalRollupAggMap(docs []map[string]any, aggs map[string]esast.AggSpec) map[
 				if !okTS {
 					continue
 				}
-				iso := bucketDateMillis(ms, dhMap)
-				parsedT, _ := time.Parse("2006-01-02T15:04:05.000Z", iso)
-				g := groups[iso]
+				bMs := floorRollupDateMillisR65(ms, dhMap, loc)
+				g := groups[bMs]
 				if g == nil {
-					g = &dhGroup{iso: iso, ms: parsedT.UTC().UnixMilli()}
-					groups[iso] = g
+					iso := formatRollupDateBucketKeyR65(bMs, spec.DateHistogram.Format, spec.DateHistogram.TimeZone, loc)
+					g = &dhGroup{iso: iso, ms: bMs}
+					groups[bMs] = g
 				}
 				g.count += cnt
 				g.docs = append(g.docs, d)
 			}
-			keys := make([]string, 0, len(groups))
-			for k := range groups {
-				keys = append(keys, k)
+			minDoc := 0
+			if spec.DateHistogram.MinDocCount != nil {
+				minDoc = *spec.DateHistogram.MinDocCount
 			}
-			sort.Strings(keys)
+			if minDoc == 0 && len(groups) >= 2 {
+				var minMs, maxMs int64
+				first := true
+				for kMs := range groups {
+					if first || kMs < minMs {
+						minMs = kMs
+					}
+					if first || kMs > maxMs {
+						maxMs = kMs
+					}
+					first = false
+				}
+				curMs := minMs
+				for steps := 0; curMs <= maxMs && steps < 10000; steps++ {
+					if groups[curMs] == nil {
+						groups[curMs] = &dhGroup{
+							iso:   formatRollupDateBucketKeyR65(curMs, spec.DateHistogram.Format, spec.DateHistogram.TimeZone, loc),
+							ms:    curMs,
+							count: 0,
+						}
+					}
+					nextMs := nextRollupDateBucketMillisR65(curMs, dhMap, loc)
+					if nextMs <= curMs {
+						break
+					}
+					curMs = nextMs
+				}
+			}
+			keys := make([]int64, 0, len(groups))
+			for kMs, g := range groups {
+				if g.count >= int64(minDoc) {
+					keys = append(keys, kMs)
+				}
+			}
+			sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
 			bList := make([]any, 0, len(keys))
-			for _, k := range keys {
-				g := groups[k]
+			for _, kMs := range keys {
+				g := groups[kMs]
 				bMap := map[string]any{
 					"key_as_string": g.iso,
 					"key":           g.ms,

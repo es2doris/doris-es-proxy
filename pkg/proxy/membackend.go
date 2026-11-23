@@ -206,6 +206,107 @@ func (m *MemoryBackend) Ping(_ context.Context) error {
 	return nil
 }
 
+func isPercolatorQueryDSLKeyR65(k string) bool {
+	switch k {
+	case "term", "terms", "terms_set", "match", "match_all", "match_none", "match_phrase",
+		"match_phrase_prefix", "match_bool_prefix", "multi_match", "query_string",
+		"simple_query_string", "bool", "range", "exists", "prefix", "wildcard",
+		"regexp", "fuzzy", "ids", "constant_score", "dis_max", "function_score",
+		"boosting", "nested", "has_child", "has_parent", "parent_id", "geo_shape",
+		"geo_bounding_box", "geo_distance", "geo_polygon", "geo_grid", "shape",
+		"percolate", "script", "script_score", "knn", "type", "span_term",
+		"span_multi", "span_near", "span_or", "span_not", "span_first",
+		"span_containing", "span_within", "intervals", "more_like_this",
+		"combined_fields", "common", "wrapper":
+		return true
+	default:
+		return false
+	}
+}
+
+func isPercolatorQueryObjectR65(key string, dm map[string]any) bool {
+	if dm == nil {
+		return false
+	}
+	if key == "query" && len(dm) == 0 {
+		return true
+	}
+	if key != "query" && key != "queries" {
+		return false
+	}
+	for subK := range dm {
+		if isPercolatorQueryDSLKeyR65(subK) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasKeyWithDottedPrefixR65(m map[string]any, prefix string) bool {
+	for k := range m {
+		if strings.HasPrefix(k, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasNestedPathInMapR65(m map[string]any, dottedPath string) bool {
+	if m == nil || dottedPath == "" {
+		return false
+	}
+	if _, ok := m[dottedPath]; ok {
+		return true
+	}
+	for i := 0; i < len(dottedPath); i++ {
+		if dottedPath[i] != '.' {
+			continue
+		}
+		head := dottedPath[:i]
+		tail := dottedPath[i+1:]
+		if sub, ok := m[head].(map[string]any); ok {
+			if hasNestedPathInMapR65(sub, tail) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func filterDocMapExcludingDottedKeysR65(dst map[string]any, prefix string, srcMap map[string]any) (map[string]any, bool) {
+	if len(srcMap) == 0 {
+		return nil, false
+	}
+	var filtered map[string]any
+	for subK, subV := range srcMap {
+		fullPath := subK
+		if prefix != "" {
+			fullPath = prefix + "." + subK
+		}
+		if _, existsDot := dst[fullPath]; existsDot {
+			continue
+		}
+		if subMap, isMap := subV.(map[string]any); isMap {
+			subFiltered, keep := filterDocMapExcludingDottedKeysR65(dst, fullPath, subMap)
+			if keep && len(subFiltered) > 0 {
+				if filtered == nil {
+					filtered = make(map[string]any, len(srcMap))
+				}
+				filtered[subK] = subFiltered
+			}
+			continue
+		}
+		if hasKeyWithDottedPrefixR65(dst, fullPath+".") {
+			continue
+		}
+		if filtered == nil {
+			filtered = make(map[string]any, len(srcMap))
+		}
+		filtered[subK] = subV
+	}
+	return filtered, len(filtered) > 0
+}
+
 func mergeMissingDocKeysIntoSourceMap(dst, src map[string]any) bool {
 	if dst == nil || len(src) == 0 {
 		return false
@@ -214,14 +315,29 @@ func mergeMissingDocKeysIntoSourceMap(dst, src map[string]any) bool {
 	for k, sv := range src {
 		dv, exists := dst[k]
 		if !exists {
+			if strings.Contains(k, ".") && hasNestedPathInMapR65(dst, k) {
+				continue
+			}
+			if sm, okS := sv.(map[string]any); okS && hasKeyWithDottedPrefixR65(dst, k+".") {
+				if filtered, keep := filterDocMapExcludingDottedKeysR65(dst, k, sm); keep {
+					dst[k] = filtered
+					changed = true
+				}
+				continue
+			}
 			dst[k] = sv
 			changed = true
 			continue
 		}
 		dm, okD := dv.(map[string]any)
 		sm, okS := sv.(map[string]any)
-		if okD && okS && mergeMissingDocKeysIntoSourceMap(dm, sm) {
-			changed = true
+		if okD && okS {
+			if isPercolatorQueryObjectR65(k, dm) {
+				continue
+			}
+			if mergeMissingDocKeysIntoSourceMap(dm, sm) {
+				changed = true
+			}
 		}
 	}
 	return changed
@@ -445,6 +561,9 @@ func (m *MemoryBackend) QueryHits(ctx context.Context, sqlStr string) ([]HitRow,
 	}
 
 	tbl := m.tables[tableName]
+	if err := checkStrictCastRowsR65Mem(tbl, sqlStr); err != nil {
+		return nil, err
+	}
 	if strings.Contains(mainWhere, "ROW_NUMBER() OVER (ORDER BY ") || strings.Contains(scoreExpr, "ROW_NUMBER() OVER (ORDER BY ") || strings.Contains(postWhere, "ROW_NUMBER() OVER (ORDER BY ") || strings.Contains(collapseSearchAfterWhere, "ROW_NUMBER() OVER (ORDER BY ") {
 		mainWhere = resolveKNNTopKSubqueries(tbl, mainWhere)
 		postWhere = resolveKNNTopKSubqueries(tbl, postWhere)
@@ -603,6 +722,9 @@ func (m *MemoryBackend) QueryAggs(_ context.Context, sqlStr string) ([]AggRow, e
 	unionBranches := strings.Split(sub[3], "\nUNION ALL\n")
 
 	tbl := m.tables[tableName]
+	if err := checkStrictCastRowsR65Mem(tbl, sqlStr); err != nil {
+		return nil, err
+	}
 	if strings.Contains(baseWhere, "ROW_NUMBER() OVER (ORDER BY ") {
 		baseWhere = resolveKNNTopKSubqueries(tbl, baseWhere)
 	}
@@ -661,10 +783,11 @@ var (
 	reAggPercentileRank         = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, '([^']+)' AS `_bucket_key`, CAST\\(COALESCE\\(AVG\\(CASE WHEN (.+?) <= ([0-9.eE+-]+) THEN 100\\.0 ELSE 0\\.0 END\\), 0\\) AS DOUBLE\\) AS `_doc_count` FROM (`base_matched`(?: LATERAL VIEW EXPLODE\\(.+?\\) `_(?:nt|t)` AS `_(?:nel|elem)`)?)(?: WHERE (.+))?$")
 	reAggDateHist               = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, CAST\\(CAST\\(FLOOR\\((?:\\((.+?) \\+ (-?\\d+)\\)|(.+?)) / (\\d+)\\) \\* \\d+(?: - -?\\d+)? AS BIGINT\\) AS STRING\\) AS `_bucket_key`, CAST\\((?:COUNT\\(\\*\\)|COUNT\\(DISTINCT `_id`\\)) AS DOUBLE\\) AS `_doc_count` FROM (`base_matched`(?: LATERAL VIEW EXPLODE\\((?:CASE WHEN .+ END|`[^`]+`)\\) `_(?:t|ht|rng_t)` AS `_(?:elem|helem|bidx|off)`)?) WHERE (?:(?:\\((.+)\\) AND )?(?:`[^`]+`|(?:TRY_CAST|CAST)\\([^)]+\\)|`_doc`\\[[^\\]]+\\]) IS NOT NULL|(.+?)) GROUP BY `_bucket_key` ORDER BY CAST\\(`_bucket_key` AS BIGINT\\) ASC")
 	reAggDateHistGeneric        = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, (.+?) AS `_bucket_key`, CAST\\((?:COUNT\\(\\*\\)|COUNT\\(DISTINCT `_id`\\)) AS DOUBLE\\) AS `_doc_count` FROM (.+?) WHERE (.+?) GROUP BY `_bucket_key` ORDER BY CAST\\(`_bucket_key` AS BIGINT\\) ASC")
-	reAggHist                   = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, CAST\\(FLOOR\\(\\((.+?) - ([^)]+)\\) / ([^)]+)\\) \\* [^)]+ \\+ [^)]+ AS STRING\\) AS `_bucket_key`, CAST\\((?:COUNT\\(\\*\\)|COUNT\\(DISTINCT `_id`\\)|COALESCE\\(SUM\\((.+?)\\), 0\\)) AS DOUBLE\\) AS `_doc_count` FROM (`base_matched`(?: LATERAL VIEW EXPLODE\\(.+?\\) `_(?:t|ht|rng_t)` AS `_(?:elem|helem|bidx|off)`)?) WHERE (?:(?:\\((.+)\\) AND )?(?:`[^`]+`|(?:TRY_CAST|CAST)\\([^)]+\\)|`_doc`\\[[^\\]]+\\]) IS NOT NULL|(.+?)) GROUP BY `_bucket_key` ORDER BY CAST\\(`_bucket_key` AS DOUBLE\\) ASC")
+	reAggHist                   = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, CAST\\((?:\\()?(?:CAST\\()?FLOOR\\(\\((.+?) - ([^)]+)\\) / ([^)]+)\\)(?: AS LARGEINT\\))? \\* [^)]+ \\+ [^)]+(?:\\))? AS STRING\\) AS `_bucket_key`, CAST\\((?:COUNT\\(\\*\\)|COUNT\\(DISTINCT `_id`\\)|COALESCE\\(SUM\\((.+?)\\), 0\\)) AS DOUBLE\\) AS `_doc_count` FROM (`base_matched`(?: LATERAL VIEW EXPLODE\\(.+?\\) `_(?:t|ht|rng_t)` AS `_(?:elem|helem|bidx|off)`)?) WHERE (?:(?:\\((.+)\\) AND )?(?:`[^`]+`|(?:TRY_CAST|CAST)\\([^)]+\\)|`_doc`\\[[^\\]]+\\]) IS NOT NULL|(.+?)) GROUP BY `_bucket_key` ORDER BY CAST\\(`_bucket_key` AS DOUBLE\\) ASC")
 	reAggRawValues              = regexp.MustCompile(`^SELECT '(__raw_vals__(?:''|[^'])*)' AS ` + "`_agg_name`, CONCAT\\('_vals:', (?:IF\\(COUNT\\(.+?\\) <= 50000, )?COALESCE\\(ARRAY_JOIN\\(COLLECT_LIST\\(CAST\\((.+?) AS DOUBLE\\)\\), ','\\), ''\\)(?:, ':OVERFLOW:'\\))?\\) AS `_bucket_key`, CAST\\(COUNT\\(.+?\\) AS DOUBLE\\) AS `_doc_count` FROM (.+)$")
 	reAggSubRawValues           = regexp.MustCompile(`^SELECT '(__raw_vals__(?:''|[^'])*)' AS ` + "`_agg_name`, CONCAT\\(CAST\\((.+?) AS STRING\\), '\\\\x1f(?:', '_vals:|_vals:)', (?:IF\\(COUNT\\(.+?\\) <= 50000, )?COALESCE\\(ARRAY_JOIN\\(COLLECT_LIST\\(CAST\\((.+?) AS DOUBLE\\)\\), ','\\), ''\\)(?:, ':OVERFLOW:'\\))?\\) AS `_bucket_key`, CAST\\(COUNT\\(.+?\\) AS DOUBLE\\) AS `_doc_count` FROM (.+)$")
 	reAggRange                  = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, '([^']+)' AS `_bucket_key`, CAST\\(" + docCountAggExprPatR62Mem + " AS DOUBLE\\) AS `_doc_count` FROM (`base_matched`(?: LATERAL VIEW EXPLODE\\(`[^`]+`\\) `_t` AS `_elem`)?) WHERE (.+)$")
+	reAggRangeHistR65           = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, '([^']+)' AS `_bucket_key`, CAST\\(COALESCE\\(SUM\\(TRY_CAST\\(SPLIT_PART\\(`_helem`, ',', 2\\) AS DOUBLE\\)\\), 0\\) AS DOUBLE\\) AS `_doc_count` FROM (`base_matched` LATERAL VIEW EXPLODE\\(.+?\\) `_ht` AS `_helem`) WHERE (.+)$")
 	reAggSubMetric              = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, (.+?) AS `_bucket_key`, CAST\\((?:COALESCE\\((AVG|SUM|MIN|MAX|COUNT|STDDEV_POP)\\((.+?)\\), 0\\)|(COUNT)\\((DISTINCT )?(.+?)\\)) AS DOUBLE\\) AS `_doc_count` FROM (.+) WHERE (.+?) GROUP BY `_bucket_key`$")
 	reAggSubPercentile          = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, (.+?) AS `_bucket_key`, CAST\\(COALESCE\\(PERCENTILE_APPROX\\((.+?), ([0-9.]+)\\), 0\\) AS DOUBLE\\) AS `_doc_count` FROM (.+) WHERE (.+?) GROUP BY `_bucket_key`$")
 	reAggSubPercentileRank      = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, (.+?) AS `_bucket_key`, CAST\\(COALESCE\\(AVG\\(CASE WHEN (.+?) <= ([0-9.eE+-]+) THEN 100\\.0 ELSE 0\\.0 END\\), 0\\) AS DOUBLE\\) AS `_doc_count` FROM (.+) WHERE (.+?) GROUP BY `_bucket_key`$")
@@ -1749,6 +1872,59 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 		if extraWhere == "" {
 			extraWhere = m[8]
 		}
+		if strings.Contains(branch, "AS LARGEINT)") {
+			if offBI, okO := parseMemBigIntR65(offsetStr); okO {
+				if intBI, okI := parseMemBigIntR65(intervalStr); okI && intBI.Sign() > 0 {
+					rawColExpr := unwrapMemDoubleCastExprR65(colExpr)
+					expanded := expandFromClauseRows(baseRows, fromClause, extraWhere)
+					counts := make(map[string]int64)
+					keyOrder := make(map[string]*big.Int)
+					seenDocBucket := make(map[string]bool)
+					isDistinctDoc := strings.Contains(branch, "COUNT(DISTINCT `_id`)")
+					for _, row := range expanded {
+						if val := resolveColumnValue(row, rawColExpr); val != nil {
+							seenRowBucket := make(map[string]bool)
+							for _, elem := range asSliceOrSingle(val) {
+								if elemBI, okE := parseMemBigIntValueR65(elem); okE {
+									bkBI := floorBucketBigIntR65(elemBI, offBI, intBI)
+									bStr := bkBI.String()
+									if seenRowBucket[bStr] {
+										continue
+									}
+									seenRowBucket[bStr] = true
+									if isDistinctDoc {
+										dk := fmt.Sprintf("%v\x00%s", row["_id"], bStr)
+										if seenDocBucket[dk] {
+											continue
+										}
+										seenDocBucket[dk] = true
+									}
+									keyOrder[bStr] = bkBI
+									counts[bStr]++
+								}
+							}
+						}
+					}
+					keys := make([]string, 0, len(counts))
+					for k := range counts {
+						keys = append(keys, k)
+					}
+					sort.Slice(keys, func(i, j int) bool {
+						return keyOrder[keys[i]].Cmp(keyOrder[keys[j]]) < 0
+					})
+					rows := make([]AggRow, 0, len(keys))
+					for _, k := range keys {
+						rows = append(rows, AggRow{
+							AggName:   aggName,
+							BucketKey: k,
+							DocCount:  counts[k],
+							Value:     float64(counts[k]),
+						})
+					}
+					return filterHaving(rows)
+				}
+			}
+		}
 		offset, _ := strconv.ParseFloat(offsetStr, 64)
 		interval, _ := strconv.ParseFloat(intervalStr, 64)
 		if interval <= 0 {
@@ -1897,7 +2073,7 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 		counts := make(map[string]int64)
 		seenDocBucket := make(map[string]bool)
 		isDistinctDoc := strings.Contains(branch, "COUNT(DISTINCT `_id`)")
-		useDocCnt := !isDistinctDoc && strings.Contains(branch, "$._doc_count")
+		useDocCnt := !isDistinctDoc && (strings.Contains(branch, "$._doc_count") || strings.Contains(branch, `$."_doc_count"`))
 		for _, row := range expanded {
 			w := rowDocCountWeightR62Mem(row, useDocCnt)
 			for _, bKey := range evalBucketKeyExprs(row, bucketKeyExpr) {
@@ -1940,7 +2116,7 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 		counts := make(map[string]int64)
 		seenDocBucket := make(map[string]bool)
 		isDistinctDoc := strings.Contains(branch, "COUNT(DISTINCT `_id`)")
-		useDocCnt := !isDistinctDoc && strings.Contains(branch, "$._doc_count")
+		useDocCnt := !isDistinctDoc && (strings.Contains(branch, "$._doc_count") || strings.Contains(branch, `$."_doc_count"`))
 		for _, row := range expanded {
 			w := rowDocCountWeightR62Mem(row, useDocCnt)
 			for _, bKey := range evalBucketKeyExprs(row, bucketKeyExpr) {
@@ -1969,7 +2145,7 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 		counts := make(map[string]int64)
 		seenDocBucket := make(map[string]bool)
 		isDistinctDoc := strings.Contains(branch, "COUNT(DISTINCT `_id`)")
-		useDocCnt := !isDistinctDoc && strings.Contains(branch, "$._doc_count")
+		useDocCnt := !isDistinctDoc && (strings.Contains(branch, "$._doc_count") || strings.Contains(branch, `$."_doc_count"`))
 		for _, row := range expanded {
 			w := rowDocCountWeightR62Mem(row, useDocCnt)
 			for _, bKey := range evalBucketKeyExprs(row, bucketKeyExpr) {
@@ -2306,13 +2482,34 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 		return out
 	}
 
+	if m := reAggRangeHistR65.FindStringSubmatch(branch); m != nil {
+		aggName, bkey, fromClause, rangeWhere := m[1], m[2], m[3], m[4]
+		if bkey != "_filter" && bkey != "_missing" && bkey != "_metric" && bkey != "_count" &&
+			bkey != "_global" && bkey != "_reverse_nested" && bkey != "_sampler" &&
+			bkey != "_children" && bkey != "_parent" {
+			expanded := expandFromClauseRows(baseRows, fromClause, rangeWhere)
+			var totalCnt float64
+			for _, r := range expanded {
+				helemStr := fmt.Sprintf("%v", r["_helem"])
+				parts := strings.Split(helemStr, ",")
+				if len(parts) >= 2 {
+					if cntF, okC := toFloat(strings.TrimSpace(parts[1])); okC {
+						totalCnt += cntF
+					}
+				}
+			}
+			cntInt := int64(math.Round(totalCnt))
+			return []AggRow{{AggName: aggName, BucketKey: bkey, DocCount: cntInt, Value: totalCnt}}
+		}
+	}
+
 	if m := reAggRange.FindStringSubmatch(branch); m != nil {
 		aggName, bkey, fromClause, rangeWhere := m[1], m[2], m[3], m[4]
 		if bkey != "_filter" && bkey != "_missing" && bkey != "_metric" && bkey != "_count" &&
 			bkey != "_global" && bkey != "_reverse_nested" && bkey != "_sampler" &&
 			bkey != "_children" && bkey != "_parent" {
 			expanded := expandFromClauseRows(baseRows, fromClause, rangeWhere)
-			useDocCnt := strings.Contains(branch, "$._doc_count")
+			useDocCnt := strings.Contains(branch, "$._doc_count") || strings.Contains(branch, `$."_doc_count"`)
 			var cnt int64
 			for _, r := range expanded {
 				cnt += rowDocCountWeightR62Mem(r, useDocCnt)
@@ -2611,8 +2808,80 @@ func expandFromClauseRows(baseRows []map[string]any, fromClause, whereClause str
 
 var (
 	reBucketDateHist = regexp.MustCompile(`^CAST\(CAST\(FLOOR\((?:\((.+?) \+ (-?\d+)\)|(.+?)) / (\d+)\) \* \d+(?: - -?\d+)? AS BIGINT\) AS STRING\)$`)
-	reBucketHist     = regexp.MustCompile(`^CAST\(FLOOR\(\((.+?) - ([^)]+)\) / ([^)]+)\) \* [^)]+ \+ [^)]+ AS STRING\)$`)
+	reBucketHist     = regexp.MustCompile(`^CAST\((?:\()?` + `(?:CAST\()?FLOOR\(\((.+?) - ([^)]+)\) / ([^)]+)\)(?: AS LARGEINT\))?` + ` \* [^)]+ \+ [^)]+(?:\))? AS STRING\)$`)
 )
+
+func unwrapMemDoubleCastExprR65(expr string) string {
+	s := strings.TrimSpace(expr)
+	for {
+		if strings.HasPrefix(s, "CAST(") && strings.HasSuffix(s, " AS DOUBLE)") {
+			s = strings.TrimSpace(s[len("CAST(") : len(s)-len(" AS DOUBLE)")])
+			continue
+		}
+		if strings.HasPrefix(s, "TRY_CAST(") && strings.HasSuffix(s, " AS DOUBLE)") {
+			s = strings.TrimSpace(s[len("TRY_CAST(") : len(s)-len(" AS DOUBLE)")])
+			continue
+		}
+		break
+	}
+	return s
+}
+
+func parseMemBigIntR65(raw string) (*big.Int, bool) {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return nil, false
+	}
+	if dot := strings.IndexByte(s, '.'); dot >= 0 && !strings.ContainsAny(s, "eE") {
+		frac := strings.TrimRight(s[dot+1:], "0")
+		if frac == "" {
+			s = s[:dot]
+		}
+	}
+	if bi, ok := new(big.Int).SetString(s, 10); ok {
+		return bi, true
+	}
+	f, _, err := big.ParseFloat(s, 10, 256, big.ToZero)
+	if err != nil || f == nil {
+		return nil, false
+	}
+	bi, acc := f.Int(nil)
+	return bi, acc == big.Exact
+}
+
+func parseMemBigIntValueR65(v any) (*big.Int, bool) {
+	switch tv := v.(type) {
+	case uint64:
+		return new(big.Int).SetUint64(tv), true
+	case int64:
+		return big.NewInt(tv), true
+	case int:
+		return big.NewInt(int64(tv)), true
+	case json.Number:
+		return parseMemBigIntR65(tv.String())
+	case string:
+		return parseMemBigIntR65(tv)
+	case float64:
+		if math.IsNaN(tv) || math.IsInf(tv, 0) {
+			return nil, false
+		}
+		f := new(big.Float).SetFloat64(tv)
+		bi, _ := f.Int(nil)
+		return bi, true
+	default:
+		return parseMemBigIntR65(fmt.Sprintf("%v", v))
+	}
+}
+
+func floorBucketBigIntR65(val, offset, interval *big.Int) *big.Int {
+	diff := new(big.Int).Sub(val, offset)
+	q, r := new(big.Int).QuoRem(diff, interval, new(big.Int))
+	if r.Sign() < 0 {
+		q.Sub(q, big.NewInt(1))
+	}
+	prod := new(big.Int).Mul(q, interval)
+	return prod.Add(prod, offset)
+}
 
 func unescapeCONCATWSSeparator(rawLit string) string {
 	sep := unquoteSQLLiteral(strings.TrimSpace(rawLit))
@@ -2721,6 +2990,28 @@ func evalBucketKeyExprs(row map[string]any, expr string) []string {
 	}
 	if m := reBucketHist.FindStringSubmatch(expr); m != nil {
 		colExpr, offsetStr, intervalStr := m[1], m[2], m[3]
+		if strings.Contains(expr, "AS LARGEINT)") {
+			if offBI, okO := parseMemBigIntR65(offsetStr); okO {
+				if intBI, okI := parseMemBigIntR65(intervalStr); okI && intBI.Sign() > 0 {
+					rawColExpr := unwrapMemDoubleCastExprR65(colExpr)
+					if val := resolveColumnValue(row, rawColExpr); val != nil {
+						var out []string
+						seen := make(map[string]bool)
+						for _, elem := range asSliceOrSingle(val) {
+							if elemBI, okE := parseMemBigIntValueR65(elem); okE {
+								s := floorBucketBigIntR65(elemBI, offBI, intBI).String()
+								if !seen[s] {
+									seen[s] = true
+									out = append(out, s)
+								}
+							}
+						}
+						return out
+					}
+					return nil
+				}
+			}
+		}
 		offset, _ := strconv.ParseFloat(offsetStr, 64)
 		interval, _ := strconv.ParseFloat(intervalStr, 64)
 		if interval <= 0 {
@@ -2846,6 +3137,19 @@ func evalBucketKeyExpr(row map[string]any, expr string) string {
 	}
 	if m := reBucketHist.FindStringSubmatch(expr); m != nil {
 		colExpr, offsetStr, intervalStr := m[1], m[2], m[3]
+		if strings.Contains(expr, "AS LARGEINT)") {
+			if offBI, okO := parseMemBigIntR65(offsetStr); okO {
+				if intBI, okI := parseMemBigIntR65(intervalStr); okI && intBI.Sign() > 0 {
+					rawColExpr := unwrapMemDoubleCastExprR65(colExpr)
+					if val := resolveColumnValue(row, rawColExpr); val != nil {
+						if elemBI, okE := parseMemBigIntValueR65(val); okE {
+							return floorBucketBigIntR65(elemBI, offBI, intBI).String()
+						}
+					}
+					return ""
+				}
+			}
+		}
 		offset, _ := strconv.ParseFloat(offsetStr, 64)
 		interval, _ := strconv.ParseFloat(intervalStr, 64)
 		if interval <= 0 {
@@ -3648,13 +3952,10 @@ func evalNumericExpr(row map[string]any, expr string) float64 {
 			}
 		}
 	}
-	if strings.HasPrefix(expr, "CAST(") && !strings.HasPrefix(expr, "CAST(`_doc`") {
+	if strings.HasPrefix(expr, "CAST(") && !strings.HasPrefix(expr, "CAST(`_doc`") && hasMatchingOuterParens(expr, 4) {
 		for _, suffix := range []string{" AS DOUBLE)", " AS BIGINT)", " AS LARGEINT)", " AS INT)"} {
 			if strings.HasSuffix(expr, suffix) {
-				inner := strings.TrimSpace(expr[len("CAST:") : len(expr)-len(suffix)])
-				if strings.HasPrefix(expr, "CAST(") {
-					inner = strings.TrimSpace(expr[len("CAST(") : len(expr)-len(suffix)])
-				}
+				inner := strings.TrimSpace(expr[len("CAST(") : len(expr)-len(suffix)])
 				return evalNumericExpr(row, inner)
 			}
 		}
@@ -3841,7 +4142,7 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 		}
 		return nil
 	}
-	if strings.HasPrefix(colExpr, "`") && strings.HasSuffix(colExpr, "`") {
+	if strings.HasPrefix(colExpr, "`") && strings.HasSuffix(colExpr, "`") && !strings.Contains(colExpr, "`.`") {
 		colName := strings.Trim(colExpr, "`")
 		if val := row[colName]; val != nil {
 			return val
@@ -5240,32 +5541,47 @@ func hasUnwrappedNullColumnRef(row map[string]any, expr string) bool {
 		return resolveColumnValue(row, expr) == nil
 	}
 	stripped := stripCoalesceSubexprs(expr)
-	for {
-		idx := strings.Index(stripped, "ST_Distance_Sphere(")
-		if idx < 0 {
-			break
-		}
-		depth := 0
-		end := -1
-		for i := idx + len("ST_Distance_Sphere"); i < len(stripped); i++ {
-			if stripped[i] == '(' {
-				depth++
-			} else if stripped[i] == ')' {
-				depth--
-				if depth == 0 {
-					end = i
-					break
-				}
+	for step := 0; step < 16; step++ {
+		ifIdx := -1
+		for i := 0; i+3 <= len(stripped); i++ {
+			if (stripped[i:i+3] == "IF(" || stripped[i:i+3] == "if(") && (i == 0 || !isIdentByteR63Mem(stripped[i-1])) {
+				ifIdx = i
+				break
 			}
 		}
+		if ifIdx < 0 {
+			break
+		}
+		end := memFindMatchingParen(stripped, ifIdx+2)
 		if end < 0 {
 			break
 		}
-		call := stripped[idx : end+1]
-		if v := resolveColumnValue(row, call); v == nil {
-			return true
+		args := splitTopLevelArgs(stripped[ifIdx+3 : end])
+		if len(args) != 3 {
+			break
 		}
-		stripped = stripped[:idx] + "1" + stripped[end+1:]
+		chosen := strings.TrimSpace(args[2])
+		if evalWhereExpr(row, strings.TrimSpace(args[0])) {
+			chosen = strings.TrimSpace(args[1])
+		}
+		stripped = stripped[:ifIdx] + "(" + chosen + ")" + stripped[end+1:]
+	}
+	for _, fnPfx := range []string{"ST_Distance_Sphere(", "L2_DISTANCE(", "COSINE_DISTANCE(", "INNER_PRODUCT("} {
+		for {
+			idx := strings.Index(stripped, fnPfx)
+			if idx < 0 {
+				break
+			}
+			end := memFindMatchingParen(stripped, idx+len(fnPfx)-1)
+			if end < 0 {
+				break
+			}
+			call := stripped[idx : end+1]
+			if v := resolveColumnValue(row, call); v == nil {
+				return true
+			}
+			stripped = stripped[:idx] + "1" + stripped[end+1:]
+		}
 	}
 	for _, m := range reUnwrappedDocExtract.FindAllString(stripped, -1) {
 		if v := resolveColumnValue(row, m); v == nil || fmt.Sprintf("%v", v) == "" {
@@ -5805,14 +6121,15 @@ func toStringSlice(v any) []string {
 
 func resolveVectorValue(row map[string]any, expr string) []float64 {
 	expr = strings.TrimSpace(expr)
-	if strings.HasPrefix(expr, "IF(") && strings.HasSuffix(expr, ")") && hasMatchingOuterParens(expr, 2) {
+	for step := 0; step < 8 && (strings.HasPrefix(expr, "IF(") || strings.HasPrefix(expr, "if(")) && strings.HasSuffix(expr, ")") && hasMatchingOuterParens(expr, 2); step++ {
 		args := splitTopLevelArgs(expr[3 : len(expr)-1])
-		if len(args) == 3 {
-			if evalWhereExpr(row, strings.TrimSpace(args[0])) {
-				expr = strings.TrimSpace(args[1])
-			} else {
-				expr = strings.TrimSpace(args[2])
-			}
+		if len(args) != 3 {
+			break
+		}
+		if evalWhereExpr(row, strings.TrimSpace(args[0])) {
+			expr = strings.TrimSpace(args[1])
+		} else {
+			expr = strings.TrimSpace(args[2])
 		}
 	}
 	if strings.HasPrefix(expr, "COALESCE(") && strings.HasSuffix(expr, ")") && hasMatchingOuterParens(expr, len("COALESCE")) {
@@ -6783,7 +7100,7 @@ var (
 	reTSTopSubSelectR62Mem       = regexp.MustCompile("^SELECT `__tsid` AS `(_ts_id_\\d+)`, (.+?) AS `(_ts_bkey_\\d+)` FROM `base_matched` WHERE (.+?) GROUP BY `__tsid`, `__tsid_key` ORDER BY (.+?) ASC LIMIT (\\d+)$")
 	reTSTopJoinTailR62Mem        = regexp.MustCompile("^\\s*`_ts_top_\\d+` ON `base_matched`\\.`__tsid` = `_ts_top_\\d+`\\.`_ts_id_\\d+`(.*)$")
 	reJPSubSelectR62Mem          = regexp.MustCompile("^SELECT DISTINCT `_id` AS `(_jp_id_\\d+)`, (.+?) AS `(_jp_bkey_\\d+)` FROM (.+)$")
-	reJPJoinTailR62Mem           = regexp.MustCompile("^\\s*`(_jp_\\d+)` ON \\((.+?)\\)(.*)$")
+	reJPJoinTailR62Mem           = regexp.MustCompile("^\\s*`(_jp_\\d+)`\\s+ON\\s+\\(")
 	reJCSubSelectR62Mem          = regexp.MustCompile("^SELECT DISTINCT (.+?) AS `(_jc_pid_\\d+)`, (.+?) AS `(_jc_bkey_\\d+)` FROM (.+)$")
 	reJCJoinTailR62Mem           = regexp.MustCompile("^\\s*`(_jc_\\d+)` ON `base_matched`\\.`_id` = `_jc_\\d+`\\.`_jc_pid_\\d+`(.*)$")
 )
@@ -7234,6 +7551,20 @@ func evalRound62AggBranchR62Mem(
 	return nil, false
 }
 
+func matchJPJoinTailR62Mem(afterParen string) (jpAlias, onCond, tailFrom string, ok bool) {
+	pm := reJPJoinTailR62Mem.FindStringSubmatchIndex(afterParen)
+	if pm == nil {
+		return "", "", "", false
+	}
+	jpAlias = afterParen[pm[2]:pm[3]]
+	onOpenIdx := pm[1] - 1
+	onCloseIdx := memFindMatchingParen(afterParen, onOpenIdx)
+	if onCloseIdx <= onOpenIdx {
+		return "", "", "", false
+	}
+	return jpAlias, afterParen[onOpenIdx+1 : onCloseIdx], afterParen[onCloseIdx+1:], true
+}
+
 func expandRound62LeadingJoinR62Mem(
 	baseRows []map[string]any,
 	currRows []map[string]any,
@@ -7320,11 +7651,8 @@ func expandRound62LeadingJoinR62Mem(
 	}
 
 	// 2. `_jp_<N>` (grouped `children` sub-agg join: child `base_matched` joined to parent `_jp_N`)
-	if tm := reJPJoinTailR62Mem.FindStringSubmatch(afterParen); tm != nil {
+	if jpAlias, onCond, tailFrom, ok := matchJPJoinTailR62Mem(afterParen); ok {
 		if sm := reJPSubSelectR62Mem.FindStringSubmatch(subquery); sm != nil {
-			jpAlias := tm[1]
-			onCond := tm[2]
-			tailFrom := tm[3]
 			jpIDCol := sm[1]
 			parentBucketExpr := sm[2]
 			jpBKeyCol := sm[3]

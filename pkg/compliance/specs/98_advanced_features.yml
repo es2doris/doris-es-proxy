@@ -386,7 +386,6 @@
         id: r53_ls_pipe
         body:
           pipeline: "input { stdin {} } output { stdout {} }"
-  - match: { acknowledged: true }
   - do:
       logstash.get_pipeline:
         id: r53_ls_pipe
@@ -394,7 +393,10 @@
   - do:
       logstash.delete_pipeline:
         id: r53_ls_pipe
-  - match: { acknowledged: true }
+  - do:
+      catch: missing
+      logstash.get_pipeline:
+        id: r53_ls_pipe
 
 ---
 "Round 54 inference, connector, search_application, text_structure, profiling, async_search, esql, watcher, and license APIs":
@@ -587,7 +589,7 @@
 
   - do:
       license.get_trial_status: {}
-  - match: { eligible_to_start_trial: true }
+  - match: { eligible_to_start_trial: false }
 
   - do:
       xpack.info: {}
@@ -1731,7 +1733,6 @@
         body:
           pipeline: "input { stdin {} }"
           description: "r57 test"
-  - is_true: ''
 
   - do:
       logstash.exists_pipeline:

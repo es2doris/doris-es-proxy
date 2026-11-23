@@ -1429,7 +1429,10 @@ func formatSyntheticDateValue(val any, b FieldBinding, ignoredSet map[string]boo
 	case "", "strict_date_optional_time", "date_optional_time", "strict_date_time", "date_time":
 		return time.UnixMilli(ms).UTC().Format("2006-01-02T15:04:05.000Z"), true
 	case "strict_date_optional_time_nanos", "date_optional_time_nanos":
-		return time.UnixMilli(ms).UTC().Format("2006-01-02T15:04:05.000000000Z"), true
+		if strings.EqualFold(b.ESType, "date_nanos") {
+			return time.UnixMilli(ms).UTC().Format("2006-01-02T15:04:05.000000000Z"), true
+		}
+		return time.UnixMilli(ms).UTC().Format("2006-01-02T15:04:05.000Z"), true
 	case "strict_date_time_no_millis", "date_time_no_millis":
 		return time.UnixMilli(ms).UTC().Format("2006-01-02T15:04:05Z"), true
 	default:
@@ -1566,12 +1569,8 @@ func flattenAndParseTSDBDimensionValues(
 		if _, isMap := v.(map[string]any); isMap {
 			return fmt.Errorf("mapper_parsing_exception: time_series_dimension field [%s] must be a scalar value", fieldName)
 		}
-		if effB.IgnoreAbove > 0 {
-			s := fmt.Sprintf("%v", v)
-			if len([]rune(s)) > effB.IgnoreAbove {
-				return nil
-			}
-		}
+		// ES 8 TSDB hashes keyword dimension values into _tsid even when exceeding ignore_above;
+		// ignore_above still omits indexing/docvalues and populates _ignored in ShredDocument.
 		if strVal, isStr := v.(string); isStr && strings.TrimSpace(strVal) == "" && effB.ESType != "keyword" && effB.ESType != "constant_keyword" && effB.ESType != "wildcard" {
 			if effB.NullValue != nil && (effB.Coerce == nil || *effB.Coerce) {
 				return walk(effB.NullValue)

@@ -334,17 +334,29 @@ func degsToRads(degrees float64) float64 { return degrees * degToRad }
 func radsToDegs(radians float64) float64 { return radians * radToDeg }
 
 func posAngleRads(rads float64) float64 {
-	tmp := rads
-	if rads < 0 {
-		tmp += twoPi
+	if math.IsNaN(rads) || math.IsInf(rads, 0) {
+		return rads
 	}
-	if rads >= twoPi {
-		tmp -= twoPi
+	tmp := rads
+	if tmp < 0 || tmp >= twoPi {
+		tmp = math.Mod(tmp, twoPi)
+		if tmp < 0 {
+			tmp += twoPi
+		}
+		if tmp >= twoPi {
+			tmp -= twoPi
+		}
 	}
 	return tmp
 }
 
 func constrainLng(lng float64) float64 {
+	if math.IsNaN(lng) || math.IsInf(lng, 0) {
+		return lng
+	}
+	if lng > 4*pi || lng < -4*pi {
+		lng = math.Mod(lng, twoPi)
+	}
 	for lng > pi {
 		lng -= 2 * pi
 	}
@@ -438,7 +450,9 @@ func greatCircleDistanceRads(a, b latLng) float64 {
 	sinLat := math.Sin((b.lat - a.lat) / 2.0)
 	sinLng := math.Sin((b.lng - a.lng) / 2.0)
 	A := sinLat*sinLat + math.Cos(a.lat)*math.Cos(b.lat)*sinLng*sinLng
-	if A > 1.0 {
+	if A < 0.0 {
+		A = 0.0
+	} else if A > 1.0 {
 		A = 1.0
 	}
 	return 2 * math.Atan2(math.Sqrt(A), math.Sqrt(1-A))
@@ -1460,20 +1474,27 @@ func h3NeighborRotations(origin uint64, dir int, rotations *int) (uint64, error)
 	return current, nil
 }
 
-// GridDisk returns all cells within grid distance k of cell h (including h).
-// Returns nil if h is invalid or k < 0.
-func GridDisk(h uint64, k int) []uint64 {
-	if !IsValidCell(h) || k < 0 {
-		return nil
+func gridDiskMaxSize(k int) (int, bool) {
+	if k < 0 || k > maxGridCellsLimit {
+		return 0, false
 	}
 	if k == 0 {
-		return []uint64{h}
+		return 1, true
 	}
-	// Try fast hexagonal spiral when no pentagon distortion is encountered.
-	if fast, ok := gridDiskUnsafe(h, k); ok {
-		return fast
+	if k > (maxGridCellsLimit-1)/3/(k+1) {
+		return 0, false
 	}
-	// Safe BFS handling pentagons and distortion regions without recursion overflow.
+	maxSize := 1 + 3*k*(k+1)
+	if maxSize > maxGridCellsLimit {
+		return 0, false
+	}
+	return maxSize, true
+}
+
+func gridDiskBFS(h uint64, k, limit int) []uint64 {
+	if limit <= 0 {
+		return nil
+	}
 	type node struct {
 		cell uint64
 		dist int
@@ -1495,6 +1516,9 @@ func GridDisk(h uint64, k int) []uint64 {
 			if _, seen := visited[nbr]; seen {
 				continue
 			}
+			if len(out) >= limit {
+				return nil
+			}
 			visited[nbr] = struct{}{}
 			out = append(out, nbr)
 			queue = append(queue, node{cell: nbr, dist: cur.dist + 1})
@@ -1503,12 +1527,32 @@ func GridDisk(h uint64, k int) []uint64 {
 	return out
 }
 
+// GridDisk returns all cells within grid distance k of cell h (including h).
+// Returns nil if h is invalid, k < 0, or the disk would exceed maxGridCellsLimit.
+func GridDisk(h uint64, k int) []uint64 {
+	if !IsValidCell(h) || k < 0 {
+		return nil
+	}
+	if k == 0 {
+		return []uint64{h}
+	}
+	if _, ok := gridDiskMaxSize(k); !ok {
+		return nil
+	}
+	// Try fast hexagonal spiral when no pentagon distortion is encountered.
+	if fast, ok := gridDiskUnsafe(h, k); ok {
+		return fast
+	}
+	// Safe BFS handling pentagons and distortion regions without recursion overflow.
+	return gridDiskBFS(h, k, maxGridCellsLimit)
+}
+
 func gridDiskUnsafe(origin uint64, k int) ([]uint64, bool) {
 	if isPentagonUnchecked(origin) {
 		return nil, false
 	}
-	maxSize := 1 + 3*k*(k+1)
-	if maxSize > maxGridCellsLimit {
+	maxSize, ok := gridDiskMaxSize(k)
+	if !ok {
 		return nil, false
 	}
 	out := make([]uint64, 0, maxSize)
@@ -1708,12 +1752,28 @@ func pointInsidePolygonLoops(outer []latLng, outerBox geoBBox, holes [][]latLng,
 	return true
 }
 
+func validateLoopCoords(pts [][2]float64) error {
+	for _, pt := range pts {
+		if math.IsNaN(pt[0]) || math.IsInf(pt[0], 0) || math.IsNaN(pt[1]) || math.IsInf(pt[1], 0) {
+			return ErrInvalidCoordinate
+		}
+	}
+	return nil
+}
+
 func lineHexEstimateCount(origin, dest latLng, pentRadiusKm float64) int64 {
 	if pentRadiusKm <= 0 {
 		return 1
 	}
 	dist := greatCircleDistanceKm(origin, dest)
-	est := int64(math.Ceil(dist / (2 * pentRadiusKm)))
+	if math.IsNaN(dist) || math.IsInf(dist, 0) {
+		return maxGridCellsLimit + 1
+	}
+	ratio := dist / (2 * pentRadiusKm)
+	if math.IsNaN(ratio) || math.IsInf(ratio, 0) || ratio > float64(maxGridCellsLimit) {
+		return maxGridCellsLimit + 1
+	}
+	est := int64(math.Ceil(ratio))
 	if est < 1 {
 		return 1
 	}
@@ -1726,6 +1786,14 @@ func lineHexEstimateCount(origin, dest latLng, pentRadiusKm float64) int64 {
 func PolygonToCells(outer [][2]float64, holes [][][2]float64, res int) ([]uint64, error) {
 	if res < 0 || res > MaxRes {
 		return nil, fmt.Errorf("%w: %d", ErrInvalidResolution, res)
+	}
+	if err := validateLoopCoords(outer); err != nil {
+		return nil, err
+	}
+	for _, hole := range holes {
+		if err := validateLoopCoords(hole); err != nil {
+			return nil, err
+		}
 	}
 	outerLoop := loopToRads(outer)
 	if len(outerLoop) < 3 {
@@ -1745,39 +1813,74 @@ func PolygonToCells(outer [][2]float64, holes [][][2]float64, res int) ([]uint64
 	pents := getPentagons(res)
 	pentRadiusKm := hexRadiusKm(pents[0])
 
-	searchSet := make(map[uint64]struct{})
-	traceLoop := func(loop []latLng) error {
+	var totalSteps int64
+	estimateLoopSteps := func(loop []latLng) ([]int64, error) {
+		edgeSteps := make([]int64, len(loop))
 		for i := 0; i < len(loop); i++ {
 			o := loop[i]
 			d := loop[(i+1)%len(loop)]
 			steps := lineHexEstimateCount(o, d, pentRadiusKm)
-			if steps > maxGridCellsLimit {
-				return ErrCellLimitExceeded
+			if steps > maxGridCellsLimit-totalSteps {
+				return nil, ErrCellLimitExceeded
 			}
+			totalSteps += steps
+			edgeSteps[i] = steps
+		}
+		return edgeSteps, nil
+	}
+	outerEdgeSteps, err := estimateLoopSteps(outerLoop)
+	if err != nil {
+		return nil, err
+	}
+	holeEdgeSteps := make([][]int64, len(holeLoops))
+	for idx, hl := range holeLoops {
+		hs, err := estimateLoopSteps(hl)
+		if err != nil {
+			return nil, err
+		}
+		holeEdgeSteps[idx] = hs
+	}
+
+	searchSet := make(map[uint64]struct{})
+	traceLoop := func(loop []latLng, edgeSteps []int64) error {
+		for i := 0; i < len(loop); i++ {
+			o := loop[i]
+			d := loop[(i+1)%len(loop)]
+			dLng := d.lng
+			if dLng-o.lng > pi {
+				dLng -= twoPi
+			} else if o.lng-dLng > pi {
+				dLng += twoPi
+			}
+			steps := edgeSteps[i]
 			for j := int64(0); j < steps; j++ {
 				t0 := float64(steps-j) / float64(steps)
 				t1 := float64(j) / float64(steps)
 				lat := o.lat*t0 + d.lat*t1
-				lng := o.lng*t0 + d.lng*t1
+				lng := constrainLng(o.lng*t0 + dLng*t1)
 				h, err := LatLonToCell(radsToDegs(lat), radsToDegs(lng), res)
 				if err != nil {
 					return err
 				}
 				searchSet[h] = struct{}{}
+				if len(searchSet) > maxGridCellsLimit {
+					return ErrCellLimitExceeded
+				}
 			}
 		}
 		return nil
 	}
-	if err := traceLoop(outerLoop); err != nil {
+	if err := traceLoop(outerLoop, outerEdgeSteps); err != nil {
 		return nil, err
 	}
-	for _, hl := range holeLoops {
-		if err := traceLoop(hl); err != nil {
+	for idx, hl := range holeLoops {
+		if err := traceLoop(hl, holeEdgeSteps[idx]); err != nil {
 			return nil, err
 		}
 	}
 
 	outSet := make(map[uint64]struct{})
+	visited := make(map[uint64]struct{}, len(searchSet))
 	queue := make([]uint64, 0, len(searchSet))
 	for h := range searchSet {
 		queue = append(queue, h)
@@ -1790,6 +1893,13 @@ func PolygonToCells(outer [][2]float64, holes [][][2]float64, res int) ([]uint64
 				if _, exists := outSet[hex]; exists {
 					continue
 				}
+				if _, seen := visited[hex]; seen {
+					continue
+				}
+				if len(visited) >= maxGridCellsLimit*4 {
+					return nil, ErrCellLimitExceeded
+				}
+				visited[hex] = struct{}{}
 				cLat, cLon := CellToLatLon(hex)
 				if !pointInsidePolygonLoops(outerLoop, outerBox, holeLoops, holeBoxes, latLng{lat: degsToRads(cLat), lng: degsToRads(cLon)}) {
 					continue
@@ -1818,6 +1928,14 @@ func PolygonIntersectingCells(outer [][2]float64, holes [][][2]float64, res int)
 	if res < 0 || res > MaxRes {
 		return nil, fmt.Errorf("%w: %d", ErrInvalidResolution, res)
 	}
+	if err := validateLoopCoords(outer); err != nil {
+		return nil, err
+	}
+	for _, hole := range holes {
+		if err := validateLoopCoords(hole); err != nil {
+			return nil, err
+		}
+	}
 	outerLoop := loopToRads(outer)
 	if len(outerLoop) < 3 {
 		return nil, nil
@@ -1836,57 +1954,103 @@ func PolygonIntersectingCells(outer [][2]float64, holes [][][2]float64, res int)
 	pents := getPentagons(res)
 	pentRadiusKm := hexRadiusKm(pents[0])
 
-	outSet := make(map[uint64]struct{})
-	outerEdgeCells := make(map[uint64]struct{})
-	visited := make(map[uint64]struct{})
-	queue := make([]uint64, 0)
-	addSeed := func(h uint64) {
-		if _, ok := visited[h]; !ok {
-			visited[h] = struct{}{}
-			queue = append(queue, h)
-		}
-	}
-
 	// Seed with all cells traced along outer and hole boundaries plus center-contained cells.
 	centerCells, err := PolygonToCells(outer, holes, res)
 	if err != nil {
 		return nil, err
 	}
-	for _, h := range centerCells {
-		outSet[h] = struct{}{}
-		addSeed(h)
-	}
 
-	traceBoundary := func(loop []latLng, isOuter bool) error {
+	var totalSteps int64
+	estimateBoundarySteps := func(loop []latLng) ([]int64, error) {
+		edgeSteps := make([]int64, len(loop))
 		for i := 0; i < len(loop); i++ {
 			o := loop[i]
 			d := loop[(i+1)%len(loop)]
 			steps := lineHexEstimateCount(o, d, pentRadiusKm*0.5)
-			if steps > maxGridCellsLimit {
+			if steps > maxGridCellsLimit-totalSteps {
+				return nil, ErrCellLimitExceeded
+			}
+			totalSteps += steps
+			edgeSteps[i] = steps
+		}
+		return edgeSteps, nil
+	}
+	outerEdgeSteps, err := estimateBoundarySteps(outerLoop)
+	if err != nil {
+		return nil, err
+	}
+	holeEdgeSteps := make([][]int64, len(holeLoops))
+	for idx, hl := range holeLoops {
+		hs, err := estimateBoundarySteps(hl)
+		if err != nil {
+			return nil, err
+		}
+		holeEdgeSteps[idx] = hs
+	}
+
+	outSet := make(map[uint64]struct{}, len(centerCells))
+	outerEdgeCells := make(map[uint64]struct{})
+	visited := make(map[uint64]struct{}, len(centerCells))
+	queue := make([]uint64, 0, len(centerCells))
+	addSeed := func(h uint64) error {
+		if _, ok := visited[h]; !ok {
+			if len(visited) >= maxGridCellsLimit*4 {
 				return ErrCellLimitExceeded
 			}
+			visited[h] = struct{}{}
+			queue = append(queue, h)
+		}
+		return nil
+	}
+
+	for _, h := range centerCells {
+		outSet[h] = struct{}{}
+		if len(outSet) > maxGridCellsLimit {
+			return nil, ErrCellLimitExceeded
+		}
+		if err := addSeed(h); err != nil {
+			return nil, err
+		}
+	}
+
+	traceBoundary := func(loop []latLng, edgeSteps []int64, isOuter bool) error {
+		for i := 0; i < len(loop); i++ {
+			o := loop[i]
+			d := loop[(i+1)%len(loop)]
+			dLng := d.lng
+			if dLng-o.lng > pi {
+				dLng -= twoPi
+			} else if o.lng-dLng > pi {
+				dLng += twoPi
+			}
+			steps := edgeSteps[i]
 			for j := int64(0); j <= steps; j++ {
 				t0 := float64(steps-j) / float64(steps)
 				t1 := float64(j) / float64(steps)
 				lat := o.lat*t0 + d.lat*t1
-				lng := o.lng*t0 + d.lng*t1
+				lng := constrainLng(o.lng*t0 + dLng*t1)
 				h, err := LatLonToCell(radsToDegs(lat), radsToDegs(lng), res)
 				if err != nil {
 					return err
 				}
 				if isOuter {
 					outerEdgeCells[h] = struct{}{}
+					if len(outerEdgeCells) > maxGridCellsLimit {
+						return ErrCellLimitExceeded
+					}
 				}
-				addSeed(h)
+				if err := addSeed(h); err != nil {
+					return err
+				}
 			}
 		}
 		return nil
 	}
-	if err := traceBoundary(outerLoop, true); err != nil {
+	if err := traceBoundary(outerLoop, outerEdgeSteps, true); err != nil {
 		return nil, err
 	}
-	for _, hl := range holeLoops {
-		if err := traceBoundary(hl, false); err != nil {
+	for idx, hl := range holeLoops {
+		if err := traceBoundary(hl, holeEdgeSteps[idx], false); err != nil {
 			return nil, err
 		}
 	}
@@ -1925,7 +2089,9 @@ func PolygonIntersectingCells(outer [][2]float64, holes [][][2]float64, res int)
 			return nil, ErrCellLimitExceeded
 		}
 		for _, nbr := range GridDisk(cur, 1) {
-			addSeed(nbr)
+			if err := addSeed(nbr); err != nil {
+				return nil, err
+			}
 		}
 	}
 
@@ -1938,7 +2104,19 @@ func PolygonIntersectingCells(outer [][2]float64, holes [][][2]float64, res int)
 }
 
 func unwrapDegLon(lon, refLon float64) float64 {
+	if math.IsNaN(lon) || math.IsInf(lon, 0) || math.IsNaN(refLon) || math.IsInf(refLon, 0) {
+		return lon
+	}
 	d := lon - refLon
+	if d > 720.0 || d < -720.0 {
+		d = math.Mod(d, 360.0)
+		if d > 180.0 {
+			d -= 360.0
+		} else if d < -180.0 {
+			d += 360.0
+		}
+		return refLon + d
+	}
 	for d > 180 {
 		lon -= 360
 		d -= 360
@@ -2061,7 +2239,10 @@ func BBoxToCells(topLat, leftLon, bottomLat, rightLon float64, res int) ([]uint6
 	// Full longitude wrap or global box.
 	lonSpan := rightLon - leftLon
 	if lonSpan >= 360.0-1e-12 || (leftLon == -180 && rightLon == 180) {
-		if res <= 4 && topLat >= 90-1e-12 && bottomLat <= -90+1e-12 {
+		if topLat >= 90-1e-12 && bottomLat <= -90+1e-12 {
+			if res >= 5 {
+				return nil, ErrCellLimitExceeded
+			}
 			out := make([]uint64, 0)
 			for _, bc := range getRes0Cells() {
 				children, err := CellToChildren(bc, res)
@@ -2189,35 +2370,60 @@ func BBoxToCells(topLat, leftLon, bottomLat, rightLon float64, res int) ([]uint6
 	visited := make(map[uint64]struct{})
 	outSet := make(map[uint64]struct{})
 	queue := make([]uint64, 0, 16)
-	enqueue := func(h uint64) {
+	enqueue := func(h uint64) error {
 		if _, ok := visited[h]; !ok {
+			if len(visited) >= maxGridCellsLimit*4 {
+				return ErrCellLimitExceeded
+			}
 			visited[h] = struct{}{}
 			queue = append(queue, h)
 		}
+		return nil
 	}
-	addSeed := func(h uint64) {
+	addSeed := func(h uint64) error {
 		seededInside[h] = struct{}{}
-		enqueue(h)
+		return enqueue(h)
 	}
 
-	// Seed corners, center, and perimeter edges.
+	// Seed corners, center, and perimeter edges, splitting wide longitudinal spans
+	// into <=60° segments so sin((b.lng-a.lng)/2) never collapses near ±2π.
+	var totalSteps int64
 	seedLine := func(lat0, lon0, lat1, lon1 float64) error {
-		p0 := latLng{lat: degsToRads(lat0), lng: degsToRads(lon0)}
-		p1 := latLng{lat: degsToRads(lat1), lng: degsToRads(lon1)}
-		steps := lineHexEstimateCount(p0, p1, pentRadiusKm*0.5)
-		if steps > maxGridCellsLimit {
-			return ErrCellLimitExceeded
-		}
-		for j := int64(0); j <= steps; j++ {
-			t := float64(j) / float64(steps)
-			lat := lat0 + (lat1-lat0)*t
-			lon := lon0 + (lon1-lon0)*t
-			cLon := radsToDegs(constrainLng(degsToRads(lon)))
-			h, err := LatLonToCell(lat, cLon, res)
-			if err != nil {
-				return err
+		dlon := math.Abs(lon1 - lon0)
+		chunks := int64(1)
+		if dlon > 60.0 {
+			chunks = int64(math.Ceil(dlon / 60.0))
+			if chunks > maxGridCellsLimit {
+				return ErrCellLimitExceeded
 			}
-			addSeed(h)
+		}
+		for c := int64(0); c < chunks; c++ {
+			f0 := float64(c) / float64(chunks)
+			f1 := float64(c+1) / float64(chunks)
+			cLat0 := lat0 + (lat1-lat0)*f0
+			cLon0 := lon0 + (lon1-lon0)*f0
+			cLat1 := lat0 + (lat1-lat0)*f1
+			cLon1 := lon0 + (lon1-lon0)*f1
+			p0 := latLng{lat: degsToRads(cLat0), lng: degsToRads(cLon0)}
+			p1 := latLng{lat: degsToRads(cLat1), lng: degsToRads(cLon1)}
+			steps := lineHexEstimateCount(p0, p1, pentRadiusKm*0.5)
+			if steps > maxGridCellsLimit-totalSteps {
+				return ErrCellLimitExceeded
+			}
+			totalSteps += steps
+			for j := int64(0); j <= steps; j++ {
+				t := float64(j) / float64(steps)
+				lat := cLat0 + (cLat1-cLat0)*t
+				lon := cLon0 + (cLon1-cLon0)*t
+				cLon := radsToDegs(constrainLng(degsToRads(lon)))
+				h, err := LatLonToCell(lat, cLon, res)
+				if err != nil {
+					return err
+				}
+				if err := addSeed(h); err != nil {
+					return err
+				}
+			}
 		}
 		return nil
 	}
@@ -2236,7 +2442,9 @@ func BBoxToCells(topLat, leftLon, bottomLat, rightLon float64, res int) ([]uint6
 	midLat := (bottomLat + topLat) / 2
 	midLon := radsToDegs(constrainLng(degsToRads((boxW + boxE) / 2)))
 	if hMid, err := LatLonToCell(midLat, midLon, res); err == nil {
-		addSeed(hMid)
+		if err := addSeed(hMid); err != nil {
+			return nil, err
+		}
 	}
 
 	for head := 0; head < len(queue); head++ {
@@ -2249,7 +2457,9 @@ func BBoxToCells(topLat, leftLon, bottomLat, rightLon float64, res int) ([]uint6
 			return nil, ErrCellLimitExceeded
 		}
 		for _, nbr := range GridDisk(cur, 1) {
-			enqueue(nbr)
+			if err := enqueue(nbr); err != nil {
+				return nil, err
+			}
 		}
 	}
 
@@ -3092,4 +3302,167 @@ var baseCellData = [numBaseCells]baseCellDataEntry{
 	{faceIJK{18, coordIJK{0, 0, 0}}, false, [2]int{0, 0}},  // 119
 	{faceIJK{19, coordIJK{1, 0, 1}}, false, [2]int{0, 0}},  // 120
 	{faceIJK{18, coordIJK{1, 0, 0}}, false, [2]int{0, 0}},  // 121
+}
+
+// CellNonChildren returns the resolution res+1 H3 cells outside h's immediate children
+// whose polygon interiors strictly overlap the polygon interior of h.
+func CellNonChildren(h uint64) ([]uint64, error) {
+	if !IsValidCell(h) {
+		return nil, ErrInvalidCell
+	}
+	res := Resolution(h)
+	if res >= MaxRes {
+		return nil, nil
+	}
+	children, err := CellToChildren(h, res+1)
+	if err != nil {
+		return nil, err
+	}
+	childSet := make(map[uint64]bool, len(children))
+	for _, ch := range children {
+		childSet[ch] = true
+	}
+	parentVerts := CellToBoundary(h)
+	if len(parentVerts) < 3 {
+		return nil, nil
+	}
+	candSet := make(map[uint64]bool)
+	cands := make([]uint64, 0, 12)
+	for _, ch := range children {
+		for _, nbr := range GridDisk(ch, 1) {
+			if !childSet[nbr] && !candSet[nbr] {
+				candSet[nbr] = true
+				cands = append(cands, nbr)
+			}
+		}
+	}
+	out := make([]uint64, 0, 6)
+	for _, nbr := range cands {
+		if cellBoundariesOverlapInterior(CellToBoundary(nbr), parentVerts) {
+			out = append(out, nbr)
+		}
+	}
+	return out, nil
+}
+
+func cellBoundariesOverlapInterior(cellA, cellB [][2]float64) bool {
+	if len(cellA) < 3 || len(cellB) < 3 {
+		return false
+	}
+	pB := unwrapPolygonAround(cellB, cellB[0][1])
+	meanLon := func(ring [][2]float64) float64 {
+		sum := 0.0
+		for _, pt := range ring {
+			sum += pt[1]
+		}
+		return sum / float64(len(ring))
+	}
+	mB := meanLon(pB)
+	pA := unwrapPolygonAround(cellA, cellA[0][1])
+	mA := meanLon(pA)
+	bestShift := 0.0
+	bestDiff := math.Abs(mA - mB)
+	for _, s := range []float64{-360.0, 360.0} {
+		if d := math.Abs((mA + s) - mB); d < bestDiff {
+			bestDiff = d
+			bestShift = s
+		}
+	}
+	if bestShift != 0 {
+		shifted := make([][2]float64, len(pA))
+		for i, pt := range pA {
+			shifted[i] = [2]float64{pt[0], pt[1] + bestShift}
+		}
+		pA = shifted
+	}
+
+	minEdgeLen := func(ring [][2]float64) float64 {
+		minSq := math.MaxFloat64
+		for i := 0; i < len(ring); i++ {
+			a := ring[i]
+			b := ring[(i+1)%len(ring)]
+			dx := b[1] - a[1]
+			dy := b[0] - a[0]
+			if d2 := dx*dx + dy*dy; d2 > 0 && d2 < minSq {
+				minSq = d2
+			}
+		}
+		if minSq == math.MaxFloat64 {
+			return 0
+		}
+		return math.Sqrt(minSq)
+	}
+	tol := minEdgeLen(pB) * 1e-4
+	if tolA := minEdgeLen(pA) * 1e-4; tolA > 0 && (tol == 0 || tolA < tol) {
+		tol = tolA
+	}
+	tolSq := tol * tol
+
+	pointStrictlyIn := func(pt [2]float64, ring [][2]float64) bool {
+		px, py := pt[1], pt[0]
+		inside := false
+		for i := 0; i < len(ring); i++ {
+			ax, ay := ring[i][1], ring[i][0]
+			bx, by := ring[(i+1)%len(ring)][1], ring[(i+1)%len(ring)][0]
+			vx, vy := bx-ax, by-ay
+			lenSq := vx*vx + vy*vy
+			t := 0.0
+			if lenSq > 0 {
+				t = ((px-ax)*vx + (py-ay)*vy) / lenSq
+				if t < 0 {
+					t = 0
+				} else if t > 1 {
+					t = 1
+				}
+			}
+			cx, cy := ax+t*vx, ay+t*vy
+			dx, dy := px-cx, py-cy
+			if dx*dx+dy*dy <= tolSq {
+				return false
+			}
+			if (ay > py) != (by > py) {
+				xInt := ax + (py-ay)*(bx-ax)/(by-ay)
+				if px < xInt {
+					inside = !inside
+				}
+			}
+		}
+		return inside
+	}
+
+	checkVertsAndMids := func(probe, target [][2]float64) bool {
+		for i := 0; i < len(probe); i++ {
+			a := probe[i]
+			b := probe[(i+1)%len(probe)]
+			if pointStrictlyIn(a, target) {
+				return true
+			}
+			mid := [2]float64{0.5 * (a[0] + b[0]), 0.5 * (a[1] + b[1])}
+			if pointStrictlyIn(mid, target) {
+				return true
+			}
+		}
+		return false
+	}
+	if checkVertsAndMids(pA, pB) || checkVertsAndMids(pB, pA) {
+		return true
+	}
+
+	for i := 0; i < len(pA); i++ {
+		ax, ay := pA[i][1], pA[i][0]
+		bx, by := pA[(i+1)%len(pA)][1], pA[(i+1)%len(pA)][0]
+		for j := 0; j < len(pB); j++ {
+			cx, cy := pB[j][1], pB[j][0]
+			dx, dy := pB[(j+1)%len(pB)][1], pB[(j+1)%len(pB)][0]
+			o1 := orient2D(ax, ay, bx, by, cx, cy)
+			o2 := orient2D(ax, ay, bx, by, dx, dy)
+			o3 := orient2D(cx, cy, dx, dy, ax, ay)
+			o4 := orient2D(cx, cy, dx, dy, bx, by)
+			if ((o1 > tolSq && o2 < -tolSq) || (o1 < -tolSq && o2 > tolSq)) &&
+				((o3 > tolSq && o4 < -tolSq) || (o3 < -tolSq && o4 > tolSq)) {
+				return true
+			}
+		}
+	}
+	return false
 }

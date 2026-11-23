@@ -58,8 +58,14 @@ import (
 const (
 	// DefaultMaxRequestBodyBytes bounds both compressed and decompressed HTTP request bodies (100 MiB, matching ES http.max_content_length).
 	DefaultMaxRequestBodyBytes int64 = 100 * 1024 * 1024
-	slowLogRingCapacity              = 100
-	shadowDiffRingCapacity           = 50
+	// maxYAMLFormatBufferBytes bounds buffered JSON responses before `?format=yaml` falls back to JSON passthrough.
+	maxYAMLFormatBufferBytes = 64 * 1024 * 1024
+	// maxYAMLMarshalDepth caps recursion depth in generic YAML serialization before falling back to compact JSON.
+	maxYAMLMarshalDepth = 128
+	// maxTermsEnumSize caps `/_terms_enum` `size` to prevent excessive slice allocations.
+	maxTermsEnumSize       = 65536
+	slowLogRingCapacity    = 100
+	shadowDiffRingCapacity = 50
 )
 
 var (
@@ -155,20 +161,28 @@ func (fw *esFormatResponseWriter) Unwrap() http.ResponseWriter {
 }
 
 func (fw *esFormatResponseWriter) WriteHeader(status int) {
+	if !fw.wroteHeader {
+		fw.wroteHeader = true
+		fw.statusCode = status
+	}
 	if !fw.yamlFormat || fw.passThrough {
 		fw.ResponseWriter.WriteHeader(status)
 		return
 	}
-	if !fw.wroteHeader {
-		fw.wroteHeader = true
-		fw.statusCode = status
+	if status == http.StatusNoContent || status == http.StatusNotModified {
+		fw.passThrough = true
+		fw.yamlBuf.Reset()
+		fw.ResponseWriter.WriteHeader(status)
+		return
 	}
 	ct := strings.ToLower(strings.TrimSpace(fw.ResponseWriter.Header().Get("Content-Type")))
 	if ct != "" && !strings.Contains(ct, "json") {
 		fw.passThrough = true
 		if fw.yamlBuf.Len() > 0 {
 			fw.ResponseWriter.WriteHeader(fw.statusCode)
-			_, _ = fw.ResponseWriter.Write(fw.yamlBuf.Bytes()) // #nosec G705 -- pass-through non-JSON API response payload
+			if !fw.isHead {
+				_, _ = fw.ResponseWriter.Write(fw.yamlBuf.Bytes()) // #nosec G705 -- pass-through non-JSON API response payload
+			}
 			fw.yamlBuf.Reset()
 			return
 		}
@@ -177,17 +191,43 @@ func (fw *esFormatResponseWriter) WriteHeader(status int) {
 }
 
 func (fw *esFormatResponseWriter) Write(b []byte) (int, error) {
+	if fw.statusCode == http.StatusNoContent || fw.statusCode == http.StatusNotModified {
+		return len(b), nil
+	}
 	if !fw.yamlFormat || fw.passThrough {
+		if fw.isHead {
+			return len(b), nil
+		}
 		return fw.ResponseWriter.Write(b)
 	}
 	if !fw.wroteHeader {
 		fw.WriteHeader(http.StatusOK)
+		if fw.statusCode == http.StatusNoContent || fw.statusCode == http.StatusNotModified {
+			return len(b), nil
+		}
 		if fw.passThrough {
+			if fw.isHead {
+				return len(b), nil
+			}
 			return fw.ResponseWriter.Write(b)
 		}
 	}
 	if fw.isHead {
 		return len(b), nil
+	}
+	if fw.yamlBuf.Len()+len(b) > maxYAMLFormatBufferBytes {
+		fw.passThrough = true
+		status := fw.statusCode
+		if status == 0 {
+			status = http.StatusOK
+		}
+		fw.ResponseWriter.Header().Del("Content-Length")
+		fw.ResponseWriter.WriteHeader(status)
+		if fw.yamlBuf.Len() > 0 {
+			_, _ = fw.ResponseWriter.Write(fw.yamlBuf.Bytes()) // #nosec G705 -- flushes already-encoded JSON/NDJSON API response bytes on YAML buffer overflow
+			fw.yamlBuf.Reset()
+		}
+		return fw.ResponseWriter.Write(b)
 	}
 	return fw.yamlBuf.Write(b)
 }
@@ -210,6 +250,10 @@ func (fw *esFormatResponseWriter) Finalize() {
 	if status == 0 {
 		status = http.StatusOK
 	}
+	if status == http.StatusNoContent || status == http.StatusNotModified {
+		fw.yamlBuf.Reset()
+		return
+	}
 	ct := strings.ToLower(strings.TrimSpace(fw.ResponseWriter.Header().Get("Content-Type")))
 	if ct != "" && !strings.Contains(ct, "json") {
 		fw.ResponseWriter.WriteHeader(status)
@@ -231,11 +275,28 @@ func (fw *esFormatResponseWriter) Finalize() {
 	fw.yamlBuf.Reset()
 	var outBytes []byte
 	if len(raw) > 0 {
-		var decoded any
+		var docs []any
 		dec := json.NewDecoder(bytes.NewReader(raw))
 		dec.UseNumber()
-		if err := dec.Decode(&decoded); err == nil {
-			outBytes = marshalGenericYAMLWireR64(decoded)
+		decodeOK := true
+		for {
+			var doc any
+			err := dec.Decode(&doc)
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				decodeOK = false
+				break
+			}
+			docs = append(docs, doc)
+		}
+		if decodeOK && len(docs) > 0 {
+			var allOut bytes.Buffer
+			for _, d := range docs {
+				allOut.Write(marshalGenericYAMLWireR64(d))
+			}
+			outBytes = allOut.Bytes()
 		} else {
 			outBytes = raw
 			fw.ResponseWriter.WriteHeader(status)
@@ -264,14 +325,19 @@ func marshalGenericYAMLWireR64(v any) []byte {
 }
 
 func writeYAMLValueWireR64(buf *strings.Builder, v any, indent int, inSeq bool) {
+	if indent >= maxYAMLMarshalDepth {
+		if b, err := json.Marshal(v); err == nil {
+			buf.Write(b)
+			buf.WriteByte('\n')
+		} else {
+			fmt.Fprintf(buf, "%q\n", fmt.Sprintf("%v", v))
+		}
+		return
+	}
 	pad := strings.Repeat("  ", indent)
 	switch tv := v.(type) {
 	case nil:
-		if inSeq {
-			buf.WriteString("null\n")
-		} else {
-			buf.WriteString("null\n")
-		}
+		buf.WriteString("null\n")
 	case bool:
 		fmt.Fprintf(buf, "%t\n", tv)
 	case json.Number:
@@ -318,9 +384,30 @@ func writeYAMLValueWireR64(buf *strings.Builder, v any, indent int, inSeq bool) 
 					fmt.Fprintf(buf, "%s:\n", keyStr)
 					writeYAMLValueWireR64(buf, cv, indent+1, false)
 				}
+			case []map[string]any:
+				if len(cv) == 0 {
+					fmt.Fprintf(buf, "%s: []\n", keyStr)
+				} else {
+					fmt.Fprintf(buf, "%s:\n", keyStr)
+					writeYAMLValueWireR64(buf, cv, indent+1, false)
+				}
 			default:
 				fmt.Fprintf(buf, "%s: ", keyStr)
 				writeYAMLValueWireR64(buf, val, indent+1, false)
+			}
+		}
+	case []map[string]any:
+		if len(tv) == 0 {
+			buf.WriteString("[]\n")
+			return
+		}
+		for _, el := range tv {
+			buf.WriteString(pad)
+			buf.WriteString("- ")
+			if len(el) == 0 {
+				buf.WriteString("{}\n")
+			} else {
+				writeYAMLValueWireR64(buf, el, indent+1, true)
 			}
 		}
 	case []any:
@@ -339,6 +426,13 @@ func writeYAMLValueWireR64(buf *strings.Builder, v any, indent int, inSeq bool) 
 					writeYAMLValueWireR64(buf, cm, indent+1, true)
 				}
 			case []any:
+				if len(cm) == 0 {
+					buf.WriteString("[]\n")
+				} else {
+					buf.WriteByte('\n')
+					writeYAMLValueWireR64(buf, cm, indent+1, false)
+				}
+			case []map[string]any:
 				if len(cm) == 0 {
 					buf.WriteString("[]\n")
 				} else {
@@ -414,19 +508,43 @@ func setESCompatHeadersWireR64(w http.ResponseWriter, r *http.Request) {
 	if tp := r.Header.Get("traceparent"); tp != "" {
 		w.Header().Set("traceparent", tp)
 	}
-	accept := strings.ToLower(strings.Join(r.Header.Values("Accept"), ", "))
+	bestAcceptQ := 0.0
+	bestAcceptCT := ""
+	for _, hdr := range r.Header.Values("Accept") {
+		for _, part := range strings.Split(hdr, ",") {
+			semi := strings.Split(strings.TrimSpace(part), ";")
+			mediaType := strings.ToLower(strings.TrimSpace(semi[0]))
+			if mediaType == "" {
+				continue
+			}
+			q := parseMediaQualityWeightR63(semi[1:])
+			if q <= 0 {
+				continue
+			}
+			var candCT string
+			if strings.Contains(mediaType, "application/vnd.opensearch+json") {
+				if cw, hasCW := extractCompatibleWithParam(part); hasCW && cw != "" {
+					candCT = "application/vnd.opensearch+json; compatible-with=" + cw
+				} else {
+					candCT = "application/vnd.opensearch+json; charset=UTF-8"
+				}
+			} else if strings.Contains(mediaType, "application/vnd.elasticsearch+json") || strings.Contains(strings.ToLower(part), "compatible-with=") {
+				if cw, hasCW := extractCompatibleWithParam(part); hasCW && (cw == "8" || cw == "7") {
+					candCT = "application/vnd.elasticsearch+json; compatible-with=" + cw
+				}
+			} else if mediaType == "application/json" {
+				candCT = "application/json; charset=UTF-8"
+			}
+			if candCT != "" && q > bestAcceptQ {
+				bestAcceptQ = q
+				bestAcceptCT = candCT
+			}
+		}
+	}
 	reqCT := strings.ToLower(strings.Join(r.Header.Values("Content-Type"), ", "))
 	switch {
-	case strings.Contains(accept, "application/vnd.opensearch+json"):
-		if cw, hasCW := extractCompatibleWithParam(accept); hasCW && cw != "" {
-			w.Header().Set("Content-Type", "application/vnd.opensearch+json; compatible-with="+cw)
-		} else {
-			w.Header().Set("Content-Type", "application/vnd.opensearch+json; charset=UTF-8")
-		}
-	case strings.Contains(accept, "compatible-with=8"):
-		w.Header().Set("Content-Type", "application/vnd.elasticsearch+json; compatible-with=8")
-	case strings.Contains(accept, "compatible-with=7"):
-		w.Header().Set("Content-Type", "application/vnd.elasticsearch+json; compatible-with=7")
+	case bestAcceptCT != "" && bestAcceptCT != "application/json; charset=UTF-8":
+		w.Header().Set("Content-Type", bestAcceptCT)
 	case strings.Contains(reqCT, "application/vnd.opensearch+"):
 		if cw, hasCW := extractCompatibleWithParam(reqCT); hasCW && cw != "" {
 			w.Header().Set("Content-Type", "application/vnd.opensearch+json; compatible-with="+cw)
@@ -575,28 +693,6 @@ func (s *Server) withWireMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
-		if !s.validateWireAcceptAndCompatHeadersRound60(w, r) {
-			return
-		}
-
-		negotiatedCT := w.Header().Get("Content-Type")
-		lowerNegCT := strings.ToLower(negotiatedCT)
-		if strings.HasPrefix(lowerNegCT, "application/vnd.elasticsearch+") || strings.HasPrefix(lowerNegCT, "application/vnd.opensearch+") {
-			w = &vendorMediaTypeGuardWriterR64{
-				ResponseWriter: w,
-				negotiatedCT:   negotiatedCT,
-			}
-		}
-
-		disableRespGzip, okComp := extractHTTPCompressionQueryParamR63Wire(w, r)
-		if !okComp {
-			return
-		}
-
-		if !validateGlobalWireQueryParamsRound59(w, r) {
-			return
-		}
-
 		trimmedPath := strings.Trim(r.URL.Path, "/")
 		wantYAML := false
 		if r.URL != nil {
@@ -611,20 +707,58 @@ func (s *Server) withWireMiddleware(next http.Handler) http.Handler {
 		}
 		fmtOpts, hasFmtOpts := parseESResponseFormatOptions(r)
 
-		authW := w
-		var authFW *esFormatResponseWriter
-		if hasFmtOpts || wantYAML {
-			authFW = &esFormatResponseWriter{
-				ResponseWriter: authW,
-				opts:           fmtOpts,
-				yamlFormat:     wantYAML,
-				isHead:         r.Method == http.MethodHead,
+		wrapEarlyWriter := func(base http.ResponseWriter) (http.ResponseWriter, *esFormatResponseWriter) {
+			ew := base
+			var fw *esFormatResponseWriter
+			if hasFmtOpts || wantYAML {
+				fw = &esFormatResponseWriter{
+					ResponseWriter: ew,
+					opts:           fmtOpts,
+					yamlFormat:     wantYAML,
+					isHead:         r.Method == http.MethodHead,
+				}
+				ew = fw
 			}
-			authW = authFW
+			if r.Method == http.MethodHead {
+				ew = &headResponseWriterR64{ResponseWriter: ew}
+			}
+			return ew, fw
 		}
-		if r.Method == http.MethodHead {
-			authW = &headResponseWriterR64{ResponseWriter: authW}
+
+		preAcceptW, preAcceptFW := wrapEarlyWriter(w)
+		if !s.validateWireAcceptAndCompatHeadersRound60(preAcceptW, r) {
+			if preAcceptFW != nil && wantYAML {
+				preAcceptFW.Finalize()
+			}
+			return
 		}
+
+		negotiatedCT := w.Header().Get("Content-Type")
+		lowerNegCT := strings.ToLower(negotiatedCT)
+		if strings.HasPrefix(lowerNegCT, "application/vnd.elasticsearch+") || strings.HasPrefix(lowerNegCT, "application/vnd.opensearch+") {
+			w = &vendorMediaTypeGuardWriterR64{
+				ResponseWriter: w,
+				negotiatedCT:   negotiatedCT,
+			}
+		}
+
+		authW, authFW := wrapEarlyWriter(w)
+
+		disableRespGzip, okComp := extractHTTPCompressionQueryParamR63Wire(authW, r)
+		if !okComp {
+			if authFW != nil && wantYAML {
+				authFW.Finalize()
+			}
+			return
+		}
+
+		if !validateGlobalWireQueryParamsRound59(authW, r) {
+			if authFW != nil && wantYAML {
+				authFW.Finalize()
+			}
+			return
+		}
+
 		if !s.checkInboundAuth(authW, r) {
 			if authFW != nil && wantYAML {
 				authFW.Finalize()
@@ -645,11 +779,14 @@ func (s *Server) withWireMiddleware(next http.Handler) http.Handler {
 			maxBytes = DefaultMaxRequestBodyBytes
 		}
 		if r.Body != nil && r.Body != http.NoBody {
-			r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
+			r.Body = http.MaxBytesReader(authW, r.Body, maxBytes)
 		}
 
-		cleanupDecomp, okDecomp := decompressRequestBodyR63Wire(w, r, maxBytes)
+		cleanupDecomp, okDecomp := decompressRequestBodyR63Wire(authW, r, maxBytes)
 		if !okDecomp {
+			if authFW != nil && wantYAML {
+				authFW.Finalize()
+			}
 			return
 		}
 		if cleanupDecomp != nil {
@@ -2097,6 +2234,19 @@ func validateIngestPipelineProcessors(procs []any) error {
 				}
 				return val, nil
 			}
+			for _, tplProp := range []string{"value", "field", "target_field", "index"} {
+				if rawTplVal, hasTplVal := specMap[tplProp]; hasTplVal && rawTplVal != nil {
+					if err := validateIngestMustacheValueR65(rawTplVal); err != nil {
+						return &ingestConfigErrorRound60{
+							errType:  "script_exception",
+							reason:   err.Error(),
+							procType: procType,
+							procTag:  effTag,
+							propName: tplProp,
+						}
+					}
+				}
+			}
 			var procValidationErr error
 			switch procType {
 			case "set":
@@ -2531,7 +2681,13 @@ func validateIngestPipelineProcessors(procs []any) error {
 				}
 				if strings.TrimSpace(effSrc) != "" && (langStr == "" || langStr == "painless") {
 					if err := painless.CompileValidate(rewriteIngestCtxReferencesWithOp(effSrc, true)); err != nil {
-						return wrapIngestProcErrRound60(procType, effTag, "source", fmt.Errorf("script_exception: %v", err))
+						return &ingestConfigErrorRound60{
+							errType:  "script_exception",
+							reason:   "compile error",
+							procType: procType,
+							procTag:  effTag,
+							propName: "source",
+						}
 					}
 				}
 			case "enrich":
@@ -2947,7 +3103,9 @@ func (s *Server) applyEffectiveAndFinalPipelinesWithMetaRound61(indexName, docID
 			}
 			s.mu.RUnlock()
 		}
+		resolvedTarget := ""
 		if resolved, _, wErr := s.resolveWriteIndexWithFilter(target); wErr == nil && resolved != "" && resolved != target {
+			resolvedTarget = resolved
 			s.mu.RLock()
 			if dp, ok := s.indexDefaultPipelines[resolved]; ok {
 				dp = strings.TrimSpace(dp)
@@ -2967,6 +3125,10 @@ func (s *Server) applyEffectiveAndFinalPipelinesWithMetaRound61(indexName, docID
 			}
 		}
 		s.mu.RLock()
+		if s.indices[target] != nil || (resolvedTarget != "" && s.indices[resolvedTarget] != nil) {
+			s.mu.RUnlock()
+			return "", false
+		}
 		_, tplDef, hasTplDef, _, _, _ := s.matchingTemplateConfigLocked(target)
 		s.mu.RUnlock()
 		if hasTplDef {
@@ -3567,6 +3729,92 @@ func evalIngestIfCondition(cond string, doc map[string]any) bool {
 	return opRes == "index"
 }
 
+func validateIngestMustacheTemplateR65(tpl string) error {
+	if !strings.Contains(tpl, "{{") {
+		return nil
+	}
+	if err := validateMustacheTemplateSyntax(tpl); err != nil {
+		return err
+	}
+	// Validate Elasticsearch Mustache function blocks (e.g. `{{#join}}ident{{/join}}`).
+	i := 0
+	for i < len(tpl) {
+		openIdx := strings.Index(tpl[i:], "{{")
+		if openIdx < 0 {
+			break
+		}
+		tagStart := i + openIdx
+		if strings.HasPrefix(tpl[tagStart:], "{{{") {
+			closeEnd := strings.Index(tpl[tagStart+3:], "}}}")
+			if closeEnd < 0 {
+				break
+			}
+			i = tagStart + 3 + closeEnd + 3
+			continue
+		}
+		closeIdx := strings.Index(tpl[tagStart+2:], "}}")
+		if closeIdx < 0 {
+			break
+		}
+		rawTag := strings.TrimSpace(tpl[tagStart+2 : tagStart+2+closeIdx])
+		afterOpen := tagStart + 2 + closeIdx + 2
+		if strings.HasPrefix(rawTag, "#join") && (len(rawTag) == 5 || rawTag[5] == ' ' || rawTag[5] == '\t') {
+			endIdx := strings.Index(tpl[afterOpen:], "{{")
+			// Find matching {{/join}}
+			closeRel := -1
+			scan := afterOpen
+			for scan < len(tpl) {
+				nextOpen := strings.Index(tpl[scan:], "{{")
+				if nextOpen < 0 {
+					break
+				}
+				ns := scan + nextOpen
+				nc := strings.Index(tpl[ns+2:], "}}")
+				if nc < 0 {
+					break
+				}
+				innerTag := strings.TrimSpace(tpl[ns+2 : ns+2+nc])
+				if innerTag == "/join" {
+					closeRel = ns - afterOpen
+					break
+				}
+				scan = ns + 2 + nc + 2
+			}
+			_ = endIdx
+			if closeRel < 0 {
+				return fmt.Errorf("Mustache function [join] must be closed") //nolint:staticcheck // Exact Elasticsearch error message
+			}
+			body := strings.TrimSpace(tpl[afterOpen : afterOpen+closeRel])
+			fields := strings.Fields(body)
+			if body == "" || len(fields) != 1 || strings.ContainsAny(body, " \t\r\n,;{}()\"'") || strings.Contains(body, "{{") {
+				return fmt.Errorf("Mustache function [join] must contain one and only one identifier") //nolint:staticcheck // Exact Elasticsearch error message
+			}
+		}
+		i = afterOpen
+	}
+	return nil
+}
+
+func validateIngestMustacheValueR65(val any) error {
+	switch tv := val.(type) {
+	case string:
+		return validateIngestMustacheTemplateR65(tv)
+	case []any:
+		for _, el := range tv {
+			if err := validateIngestMustacheValueR65(el); err != nil {
+				return err
+			}
+		}
+	case map[string]any:
+		for _, el := range tv {
+			if err := validateIngestMustacheValueR65(el); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 func expandIngestTemplate(val any, doc map[string]any) any {
 	switch v := val.(type) {
 	case map[string]any:
@@ -3585,6 +3833,14 @@ func expandIngestTemplate(val any, doc map[string]any) any {
 	s, ok := val.(string)
 	if !ok || !strings.Contains(s, "{{") {
 		return val
+	}
+	lookupTemplatePath := func(rawKey string) (any, bool) {
+		key := strings.TrimSpace(rawKey)
+		if key == "." {
+			return doc, true
+		}
+		key = strings.TrimPrefix(key, "_source.")
+		return getIngestPath(doc, key)
 	}
 	var out strings.Builder
 	i := 0
@@ -3608,12 +3864,58 @@ func expandIngestTemplate(val any, doc map[string]any) any {
 			out.WriteString(s[i:])
 			break
 		}
-		key := strings.TrimSpace(s[i+openLen : i+openLen+end])
-		key = strings.TrimPrefix(key, "_source.")
-		if v, exists := getIngestPath(doc, key); exists && v != nil {
+		rawTag := strings.TrimSpace(s[i+openLen : i+openLen+end])
+		afterOpen := i + openLen + end + len(closeSeq)
+		if !triple && (rawTag == "#join" || strings.HasPrefix(rawTag, "#join ") ||
+			rawTag == "#toJson" || strings.HasPrefix(rawTag, "#toJson ") ||
+			rawTag == "#url" || strings.HasPrefix(rawTag, "#url ")) {
+			fnName := strings.TrimPrefix(strings.Fields(rawTag)[0], "#")
+			closeTag := "{{/" + fnName + "}}"
+			closePos := strings.Index(s[afterOpen:], closeTag)
+			if closePos >= 0 {
+				innerBody := s[afterOpen : afterOpen+closePos]
+				switch fnName {
+				case "join":
+					delim := ","
+					if rest := strings.TrimSpace(strings.TrimPrefix(rawTag, "#join")); rest != "" {
+						if eqIdx := strings.IndexByte(rest, '='); eqIdx >= 0 && strings.EqualFold(strings.TrimSpace(rest[:eqIdx]), "delimiter") {
+							d := strings.TrimSpace(rest[eqIdx+1:])
+							d = strings.Trim(d, `"'`)
+							delim = d
+						}
+					}
+					if fv, exists := lookupTemplatePath(innerBody); exists && fv != nil {
+						switch sl := fv.(type) {
+						case []any:
+							parts := make([]string, 0, len(sl))
+							for _, el := range sl {
+								parts = append(parts, fmt.Sprintf("%v", el))
+							}
+							out.WriteString(strings.Join(parts, delim))
+						case []string:
+							out.WriteString(strings.Join(sl, delim))
+						default:
+							_, _ = fmt.Fprintf(&out, "%v", fv)
+						}
+					}
+				case "toJson":
+					if fv, exists := lookupTemplatePath(innerBody); exists {
+						if b, err := json.Marshal(fv); err == nil {
+							out.Write(b)
+						}
+					}
+				case "url":
+					expandedInner := fmt.Sprintf("%v", expandIngestTemplate(innerBody, doc))
+					out.WriteString(url.QueryEscape(expandedInner))
+				}
+				i = afterOpen + closePos + len(closeTag)
+				continue
+			}
+		}
+		if v, exists := lookupTemplatePath(rawTag); exists && v != nil {
 			_, _ = fmt.Fprintf(&out, "%v", v)
 		}
-		i += openLen + end + len(closeSeq)
+		i = afterOpen
 	}
 	return out.String()
 }
@@ -3685,7 +3987,7 @@ var defaultGrokPatterns = map[string]string{
 
 var ecsGrokPatterns = map[string]string{
 	"COMMONAPACHELOG":   `%{IPORHOST:[client][address]} %{USER:[user][id]} %{USER:[user][name]} \[%{HTTPDATE:timestamp}\] "(?:%{WORD:[http][request][method]} %{NOTSPACE:[url][original]}(?: HTTP/%{NUMBER:[http][version]})?|%{DATA})" %{NUMBER:[http][response][status_code]:int} (?:%{NUMBER:[http][response][body][bytes]:long}|-)`,
-	"COMBINEDAPACHELOG": `%{COMMONAPACHELOG} %{QS:[http][request][referrer]} %{QS:[user_agent][original]}`,
+	"COMBINEDAPACHELOG": `%{IPORHOST:[source][address]} (?:-|%{USER:[user][id]}) (?:-|%{USER:[user][name]}) \[%{HTTPDATE:timestamp}\] "(?:%{WORD:[http][request][method]} %{NOTSPACE:[url][original]}(?: HTTP/%{NUMBER:[http][version]})?|%{DATA})" %{NUMBER:[http][response][status_code]:int} (?:%{NUMBER:[http][response][body][bytes]:long}|-) %{QS:[http][request][referrer]} %{QS:[user_agent][original]}`,
 	"HTTPD_COMMONLOG":   `%{IPORHOST:[client][address]} (?:-|%{HTTPDUSER:[user][id]}) (?:-|%{HTTPDUSER:[user][name]}) \[%{HTTPDATE:timestamp}\] "(?:%{WORD:[http][request][method]} %{NOTSPACE:[url][original]}(?: HTTP/%{NUMBER:[http][version]})?|%{DATA})" (?:-|%{INT:[http][response][status_code]:int}) (?:-|%{INT:[http][response][body][bytes]:long})`,
 	"HTTPD_COMBINEDLOG": `%{HTTPD_COMMONLOG} %{QS:[http][request][referrer]} %{QS:[user_agent][original]}`,
 	"HTTPD20_ERRORLOG":  `\[%{HTTPDERROR_DATE:timestamp}\] \[%{LOGLEVEL:[log][level]}\] (?:\[client %{IPORHOST:[client][address]}\] )?%{GREEDYDATA:message}`,
@@ -3901,16 +4203,22 @@ func normalizeGrokFieldName(fieldName string) string {
 }
 
 func compileGrokRegex(pat string, customDefs map[string]any) (*regexp.Regexp, map[string]string, map[string]string, error) {
+	re, groupKeyMap, groupTypes, _, err := compileGrokRegexWithMetaR65(pat, customDefs)
+	return re, groupKeyMap, groupTypes, err
+}
+
+func compileGrokRegexWithMetaR65(pat string, customDefs map[string]any) (*regexp.Regexp, map[string]string, map[string]string, map[string]string, error) {
 	if len(pat) > maxRegexPatternLen {
-		return nil, nil, nil, fmt.Errorf("illegal_argument_exception: grok pattern length [%d] exceeds maximum [%d]", len(pat), maxRegexPatternLen)
+		return nil, nil, nil, nil, fmt.Errorf("illegal_argument_exception: grok pattern length [%d] exceeds maximum [%d]", len(pat), maxRegexPatternLen)
 	}
 	groupKeyMap := make(map[string]string)
 	groupTypes := make(map[string]string)
+	groupPatNames := make(map[string]string)
 	groupSeq := 0
 	expanded := pat
 	for pass := 0; pass < 16; pass++ {
 		if len(expanded) > maxExpandedGrokRegexLen {
-			return nil, nil, nil, fmt.Errorf("illegal_argument_exception: expanded grok pattern length [%d] exceeds maximum [%d]", len(expanded), maxExpandedGrokRegexLen)
+			return nil, nil, nil, nil, fmt.Errorf("illegal_argument_exception: expanded grok pattern length [%d] exceeds maximum [%d]", len(expanded), maxExpandedGrokRegexLen)
 		}
 		if !strings.Contains(expanded, "%{") {
 			break
@@ -3946,6 +4254,7 @@ func compileGrokRegex(pat string, customDefs map[string]any) (*regexp.Regexp, ma
 				groupSeq++
 				grpID := fmt.Sprintf("g%d", groupSeq)
 				groupKeyMap[grpID] = fieldName
+				groupPatNames[grpID] = patName
 				if fieldType != "" {
 					groupTypes[grpID] = fieldType
 				}
@@ -3961,14 +4270,14 @@ func compileGrokRegex(pat string, customDefs map[string]any) (*regexp.Regexp, ma
 			return repl
 		})
 		if resolveErr != nil {
-			return nil, nil, nil, resolveErr
+			return nil, nil, nil, nil, resolveErr
 		}
 		if len(expanded) > maxExpandedGrokRegexLen {
-			return nil, nil, nil, fmt.Errorf("illegal_argument_exception: expanded grok pattern length [%d] exceeds maximum [%d]", len(expanded), maxExpandedGrokRegexLen)
+			return nil, nil, nil, nil, fmt.Errorf("illegal_argument_exception: expanded grok pattern length [%d] exceeds maximum [%d]", len(expanded), maxExpandedGrokRegexLen)
 		}
 	}
 	if reGrokToken.MatchString(expanded) {
-		return nil, nil, nil, fmt.Errorf("illegal_argument_exception: cyclic or unresolved grok pattern in [%s]", pat)
+		return nil, nil, nil, nil, fmt.Errorf("illegal_argument_exception: cyclic or unresolved grok pattern in [%s]", pat)
 	}
 	expanded = reGrokNamedCapture.ReplaceAllStringFunc(expanded, func(m string) string {
 		sub := reGrokNamedCapture.FindStringSubmatch(m)
@@ -3987,7 +4296,7 @@ func compileGrokRegex(pat string, customDefs map[string]any) (*regexp.Regexp, ma
 		return fmt.Sprintf("(?P<%s>", grpID)
 	})
 	if len(expanded) > maxExpandedGrokRegexLen {
-		return nil, nil, nil, fmt.Errorf("illegal_argument_exception: expanded grok pattern length [%d] exceeds maximum [%d]", len(expanded), maxExpandedGrokRegexLen)
+		return nil, nil, nil, nil, fmt.Errorf("illegal_argument_exception: expanded grok pattern length [%d] exceeds maximum [%d]", len(expanded), maxExpandedGrokRegexLen)
 	}
 	var (
 		re  *regexp.Regexp
@@ -3999,9 +4308,9 @@ func compileGrokRegex(pat string, customDefs map[string]any) (*regexp.Regexp, ma
 		re, err = compileIngestJavaRegex(expanded)
 	}
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
-	return re, groupKeyMap, groupTypes, nil
+	return re, groupKeyMap, groupTypes, groupPatNames, nil
 }
 
 func convertESDateFormatToGoLayouts(esFmt string) []string {
@@ -6856,6 +7165,8 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 			default:
 				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is not a string", field)
 			}
+			ecsCompat, _ := specMap["ecs_compatibility"].(string)
+			ecsV1 := strings.EqualFold(strings.TrimSpace(ecsCompat), "v1")
 			traceMatch, _ := specMap["trace_match"].(bool)
 			extracted := make(map[string]any)
 			var extractedOrder []string
@@ -6876,7 +7187,7 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 					if !ok || patStr == "" {
 						continue
 					}
-					re, grpMap, grpTypes, err := compileGrokRegex(patStr, customDefs)
+					re, grpMap, grpTypes, grpPatNames, err := compileGrokRegexWithMetaR65(patStr, customDefs)
 					if err != nil {
 						return false, false, procType, procTag, specMap, err
 					}
@@ -6906,15 +7217,27 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 						if strings.HasPrefix(fieldName, "[") && strings.HasSuffix(fieldName, "]") {
 							fieldName = strings.ReplaceAll(strings.Trim(fieldName, "[]"), "][", ".")
 						}
-						isEmptyCapture := loc[2*i] < 0 || m[i] == ""
+						capStr := m[i]
+						if ecsV1 && (grpPatNames[grpID] == "QS" || grpPatNames[grpID] == "QUOTEDSTRING") && len(capStr) >= 2 {
+							if (capStr[0] == '"' && capStr[len(capStr)-1] == '"') || (capStr[0] == '\'' && capStr[len(capStr)-1] == '\'') {
+								q := capStr[0]
+								capStr = capStr[1 : len(capStr)-1]
+								if q == '"' {
+									capStr = strings.ReplaceAll(capStr, `\"`, `"`)
+								} else {
+									capStr = strings.ReplaceAll(capStr, `\'`, `'`)
+								}
+							}
+						}
+						isEmptyCapture := loc[2*i] < 0 || capStr == ""
 						if isEmptyCapture && !keepEmptyCaptures {
 							continue
 						}
 						var finalVal any
 						if !isEmptyCapture {
-							finalVal = m[i]
+							finalVal = capStr
 							if convT := grpTypes[grpID]; convT != "" {
-								cv, err := convertSingleIngestValue(m[i], convT)
+								cv, err := convertSingleIngestValue(capStr, convT)
 								if err != nil {
 									return false, false, procType, procTag, specMap, err
 								}
@@ -7173,8 +7496,11 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		}
 		if field != "" && len(patterns) > 0 {
 			val, exists := getIngestPath(doc, field)
-			if skip, err := checkIngestFieldMissingOrNullRound60(doc, field, val, exists, specMap); skip {
-				return false, false, procType, procTag, specMap, err
+			if !exists || val == nil {
+				if ignoreMissing, _ := specMap["ignore_missing"].(bool); ignoreMissing {
+					return false, false, procType, procTag, specMap, nil
+				}
+				return false, false, procType, procTag, specMap, fmt.Errorf("illegal_argument_exception: field [%s] is null or missing", field)
 			}
 			redactOneString := func(strVal string) (string, error) {
 				for _, patAny := range patterns {
@@ -8989,6 +9315,16 @@ func applyIngestPipelineSpecWithNameAndRoutingAndIngestMeta(s *Server, pipe map[
 	origVerTypeVal, hadOrigVerType := doc["_version_type"]
 	origIfSeqVal, hadOrigIfSeq := doc["_if_seq_no"]
 	origIfPTVal, hadOrigIfPT := doc["_if_primary_term"]
+	origDTVal, hadOrigDT := doc["_dynamic_templates"]
+	if !hadOrigDT && initialIngestMeta != nil {
+		if prevDT, ok := initialIngestMeta["__mutated_dynamic_templates"].(map[string]string); ok && len(prevDT) > 0 {
+			seedDT := make(map[string]any, len(prevDT))
+			for k, v := range prevDT {
+				seedDT[k] = v
+			}
+			doc["_dynamic_templates"] = seedDT
+		}
+	}
 	if indexName != "" {
 		doc["_index"] = indexName
 	} else {
@@ -9019,6 +9355,8 @@ func applyIngestPipelineSpecWithNameAndRoutingAndIngestMeta(s *Server, pipe map[
 			if sp, ok := v.([]string); ok {
 				seedExecPipes = append([]string(nil), sp...)
 			}
+		case "__mutated_dynamic_templates":
+			continue
 		case "_subst_pipes":
 			seedSubstPipes, _ = v.(map[string]map[string]any)
 		case "_inline_sim_pipeline":
@@ -9086,7 +9424,7 @@ func applyIngestPipelineSpecWithNameAndRoutingAndIngestMeta(s *Server, pipe map[
 			if ep, okE := om["_executed_pipelines"].([]string); okE && len(ep) > 0 {
 				outIngestMeta["__executed_pipelines"] = append([]string(nil), ep...)
 			}
-			for _, mk := range []string{"__mutated_version", "__mutated_version_type", "__mutated_if_seq_no", "__mutated_if_primary_term"} {
+			for _, mk := range []string{"__mutated_version", "__mutated_version_type", "__mutated_if_seq_no", "__mutated_if_primary_term", "__mutated_dynamic_templates"} {
 				if mv, hasMV := om[mk]; hasMV {
 					outIngestMeta[mk] = mv
 				}
@@ -9196,6 +9534,17 @@ func applyIngestPipelineSpecWithNameAndRoutingAndIngestMeta(s *Server, pipe map[
 			origMeta["__mutated_if_primary_term"] = pt
 		}
 	}
+	if rawDT, okDT := doc["_dynamic_templates"].(map[string]any); okDT && len(rawDT) > 0 {
+		dtStrMap := make(map[string]string, len(rawDT))
+		for fk, fv := range rawDT {
+			if fv != nil {
+				dtStrMap[fk] = fmt.Sprintf("%v", fv)
+			}
+		}
+		if len(dtStrMap) > 0 {
+			origMeta["__mutated_dynamic_templates"] = dtStrMap
+		}
+	}
 	outIngestMeta, outIngestTS := buildOutMeta()
 	if hadOrigIndex {
 		doc["_index"] = origIndexVal
@@ -9231,6 +9580,11 @@ func applyIngestPipelineSpecWithNameAndRoutingAndIngestMeta(s *Server, pipe map[
 		doc["_if_primary_term"] = origIfPTVal
 	} else {
 		delete(doc, "_if_primary_term")
+	}
+	if hadOrigDT {
+		doc["_dynamic_templates"] = origDTVal
+	} else {
+		delete(doc, "_dynamic_templates")
 	}
 	delete(doc, "__internal_ingest_orig")
 	delete(doc, "_ingest")
@@ -11060,6 +11414,16 @@ func (s *Server) handleUpgrade(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if !s.isES8Mode(r) && s.hasExplicitTargetESVersion() && strings.HasPrefix(s.getTargetESVersion(), "8.") {
+		emitESDeprecationWarningRound61(w, s, r, "The _upgrade API is no longer useful and will be removed. Instead, see _reindex API.")
+		reqPath := "/_upgrade"
+		if rawIndex != "" {
+			reqPath = "/" + rawIndex + "/_upgrade"
+		}
+		writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
+			fmt.Sprintf("Upgrade action %s %s was removed, use _reindex API instead", r.Method, reqPath))
+		return
+	}
 	verStr := s.effectiveClusterESVersionNumber(r)
 	upgraded := make(map[string]any, len(targets))
 	totalShards := 0
@@ -11105,6 +11469,16 @@ func (s *Server) handleGetUpgrade(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.Method == http.MethodHead {
 		w.WriteHeader(http.StatusOK)
+		return
+	}
+	if !s.isES8Mode(r) && s.hasExplicitTargetESVersion() && strings.HasPrefix(s.getTargetESVersion(), "8.") {
+		emitESDeprecationWarningRound61(w, s, r, "The _upgrade API is no longer useful and will be removed. Instead, see _reindex API.")
+		reqPath := "/_upgrade"
+		if rawIndex != "" {
+			reqPath = "/" + rawIndex + "/_upgrade"
+		}
+		writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
+			fmt.Sprintf("Upgrade action %s %s was removed, use _reindex API instead", r.Method, reqPath))
 		return
 	}
 	human := isTruthyBoolQueryParam(r, "human")
@@ -13182,8 +13556,13 @@ func (s *Server) handleTermsEnum(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if rawSize, hasSize := rawMap["size"]; hasSize {
-			if sz, ok := toInt64(rawSize); !ok || sz <= 0 {
+			sz, ok := toInt64(rawSize)
+			if !ok || sz <= 0 {
 				writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "size must be greater than 0")
+				return
+			}
+			if sz > maxTermsEnumSize {
+				writeESError(w, http.StatusBadRequest, "illegal_argument_exception", fmt.Sprintf("size must not be greater than [%d]", maxTermsEnumSize))
 				return
 			}
 		}
@@ -13192,9 +13571,35 @@ func (s *Server) handleTermsEnum(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if req.Size > maxTermsEnumSize {
+		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", fmt.Sprintf("size must not be greater than [%d]", maxTermsEnumSize))
+		return
+	}
 	if strings.TrimSpace(req.Field) == "" {
 		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "field must be specified for _terms_enum")
 		return
+	}
+	resolveTermsEnumFieldType := func(sch *schema.IndexSchema, fieldPath string) (string, bool) {
+		if sch == nil {
+			return "", false
+		}
+		parts := strings.Split(fieldPath, ".")
+		for i := 1; i < len(parts); i++ {
+			anc := strings.Join(parts[:i], ".")
+			if fb, exists := sch.Fields[anc]; exists && fb.ESType == "flattened" {
+				return "flattened", true
+			}
+			if fb := sch.ResolveField(anc); fb.ESType == "flattened" {
+				return "flattened", true
+			}
+		}
+		if fb := sch.ResolveField(fieldPath); fb.ESType != "" {
+			return fb.ESType, true
+		}
+		if fb, exists := sch.Fields[fieldPath]; exists && fb.ESType != "" {
+			return fb.ESType, true
+		}
+		return "", false
 	}
 	rawIndex := strings.TrimSpace(r.PathValue("index"))
 	var targets []string
@@ -13208,15 +13613,15 @@ func (s *Server) handleTermsEnum(w http.ResponseWriter, r *http.Request) {
 		s.mu.RLock()
 		for _, idxName := range targets {
 			if sch := s.indices[idxName]; sch != nil {
-				if fb, exists := sch.Fields[req.Field]; exists && fb.ESType != "" {
-					switch fb.ESType {
+				if esType, exists := resolveTermsEnumFieldType(sch, req.Field); exists && esType != "" {
+					switch esType {
 					case "version":
 						isVersionField = true
 					case "keyword", "constant_keyword", "flattened", "wildcard":
 					default:
 						s.mu.RUnlock()
 						writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
-							fmt.Sprintf("field [%s] is of an unsupported type [%s] for terms_enum", req.Field, fb.ESType))
+							fmt.Sprintf("field [%s] is of an unsupported type [%s] for terms_enum", req.Field, esType))
 						return
 					}
 				}
@@ -13228,7 +13633,7 @@ func (s *Server) handleTermsEnum(w http.ResponseWriter, r *http.Request) {
 		s.mu.RLock()
 		for _, idxName := range targets {
 			if sch := s.indices[idxName]; sch != nil {
-				if fb, exists := sch.Fields[req.Field]; exists && fb.ESType == "version" {
+				if esType, exists := resolveTermsEnumFieldType(sch, req.Field); exists && esType == "version" {
 					isVersionField = true
 					break
 				}
@@ -13240,9 +13645,12 @@ func (s *Server) handleTermsEnum(w http.ResponseWriter, r *http.Request) {
 	if limit <= 0 {
 		limit = 10
 	}
+	if limit > maxTermsEnumSize {
+		limit = maxTermsEnumSize
+	}
 	allowedTargets := make([]string, 0, len(targets))
 	for _, tgt := range targets {
-		if s.FilterTermsEnumByDLSR64(r, []string{tgt}, req.Field) {
+		if s.FilterTermsEnumByDLSWithRawTargetsR65(r, rawIndex, []string{tgt}, req.Field) {
 			allowedTargets = append(allowedTargets, tgt)
 		}
 	}
@@ -13362,7 +13770,7 @@ func (s *Server) handleTermsEnum(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	numShards := len(targets)
-	writeJSON(w, http.StatusOK, map[string]any{
+	writeJSONWithRequest(w, r, http.StatusOK, map[string]any{
 		"_shards":  map[string]any{"total": numShards, "successful": numShards, "skipped": 0, "failed": 0},
 		"terms":    termsOut,
 		"complete": complete,
@@ -15348,6 +15756,11 @@ func (s *Server) handleResizeOrCloneIndex(w http.ResponseWriter, r *http.Request
 	}
 	if r != nil && r.URL != nil {
 		if strings.Contains(r.URL.Path, "/_split/") {
+			if strings.EqualFold(srcSchema.IndexMode, "time_series") {
+				writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
+					fmt.Sprintf("index-split is not supported because the destination index [%s] is in time series mode", srcIndex))
+				return
+			}
 			if _, hasRoutingOverride := lookupRawIndexSettingPresenceR62Admin(req.Settings, "number_of_routing_shards"); hasRoutingOverride {
 				writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
 					"the number of routing shards cannot be changed via [_split]")
@@ -15375,6 +15788,9 @@ func (s *Server) handleResizeOrCloneIndex(w http.ResponseWriter, r *http.Request
 
 	effectiveMappings := schema.MergeMappingSpecs(srcSchema.RawMapping, req.Mappings)
 	compiled := schema.CompileIndexSchema(s.dorisDB, targetIndex, effectiveMappings)
+	compiled.CopyIndexMappingSettingsFrom(srcSchema)
+	compiled.ES8Mode = srcSchema.ES8Mode
+	schema.ApplyIndexModeDefaults(compiled)
 	ddl := schema.GenerateCreateTableDDL(compiled)
 	if err := s.backend.ExecDDL(r.Context(), ddl); err != nil {
 		writeESError(w, http.StatusInternalServerError, "doris_ddl_exception", err.Error())

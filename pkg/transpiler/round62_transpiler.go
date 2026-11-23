@@ -490,6 +490,19 @@ func (t *Transpiler) validateRound62AggTree(aggs map[string]esast.AggSpec, ances
 					t.searchErr = esTranspilerError("illegal_argument_exception: Time series aggregations cannot be used inside global aggregation.")
 					return
 				case "auto_date_histogram", "variable_width_histogram":
+					var hasRate func(m map[string]esast.AggSpec) bool
+					hasRate = func(m map[string]esast.AggSpec) bool {
+						for _, sub := range m {
+							if sub.Rate != nil || hasRate(sub.SubAggs()) {
+								return true
+							}
+						}
+						return false
+					}
+					if hasRate(spec.SubAggs()) {
+						t.searchErr = esTranspilerError("illegal_argument_exception: Wrapping a time-series rate aggregation within a DeferableBucketAggregator is not supported")
+						return
+					}
 					t.searchErr = esTranspilerError(fmt.Sprintf("illegal_argument_exception: [%s] aggregation is incompatible with time series execution mode", anc.name))
 					return
 				}
@@ -2196,6 +2209,48 @@ func (t *Transpiler) compileMatchWithAnalysisGraphOpts(
 	), true
 }
 
+// combineMatchPredicatesR65 joins fulltext-capable predicates (`preds`) and their
+// expression/projection-safe equivalents (`safePreds`), ensuring
+// `CAST(COALESCE(..., FALSE) AS INT)` arithmetic never wraps `MATCH_*` operators.
+func combineMatchPredicatesR65(preds, safePreds []string, isAnd bool, msm any) (whereSQL, safeWhereSQL string, impossible bool) {
+	if msm != nil && parseMinShouldMatch(msm, len(preds), true) > len(preds) {
+		return "FALSE", "FALSE", true
+	}
+	if isAnd {
+		if len(preds) == 1 {
+			return preds[0], safePreds[0], false
+		}
+		return "(" + strings.Join(preds, " AND ") + ")", "(" + strings.Join(safePreds, " AND ") + ")", false
+	}
+	if msm != nil {
+		reqCount := parseMinShouldMatch(msm, len(preds), true)
+		if reqCount > len(preds) {
+			return "FALSE", "FALSE", true
+		}
+		if reqCount <= 1 {
+			if len(preds) == 1 {
+				return preds[0], safePreds[0], false
+			}
+			return "(" + strings.Join(preds, " OR ") + ")", "(" + strings.Join(safePreds, " OR ") + ")", false
+		}
+		if reqCount == len(preds) {
+			return "(" + strings.Join(preds, " AND ") + ")", "(" + strings.Join(safePreds, " AND ") + ")", false
+		}
+		var casts []string
+		for _, sp := range safePreds {
+			casts = append(casts, fmt.Sprintf("CAST(COALESCE(%s, FALSE) AS INT)", sp))
+		}
+		castSum := strings.Join(casts, " + ")
+		return fmt.Sprintf("((%s) AND ((%s) >= %d))", strings.Join(preds, " OR "), castSum, reqCount),
+			fmt.Sprintf("((%s) AND ((%s) >= %d))", strings.Join(safePreds, " OR "), castSum, reqCount),
+			false
+	}
+	if len(preds) == 1 {
+		return preds[0], safePreds[0], false
+	}
+	return "(" + strings.Join(preds, " OR ") + ")", "(" + strings.Join(safePreds, " OR ") + ")", false
+}
+
 func (t *Transpiler) compileMatchGraphToSQLR64(
 	resolved string,
 	b schema.FieldBinding,
@@ -2233,13 +2288,28 @@ func (t *Transpiler) compileMatchGraphToSQLR64(
 	}
 	isAnd := strings.EqualFold(operator, "and")
 	caseSensitive, isWhitespace := analyzerCaseAndWhitespaceFlagsR63(effAn, effCfg, t.Opts.AnalysisOpts)
-	var segPreds, segScores []string
+
+	var segPreds, segSafePreds, segScores []string
+	usesFT := false
 
 	for _, seg := range graph.Segments {
 		if len(seg.Alternatives) == 0 {
 			continue
 		}
-		var altPreds, altScores []string
+		var altPreds, altSafePreds, altScores []string
+		appendAlt := func(cp CompiledQuery) {
+			if cp.WhereSQL == "FALSE" {
+				return
+			}
+			altPreds = append(altPreds, cp.WhereSQL)
+			altSafePreds = append(altSafePreds, cp.EffectiveSafeWhere())
+			if cp.UsesFulltextMatch {
+				usesFT = true
+			}
+			if scoring && cp.ScoreSQL != "0.0" {
+				altScores = append(altScores, cp.ScoreSQL)
+			}
+		}
 		if seg.IsSingleTermAlternatives() {
 			for _, tk := range seg.SingleTermAlternatives() {
 				var cp CompiledQuery
@@ -2248,12 +2318,7 @@ func (t *Transpiler) compileMatchGraphToSQLR64(
 				} else {
 					cp = t.singleAnalyzedTokenWithFlagsR63(resolved, b, tk, caseSensitive, isWhitespace, 1.0, scoring, nctx)
 				}
-				if cp.WhereSQL != "FALSE" {
-					altPreds = append(altPreds, cp.WhereSQL)
-					if scoring && cp.ScoreSQL != "0.0" {
-						altScores = append(altScores, cp.ScoreSQL)
-					}
-				}
+				appendAlt(cp)
 			}
 		} else {
 			for _, alt := range seg.Alternatives {
@@ -2270,27 +2335,29 @@ func (t *Transpiler) compileMatchGraphToSQLR64(
 				} else if autoPhrase {
 					cp = t.multiTokenExactPhraseSQL(resolved, b, alt, 0, false, caseSensitive, 1.0, scoring, nctx)
 				} else {
-					var subParts []string
+					var subParts, subSafeParts []string
+					subFT := false
 					for _, tk := range alt {
-						subParts = append(subParts, t.singleAnalyzedTokenWithFlagsR63(resolved, b, tk, caseSensitive, isWhitespace, 1.0, false, nctx).WhereSQL)
+						subCP := t.singleAnalyzedTokenWithFlagsR63(resolved, b, tk, caseSensitive, isWhitespace, 1.0, false, nctx)
+						subParts = append(subParts, subCP.WhereSQL)
+						subSafeParts = append(subSafeParts, subCP.EffectiveSafeWhere())
+						if subCP.UsesFulltextMatch {
+							subFT = true
+						}
 					}
 					joiner := " OR "
 					if isAnd {
 						joiner = " AND "
 					}
 					w := "(" + strings.Join(subParts, joiner) + ")"
+					sw := "(" + strings.Join(subSafeParts, joiner) + ")"
 					sc := "0.0"
 					if scoring {
-						sc = fmt.Sprintf("(CASE WHEN %s THEN 1.0 ELSE 0.0 END)", w)
+						sc = fmt.Sprintf("(CASE WHEN %s THEN 1.0 ELSE 0.0 END)", sw)
 					}
-					cp = CompiledQuery{WhereSQL: w, SafeWhereSQL: w, ScoreSQL: sc}
+					cp = CompiledQuery{WhereSQL: w, SafeWhereSQL: sw, ScoreSQL: sc, UsesFulltextMatch: subFT}
 				}
-				if cp.WhereSQL != "FALSE" {
-					altPreds = append(altPreds, cp.WhereSQL)
-					if scoring && cp.ScoreSQL != "0.0" {
-						altScores = append(altScores, cp.ScoreSQL)
-					}
-				}
+				appendAlt(cp)
 			}
 		}
 		if len(altPreds) == 0 {
@@ -2300,10 +2367,13 @@ func (t *Transpiler) compileMatchGraphToSQLR64(
 			continue
 		}
 		segW := altPreds[0]
+		segSW := altSafePreds[0]
 		if len(altPreds) > 1 {
 			segW = "(" + strings.Join(altPreds, " OR ") + ")"
+			segSW = "(" + strings.Join(altSafePreds, " OR ") + ")"
 		}
 		segPreds = append(segPreds, segW)
+		segSafePreds = append(segSafePreds, segSW)
 		if scoring {
 			if len(altScores) == 1 {
 				segScores = append(segScores, altScores[0])
@@ -2317,33 +2387,9 @@ func (t *Transpiler) compileMatchGraphToSQLR64(
 		return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
 	}
 
-	var whereSQL string
-	if isAnd {
-		if len(segPreds) == 1 {
-			whereSQL = segPreds[0]
-		} else {
-			whereSQL = "(" + strings.Join(segPreds, " AND ") + ")"
-		}
-	} else if msm != nil {
-		reqCount := parseMinShouldMatch(msm, len(segPreds), true)
-		if reqCount > len(segPreds) {
-			return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
-		}
-		if reqCount <= 1 {
-			whereSQL = "(" + strings.Join(segPreds, " OR ") + ")"
-		} else if reqCount == len(segPreds) {
-			whereSQL = "(" + strings.Join(segPreds, " AND ") + ")"
-		} else {
-			var casts []string
-			for _, sp := range segPreds {
-				casts = append(casts, fmt.Sprintf("CAST(COALESCE(%s, FALSE) AS INT)", sp))
-			}
-			whereSQL = fmt.Sprintf("((%s) AND ((%s) >= %d))", strings.Join(segPreds, " OR "), strings.Join(casts, " + "), reqCount)
-		}
-	} else if len(segPreds) == 1 {
-		whereSQL = segPreds[0]
-	} else {
-		whereSQL = "(" + strings.Join(segPreds, " OR ") + ")"
+	whereSQL, safeWhereSQL, impossible := combineMatchPredicatesR65(segPreds, segSafePreds, isAnd, msm)
+	if impossible {
+		return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
 	}
 
 	scoreSQL := "0.0"
@@ -2353,12 +2399,12 @@ func (t *Transpiler) compileMatchGraphToSQLR64(
 			if len(segScores) > 1 {
 				sumSc = "(" + strings.Join(segScores, " + ") + ")"
 			}
-			scoreSQL = fmt.Sprintf("(CASE WHEN %s THEN (%s * %s) ELSE 0.0 END)", whereSQL, strconv.FormatFloat(effBoost, 'g', -1, 64), sumSc)
+			scoreSQL = fmt.Sprintf("(CASE WHEN %s THEN (%s * %s) ELSE 0.0 END)", safeWhereSQL, strconv.FormatFloat(effBoost, 'g', -1, 64), sumSc)
 		} else {
-			scoreSQL = fmt.Sprintf("(CASE WHEN %s THEN %s ELSE 0.0 END)", whereSQL, strconv.FormatFloat(effBoost, 'g', -1, 64))
+			scoreSQL = fmt.Sprintf("(CASE WHEN %s THEN %s ELSE 0.0 END)", safeWhereSQL, strconv.FormatFloat(effBoost, 'g', -1, 64))
 		}
 	}
-	return CompiledQuery{WhereSQL: whereSQL, SafeWhereSQL: whereSQL, ScoreSQL: scoreSQL}
+	return CompiledQuery{WhereSQL: whereSQL, SafeWhereSQL: safeWhereSQL, ScoreSQL: scoreSQL, UsesFulltextMatch: usesFT}
 }
 
 // compileCommonTermsQueryR64 compiles Elasticsearch `common` queries as well as `match` / `multi_match`
@@ -2485,11 +2531,16 @@ func (t *Transpiler) compileCommonTermsQueryR64(
 	// Only high-frequency tokens matched.
 	if len(lowToks) == 0 {
 		if highMSM != nil {
-			var tokPreds, tokScores []string
+			var tokPreds, tokSafePreds, tokScores []string
+			usesFT := false
 			for _, tk := range highToks {
 				cp := t.singleAnalyzedTokenWithFlagsR63(resolved, b, tk.Term, caseSensitive, isWhitespace, 1.0, scoring, nctx)
 				if cp.WhereSQL != "FALSE" {
 					tokPreds = append(tokPreds, cp.WhereSQL)
+					tokSafePreds = append(tokSafePreds, cp.EffectiveSafeWhere())
+					if cp.UsesFulltextMatch {
+						usesFT = true
+					}
 					if scoring && cp.ScoreSQL != "0.0" {
 						tokScores = append(tokScores, cp.ScoreSQL)
 					}
@@ -2498,21 +2549,9 @@ func (t *Transpiler) compileCommonTermsQueryR64(
 			if len(tokPreds) == 0 {
 				return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}, true
 			}
-			reqCount := parseMinShouldMatch(highMSM, len(tokPreds), true)
-			if reqCount > len(tokPreds) {
+			whereSQL, safeWhereSQL, impossible := combineMatchPredicatesR65(tokPreds, tokSafePreds, false, highMSM)
+			if impossible {
 				return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}, true
-			}
-			var whereSQL string
-			if reqCount <= 1 {
-				whereSQL = "(" + strings.Join(tokPreds, " OR ") + ")"
-			} else if reqCount == len(tokPreds) {
-				whereSQL = "(" + strings.Join(tokPreds, " AND ") + ")"
-			} else {
-				var casts []string
-				for _, tp := range tokPreds {
-					casts = append(casts, fmt.Sprintf("CAST(COALESCE(%s, FALSE) AS INT)", tp))
-				}
-				whereSQL = fmt.Sprintf("((%s) AND ((%s) >= %d))", strings.Join(tokPreds, " OR "), strings.Join(casts, " + "), reqCount)
 			}
 			scoreSQL := "0.0"
 			if scoring {
@@ -2521,12 +2560,12 @@ func (t *Transpiler) compileCommonTermsQueryR64(
 					if len(tokScores) > 1 {
 						sumSc = "(" + strings.Join(tokScores, " + ") + ")"
 					}
-					scoreSQL = fmt.Sprintf("(CASE WHEN %s THEN (%s * %s) ELSE 0.0 END)", whereSQL, strconv.FormatFloat(effBoost, 'g', -1, 64), sumSc)
+					scoreSQL = fmt.Sprintf("(CASE WHEN %s THEN (%s * %s) ELSE 0.0 END)", safeWhereSQL, strconv.FormatFloat(effBoost, 'g', -1, 64), sumSc)
 				} else {
-					scoreSQL = fmt.Sprintf("(CASE WHEN %s THEN %s ELSE 0.0 END)", whereSQL, strconv.FormatFloat(effBoost, 'g', -1, 64))
+					scoreSQL = fmt.Sprintf("(CASE WHEN %s THEN %s ELSE 0.0 END)", safeWhereSQL, strconv.FormatFloat(effBoost, 'g', -1, 64))
 				}
 			}
-			return CompiledQuery{WhereSQL: whereSQL, SafeWhereSQL: whereSQL, ScoreSQL: scoreSQL}, true
+			return CompiledQuery{WhereSQL: whereSQL, SafeWhereSQL: safeWhereSQL, ScoreSQL: scoreSQL, UsesFulltextMatch: usesFT}, true
 		}
 		opForHigh := effHighOp
 		if explicitHighOp == "" && hasCorpusStats {
@@ -2549,11 +2588,12 @@ func (t *Transpiler) compileCommonTermsQueryR64(
 		if effBoost == 1.0 {
 			return lowCompiled, true
 		}
+		lowSafe := lowCompiled.EffectiveSafeWhere()
 		sc := "0.0"
 		if scoring && lowCompiled.ScoreSQL != "" && lowCompiled.ScoreSQL != "0.0" {
-			sc = fmt.Sprintf("(CASE WHEN %s THEN (%s * %s) ELSE 0.0 END)", lowCompiled.WhereSQL, strconv.FormatFloat(effBoost, 'g', -1, 64), lowCompiled.ScoreSQL)
+			sc = fmt.Sprintf("(CASE WHEN %s THEN (%s * %s) ELSE 0.0 END)", lowSafe, strconv.FormatFloat(effBoost, 'g', -1, 64), lowCompiled.ScoreSQL)
 		}
-		return CompiledQuery{WhereSQL: lowCompiled.WhereSQL, SafeWhereSQL: lowCompiled.SafeWhereSQL, ScoreSQL: sc}, true
+		return CompiledQuery{WhereSQL: lowCompiled.WhereSQL, SafeWhereSQL: lowSafe, ScoreSQL: sc, UsesFulltextMatch: lowCompiled.UsesFulltextMatch}, true
 	}
 
 	// Both low-frequency and high-frequency groups are non-empty.
@@ -2563,25 +2603,38 @@ func (t *Transpiler) compileCommonTermsQueryR64(
 	lowRequired := effLowOp == "and" || effLowMSM != nil
 	highRequired := effHighOp == "and" || highMSM != nil
 
-	var whereSQL string
+	var whereSQL, safeWhereSQL string
+	usesFT := false
 	switch {
 	case lowRequired && highRequired:
 		if lowCompiled.WhereSQL == "FALSE" || highCompiled.WhereSQL == "FALSE" {
 			return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}, true
 		}
 		whereSQL = fmt.Sprintf("((%s) AND (%s))", lowCompiled.WhereSQL, highCompiled.WhereSQL)
+		safeWhereSQL = fmt.Sprintf("((%s) AND (%s))", lowCompiled.EffectiveSafeWhere(), highCompiled.EffectiveSafeWhere())
+		usesFT = lowCompiled.UsesFulltextMatch || highCompiled.UsesFulltextMatch
 	case lowRequired:
 		whereSQL = lowCompiled.WhereSQL
+		safeWhereSQL = lowCompiled.EffectiveSafeWhere()
+		usesFT = lowCompiled.UsesFulltextMatch
 	case highRequired:
 		whereSQL = highCompiled.WhereSQL
+		safeWhereSQL = highCompiled.EffectiveSafeWhere()
+		usesFT = highCompiled.UsesFulltextMatch
 	default:
 		switch {
 		case lowCompiled.WhereSQL == "FALSE":
 			whereSQL = highCompiled.WhereSQL
+			safeWhereSQL = highCompiled.EffectiveSafeWhere()
+			usesFT = highCompiled.UsesFulltextMatch
 		case highCompiled.WhereSQL == "FALSE":
 			whereSQL = lowCompiled.WhereSQL
+			safeWhereSQL = lowCompiled.EffectiveSafeWhere()
+			usesFT = lowCompiled.UsesFulltextMatch
 		default:
 			whereSQL = fmt.Sprintf("((%s) OR (%s))", lowCompiled.WhereSQL, highCompiled.WhereSQL)
+			safeWhereSQL = fmt.Sprintf("((%s) OR (%s))", lowCompiled.EffectiveSafeWhere(), highCompiled.EffectiveSafeWhere())
+			usesFT = lowCompiled.UsesFulltextMatch || highCompiled.UsesFulltextMatch
 		}
 	}
 	if whereSQL == "FALSE" {
@@ -2601,12 +2654,12 @@ func (t *Transpiler) compileCommonTermsQueryR64(
 			if len(parts) > 1 {
 				sumSc = "(" + strings.Join(parts, " + ") + ")"
 			}
-			scoreSQL = fmt.Sprintf("(CASE WHEN %s THEN (%s * %s) ELSE 0.0 END)", whereSQL, strconv.FormatFloat(effBoost, 'g', -1, 64), sumSc)
+			scoreSQL = fmt.Sprintf("(CASE WHEN %s THEN (%s * %s) ELSE 0.0 END)", safeWhereSQL, strconv.FormatFloat(effBoost, 'g', -1, 64), sumSc)
 		} else {
-			scoreSQL = fmt.Sprintf("(CASE WHEN %s THEN %s ELSE 0.0 END)", whereSQL, strconv.FormatFloat(effBoost, 'g', -1, 64))
+			scoreSQL = fmt.Sprintf("(CASE WHEN %s THEN %s ELSE 0.0 END)", safeWhereSQL, strconv.FormatFloat(effBoost, 'g', -1, 64))
 		}
 	}
-	return CompiledQuery{WhereSQL: whereSQL, SafeWhereSQL: whereSQL, ScoreSQL: scoreSQL}, true
+	return CompiledQuery{WhereSQL: whereSQL, SafeWhereSQL: safeWhereSQL, ScoreSQL: scoreSQL, UsesFulltextMatch: usesFT}, true
 }
 
 // compileMatchPhraseWithAnalysisGraph compiles `match_phrase` and `match_phrase_prefix` via
@@ -2776,67 +2829,88 @@ func (t *Transpiler) compileMatchBoolPrefixRound62Opts(rawField string, pe esast
 			autoPhrase = *autoSynPhrase && graph.HasGraphSpans
 		}
 		isAnd := strings.EqualFold(pe.Operator, "and")
-		var segPreds, segScores []string
+		var segPreds, segSafePreds, segScores []string
+		usesFT := false
 		for si, seg := range graph.Segments {
 			isLast := si == len(graph.Segments)-1
-			compilePrefixTok := func(ptk string) string {
+			compilePrefixTok := func(ptk string) CompiledQuery {
 				if !isAnWS && b.Kind == schema.StoragePromotedScalar && !b.NotIndexed && nctx == nil && !strings.ContainsAny(ptk, " \t\r\n'\"\\") {
-					return t.compileMatchPhraseField(resolved, ptk, 0, 1.0, true, false, nctx).WhereSQL
+					return t.compileMatchPhraseField(resolved, ptk, 0, 1.0, true, false, nctx)
 				}
-				return t.compileAnalyzedTokenOrPhrasePrefixRegex(resolved, b, ptk, !isAnWS, nctx)
+				sw := t.compileAnalyzedTokenOrPhrasePrefixRegex(resolved, b, ptk, !isAnWS, nctx)
+				return CompiledQuery{WhereSQL: sw, SafeWhereSQL: sw}
 			}
-			var altPreds, altScores []string
+			var altPreds, altSafePreds, altScores []string
+			appendAlt := func(w, sw, sc string, ft bool) {
+				if w == "FALSE" {
+					return
+				}
+				altPreds = append(altPreds, w)
+				altSafePreds = append(altSafePreds, sw)
+				if ft {
+					usesFT = true
+				}
+				if scoring && sc != "" && sc != "0.0" {
+					altScores = append(altScores, sc)
+				}
+			}
 			if seg.IsSingleTermAlternatives() {
 				for _, tk := range seg.SingleTermAlternatives() {
-					var w, sc string
+					var cp CompiledQuery
+					var w, sw, sc string
 					if isLast {
-						w = compilePrefixTok(tk)
+						cp = compilePrefixTok(tk)
+						w, sw = cp.WhereSQL, cp.EffectiveSafeWhere()
 						if scoring {
-							sc = fmt.Sprintf("(CASE WHEN %s THEN 1.0 ELSE 0.0 END)", w)
+							sc = fmt.Sprintf("(CASE WHEN %s THEN 1.0 ELSE 0.0 END)", sw)
 						}
 					} else if hasNonZeroFuzziness(pe.Fuzziness) {
-						cp := t.compileFuzzyFieldWithOpts(resolved, tk, "or", pe.Fuzziness, false, pe.PrefixLength, pe.FuzzyTranspositions, 1.0, scoring, nctx)
-						w, sc = cp.WhereSQL, cp.ScoreSQL
+						cp = t.compileFuzzyFieldWithOpts(resolved, tk, "or", pe.Fuzziness, false, pe.PrefixLength, pe.FuzzyTranspositions, 1.0, scoring, nctx)
+						w, sw, sc = cp.WhereSQL, cp.EffectiveSafeWhere(), cp.ScoreSQL
 					} else {
-						cp := t.singleAnalyzedTokenWithFlagsR63(resolved, b, tk, caseSens, isAnWS, 1.0, scoring, nctx)
-						w, sc = cp.WhereSQL, cp.ScoreSQL
+						cp = t.singleAnalyzedTokenWithFlagsR63(resolved, b, tk, caseSens, isAnWS, 1.0, scoring, nctx)
+						w, sw, sc = cp.WhereSQL, cp.EffectiveSafeWhere(), cp.ScoreSQL
 					}
-					if w != "FALSE" {
-						altPreds = append(altPreds, w)
-						if scoring && sc != "" && sc != "0.0" {
-							altScores = append(altScores, sc)
-						}
-					}
+					appendAlt(w, sw, sc, cp.UsesFulltextMatch)
 				}
 			} else {
 				for _, alt := range seg.Alternatives {
 					if len(alt) == 0 {
 						continue
 					}
-					var w, sc string
+					var cp CompiledQuery
+					var w, sw, sc string
+					ft := false
 					if len(alt) == 1 {
 						if isLast {
-							w = compilePrefixTok(alt[0])
+							cp = compilePrefixTok(alt[0])
+							w, sw, ft = cp.WhereSQL, cp.EffectiveSafeWhere(), cp.UsesFulltextMatch
 							if scoring {
-								sc = fmt.Sprintf("(CASE WHEN %s THEN 1.0 ELSE 0.0 END)", w)
+								sc = fmt.Sprintf("(CASE WHEN %s THEN 1.0 ELSE 0.0 END)", sw)
 							}
 						} else if hasNonZeroFuzziness(pe.Fuzziness) {
-							cp := t.compileFuzzyFieldWithOpts(resolved, alt[0], "or", pe.Fuzziness, false, pe.PrefixLength, pe.FuzzyTranspositions, 1.0, scoring, nctx)
-							w, sc = cp.WhereSQL, cp.ScoreSQL
+							cp = t.compileFuzzyFieldWithOpts(resolved, alt[0], "or", pe.Fuzziness, false, pe.PrefixLength, pe.FuzzyTranspositions, 1.0, scoring, nctx)
+							w, sw, sc, ft = cp.WhereSQL, cp.EffectiveSafeWhere(), cp.ScoreSQL, cp.UsesFulltextMatch
 						} else {
-							cp := t.singleAnalyzedTokenWithFlagsR63(resolved, b, alt[0], caseSens, isAnWS, 1.0, scoring, nctx)
-							w, sc = cp.WhereSQL, cp.ScoreSQL
+							cp = t.singleAnalyzedTokenWithFlagsR63(resolved, b, alt[0], caseSens, isAnWS, 1.0, scoring, nctx)
+							w, sw, sc, ft = cp.WhereSQL, cp.EffectiveSafeWhere(), cp.ScoreSQL, cp.UsesFulltextMatch
 						}
 					} else if autoPhrase {
-						cp := t.multiTokenExactPhraseSQL(resolved, b, alt, 0, isLast, caseSens, 1.0, scoring, nctx)
-						w, sc = cp.WhereSQL, cp.ScoreSQL
+						cp = t.multiTokenExactPhraseSQL(resolved, b, alt, 0, isLast, caseSens, 1.0, scoring, nctx)
+						w, sw, sc, ft = cp.WhereSQL, cp.EffectiveSafeWhere(), cp.ScoreSQL, cp.UsesFulltextMatch
 					} else {
-						var subParts []string
+						var subParts, subSafeParts []string
 						for ai, tk := range alt {
+							var subCP CompiledQuery
 							if isLast && ai == len(alt)-1 {
-								subParts = append(subParts, compilePrefixTok(tk))
+								subCP = compilePrefixTok(tk)
 							} else {
-								subParts = append(subParts, t.singleAnalyzedTokenWithFlagsR63(resolved, b, tk, caseSens, isAnWS, 1.0, false, nctx).WhereSQL)
+								subCP = t.singleAnalyzedTokenWithFlagsR63(resolved, b, tk, caseSens, isAnWS, 1.0, false, nctx)
+							}
+							subParts = append(subParts, subCP.WhereSQL)
+							subSafeParts = append(subSafeParts, subCP.EffectiveSafeWhere())
+							if subCP.UsesFulltextMatch {
+								ft = true
 							}
 						}
 						joiner := " OR "
@@ -2844,16 +2918,12 @@ func (t *Transpiler) compileMatchBoolPrefixRound62Opts(rawField string, pe esast
 							joiner = " AND "
 						}
 						w = "(" + strings.Join(subParts, joiner) + ")"
+						sw = "(" + strings.Join(subSafeParts, joiner) + ")"
 						if scoring {
-							sc = fmt.Sprintf("(CASE WHEN %s THEN 1.0 ELSE 0.0 END)", w)
+							sc = fmt.Sprintf("(CASE WHEN %s THEN 1.0 ELSE 0.0 END)", sw)
 						}
 					}
-					if w != "FALSE" {
-						altPreds = append(altPreds, w)
-						if scoring && sc != "" && sc != "0.0" {
-							altScores = append(altScores, sc)
-						}
-					}
+					appendAlt(w, sw, sc, ft)
 				}
 			}
 			if len(altPreds) == 0 {
@@ -2863,10 +2933,13 @@ func (t *Transpiler) compileMatchBoolPrefixRound62Opts(rawField string, pe esast
 				continue
 			}
 			segW := altPreds[0]
+			segSW := altSafePreds[0]
 			if len(altPreds) > 1 {
 				segW = "(" + strings.Join(altPreds, " OR ") + ")"
+				segSW = "(" + strings.Join(altSafePreds, " OR ") + ")"
 			}
 			segPreds = append(segPreds, segW)
+			segSafePreds = append(segSafePreds, segSW)
 			if scoring && len(altScores) > 0 {
 				if len(altScores) == 1 {
 					segScores = append(segScores, altScores[0])
@@ -2878,39 +2951,9 @@ func (t *Transpiler) compileMatchBoolPrefixRound62Opts(rawField string, pe esast
 		if len(segPreds) == 0 {
 			return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
 		}
-		if pe.MinimumShouldMatch != nil && !isAnd {
-			if parseMinShouldMatch(pe.MinimumShouldMatch, len(segPreds), true) > len(segPreds) {
-				return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
-			}
-		}
-		var whereSQL string
-		if isAnd {
-			if len(segPreds) == 1 {
-				whereSQL = segPreds[0]
-			} else {
-				whereSQL = "(" + strings.Join(segPreds, " AND ") + ")"
-			}
-		} else if pe.MinimumShouldMatch != nil {
-			reqCount := parseMinShouldMatch(pe.MinimumShouldMatch, len(segPreds), true)
-			if reqCount <= 1 {
-				if len(segPreds) == 1 {
-					whereSQL = segPreds[0]
-				} else {
-					whereSQL = "(" + strings.Join(segPreds, " OR ") + ")"
-				}
-			} else if reqCount == len(segPreds) {
-				whereSQL = "(" + strings.Join(segPreds, " AND ") + ")"
-			} else {
-				var casts []string
-				for _, sp := range segPreds {
-					casts = append(casts, fmt.Sprintf("CAST(COALESCE(%s, FALSE) AS INT)", sp))
-				}
-				whereSQL = fmt.Sprintf("((%s) AND ((%s) >= %d))", strings.Join(segPreds, " OR "), strings.Join(casts, " + "), reqCount)
-			}
-		} else if len(segPreds) == 1 {
-			whereSQL = segPreds[0]
-		} else {
-			whereSQL = "(" + strings.Join(segPreds, " OR ") + ")"
+		whereSQL, safeWhereSQL, impossible := combineMatchPredicatesR65(segPreds, segSafePreds, isAnd, pe.MinimumShouldMatch)
+		if impossible {
+			return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
 		}
 		scoreSQL := "0.0"
 		if scoring {
@@ -2920,9 +2963,9 @@ func (t *Transpiler) compileMatchBoolPrefixRound62Opts(rawField string, pe esast
 			} else if len(segScores) > 1 {
 				sumSc = "(" + strings.Join(segScores, " + ") + ")"
 			}
-			scoreSQL = fmt.Sprintf("(CASE WHEN %s THEN (%s * %s) ELSE 0.0 END)", whereSQL, strconv.FormatFloat(effBoost, 'g', -1, 64), sumSc)
+			scoreSQL = fmt.Sprintf("(CASE WHEN %s THEN (%s * %s) ELSE 0.0 END)", safeWhereSQL, strconv.FormatFloat(effBoost, 'g', -1, 64), sumSc)
 		}
-		return CompiledQuery{WhereSQL: whereSQL, SafeWhereSQL: whereSQL, ScoreSQL: scoreSQL}
+		return CompiledQuery{WhereSQL: whereSQL, SafeWhereSQL: safeWhereSQL, ScoreSQL: scoreSQL, UsesFulltextMatch: usesFT}
 	}
 
 	var tokens []string
@@ -2990,7 +3033,8 @@ func (t *Transpiler) compileMatchBoolPrefixRound62Opts(rawField string, pe esast
 		}
 	}
 
-	var clausePreds, clauseScores []string
+	var clausePreds, clauseSafePreds, clauseScores []string
+	usesFT := false
 	for i := 0; i < len(tokens)-1; i++ {
 		tok := tokens[i]
 		var cp CompiledQuery
@@ -3011,6 +3055,10 @@ func (t *Transpiler) compileMatchBoolPrefixRound62Opts(rawField string, pe esast
 			cp = t.singleAnalyzedTokenSQL(resolved, b, tok, isWS, 1.0, scoring, nctx)
 		}
 		clausePreds = append(clausePreds, cp.WhereSQL)
+		clauseSafePreds = append(clauseSafePreds, cp.EffectiveSafeWhere())
+		if cp.UsesFulltextMatch {
+			usesFT = true
+		}
 		if scoring {
 			clauseScores = append(clauseScores, cp.ScoreSQL)
 		}
@@ -3018,7 +3066,7 @@ func (t *Transpiler) compileMatchBoolPrefixRound62Opts(rawField string, pe esast
 
 	// Trailing token is ALWAYS a prefix query (never fuzzy).
 	lastTok := tokens[len(tokens)-1]
-	var lastPred string
+	var lastPred, lastSafePred string
 	switch {
 	case b.IsVirtualSAYTSubfield && b.EffectiveArrayColumn(false) != "" && nctx == nil:
 		arrCol := b.EffectiveArrayColumn(false)
@@ -3028,58 +3076,40 @@ func (t *Transpiler) compileMatchBoolPrefixRound62Opts(rawField string, pe esast
 		} else {
 			lastPred = fmt.Sprintf("array_exists(_x -> lower(_x) LIKE lower(%s), `%s`)", likePat, arrCol)
 		}
+		lastSafePred = lastPred
 	case b.ESType == "search_as_you_type":
 		lastPred = t.compileSAYTRootPrefix(resolved, b, lastTok, false, nctx)
+		lastSafePred = lastPred
 	case isExactKeywordField(resolved, b):
 		lastPred = t.compilePrefixSingleField(resolved, lastTok, false, nctx)
+		lastSafePred = lastPred
 	case !isWS && b.Kind == schema.StoragePromotedScalar && !b.NotIndexed && nctx == nil && !strings.ContainsAny(lastTok, " \t\r\n'\"\\"):
-		lastPred = t.compileMatchPhraseField(resolved, lastTok, 0, 1.0, true, false, nctx).WhereSQL
+		cp := t.compileMatchPhraseField(resolved, lastTok, 0, 1.0, true, false, nctx)
+		lastPred = cp.WhereSQL
+		lastSafePred = cp.EffectiveSafeWhere()
+		if cp.UsesFulltextMatch {
+			usesFT = true
+		}
 	default:
 		lastPred = t.compileAnalyzedTokenOrPhrasePrefixRegex(resolved, b, lastTok, !isWS, nctx)
+		lastSafePred = lastPred
 	}
 	clausePreds = append(clausePreds, lastPred)
+	clauseSafePreds = append(clauseSafePreds, lastSafePred)
 	if scoring {
-		clauseScores = append(clauseScores, fmt.Sprintf("(CASE WHEN %s THEN 1.0 ELSE 0.0 END)", lastPred))
+		clauseScores = append(clauseScores, fmt.Sprintf("(CASE WHEN %s THEN 1.0 ELSE 0.0 END)", lastSafePred))
 	}
 
-	if pe.MinimumShouldMatch != nil {
+	isAnd := strings.EqualFold(pe.Operator, "and")
+	if pe.MinimumShouldMatch != nil && !isAnd {
 		if parseMinShouldMatch(pe.MinimumShouldMatch, len(clausePreds), true) > len(clausePreds) {
 			return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
 		}
 	}
 
-	isAnd := strings.EqualFold(pe.Operator, "and")
-	var whereSQL string
-	if isAnd {
-		if len(clausePreds) == 1 {
-			whereSQL = clausePreds[0]
-		} else {
-			whereSQL = "(" + strings.Join(clausePreds, " AND ") + ")"
-		}
-	} else if pe.MinimumShouldMatch != nil {
-		reqCount := parseMinShouldMatch(pe.MinimumShouldMatch, len(clausePreds), true)
-		if reqCount > len(clausePreds) {
-			return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
-		}
-		if reqCount <= 1 {
-			if len(clausePreds) == 1 {
-				whereSQL = clausePreds[0]
-			} else {
-				whereSQL = "(" + strings.Join(clausePreds, " OR ") + ")"
-			}
-		} else if reqCount == len(clausePreds) {
-			whereSQL = "(" + strings.Join(clausePreds, " AND ") + ")"
-		} else {
-			var casts []string
-			for _, cp := range clausePreds {
-				casts = append(casts, fmt.Sprintf("CAST(COALESCE(%s, FALSE) AS INT)", cp))
-			}
-			whereSQL = fmt.Sprintf("((%s) AND ((%s) >= %d))", strings.Join(clausePreds, " OR "), strings.Join(casts, " + "), reqCount)
-		}
-	} else if len(clausePreds) == 1 {
-		whereSQL = clausePreds[0]
-	} else {
-		whereSQL = "(" + strings.Join(clausePreds, " OR ") + ")"
+	whereSQL, safeWhereSQL, impossible := combineMatchPredicatesR65(clausePreds, clauseSafePreds, isAnd, pe.MinimumShouldMatch)
+	if impossible {
+		return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
 	}
 
 	scoreSQL := "0.0"
@@ -3090,9 +3120,9 @@ func (t *Transpiler) compileMatchBoolPrefixRound62Opts(rawField string, pe esast
 		} else if len(clauseScores) > 1 {
 			sumSc = "(" + strings.Join(clauseScores, " + ") + ")"
 		}
-		scoreSQL = fmt.Sprintf("(CASE WHEN %s THEN (%s * %s) ELSE 0.0 END)", whereSQL, strconv.FormatFloat(effBoost, 'g', -1, 64), sumSc)
+		scoreSQL = fmt.Sprintf("(CASE WHEN %s THEN (%s * %s) ELSE 0.0 END)", safeWhereSQL, strconv.FormatFloat(effBoost, 'g', -1, 64), sumSc)
 	}
-	return CompiledQuery{WhereSQL: whereSQL, SafeWhereSQL: whereSQL, ScoreSQL: scoreSQL}
+	return CompiledQuery{WhereSQL: whereSQL, SafeWhereSQL: safeWhereSQL, ScoreSQL: scoreSQL, UsesFulltextMatch: usesFT}
 }
 
 // expandMultiMatchBoolPrefixSAYTFields expands root `search_as_you_type` fields in a `multi_match`

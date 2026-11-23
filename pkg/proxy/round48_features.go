@@ -472,7 +472,7 @@ func (s *Server) handlePainlessExecute(w http.ResponseWriter, r *http.Request) {
 		idxSchema = s.getOrCompileReadOnlySchema(r.Context(), indexName)
 	}
 	fieldTypes := extractSchemaFieldTypesMapRound60(idxSchema)
-	evalDoc := prepareDocForRuntimeScript(idxSchema, docMap)
+	evalDoc := PrepareDocForRuntimeScriptRound61(idxSchema, docMap, resolveRuntimeScriptES8ModeR61Search(idxSchema, docMap))
 	if params == nil {
 		params = make(map[string]any)
 	} else if normP, okNP := normalizeJSONNumbersPreservingFloatDotRound60(params).(map[string]any); okNP {
@@ -4910,7 +4910,9 @@ func collectMatchedQueryNamesForSearch(idxSchema *schema.IndexSchema, docMap map
 			}
 		}
 	}
-	sort.Strings(out)
+	if len(knns) > 0 {
+		sort.Strings(out)
+	}
 	return out
 }
 
@@ -5063,7 +5065,6 @@ func collectMatchedQueryNames(idxSchema *schema.IndexSchema, docMap map[string]a
 		}
 	}
 	walk(idxSchema, docMap, q)
-	sort.Strings(out)
 	return out
 }
 
@@ -5837,10 +5838,15 @@ func (s *Server) preResolveSpecialQueriesInQuery(ctx context.Context, targets []
 			}
 		}
 		sort.Strings(matchedChildIDs)
+		idsBoost := hp.Boost
+		if !scoreEnabled {
+			zeroBoost := 0.0
+			idsBoost = &zeroBoost
+		}
 		cp.HasParent = nil
 		cp.Ids = &esast.IdsQuery{
 			Values:            matchedChildIDs,
-			Boost:             hp.Boost,
+			Boost:             idsBoost,
 			Name:              hp.Name,
 			ResolvedScores:    resolvedScores,
 			ResolvedInnerHits: resolvedInnerHits,

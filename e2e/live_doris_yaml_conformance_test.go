@@ -42,7 +42,7 @@ import (
 
 const liveDorisRemoteReindexWhitelistForTest = "127.0.0.1:*,[::1]:*,localhost:*,conformance.local:*"
 
-// liveDorisTier1UpstreamYAMLSpecs defines the curated 206-file Tier-1 upstream Elasticsearch v8.15.5
+// liveDorisTier1UpstreamYAMLSpecs defines the curated 316-file Tier-1 upstream Elasticsearch v8.15.5
 // YAML REST conformance corpus executed end-to-end against a live Apache Doris 4.1.3 FE+BE cluster.
 var liveDorisTier1UpstreamYAMLSpecs = []string{
 	// Bulk & Single-Doc CRUD (28)
@@ -194,13 +194,10 @@ var liveDorisTier1UpstreamYAMLSpecs = []string{
 	"rrf/100_rank_rrf.yml",
 	"rrf/300_rrf_retriever.yml",
 
-	// Round 64 Tier-1 Expansion: Clean Zero-Fail v8.15.5 Specs & F10-Unblocked Specs (70)
-	"cluster.desired_nodes/10_basic.yml",
+	// Round 64 Tier-1 Expansion: Clean Zero-Fail v8.15.5 Specs & F10-Unblocked Specs (67 retained; 3 dead cluster.desired_* specs removed in Round 65)
 	"indices.stats/13_fields.yml",
 	"cat.aliases/10_basic.yml",
 	"nodes.info/50_metrics.yml",
-	"cluster.desired_nodes/11_old_format.yml",
-	"cluster.desired_balance/10_basic.yml",
 	"indices.delete_alias/all_path_options.yml",
 	"indices.put_index_template/15_composition.yml",
 	"cluster.state/20_filtering.yml",
@@ -265,6 +262,131 @@ var liveDorisTier1UpstreamYAMLSpecs = []string{
 	"tsdb/20_mapping.yml",
 	"aggregations/time_series.yml",
 	"runtime_fields/14_keyword_errors.yml",
+
+	// Round 65 Tier-1 Expansion: +113 verified zero-failure v8.15.5 specs (+720 sections)
+	// search-as-you-type (3)
+	"search-as-you-type/10_basic.yml",
+	"search-as-you-type/20_highlighting.yml",
+	"search-as-you-type/30_synthetic_source.yml",
+	// synonyms (10)
+	"synonyms/10_synonyms_put.yml",
+	"synonyms/20_synonyms_get.yml",
+	"synonyms/30_synonyms_delete.yml",
+	"synonyms/40_synonyms_sets_get.yml",
+	"synonyms/50_synonym_rule_put.yml",
+	"synonyms/60_synonym_rule_get.yml",
+	"synonyms/70_synonym_rule_delete.yml",
+	"synonyms/80_synonyms_from_index.yml",
+	"synonyms/90_synonyms_reloading_for_synset.yml",
+	"synonyms/100_synonyms_no_system_index.yml",
+	// wildcard, constant_keyword, counted_keyword, mapper_annotatedtext (8)
+	"wildcard/10_wildcard_basic.yml",
+	"wildcard/10_script_values.yml",
+	"constant_keyword/10_basic.yml",
+	"constant_keyword/20_dynamic_mapping.yml",
+	"counted_keyword/10_basic.yml",
+	"counted_keyword/20_no_index.yml",
+	"mapper_annotatedtext/10_basic.yml",
+	"mapper_annotatedtext/20_synthetic_source.yml",
+	// aggregations + vector-tile (16)
+	"vector-tile/20_aggregations.yml",
+	"aggregations/percentile_ranks_tdigest_metric.yml",
+	"aggregations/weighted_avg.yml",
+	"aggregations/diversified_sampler.yml",
+	"aggregations/matrix_stats_multi_value_field.yml",
+	"aggregations/percentile_ranks_hdr_metric.yml",
+	"aggregations/matrix_stats_single_value_field.yml",
+	"aggregations/median_absolute_deviation_metric.yml",
+	"aggregations/extended_stats_bucket.yml",
+	"aggregations/terms_flattened_field.yml",
+	"aggregations/auto_date_histogram.yml",
+	"aggregations/composite_sorted.yml",
+	"aggregations/serial_diff.yml",
+	"aggregations/variable_width_histogram.yml",
+	"aggregations/date_range.yml",
+	"aggregations/ip_range.yml",
+	// search + search.query (18)
+	"search.query/60_synonym_graph.yml",
+	"search.query/20_ngram_search.yml",
+	"search.query/50_queries_with_synonyms.yml",
+	"search/520_fetch_fields.yml",
+	"search/200_ignore_malformed.yml",
+	"search/340_flattened.yml",
+	"search/40_indices_boost.yml",
+	"search/500_date_range.yml",
+	"search/140_pre_filter_search_shards.yml",
+	"search/20_default_values.yml",
+	"search/240_date_nanos.yml",
+	"search/300_sequence_numbers.yml",
+	"search/80_indices_options.yml",
+	"search/120_batch_reduce_size.yml",
+	"search/190_index_prefix_search.yml",
+	"search/260_parameter_validation.yml",
+	"search/350_binary_field.yml",
+	"search/390_lookup_fields.yml",
+	// search.vectors + rrf (10)
+	"search.vectors/60_dense_vector_dynamic_mapping.yml",
+	"search.vectors/100_knn_nested_search.yml",
+	"search.vectors/150_knn_search_missing_params.yml",
+	"search.vectors/170_knn_search_hex_encoded_byte_vectors.yml",
+	"search.vectors/45_knn_search_bit_flat.yml",
+	"search.vectors/45_knn_search_byte.yml",
+	"search.vectors/80_dense_vector_indexed_by_default.yml",
+	"search.vectors/110_knn_query_with_filter.yml",
+	"rrf/150_rank_rrf_pagination.yml",
+	"rrf/550_rrf_sub_searches_explain.yml",
+	// esql + sql + eql (14)
+	"sql/sql.yml",
+	"sql/translate.yml",
+	"eql/20_runtime_mappings.yml",
+	"esql/160_union_types.yml",
+	"esql/20_aggs.yml",
+	"esql/130_spatial.yml",
+	"esql/140_metadata.yml",
+	"esql/150_lookup.yml",
+	"esql/25_aggs_on_null.yml",
+	"esql/161_union_types_subfields.yml",
+	"esql/110_all_null.yml",
+	"esql/60_enrich.yml",
+	"esql/61_enrich_ip.yml",
+	"esql/45_non_tsdb_counter.yml",
+	// mget + update_by_query + delete_by_query + reindex + scroll (12)
+	"mget/90_synthetic_source.yml",
+	"mget/40_routing.yml",
+	"mget/12_non_existent_index.yml",
+	"mget/14_alias_to_multiple_indices.yml",
+	"update_by_query/60_throttle.yml",
+	"update_by_query/70_slices.yml",
+	"delete_by_query/70_throttle.yml",
+	"delete_by_query/80_slices.yml",
+	"reindex/100_tsdb.yml",
+	"reindex/40_versioning.yml",
+	"reindex/80_slices.yml",
+	"scroll/12_slices.yml",
+	// ingest + ingest_attachment + simulate.ingest (12)
+	"simulate.ingest/10_basic.yml",
+	"ingest_attachment/20_attachment_processor.yml",
+	"ingest/15_info_ingest.yml",
+	"ingest/120_grok.yml",
+	"ingest/210_pipeline_processor.yml",
+	"ingest/50_on_failure.yml",
+	"ingest/70_bulk.yml",
+	"ingest/140_json.yml",
+	"ingest/220_drop_processor.yml",
+	"ingest/250_csv.yml",
+	"ingest/60_fail.yml",
+	"ingest/200_dissect_processor.yml",
+	// runtime_fields (10)
+	"runtime_fields/101_geo_point_from_source.yml",
+	"runtime_fields/102_geo_point_source_in_query.yml",
+	"runtime_fields/24_long_errors.yml",
+	"runtime_fields/34_double_errors.yml",
+	"runtime_fields/44_date_errors.yml",
+	"runtime_fields/54_ip_errors.yml",
+	"runtime_fields/64_boolean_errors.yml",
+	"runtime_fields/100_geo_point.yml",
+	"runtime_fields/103_geo_point_calculated_at_index.yml",
+	"runtime_fields/13_keyword_calculated_at_index.yml",
 }
 
 type liveInProcessHandlerTransport struct {
@@ -463,15 +585,15 @@ func waitForLiveDorisBEReady(t *testing.T, db *sql.DB, dorisDB string) {
 }
 
 // TestLiveDorisTier1SpecList_ValidatesAgainstUpstreamCache verifies that when the gitignored
-// `.cache/es-v8.15.5` corpus is populated on disk, the curated Tier-1 list resolves to 200–220
-// (specifically 206) unique upstream YAML files whose `displayPath` matches `ScoreMatchingFiles`.
+// `.cache/es-v8.15.5` corpus is populated on disk, the curated Tier-1 list resolves to 305–330
+// (specifically 316) unique upstream YAML files whose `displayPath` matches `ScoreMatchingFiles`.
 func TestLiveDorisTier1SpecList_ValidatesAgainstUpstreamCache(t *testing.T) {
 	tier1Filter := buildTier1SpecFilter()
 	if len(tier1Filter) != len(liveDorisTier1UpstreamYAMLSpecs) {
 		t.Fatalf("duplicate entries in liveDorisTier1UpstreamYAMLSpecs: unique=%d total=%d", len(tier1Filter), len(liveDorisTier1UpstreamYAMLSpecs))
 	}
-	if len(tier1Filter) < 200 || len(tier1Filter) > 220 {
-		t.Fatalf("curated Tier-1 spec count = %d, want between 200 and 220", len(tier1Filter))
+	if len(tier1Filter) < 305 || len(tier1Filter) > 330 {
+		t.Fatalf("curated Tier-1 spec count = %d, want between 305 and 330", len(tier1Filter))
 	}
 
 	v8Root := filepath.Join(resolveE2EConformanceCacheDir(), "es-v8.15.5")
@@ -517,7 +639,7 @@ func TestLiveDorisTier1SpecList_ValidatesAgainstUpstreamCache(t *testing.T) {
 		t.Fatalf("curated Tier-1 specs missing from .cache/es-v8.15.5: %v", missing)
 	}
 
-	// Verify ScoreMatchingFiles agrees 100% on all 206 displayPath entries and yields >= 1400 passed sections.
+	// Verify ScoreMatchingFiles agrees 100% on all 316 displayPath entries and yields >= 2350 passed sections.
 	memCard, scoreErr := compliance.ScoreMatchingFiles(
 		compliance.SuiteOptions{
 			CorpusName:                 "mem-tier1-validation",
@@ -546,14 +668,14 @@ func TestLiveDorisTier1SpecList_ValidatesAgainstUpstreamCache(t *testing.T) {
 	if memCard.ParseErrors != 0 {
 		t.Fatalf("ScoreMatchingFiles ParseErrors = %d, want 0", memCard.ParseErrors)
 	}
-	if memCard.SectionsPassed < 1400 {
-		t.Fatalf("Tier-1 206-file suite SectionsPassed = %d, want >= 1400", memCard.SectionsPassed)
+	if memCard.SectionsPassed < 2350 {
+		t.Fatalf("Tier-1 316-file suite SectionsPassed = %d, want >= 2350", memCard.SectionsPassed)
 	}
-	t.Logf("[Tier-1 206-File Precheck] files=%d sections=%d passed=%d failed=%d skipped=%d pass_rate=%.2f%%",
+	t.Logf("[Tier-1 316-File Precheck] files=%d sections=%d passed=%d failed=%d skipped=%d pass_rate=%.2f%%",
 		memCard.TotalFiles, memCard.SectionsTotal, memCard.SectionsPassed, memCard.SectionsFailed, memCard.SectionsSkipped, memCard.PassRatePct)
 }
 
-// TestLiveDorisUpstreamYAMLConformance_E2E executes the curated 206-file Tier-1 upstream
+// TestLiveDorisUpstreamYAMLConformance_E2E executes the curated 316-file Tier-1 upstream
 // Elasticsearch v8.15.5 YAML REST conformance suite against a live Apache Doris 4.1.3 cluster
 // via ScoreMatchingFiles, resetting Doris table/catalog state cleanly between sections.
 func TestLiveDorisUpstreamYAMLConformance_E2E(t *testing.T) {
@@ -683,7 +805,7 @@ func TestLiveDorisUpstreamYAMLConformance_E2E(t *testing.T) {
 		}
 	}
 
-	minPassed := 1400
+	minPassed := 2350
 	if rawMin := strings.TrimSpace(os.Getenv("DORIS_LIVE_YAML_MIN_PASSED")); rawMin != "" {
 		parsedMin, convErr := strconv.Atoi(rawMin)
 		if convErr != nil {

@@ -2436,6 +2436,7 @@ func (s *Server) createPhysicalBackingIndexR62Search(
 	compiled := schema.CompileIndexSchema(s.dorisDB, backingName, effMappings)
 	compiled.ES8Mode = isES8
 	_ = parseAndApplyIndexMappingSettingsRound59(mergedSettings, compiled)
+	_ = compiled.SetAnalysisSettings(normalizeJSONNumbersForAnalysisR65(mergedSettings))
 	if !isFailureStore {
 		if mode, routingPath, startTime, endTime, tsErr := schema.ExtractTSDBSettings(mergedSettings); tsErr == nil && mode == "time_series" {
 			compiled.IndexMode = "time_series"
@@ -2452,6 +2453,14 @@ func (s *Server) createPhysicalBackingIndexR62Search(
 		}
 	}
 	schema.ApplyIndexModeDefaults(compiled)
+	if compiled.IndexMode == "time_series" {
+		if compiled.RawMapping == nil {
+			compiled.RawMapping = &esast.MappingSpec{}
+		}
+		if compiled.RawMapping.Source == nil && !compiled.SourceDisabled() {
+			compiled.RawMapping.Source = map[string]any{"mode": "synthetic"}
+		}
+	}
 	if err := schema.ValidateIndexSortFields(compiled, mergedSettings); err != nil {
 		return nil, err
 	}
@@ -2691,6 +2700,7 @@ func (s *Server) createOrAutoCreateDataStreamR62Search(
 
 func (s *Server) enrichDataStreamResponseMapLockedR62Search(ds map[string]any) map[string]any {
 	cp := deepCloneDocMap(ds)
+	delete(cp, "__lazy_rollover")
 	streamName, _ := cp["name"].(string)
 	if _, hasFS := cp["failure_store"]; !hasFS {
 		cp["failure_store"] = map[string]any{
@@ -3907,6 +3917,18 @@ func (s *Server) handleRolloverR62Search(w http.ResponseWriter, r *http.Request)
 				"lazy rollover does not support conditions")
 			return
 		}
+		if !dryRun {
+			var lazySnap map[string]any
+			s.mu.Lock()
+			if liveDS := s.dataStreams[alias]; liveDS != nil {
+				liveDS["__lazy_rollover"] = true
+				lazySnap = deepCloneDocMap(liveDS)
+			}
+			s.mu.Unlock()
+			if lazySnap != nil {
+				s.persistDataStream(r.Context(), alias, lazySnap)
+			}
+		}
 		writeJSONWithRequest(w, r, http.StatusOK, map[string]any{
 			"acknowledged":        true,
 			"shards_acknowledged": false,
@@ -4552,6 +4574,64 @@ func (s *Server) prepareAutoCreateTargetR62Search(
 	if isDS {
 		if !isCreateOp && s.isDataStream(target) {
 			return http.StatusBadRequest, "illegal_argument_exception", "only write ops with an op_type of create are allowed in data streams"
+		}
+		var needLazyRollover bool
+		var nextGen int
+		s.mu.RLock()
+		if dsObj := s.dataStreams[target]; dsObj != nil {
+			if lazy, _ := dsObj["__lazy_rollover"].(bool); lazy {
+				needLazyRollover = true
+				curGen, _ := toInt64(dsObj["generation"])
+				nextGen = int(curGen) + 1
+				if nextGen < 2 {
+					nextGen = 2
+				}
+			}
+		}
+		s.mu.RUnlock()
+		if needLazyRollover {
+			newIdx := formatDataStreamBackingIndexNameR62Search(target, nextGen, s.hasExplicitTargetESVersion())
+			newSchema, ddlErr := s.createPhysicalBackingIndexR62Search(ctx, target, newIdx, false, nil, nil, s.isES8Mode(r))
+			if ddlErr != nil {
+				return http.StatusInternalServerError, "doris_ddl_exception", ddlErr.Error()
+			}
+			s.mu.Lock()
+			if liveDS := s.dataStreams[target]; liveDS != nil {
+				delete(liveDS, "__lazy_rollover")
+				liveDS["generation"] = nextGen
+				preferILM, _ := liveDS["prefer_ilm"].(bool)
+				nextManagedBy, _ := liveDS["next_generation_managed_by"].(string)
+				if nextManagedBy == "" {
+					nextManagedBy = "Unmanaged"
+				}
+				newEntry := map[string]any{
+					"index_name": newIdx,
+					"index_uuid": indexUUIDForNameRound61(newIdx),
+					"prefer_ilm": preferILM,
+					"managed_by": nextManagedBy,
+				}
+				if ilmPol, okP := liveDS["ilm_policy"].(string); okP && ilmPol != "" {
+					newEntry["ilm_policy"] = ilmPol
+				}
+				curIndices, _ := liveDS["indices"].([]any)
+				liveDS["indices"] = append(curIndices, newEntry)
+				if newSchema != nil && newSchema.IndexMode == "time_series" {
+					liveDS["time_series"] = map[string]any{
+						"temporal_ranges": []any{
+							map[string]any{
+								"start": newSchema.TimeSeriesStartTime,
+								"end":   newSchema.TimeSeriesEndTime,
+							},
+						},
+					}
+				}
+				snap := deepCloneDocMap(liveDS)
+				s.mu.Unlock()
+				s.persistDataStream(ctx, target, snap)
+				s.queryCache.InvalidateAll()
+			} else {
+				s.mu.Unlock()
+			}
 		}
 		return 0, "", ""
 	}
@@ -6504,6 +6584,11 @@ func (s *Server) effectiveTranspileOptsForIndexR62Search(
 				opts.MaxRegexLength = iv
 			}
 		}
+		if rawV, ok := lookupRawIndexSettingPresenceR62Admin(idxCustom, "top_metrics_max_size"); ok && rawV != nil {
+			if iv, err := strconv.Atoi(strings.TrimSpace(fmt.Sprintf("%v", rawV))); err == nil && iv > 0 {
+				opts.TopMetricsMaxSize = iv
+			}
+		}
 		if rawV, ok := lookupRawIndexSettingPresenceR62Admin(idxCustom, "search.synonyms_phrase_query"); ok && rawV != nil {
 			if b, okB := parseOptionalBoolAny(rawV); okB && !b {
 				opts.DisableSynonymsPhraseQuery = true
@@ -6767,7 +6852,7 @@ func emitRuntimeIPPrefixAggRowsR62Search(
 		if parentBucketKey != "" {
 			rowKey = parentBucketKey + "\x1f" + k
 		}
-		cnt := int64(len(bDocs))
+		cnt := sumDocCountFieldForMatchedDocsR63(bDocs)
 		*out = append(*out, AggRow{
 			AggName:   fullAggName,
 			BucketKey: rowKey,
@@ -7539,7 +7624,7 @@ func emitRuntimeAutoDateHistogramAggRowsR62Search(
 		if parentBucketKey != "" {
 			rowKey = parentBucketKey + "\x1f" + k
 		}
-		cnt := int64(len(bDocs))
+		cnt := sumDocCountFieldForMatchedDocsR63(bDocs)
 		*out = append(*out, AggRow{
 			AggName:   fullAggName,
 			BucketKey: rowKey,
@@ -7554,7 +7639,7 @@ func emitRuntimeAutoDateHistogramAggRowsR62Search(
 
 func aggsHaveAutoDateOrSignificantTextR62Search(aggs map[string]esast.AggSpec) bool {
 	for _, spec := range aggs {
-		if spec.AutoDateHistogram != nil || spec.SignificantText != nil {
+		if spec.AutoDateHistogram != nil || spec.SignificantText != nil || (spec.IsSignificantTerms() && spec.EffectiveTerms() != nil && spec.EffectiveTerms().BackgroundFilter != nil) {
 			return true
 		}
 		if spec.Composite != nil {
@@ -7760,28 +7845,37 @@ type sigHeuristicSpecR62Search struct {
 }
 
 func computeSignificantScoreR62Search(heur sigHeuristicSpecR62Search, fgCount, fgTotal, bgCount, bgTotal int64) float64 {
+	return computeSignificantScoreWithSupersetR62Search(heur, fgCount, fgTotal, bgCount, bgTotal, true)
+}
+
+func computeSignificantScoreWithSupersetR62Search(heur sigHeuristicSpecR62Search, fgCount, fgTotal, bgCount, bgTotal int64, defaultSuperset bool) float64 {
 	if fgCount <= 0 || fgTotal <= 0 || bgTotal <= 0 {
 		return 0
 	}
-	if bgCount < fgCount {
-		bgCount = fgCount
+	bgIsSuperset := defaultSuperset
+	if b, ok := heur.params["background_is_superset"].(bool); ok {
+		bgIsSuperset = b
 	}
-	if bgTotal < fgTotal {
-		bgTotal = fgTotal
+	if bgIsSuperset {
+		if bgCount < fgCount {
+			bgCount = fgCount
+		}
+		if bgTotal < fgTotal {
+			bgTotal = fgTotal
+		}
 	}
 	fgFreq := float64(fgCount) / float64(fgTotal)
 	bgFreq := float64(bgCount) / float64(bgTotal)
-	if bgFreq <= 0 {
+	if bgFreq <= 0 && heur.kind != "jlh" && heur.kind != "percentage" && heur.kind != "gnd" && heur.kind != "chi_square" {
 		return 0
 	}
 	switch heur.kind {
 	case "percentage":
+		if bgCount <= 0 {
+			return float64(fgCount)
+		}
 		return float64(fgCount) / float64(bgCount)
 	case "gnd":
-		bgIsSuperset := true
-		if b, ok := heur.params["background_is_superset"].(bool); ok {
-			bgIsSuperset = b
-		}
 		n11 := float64(fgCount)
 		n10 := float64(fgTotal - fgCount)
 		var n01, n00 float64
@@ -7813,12 +7907,8 @@ func computeSignificantScoreR62Search(heur sigHeuristicSpecR62Search, fgCount, f
 		if b, ok := heur.params["include_negatives"].(bool); ok {
 			includeNeg = b
 		}
-		if !includeNeg && fgFreq < bgFreq {
+		if !includeNeg && fgFreq <= bgFreq {
 			return 0
-		}
-		bgIsSuperset := true
-		if b, ok := heur.params["background_is_superset"].(bool); ok {
-			bgIsSuperset = b
 		}
 		var allDocs, otherSubTotal, otherTermCount float64
 		if bgIsSuperset {
@@ -7882,8 +7972,38 @@ func emitRuntimeSignificantTextAggRowsR62Search(
 	idxSchema *schema.IndexSchema,
 ) {
 	stSpec := aggSpec.SignificantText
-	if stSpec == nil {
+	tSpec := aggSpec.EffectiveTerms()
+	isSigTerms := stSpec == nil && aggSpec.IsSignificantTerms() && tSpec != nil
+	if stSpec == nil && !isSigTerms {
 		return
+	}
+	fieldName := ""
+	aggSize := 10
+	var minDocCnt *int
+	var bgFilter *esast.Query
+	var incFilter, excFilter any
+	var sourceFields []string
+	filterDup := false
+	if stSpec != nil {
+		fieldName = stSpec.Field
+		if stSpec.Size > 0 {
+			aggSize = stSpec.Size
+		}
+		minDocCnt = stSpec.MinDocCount
+		bgFilter = stSpec.BackgroundFilter
+		incFilter = stSpec.Include
+		excFilter = stSpec.Exclude
+		sourceFields = stSpec.SourceFields
+		filterDup = stSpec.FilterDuplicateText != nil && *stSpec.FilterDuplicateText
+	} else {
+		fieldName = tSpec.Field
+		if tSpec.Size > 0 {
+			aggSize = tSpec.Size
+		}
+		minDocCnt = tSpec.MinDocCount
+		bgFilter = tSpec.BackgroundFilter
+		incFilter = tSpec.Include
+		excFilter = tSpec.Exclude
 	}
 	bgDocs := allCorpusDocs
 	scope := scopeFromMatchedDocsR63(fgDocs, allCorpusDocs)
@@ -7909,10 +8029,10 @@ func emitRuntimeSignificantTextAggRowsR62Search(
 	if len(bgDocs) == 0 {
 		bgDocs = fgDocs
 	}
-	if stSpec.BackgroundFilter != nil {
+	if bgFilter != nil {
 		filteredBG := make([]runtimeMatchedDoc, 0, len(bgDocs))
 		for _, md := range bgDocs {
-			if evalBranchMatchesDoc(md.EffectiveSchema(idxSchema), md.doc, stSpec.BackgroundFilter) {
+			if evalBranchMatchesDoc(md.EffectiveSchema(idxSchema), md.doc, bgFilter) {
 				filteredBG = append(filteredBG, md)
 			}
 		}
@@ -7920,10 +8040,13 @@ func emitRuntimeSignificantTextAggRowsR62Search(
 	}
 
 	analyzerName := "standard"
+	fieldESType := ""
 	if idxSchema != nil {
-		if b := idxSchema.ResolveField(stSpec.Field); b.Analyzer != "" {
+		b := idxSchema.ResolveField(fieldName)
+		if b.Analyzer != "" {
 			analyzerName = b.Analyzer
 		}
+		fieldESType = b.ESType
 	}
 	var anCfg *analysis.IndexAnalysisConfig
 	if idxSchema != nil && idxSchema.IndexName != "" && scope != nil && scope.srv != nil {
@@ -7939,12 +8062,28 @@ func emitRuntimeSignificantTextAggRowsR62Search(
 		anCfg = analysis.DefaultIndexAnalysisConfig()
 	}
 
-	sourceFields := stSpec.SourceFields
 	if len(sourceFields) == 0 {
-		sourceFields = []string{stSpec.Field}
+		sourceFields = []string{fieldName}
 	}
 
 	extractDocTokens := func(md runtimeMatchedDoc) ([]string, string) {
+		if isSigTerms && fieldESType != "text" && fieldESType != "match_only_text" {
+			vals := extractDocRawValuesForMetric(md, &esast.MetricAggSpec{
+				Field:   fieldName,
+				Missing: tSpec.Missing,
+				Script:  tSpec.Script,
+			})
+			seen := make(map[string]bool, len(vals))
+			var toks []string
+			for _, v := range vals {
+				s := fmt.Sprintf("%v", v)
+				if s != "" && !seen[s] {
+					seen[s] = true
+					toks = append(toks, s)
+				}
+			}
+			return toks, strings.Join(toks, " ")
+		}
 		var rawTexts []string
 		effSc := md.EffectiveSchema(idxSchema)
 		for _, sf := range sourceFields {
@@ -7973,7 +8112,7 @@ func emitRuntimeSignificantTextAggRowsR62Search(
 		seen := make(map[string]bool)
 		var toks []string
 		if effSc != nil {
-			fType := effSc.ResolveField(stSpec.Field).ESType
+			fType := effSc.ResolveField(fieldName).ESType
 			if fType == "annotated_text" || fType == "annotated-text" {
 				for _, rt := range rawTexts {
 					for _, ann := range extractAnnotatedTextAnnotationsWave3R63(rt) {
@@ -7995,8 +8134,6 @@ func emitRuntimeSignificantTextAggRowsR62Search(
 		}
 		return toks, joined
 	}
-
-	filterDup := stSpec.FilterDuplicateText != nil && *stSpec.FilterDuplicateText
 	rawFgDocFreq := make(map[string]int64)
 	fgDeduplicated := make([]runtimeMatchedDoc, 0, len(fgDocs))
 	fgTokensByDoc := make([][]string, 0, len(fgDocs))
@@ -8065,18 +8202,20 @@ func emitRuntimeSignificantTextAggRowsR62Search(
 	}
 
 	minCnt := int64(3)
-	if stSpec.MinDocCount != nil {
-		minCnt = int64(*stSpec.MinDocCount)
+	if minDocCnt != nil {
+		minCnt = int64(*minDocCnt)
 	}
 	var incRe, excRe *regexp.Regexp
-	if s, ok := stSpec.Include.(string); ok {
+	if s, ok := incFilter.(string); ok {
 		incRe, _ = regexp.Compile("^(?:" + s + ")$")
 	}
-	if s, ok := stSpec.Exclude.(string); ok {
+	if s, ok := excFilter.(string); ok {
 		excRe, _ = regexp.Compile("^(?:" + s + ")$")
 	}
 
 	heur := extractSigHeuristicForAggFromRawR63(scopeRawBodyR63(scope), fullAggName)
+	includeNeg, _ := heur.params["include_negatives"].(bool)
+	bgIsSuperset := bgFilter == nil
 	type sigCand struct {
 		term    string
 		fgCount int64
@@ -8090,7 +8229,7 @@ func emitRuntimeSignificantTextAggRowsR62Search(
 	for term, tDocs := range fgDocsByTerm {
 		fgCnt := int64(len(tDocs))
 		effFgCnt := fgCnt
-		if filterDup && stSpec.MinDocCount == nil {
+		if filterDup && minDocCnt == nil {
 			if fgCnt < 2 {
 				continue
 			}
@@ -8099,18 +8238,23 @@ func emitRuntimeSignificantTextAggRowsR62Search(
 		if effFgCnt < minCnt {
 			continue
 		}
-		if stSpec.Include != nil && !matchesTermsFilterPrecompiledWithSchemaR62Search(term, stSpec.Include, incRe, "keyword") {
+		if incFilter != nil && !matchesTermsFilterPrecompiledWithSchemaR62Search(term, incFilter, incRe, "keyword") {
 			continue
 		}
-		if stSpec.Exclude != nil && matchesTermsFilterPrecompiledWithSchemaR62Search(term, stSpec.Exclude, excRe, "keyword") {
+		if excFilter != nil && matchesTermsFilterPrecompiledWithSchemaR62Search(term, excFilter, excRe, "keyword") {
 			continue
 		}
 		bgCnt := bgDocFreq[term]
-		if bgCnt < fgCnt {
+		if bgIsSuperset && bgCnt < fgCnt {
 			bgCnt = fgCnt
 		}
-		sc := computeSignificantScoreR62Search(heur, fgCnt, fgTotal, bgCnt, bgTotal)
-		if sc <= 0 && heur.kind != "mutual_information" && heur.kind != "percentage" && heur.kind != "gnd" {
+		sc := computeSignificantScoreWithSupersetR62Search(heur, fgCnt, fgTotal, bgCnt, bgTotal, bgIsSuperset)
+		if !bgIsSuperset && bgCnt == 0 && (heur.kind == "jlh" || heur.kind == "") {
+			fgFreq := float64(fgCnt) / math.Max(1, float64(fgTotal))
+			effBgFreq := 1.0 / float64(bgTotal+1)
+			sc = math.Max(fgFreq/effBgFreq, (fgFreq-effBgFreq)*(fgFreq/effBgFreq))
+		}
+		if sc <= 0 && (!includeNeg || (heur.kind != "mutual_information" && heur.kind != "chi_square" && heur.kind != "gnd")) && heur.kind != "percentage" {
 			continue
 		}
 		cands = append(cands, sigCand{
@@ -8128,9 +8272,9 @@ func emitRuntimeSignificantTextAggRowsR62Search(
 		if cands[i].fgCount != cands[j].fgCount {
 			return cands[i].fgCount > cands[j].fgCount
 		}
-		return cands[i].term < cands[j].term
+		return cands[i].term > cands[j].term
 	})
-	limit := stSpec.Size
+	limit := aggSize
 	if limit <= 0 {
 		limit = 10
 	}
@@ -8627,7 +8771,227 @@ func (s *Server) validateSearchLimitsAndParamsR62Search(
 			return st, et, er
 		}
 	}
+	if s != nil && s.hasExplicitTargetESVersion() {
+		verNum := s.getTargetESVersion()
+		if !esVersionAtLeastR65(verNum, 8, 11, 0) && queryHasPinnedDocsMissingIndexR65(req.Query) {
+			return http.StatusBadRequest, "parsing_exception", "[pinned.docs] [_index] must not be null or empty"
+		}
+		if strings.HasPrefix(verNum, "8.") {
+			for _, sSpec := range req.Sort {
+				if sSpec.Entry.WasLegacyNestedPath {
+					return http.StatusBadRequest, "parsing_exception", "[nested_path] has been removed in favour of the [nested] parameter"
+				}
+				if sSpec.Entry.WasLegacyNestedFilter {
+					return http.StatusBadRequest, "parsing_exception", "[nested_filter] has been removed in favour of the [nested] parameter"
+				}
+			}
+			if st, et, er := validateRemovedES8SearchConstructsR65(req); st != 0 {
+				return st, et, er
+			}
+		}
+	}
 	return 0, "", ""
+}
+
+func esVersionAtLeastR65(ver string, maj, min, pat int) bool {
+	parts := strings.Split(strings.TrimSpace(ver), ".")
+	parsePart := func(idx int) int {
+		if idx >= len(parts) {
+			return 0
+		}
+		p := strings.TrimSpace(parts[idx])
+		if dash := strings.IndexAny(p, "-+"); dash >= 0 {
+			p = p[:dash]
+		}
+		v, _ := strconv.Atoi(p)
+		return v
+	}
+	vmaj, vmin, vpat := parsePart(0), parsePart(1), parsePart(2)
+	if vmaj != maj {
+		return vmaj > maj
+	}
+	if vmin != min {
+		return vmin > min
+	}
+	return vpat >= pat
+}
+
+func queryHasPinnedDocsMissingIndexR65(q *esast.Query) bool {
+	if q == nil {
+		return false
+	}
+	if q.Pinned != nil && q.Pinned.HasDocsMissingIndex {
+		return true
+	}
+	if q.Pinned != nil && queryHasPinnedDocsMissingIndexR65(q.Pinned.Organic) {
+		return true
+	}
+	if q.ConstantScore != nil && queryHasPinnedDocsMissingIndexR65(&q.ConstantScore.Filter) {
+		return true
+	}
+	if q.Boosting != nil {
+		if queryHasPinnedDocsMissingIndexR65(&q.Boosting.Positive) || queryHasPinnedDocsMissingIndexR65(&q.Boosting.Negative) {
+			return true
+		}
+	}
+	if q.DisMax != nil {
+		for i := range q.DisMax.Queries {
+			if queryHasPinnedDocsMissingIndexR65(&q.DisMax.Queries[i]) {
+				return true
+			}
+		}
+	}
+	if q.FunctionScore != nil && queryHasPinnedDocsMissingIndexR65(q.FunctionScore.Query) {
+		return true
+	}
+	if q.ScriptScore != nil && queryHasPinnedDocsMissingIndexR65(q.ScriptScore.Query) {
+		return true
+	}
+	if q.Nested != nil && queryHasPinnedDocsMissingIndexR65(&q.Nested.Query) {
+		return true
+	}
+	if q.HasChild != nil && queryHasPinnedDocsMissingIndexR65(&q.HasChild.Query) {
+		return true
+	}
+	if q.HasParent != nil && queryHasPinnedDocsMissingIndexR65(&q.HasParent.Query) {
+		return true
+	}
+	if q.Wrapper != nil && q.Wrapper.Decoded != nil && queryHasPinnedDocsMissingIndexR65(q.Wrapper.Decoded) {
+		return true
+	}
+	if q.Bool != nil {
+		for _, cl := range [][]esast.Query{q.Bool.Must, q.Bool.Filter, q.Bool.Should, q.Bool.MustNot} {
+			for i := range cl {
+				if queryHasPinnedDocsMissingIndexR65(&cl[i]) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func validateRemovedES8SearchConstructsR65(req *esast.SearchRequest) (int, string, string) {
+	if req == nil {
+		return 0, "", ""
+	}
+	var walkQuery func(q *esast.Query) (int, string, string)
+	walkQuery = func(q *esast.Query) (int, string, string) {
+		if q == nil {
+			return 0, "", ""
+		}
+		if len(q.Common) > 0 {
+			return http.StatusBadRequest, "parsing_exception",
+				"Common Terms Query usage is not supported. Use [match] query which can efficiently skip blocks of documents if the total number of hits is not tracked."
+		}
+		if q.MultiMatch != nil && q.MultiMatch.CutoffFrequency != 0 {
+			return http.StatusBadRequest, "parsing_exception",
+				"cutoff_freqency is not supported. The [multi_match] query can skip block of documents efficiently if the total number of hits is not tracked"
+		}
+		for _, entry := range q.Match {
+			if entry.CutoffFrequency != 0 {
+				return http.StatusBadRequest, "parsing_exception",
+					"cutoff_freqency is not supported. The [match] query can skip block of documents efficiently if the total number of hits is not tracked"
+			}
+		}
+		if q.ConstantScore != nil {
+			if st, et, er := walkQuery(&q.ConstantScore.Filter); st != 0 {
+				return st, et, er
+			}
+		}
+		if q.Boosting != nil {
+			if st, et, er := walkQuery(&q.Boosting.Positive); st != 0 {
+				return st, et, er
+			}
+			if st, et, er := walkQuery(&q.Boosting.Negative); st != 0 {
+				return st, et, er
+			}
+		}
+		if q.DisMax != nil {
+			for i := range q.DisMax.Queries {
+				if st, et, er := walkQuery(&q.DisMax.Queries[i]); st != 0 {
+					return st, et, er
+				}
+			}
+		}
+		if q.FunctionScore != nil {
+			if st, et, er := walkQuery(q.FunctionScore.Query); st != 0 {
+				return st, et, er
+			}
+			for _, fn := range q.FunctionScore.Functions {
+				if st, et, er := walkQuery(fn.Filter); st != 0 {
+					return st, et, er
+				}
+			}
+		}
+		if q.ScriptScore != nil {
+			if st, et, er := walkQuery(q.ScriptScore.Query); st != 0 {
+				return st, et, er
+			}
+		}
+		if q.Nested != nil {
+			if st, et, er := walkQuery(&q.Nested.Query); st != 0 {
+				return st, et, er
+			}
+		}
+		if q.HasChild != nil {
+			if st, et, er := walkQuery(&q.HasChild.Query); st != 0 {
+				return st, et, er
+			}
+		}
+		if q.HasParent != nil {
+			if st, et, er := walkQuery(&q.HasParent.Query); st != 0 {
+				return st, et, er
+			}
+		}
+		if q.Pinned != nil {
+			if st, et, er := walkQuery(q.Pinned.Organic); st != 0 {
+				return st, et, er
+			}
+		}
+		if q.Wrapper != nil && q.Wrapper.Decoded != nil {
+			if st, et, er := walkQuery(q.Wrapper.Decoded); st != 0 {
+				return st, et, er
+			}
+		}
+		if q.Bool != nil {
+			for _, cl := range [][]esast.Query{q.Bool.Must, q.Bool.Filter, q.Bool.Should, q.Bool.MustNot} {
+				for i := range cl {
+					if st, et, er := walkQuery(&cl[i]); st != 0 {
+						return st, et, er
+					}
+				}
+			}
+		}
+		return 0, "", ""
+	}
+	if st, et, er := walkQuery(req.Query); st != 0 {
+		return st, et, er
+	}
+	if st, et, er := walkQuery(req.PostFilter); st != 0 {
+		return st, et, er
+	}
+	var walkAggs func(aggs map[string]esast.AggSpec) (int, string, string)
+	walkAggs = func(aggs map[string]esast.AggSpec) (int, string, string) {
+		for _, spec := range aggs {
+			if spec.MovingAvg != nil {
+				return http.StatusBadRequest, "parsing_exception",
+					"Moving Average aggregation usage is not supported. Use the [moving_fn] aggregation instead."
+			}
+			if spec.Filter != nil {
+				if st, et, er := walkQuery(spec.Filter); st != 0 {
+					return st, et, er
+				}
+			}
+			if sub := spec.SubAggs(); len(sub) > 0 {
+				if st, et, er := walkAggs(sub); st != 0 {
+					return st, et, er
+				}
+			}
+		}
+		return 0, "", ""
+	}
+	return walkAggs(req.EffectiveAggs())
 }
 
 func extractIntSettingR62Search(m map[string]any, keys ...string) (int, bool) {
@@ -8981,7 +9345,7 @@ func enrichSearchProfilePayloadR62Search(
 		for _, sn := range subNames {
 			subSpec := subAggs[sn]
 			if isSiblingPipelineAggSpec(subSpec) || subSpec.EffectiveCumulative() != nil || subSpec.Derivative != nil ||
-				subSpec.EffectiveMovingAvg() != nil || subSpec.SerialDiff != nil || subSpec.Normalize != nil ||
+				subSpec.EffectiveMovingAvg() != nil || subSpec.MovingPercentiles != nil || subSpec.SerialDiff != nil || subSpec.Normalize != nil ||
 				subSpec.BucketScript != nil || subSpec.BucketSelector != nil || subSpec.BucketSort != nil {
 				continue
 			}
@@ -9201,10 +9565,46 @@ func profileAggClassR62Search(
 // Wave-3 Batch A: Analysis Settings Validation, Phrase Suggester & SAYT Highlighting
 // ============================================================================
 
+func normalizeJSONNumbersForAnalysisR65(settings map[string]any) map[string]any {
+	if len(settings) == 0 {
+		return settings
+	}
+	var conv func(v any) any
+	conv = func(v any) any {
+		switch tv := v.(type) {
+		case json.Number:
+			if i, err := tv.Int64(); err == nil {
+				return i
+			}
+			if f, err := tv.Float64(); err == nil {
+				return f
+			}
+			return tv.String()
+		case map[string]any:
+			out := make(map[string]any, len(tv))
+			for k, val := range tv {
+				out[k] = conv(val)
+			}
+			return out
+		case []any:
+			out := make([]any, len(tv))
+			for i, val := range tv {
+				out[i] = conv(val)
+			}
+			return out
+		default:
+			return v
+		}
+	}
+	res, _ := conv(settings).(map[string]any)
+	return res
+}
+
 func (s *Server) validateIndexAnalysisSettingsR62Search(settings map[string]any) (int, string, string) {
 	if len(settings) == 0 {
 		return 0, "", ""
 	}
+	settings = normalizeJSONNumbersForAnalysisR65(settings)
 	flat := make(map[string]any)
 	flattenSettingsInput("", settings, flat)
 	hasAnalysis := false

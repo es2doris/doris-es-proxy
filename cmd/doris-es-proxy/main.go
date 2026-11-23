@@ -23,6 +23,7 @@ import (
 	"crypto/tls"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -46,7 +47,7 @@ import (
 	"github.com/es2doris/doris-es-proxy/pkg/transpiler"
 )
 
-var version = "v0.20.0"
+var version = "v0.21.0"
 
 func envOrDefault(key, fallback string) string {
 	if val := strings.TrimSpace(os.Getenv(key)); val != "" {
@@ -112,62 +113,79 @@ func escapeDorisBacktickIdent(name string) string {
 	return strings.ReplaceAll(schema.SanitizeDorisIdentifier(name), "`", "``")
 }
 
+type serverListenFunc func(srv *http.Server, tlsCertFile, tlsKeyFile string) error
+
 func main() {
-	if len(os.Args) > 1 {
-		switch os.Args[1] {
+	err := runCLI(context.Background(), os.Args[1:], os.Stdin, os.Stdout, os.Stderr, nil)
+	if err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			os.Exit(2)
+		}
+		log.Fatalf("%v", err)
+	}
+}
+
+func runCLI(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer, listenFn serverListenFunc) error {
+	if len(args) > 0 {
+		switch args[0] {
 		case "version", "--version", "-v":
-			fmt.Printf("doris-es-proxy %s\n", version)
-			return
+			_, _ = fmt.Fprintf(stdout, "doris-es-proxy %s\n", version)
+			return nil
 		case "transpile":
-			runTranspileSubcommand(os.Args[2:])
-			return
+			return runTranspileSubcommandErr(args[1:], stdin, stdout, stderr)
 		case "ddl":
-			runDDLSubcommand(os.Args[2:])
-			return
+			return runDDLSubcommandErr(args[1:], stdin, stdout, stderr)
 		case "doctor":
-			runDoctorSubcommand(os.Args[2:])
-			return
+			return runDoctorSubcommandErr(args[1:], stdout, stderr)
 		case "migrate-schema":
-			runMigrateSchemaSubcommand(os.Args[2:])
-			return
+			return runMigrateSchemaSubcommandErr(args[1:], stdout, stderr)
 		}
 	}
+	return runServerErr(ctx, args, stderr, listenFn)
+}
 
-	var (
-		listenAddr                = flag.String("listen", envOrDefault("LISTEN_ADDR", ":9200"), "Elasticsearch HTTP REST listen address (env: LISTEN_ADDR)")
-		dorisDSN                  = flag.String("doris-dsn", envOrDefault("DORIS_DSN", "root:@tcp(127.0.0.1:9030)/?interpolateParams=true&timeout=5s&readTimeout=30s&writeTimeout=30s"), "Apache Doris FE MySQL wire protocol DSN (env: DORIS_DSN)")
-		dorisHTTP                 = flag.String("doris-http", envOrDefault("DORIS_HTTP", "http://127.0.0.1:8030"), "Apache Doris FE HTTP endpoint for Stream Load (env: DORIS_HTTP)")
-		dorisUser                 = flag.String("doris-user", envOrDefault("DORIS_USER", "root"), "Apache Doris username (env: DORIS_USER)")
-		dorisPassword             = flag.String("doris-password", envOrDefault("DORIS_PASSWORD", ""), "Apache Doris password (env: DORIS_PASSWORD)")
-		dorisDB                   = flag.String("doris-db", envOrDefault("DORIS_DB", "es_compat"), "Target Apache Doris database name (env: DORIS_DB)")
-		shadowESURL               = flag.String("shadow-es-url", envOrDefault("SHADOW_ES_URL", ""), "Optional legacy Elasticsearch URL for dual-read shadow parity verification (env: SHADOW_ES_URL)")
-		useDoris4SearchFunc       = flag.Bool("doris4-search-fn", envBoolOrDefault("DORIS4_SEARCH_FN", false), "Push query_string down to Apache Doris 4.0 SEARCH() SQL function (env: DORIS4_SEARCH_FN)")
-		autoPromote               = flag.Bool("auto-promote", envBoolOrDefault("AUTO_PROMOTE", false), "Automatically promote hot unindexed _doc[...] VARIANT fields to f__* inverted index columns (env: AUTO_PROMOTE)")
-		bulkCoalesceMs            = flag.Int("bulk-coalesce-ms", envIntOrDefault("BULK_COALESCE_MS", 0), "Group-commit Stream Load micro-batch window in milliseconds across concurrent writes (0 disables, env: BULK_COALESCE_MS)")
-		bulkCoalesceBytes         = flag.Int("bulk-coalesce-bytes", envIntOrDefault("BULK_COALESCE_BYTES", proxy.DefaultBulkCoalesceMaxBytes), "Maximum byte size of a coalesced Stream Load batch before immediate flush (env: BULK_COALESCE_BYTES)")
-		queryCacheTTL             = flag.Duration("query-cache-ttl", envDurationOrDefault("QUERY_CACHE_TTL", 0), "Optional TTL for caching search responses with automatic write invalidation (e.g. 5s, 0s disables, env: QUERY_CACHE_TTL)")
-		basicAuthUser             = flag.String("basic-auth-user", envOrDefault("BASIC_AUTH_USER", ""), "Optional inbound HTTP Basic Auth username (env: BASIC_AUTH_USER)")
-		basicAuthPass             = flag.String("basic-auth-pass", envOrDefault("BASIC_AUTH_PASS", ""), "Optional inbound HTTP Basic Auth password (env: BASIC_AUTH_PASS)")
-		apiKey                    = flag.String("api-key", envOrDefault("API_KEY", ""), "Optional inbound Elasticsearch ApiKey / Bearer token (env: API_KEY)")
-		tlsCertFile               = flag.String("tls-cert", envOrDefault("TLS_CERT_FILE", ""), "Optional TLS server certificate PEM file for HTTPS (env: TLS_CERT_FILE)")
-		tlsKeyFile                = flag.String("tls-key", envOrDefault("TLS_KEY_FILE", ""), "Optional TLS private key PEM file for HTTPS (env: TLS_KEY_FILE)")
-		reindexRemoteWhitelist    = flag.String("reindex-remote-whitelist", envOrDefault("DORIS_ES_REINDEX_REMOTE_WHITELIST", ""), "Static comma-separated host:port whitelist for remote _reindex (env: DORIS_ES_REINDEX_REMOTE_WHITELIST)")
-		reindexRemoteAllowPrivate = flag.Bool("reindex-remote-allow-private", envBoolOrDefault("DORIS_ES_REINDEX_REMOTE_ALLOW_PRIVATE", false), "Allow private, loopback, link-local, and CGNAT IPs for remote _reindex (env: DORIS_ES_REINDEX_REMOTE_ALLOW_PRIVATE)")
-		esTargetVersion           = flag.String("es-version", envOrDefault("ES_TARGET_VERSION", ""), "Optional explicit Elasticsearch compatibility version (e.g. 8.15.5 or 7.10.2, env: ES_TARGET_VERSION)")
-		inMemoryMode              = flag.Bool("in-memory", envBoolOrDefault("IN_MEMORY", false), "Run with in-memory shredded Doris emulator (env: IN_MEMORY)")
-		logSQL                    = flag.Bool("log-sql", envBoolOrDefault("LOG_SQL", false), "Log transpiled Apache Doris DDL, Stream Load, HitsSQL, and AggsSQL (env: LOG_SQL)")
-	)
-	flag.Usage = func() {
-		_, _ = fmt.Fprintf(flag.CommandLine.Output(), "Usage: doris-es-proxy [subcommand] [flags]\n\nSubcommands:\n  transpile       Offline ES Query DSL -> Apache Doris SQL transpiler\n  ddl             Offline ES _mapping -> Apache Doris CREATE TABLE DDL compiler\n  doctor          Live Apache Doris cluster & inverted-index readiness checker\n  migrate-schema  Live Elasticsearch cluster -> Apache Doris DDL & template exporter\n  version         Print proxy version\n\nServer Flags:\n")
-		flag.PrintDefaults()
+func runServerErr(ctx context.Context, args []string, flagOut io.Writer, listenFn serverListenFunc) error {
+	fs := flag.NewFlagSet("doris-es-proxy", flag.ContinueOnError)
+	if flagOut != nil {
+		fs.SetOutput(flagOut)
 	}
-	flag.Parse()
+	var (
+		listenAddr                = fs.String("listen", envOrDefault("LISTEN_ADDR", ":9200"), "Elasticsearch HTTP REST listen address (env: LISTEN_ADDR)")
+		dorisDSN                  = fs.String("doris-dsn", envOrDefault("DORIS_DSN", "root:@tcp(127.0.0.1:9030)/?interpolateParams=true&timeout=5s&readTimeout=30s&writeTimeout=30s"), "Apache Doris FE MySQL wire protocol DSN (env: DORIS_DSN)")
+		dorisHTTP                 = fs.String("doris-http", envOrDefault("DORIS_HTTP", "http://127.0.0.1:8030"), "Apache Doris FE HTTP endpoint for Stream Load (env: DORIS_HTTP)")
+		dorisUser                 = fs.String("doris-user", envOrDefault("DORIS_USER", "root"), "Apache Doris username (env: DORIS_USER)")
+		dorisPassword             = fs.String("doris-password", envOrDefault("DORIS_PASSWORD", ""), "Apache Doris password (env: DORIS_PASSWORD)")
+		dorisDB                   = fs.String("doris-db", envOrDefault("DORIS_DB", "es_compat"), "Target Apache Doris database name (env: DORIS_DB)")
+		shadowESURL               = fs.String("shadow-es-url", envOrDefault("SHADOW_ES_URL", ""), "Optional legacy Elasticsearch URL for dual-read shadow parity verification (env: SHADOW_ES_URL)")
+		useDoris4SearchFunc       = fs.Bool("doris4-search-fn", envBoolOrDefault("DORIS4_SEARCH_FN", false), "Push query_string down to Apache Doris 4.0 SEARCH() SQL function (env: DORIS4_SEARCH_FN)")
+		autoPromote               = fs.Bool("auto-promote", envBoolOrDefault("AUTO_PROMOTE", false), "Automatically promote hot unindexed _doc[...] VARIANT fields to f__* inverted index columns (env: AUTO_PROMOTE)")
+		bulkCoalesceMs            = fs.Int("bulk-coalesce-ms", envIntOrDefault("BULK_COALESCE_MS", 0), "Group-commit Stream Load micro-batch window in milliseconds across concurrent writes (0 disables, env: BULK_COALESCE_MS)")
+		bulkCoalesceBytes         = fs.Int("bulk-coalesce-bytes", envIntOrDefault("BULK_COALESCE_BYTES", proxy.DefaultBulkCoalesceMaxBytes), "Maximum byte size of a coalesced Stream Load batch before immediate flush (env: BULK_COALESCE_BYTES)")
+		queryCacheTTL             = fs.Duration("query-cache-ttl", envDurationOrDefault("QUERY_CACHE_TTL", 0), "Optional TTL for caching search responses with automatic write invalidation (e.g. 5s, 0s disables, env: QUERY_CACHE_TTL)")
+		basicAuthUser             = fs.String("basic-auth-user", envOrDefault("BASIC_AUTH_USER", ""), "Optional inbound HTTP Basic Auth username (env: BASIC_AUTH_USER)")
+		basicAuthPass             = fs.String("basic-auth-pass", envOrDefault("BASIC_AUTH_PASS", ""), "Optional inbound HTTP Basic Auth password (env: BASIC_AUTH_PASS)")
+		apiKey                    = fs.String("api-key", envOrDefault("API_KEY", ""), "Optional inbound Elasticsearch ApiKey / Bearer token (env: API_KEY)")
+		tlsCertFile               = fs.String("tls-cert", envOrDefault("TLS_CERT_FILE", ""), "Optional TLS server certificate PEM file for HTTPS (env: TLS_CERT_FILE)")
+		tlsKeyFile                = fs.String("tls-key", envOrDefault("TLS_KEY_FILE", ""), "Optional TLS private key PEM file for HTTPS (env: TLS_KEY_FILE)")
+		reindexRemoteWhitelist    = fs.String("reindex-remote-whitelist", envOrDefault("DORIS_ES_REINDEX_REMOTE_WHITELIST", ""), "Static comma-separated host:port whitelist for remote _reindex (env: DORIS_ES_REINDEX_REMOTE_WHITELIST)")
+		reindexRemoteAllowPrivate = fs.Bool("reindex-remote-allow-private", envBoolOrDefault("DORIS_ES_REINDEX_REMOTE_ALLOW_PRIVATE", false), "Allow private, loopback, link-local, and CGNAT IPs for remote _reindex (env: DORIS_ES_REINDEX_REMOTE_ALLOW_PRIVATE)")
+		esTargetVersion           = fs.String("es-version", envOrDefault("ES_TARGET_VERSION", ""), "Optional explicit Elasticsearch compatibility version (e.g. 8.15.5 or 7.10.2, env: ES_TARGET_VERSION)")
+		inMemoryMode              = fs.Bool("in-memory", envBoolOrDefault("IN_MEMORY", false), "Run with in-memory shredded Doris emulator (env: IN_MEMORY)")
+		logSQL                    = fs.Bool("log-sql", envBoolOrDefault("LOG_SQL", false), "Log transpiled Apache Doris DDL, Stream Load, HitsSQL, and AggsSQL (env: LOG_SQL)")
+	)
+	fs.Usage = func() {
+		_, _ = fmt.Fprintf(fs.Output(), "Usage: doris-es-proxy [subcommand] [flags]\n\nSubcommands:\n  transpile       Offline ES Query DSL -> Apache Doris SQL transpiler\n  ddl             Offline ES _mapping -> Apache Doris CREATE TABLE DDL compiler\n  doctor          Live Apache Doris cluster & inverted-index readiness checker\n  migrate-schema  Live Elasticsearch cluster -> Apache Doris DDL & template exporter\n  version         Print proxy version\n\nServer Flags:\n")
+		fs.PrintDefaults()
+	}
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
 
 	if (*basicAuthUser != "") != (*basicAuthPass != "") {
-		log.Fatalf("both --basic-auth-user and --basic-auth-pass must be provided together when Basic Auth is enabled")
+		return fmt.Errorf("both --basic-auth-user and --basic-auth-pass must be provided together when Basic Auth is enabled")
 	}
 	if (*tlsCertFile != "") != (*tlsKeyFile != "") {
-		log.Fatalf("both --tls-cert and --tls-key must be provided together when TLS is enabled")
+		return fmt.Errorf("both --tls-cert and --tls-key must be provided together when TLS is enabled")
 	}
 
 	var backend proxy.DorisBackend
@@ -180,7 +198,7 @@ func main() {
 		if effectiveDSN != "" {
 			db, err := sql.Open("mysql", effectiveDSN)
 			if err != nil {
-				log.Fatalf("failed to configure Doris MySQL driver: %v", err)
+				return fmt.Errorf("failed to configure Doris MySQL driver: %w", err)
 			}
 			db.SetMaxOpenConns(64)
 			db.SetMaxIdleConns(16)
@@ -189,13 +207,13 @@ func main() {
 			sqlDB = db
 			defer func() { _ = sqlDB.Close() }()
 
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			dbCtx, dbCancel := context.WithTimeout(ctx, 5*time.Second)
 			// #nosec G201 -- identifier is strictly sanitized via schema.SanitizeDorisIdentifier and backtick-escaped
 			createDBSQL := fmt.Sprintf("CREATE DATABASE IF NOT EXISTS `%s`", escapeDorisBacktickIdent(*dorisDB))
-			if _, err := sqlDB.ExecContext(ctx, createDBSQL); err != nil {
+			if _, err := sqlDB.ExecContext(dbCtx, createDBSQL); err != nil {
 				log.Printf("warning: initial Doris database bootstrap (%s) deferred until cluster is reachable: %v", createDBSQL, err)
 			}
-			cancel()
+			dbCancel()
 		}
 
 		slClient := proxy.NewStreamLoadClient(proxy.StreamLoadConfig{
@@ -241,7 +259,7 @@ func main() {
 		srv.SetAuth(*basicAuthUser, *basicAuthPass, *apiKey)
 		log.Printf("inbound HTTP authentication enabled (basic_auth=%v, api_key=%v)", *basicAuthUser != "" || *basicAuthPass != "", *apiKey != "")
 	}
-	bootCtx, bootCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	bootCtx, bootCancel := context.WithTimeout(ctx, 5*time.Second)
 	if err := srv.BootstrapCatalog(bootCtx); err != nil {
 		log.Printf("warning: initial _es_catalog bootstrap deferred: %v", err)
 	}
@@ -260,7 +278,7 @@ func main() {
 		},
 	}
 
-	sigCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	sigCtx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
 	shutdownDone := make(chan struct{})
@@ -268,45 +286,63 @@ func main() {
 		defer close(shutdownDone)
 		<-sigCtx.Done()
 		log.Printf("shutting down doris-es-proxy gracefully...")
-		shutCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		shutCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
 		defer cancel()
 		_ = httpServer.Shutdown(shutCtx)
 		_ = srv.Close(shutCtx)
 	}()
 
-	var serveErr error
+	if listenFn == nil {
+		listenFn = func(s *http.Server, certFile, keyFile string) error {
+			if certFile != "" && keyFile != "" {
+				return s.ListenAndServeTLS(certFile, keyFile)
+			}
+			return s.ListenAndServe()
+		}
+	}
 	if *tlsCertFile != "" && *tlsKeyFile != "" {
 		log.Printf("HTTPS TLS listener enabled (cert=%s)", *tlsCertFile)
-		serveErr = httpServer.ListenAndServeTLS(*tlsCertFile, *tlsKeyFile)
-	} else {
-		serveErr = httpServer.ListenAndServe()
 	}
-	if serveErr != nil && serveErr != http.ErrServerClosed {
-		log.Fatalf("server exited: %v", serveErr)
-	}
+	serveErr := listenFn(httpServer, *tlsCertFile, *tlsKeyFile)
+	stop()
 	<-shutdownDone
+	if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+		return fmt.Errorf("server exited: %w", serveErr)
+	}
+	return nil
 }
 
 func runTranspileSubcommand(args []string) {
-	fs := flag.NewFlagSet("transpile", flag.ExitOnError)
+	if err := runTranspileSubcommandErr(args, os.Stdin, os.Stdout, os.Stderr); err != nil {
+		log.Fatalf("%v", err)
+	}
+}
+
+func runTranspileSubcommandErr(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
+	fs := flag.NewFlagSet("transpile", flag.ContinueOnError)
+	if stderr != nil {
+		fs.SetOutput(stderr)
+	}
 	indexName := fs.String("index", "table_search_index", "Target Elasticsearch index name")
 	dorisDB := fs.String("db", "es_compat", "Target Apache Doris database name")
 	mappingPath := fs.String("mapping", "", "Optional path to Elasticsearch mapping JSON file")
 	queryPath := fs.String("query", "", "Optional path to Elasticsearch _search JSON file (defaults to stdin)")
 	doris4Search := fs.Bool("doris4-search-fn", false, "Use Apache Doris 4.0 SEARCH() function")
 	format := fs.String("format", "sql", "Output format: sql or json")
-	_ = fs.Parse(args)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
 
 	var mappingSpec *esast.MappingSpec
 	if *mappingPath != "" {
 		// #nosec G304 -- CLI subcommand explicitly reads user-specified local file path
 		raw, err := os.ReadFile(filepath.Clean(*mappingPath))
 		if err != nil {
-			log.Fatalf("failed to read --mapping %s: %v", *mappingPath, err)
+			return fmt.Errorf("failed to read --mapping %s: %w", *mappingPath, err)
 		}
 		mappingSpec, err = parseMappingJSON(raw)
 		if err != nil {
-			log.Fatalf("failed to parse --mapping %s: %v", *mappingPath, err)
+			return fmt.Errorf("failed to parse --mapping %s: %w", *mappingPath, err)
 		}
 	}
 
@@ -316,16 +352,16 @@ func runTranspileSubcommand(args []string) {
 		// #nosec G304 -- CLI subcommand explicitly reads user-specified local file path
 		queryBytes, err = os.ReadFile(filepath.Clean(*queryPath))
 	} else {
-		queryBytes, err = io.ReadAll(os.Stdin)
+		queryBytes, err = io.ReadAll(stdin)
 	}
 	if err != nil {
-		log.Fatalf("failed to read search query payload: %v", err)
+		return fmt.Errorf("failed to read search query payload: %w", err)
 	}
 
 	var req esast.SearchRequest
 	if len(bytes.TrimSpace(queryBytes)) > 0 {
 		if err := json.Unmarshal(queryBytes, &req); err != nil {
-			log.Fatalf("invalid Elasticsearch _search JSON: %v", err)
+			return fmt.Errorf("invalid Elasticsearch _search JSON: %w", err)
 		}
 	}
 
@@ -335,14 +371,14 @@ func runTranspileSubcommand(args []string) {
 	})
 	plan, err := tr.BuildSearchPlan(&req)
 	if err != nil {
-		log.Fatalf("transpile error: %v", err)
+		return fmt.Errorf("transpile error: %w", err)
 	}
 
 	normHitsSQL := proxy.NormalizeDorisSQL(plan.HitsSQL)
 	normAggsSQL := proxy.NormalizeDorisSQL(plan.AggsSQL)
 
 	if strings.EqualFold(*format, "json") {
-		enc := json.NewEncoder(os.Stdout)
+		enc := json.NewEncoder(stdout)
 		enc.SetIndent("", "  ")
 		_ = enc.Encode(map[string]any{
 			"index":               *indexName,
@@ -354,26 +390,38 @@ func runTranspileSubcommand(args []string) {
 			"aggs_sql":            plan.AggsSQL,
 			"aggs_sql_normalized": normAggsSQL,
 		})
-		return
+		return nil
 	}
 
 	if normHitsSQL != "" {
-		fmt.Printf("-- [HitsSQL] (%s.%s)\n%s;\n", idxSchema.DorisDB, idxSchema.DorisTable, normHitsSQL)
+		_, _ = fmt.Fprintf(stdout, "-- [HitsSQL] (%s.%s)\n%s;\n", idxSchema.DorisDB, idxSchema.DorisTable, normHitsSQL)
 	}
 	if normAggsSQL != "" {
 		if normHitsSQL != "" {
-			fmt.Println()
+			_, _ = fmt.Fprintln(stdout)
 		}
-		fmt.Printf("-- [AggsSQL - Nereids Multi-Cast CTE] (%s.%s)\n%s;\n", idxSchema.DorisDB, idxSchema.DorisTable, normAggsSQL)
+		_, _ = fmt.Fprintf(stdout, "-- [AggsSQL - Nereids Multi-Cast CTE] (%s.%s)\n%s;\n", idxSchema.DorisDB, idxSchema.DorisTable, normAggsSQL)
 	}
+	return nil
 }
 
 func runDDLSubcommand(args []string) {
-	fs := flag.NewFlagSet("ddl", flag.ExitOnError)
+	if err := runDDLSubcommandErr(args, os.Stdin, os.Stdout, os.Stderr); err != nil {
+		log.Fatalf("%v", err)
+	}
+}
+
+func runDDLSubcommandErr(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
+	fs := flag.NewFlagSet("ddl", flag.ContinueOnError)
+	if stderr != nil {
+		fs.SetOutput(stderr)
+	}
 	indexName := fs.String("index", "table_search_index", "Target Elasticsearch index name")
 	dorisDB := fs.String("db", "es_compat", "Target Apache Doris database name")
 	mappingPath := fs.String("mapping", "", "Optional path to Elasticsearch mapping JSON file (defaults to stdin)")
-	_ = fs.Parse(args)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
 
 	var raw []byte
 	var err error
@@ -381,67 +429,89 @@ func runDDLSubcommand(args []string) {
 		// #nosec G304 -- CLI subcommand explicitly reads user-specified local file path
 		raw, err = os.ReadFile(filepath.Clean(*mappingPath))
 	} else {
-		raw, err = io.ReadAll(os.Stdin)
+		raw, err = io.ReadAll(stdin)
 	}
 	if err != nil {
-		log.Fatalf("failed to read mapping JSON: %v", err)
+		return fmt.Errorf("failed to read mapping JSON: %w", err)
 	}
 
 	var spec *esast.MappingSpec
 	if len(bytes.TrimSpace(raw)) > 0 {
 		spec, err = parseMappingJSON(raw)
 		if err != nil {
-			log.Fatalf("invalid Elasticsearch mapping JSON: %v", err)
+			return fmt.Errorf("invalid Elasticsearch mapping JSON: %w", err)
 		}
 	}
 	idxSchema := schema.CompileIndexSchema(*dorisDB, *indexName, spec)
-	fmt.Println(schema.GenerateCreateTableDDL(idxSchema))
+	_, _ = fmt.Fprintln(stdout, schema.GenerateCreateTableDDL(idxSchema))
+	return nil
 }
 
 func runDoctorSubcommand(args []string) {
-	fs := flag.NewFlagSet("doctor", flag.ExitOnError)
+	if err := runDoctorSubcommandErr(args, os.Stdout, os.Stderr); err != nil {
+		os.Exit(1)
+	}
+}
+
+func runDoctorSubcommandErr(args []string, stdout, stderr io.Writer) error {
+	fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
+	if stderr != nil {
+		fs.SetOutput(stderr)
+	}
 	dorisDSN := fs.String("doris-dsn", envOrDefault("DORIS_DSN", "root:@tcp(127.0.0.1:9030)/?interpolateParams=true&timeout=5s"), "Apache Doris FE MySQL DSN")
 	dorisHTTP := fs.String("doris-http", envOrDefault("DORIS_HTTP", "http://127.0.0.1:8030"), "Apache Doris FE HTTP endpoint")
 	dorisUser := fs.String("doris-user", envOrDefault("DORIS_USER", "root"), "Apache Doris username")
 	dorisPassword := fs.String("doris-password", envOrDefault("DORIS_PASSWORD", ""), "Apache Doris password")
-	_ = fs.Parse(args)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
 
 	effectiveDSN := proxy.ApplyDSNAuth(*dorisDSN, *dorisUser, *dorisPassword)
-	fmt.Printf("==> doris-es-proxy %s Connectivity Doctor\n", version)
-	fmt.Printf("  1. Checking Doris FE MySQL (%s)... ", redactDSN(effectiveDSN))
+	_, _ = fmt.Fprintf(stdout, "==> doris-es-proxy %s Connectivity Doctor\n", version)
+	_, _ = fmt.Fprintf(stdout, "  1. Checking Doris FE MySQL (%s)... ", redactDSN(effectiveDSN))
 	db, err := sql.Open("mysql", effectiveDSN)
 	if err != nil {
-		fmt.Printf("FAIL (%v)\n", err)
-		os.Exit(1)
+		_, _ = fmt.Fprintf(stdout, "FAIL (%v)\n", err)
+		return err
 	}
 	defer func() { _ = db.Close() }()
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	var verComment string
 	if err := db.QueryRowContext(ctx, "SELECT @@version_comment").Scan(&verComment); err != nil {
-		fmt.Printf("UNREACHABLE (%v)\n", err)
+		_, _ = fmt.Fprintf(stdout, "UNREACHABLE (%v)\n", err)
 	} else {
-		fmt.Printf("OK (%s)\n", verComment)
+		_, _ = fmt.Fprintf(stdout, "OK (%s)\n", verComment)
 	}
 
-	fmt.Printf("  2. Checking Doris FE HTTP (%s)... ", *dorisHTTP)
+	_, _ = fmt.Fprintf(stdout, "  2. Checking Doris FE HTTP (%s)... ", *dorisHTTP)
 	client := &http.Client{Timeout: 3 * time.Second}
 	// #nosec G704 -- operator-supplied --doris-http endpoint in CLI doctor subcommand
 	resp, err := client.Get(strings.TrimRight(*dorisHTTP, "/") + "/api/bootstrap")
 	if err != nil {
-		fmt.Printf("UNREACHABLE (%v)\n", err)
+		_, _ = fmt.Fprintf(stdout, "UNREACHABLE (%v)\n", err)
 	} else {
 		_ = resp.Body.Close()
 		if resp.StatusCode >= 400 {
-			fmt.Printf("FAIL (HTTP %d)\n", resp.StatusCode)
+			_, _ = fmt.Fprintf(stdout, "FAIL (HTTP %d)\n", resp.StatusCode)
 		} else {
-			fmt.Printf("OK (HTTP %d)\n", resp.StatusCode)
+			_, _ = fmt.Fprintf(stdout, "OK (HTTP %d)\n", resp.StatusCode)
 		}
 	}
+	return nil
 }
 
 func runMigrateSchemaSubcommand(args []string) {
-	fs := flag.NewFlagSet("migrate-schema", flag.ExitOnError)
+	if err := runMigrateSchemaSubcommandErr(args, os.Stdout, os.Stderr); err != nil {
+		log.Fatalf("%v", err)
+	}
+}
+
+func runMigrateSchemaSubcommandErr(args []string, stdout, stderr io.Writer) error {
+	fs := flag.NewFlagSet("migrate-schema", flag.ContinueOnError)
+	if stderr != nil {
+		fs.SetOutput(stderr)
+	}
 	esURL := fs.String("es-url", envOrDefault("ES_URL", "http://127.0.0.1:9200"), "Source Elasticsearch / OpenSearch HTTP URL (env: ES_URL)")
 	indexPattern := fs.String("index", "_all", "Index name or pattern to migrate")
 	dorisDB := fs.String("db", "es_compat", "Target Apache Doris database name")
@@ -450,7 +520,9 @@ func runMigrateSchemaSubcommand(args []string) {
 	esPassword := fs.String("es-password", envOrDefault("ES_PASSWORD", ""), "Optional source Elasticsearch Basic Auth password (env: ES_PASSWORD)")
 	esAPIKey := fs.String("es-api-key", envOrDefault("ES_API_KEY", ""), "Optional source Elasticsearch ApiKey / Bearer token (env: ES_API_KEY)")
 	esInsecure := fs.Bool("es-insecure-skip-verify", false, "Skip TLS certificate verification when connecting to source Elasticsearch")
-	_ = fs.Parse(args)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
 
 	endpoint := strings.TrimRight(*esURL, "/") + "/" + url.PathEscape(*indexPattern) + "/_mapping"
 	transport := http.DefaultTransport.(*http.Transport).Clone()
@@ -467,7 +539,7 @@ func runMigrateSchemaSubcommand(args []string) {
 	}
 	httpReq, err := http.NewRequest(http.MethodGet, endpoint, nil)
 	if err != nil {
-		log.Fatalf("invalid endpoint %s: %v", endpoint, err)
+		return fmt.Errorf("invalid endpoint %s: %w", endpoint, err)
 	}
 	if *esAPIKey != "" {
 		if strings.HasPrefix(strings.ToLower(*esAPIKey), "apikey ") || strings.HasPrefix(strings.ToLower(*esAPIKey), "bearer ") {
@@ -481,22 +553,22 @@ func runMigrateSchemaSubcommand(args []string) {
 	// #nosec G704 -- operator-supplied --es-url in CLI migrate-schema subcommand
 	resp, err := client.Do(httpReq)
 	if err != nil {
-		log.Fatalf("failed to fetch mappings from %s: %v", endpoint, err)
+		return fmt.Errorf("failed to fetch mappings from %s: %w", endpoint, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 50*1024*1024))
 	if err != nil {
-		log.Fatalf("failed to read mapping response: %v", err)
+		return fmt.Errorf("failed to read mapping response: %w", err)
 	}
 	if resp.StatusCode >= 300 {
-		log.Fatalf("mapping endpoint %s returned HTTP %d: %s", endpoint, resp.StatusCode, strings.TrimSpace(string(raw)))
+		return fmt.Errorf("mapping endpoint %s returned HTTP %d: %s", endpoint, resp.StatusCode, strings.TrimSpace(string(raw)))
 	}
 
 	var byIndex map[string]struct {
 		Mappings *esast.MappingSpec `json:"mappings"`
 	}
 	if err := json.Unmarshal(raw, &byIndex); err != nil {
-		log.Fatalf("invalid Elasticsearch _mapping response: %v", err)
+		return fmt.Errorf("invalid Elasticsearch _mapping response: %w", err)
 	}
 
 	idxNames := make([]string, 0, len(byIndex))
@@ -510,11 +582,11 @@ func runMigrateSchemaSubcommand(args []string) {
 	if *outDir != "" {
 		cleanDir := filepath.Clean(*outDir)
 		if err := os.MkdirAll(cleanDir, 0o750); err != nil {
-			log.Fatalf("failed to create --out-dir %s: %v", cleanDir, err)
+			return fmt.Errorf("failed to create --out-dir %s: %w", cleanDir, err)
 		}
 		dbSQL := fmt.Sprintf("-- Generated by doris-es-proxy %s migrate-schema\nCREATE DATABASE IF NOT EXISTS `%s`;\n", version, escapeDorisBacktickIdent(*dorisDB))
 		if err := os.WriteFile(filepath.Join(cleanDir, "00_create_database.sql"), []byte(dbSQL), 0o600); err != nil {
-			log.Fatalf("failed to write 00_create_database.sql: %v", err)
+			return fmt.Errorf("failed to write 00_create_database.sql: %w", err)
 		}
 		for _, idxName := range idxNames {
 			entry := byIndex[idxName]
@@ -523,20 +595,21 @@ func runMigrateSchemaSubcommand(args []string) {
 			ddlContent := fmt.Sprintf("-- Index: %s (Doris table: `%s`.`%s`)\n%s\n", safeCommentName, strings.ReplaceAll(compiled.DorisDB, "`", "``"), strings.ReplaceAll(compiled.DorisTable, "`", "``"), schema.GenerateCreateTableDDL(compiled))
 			fileName := schema.SanitizeDorisIdentifier(idxName) + ".sql"
 			if err := os.WriteFile(filepath.Join(cleanDir, fileName), []byte(ddlContent), 0o600); err != nil {
-				log.Fatalf("failed to write %s: %v", fileName, err)
+				return fmt.Errorf("failed to write %s: %w", fileName, err)
 			}
 		}
-		return
+		return nil
 	}
 
-	fmt.Printf("-- Generated by doris-es-proxy %s migrate-schema\n", version)
-	fmt.Printf("CREATE DATABASE IF NOT EXISTS `%s`;\n\n", escapeDorisBacktickIdent(*dorisDB))
+	_, _ = fmt.Fprintf(stdout, "-- Generated by doris-es-proxy %s migrate-schema\n", version)
+	_, _ = fmt.Fprintf(stdout, "CREATE DATABASE IF NOT EXISTS `%s`;\n\n", escapeDorisBacktickIdent(*dorisDB))
 	for _, idxName := range idxNames {
 		entry := byIndex[idxName]
 		compiled := schema.CompileIndexSchema(*dorisDB, idxName, entry.Mappings)
 		safeCommentName := strings.NewReplacer("\n", " ", "\r", " ").Replace(idxName)
-		fmt.Printf("-- Index: %s (Doris table: `%s`.`%s`)\n%s\n\n", safeCommentName, strings.ReplaceAll(compiled.DorisDB, "`", "``"), strings.ReplaceAll(compiled.DorisTable, "`", "``"), schema.GenerateCreateTableDDL(compiled))
+		_, _ = fmt.Fprintf(stdout, "-- Index: %s (Doris table: `%s`.`%s`)\n%s\n\n", safeCommentName, strings.ReplaceAll(compiled.DorisDB, "`", "``"), strings.ReplaceAll(compiled.DorisTable, "`", "``"), schema.GenerateCreateTableDDL(compiled))
 	}
+	return nil
 }
 
 func parseMappingJSON(raw []byte) (*esast.MappingSpec, error) {

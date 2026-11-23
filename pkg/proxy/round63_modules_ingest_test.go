@@ -426,7 +426,7 @@ func TestRound63_WP2_MVT_SQL_EQL_Downsample_ESQL_SLM_ILM(t *testing.T) {
 
 	// --- 4. Downsample (`/_downsample`) ---
 	_ = doRound63ModulesReq(t, h, http.MethodPut, "/ts_src", `{
-		"settings": {"index": {"mode": "time_series"}},
+		"settings": {"index": {"mode": "time_series", "routing_path": ["host"]}},
 		"mappings": {
 			"properties": {
 				"@timestamp": {"type": "date"},

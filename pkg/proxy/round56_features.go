@@ -518,19 +518,45 @@ func (s *Server) handleIngestGeoIPDatabase(w http.ResponseWriter, r *http.Reques
 		if customSha, ok := body["sha256"].(string); ok && strings.TrimSpace(customSha) != "" {
 			shaHex = strings.TrimSpace(customSha)
 		}
-		entry := map[string]any{
-			"id":                   id,
-			"name":                 nameStr,
-			"database_file":        strings.TrimSpace(dbFile),
-			"sha256":               shaHex,
-			"modified_date_millis": time.Now().UTC().UnixMilli(),
+		accountID := "0"
+		if mmBody, okMM := body["maxmind"].(map[string]any); okMM && mmBody != nil {
+			if acct, okA := mmBody["account_id"].(string); okA && strings.TrimSpace(acct) != "" {
+				accountID = strings.TrimSpace(acct)
+			}
+		} else if cfgMap, okC := body["config"].(map[string]any); okC && cfgMap != nil {
+			if mmMap, okMM := cfgMap["max_mind"].(map[string]any); okMM && mmMap != nil {
+				if acct, okA := mmMap["account_id"].(string); okA && strings.TrimSpace(acct) != "" {
+					accountID = strings.TrimSpace(acct)
+				}
+			}
 		}
-		if entry["name"] == "" {
-			entry["name"] = id
+		displayName := strings.TrimSpace(nameStr)
+		if displayName == "" {
+			displayName = id
 		}
 		s.mu.Lock()
 		if s.geoipDatabases == nil {
 			s.geoipDatabases = make(map[string]map[string]any)
+		}
+		version := int64(1)
+		if prev, exists := s.geoipDatabases[id]; exists && prev != nil {
+			if pv, okV := toInt64(prev["version"]); okV && pv > 0 {
+				version = pv + 1
+			}
+		}
+		entry := map[string]any{
+			"id":                   id,
+			"name":                 displayName,
+			"version":              version,
+			"database_file":        strings.TrimSpace(dbFile),
+			"sha256":               shaHex,
+			"modified_date_millis": time.Now().UTC().UnixMilli(),
+			"database": map[string]any{
+				"name": displayName,
+				"maxmind": map[string]any{
+					"account_id": accountID,
+				},
+			},
 		}
 		s.geoipDatabases[id] = entry
 		s.mu.Unlock()
@@ -599,9 +625,21 @@ func (s *Server) handleILMMigrateToDataTiers(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	dryRun := isTruthyBoolQueryParam(r, "dry_run")
+	removedTpl := ""
+	if r.ContentLength != 0 {
+		if b, err := io.ReadAll(io.LimitReader(r.Body, 1<<20)); err == nil && len(bytes.TrimSpace(b)) > 0 {
+			var body map[string]any
+			if json.Unmarshal(b, &body) == nil && body != nil {
+				if lt, ok := body["legacy_template_to_delete"].(string); ok {
+					removedTpl = strings.TrimSpace(lt)
+				}
+			}
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"acknowledged":                  true,
 		"dry_run":                       dryRun,
+		"removed_legacy_template":       removedTpl,
 		"migrated_ilm_policies":         []any{},
 		"migrated_indices":              []any{},
 		"migrated_legacy_templates":     []any{},
@@ -4406,7 +4444,7 @@ func (s *Server) executeESQLQueryEngine(w http.ResponseWriter, r *http.Request, 
 										}
 									}
 								}
-							} else {
+							} else if !fromSummary.dynamicFalse {
 								for k, v := range srcMap {
 									nv := normalizeESQLNumber(v)
 									if arr, okA := nv.([]any); okA && len(arr) == 1 {
@@ -4523,16 +4561,17 @@ func (s *Server) executeESQLQueryEngine(w http.ResponseWriter, r *http.Request, 
 				if col == exprStr || unquoteESQLIdent(exprStr) != col {
 					delete(fromSummary.ambiguousError, col)
 				}
-				hasCol := false
-				for _, c := range colOrder {
+				existingIdx := -1
+				for idxC, c := range colOrder {
 					if c == col {
-						hasCol = true
+						existingIdx = idxC
 						break
 					}
 				}
-				if !hasCol {
-					colOrder = append(colOrder, col)
+				if existingIdx >= 0 {
+					colOrder = append(colOrder[:existingIdx], colOrder[existingIdx+1:]...)
 				}
+				colOrder = append(colOrder, col)
 				if staticT != "" {
 					colTypes[col] = staticT
 				} else if inferred != "" {
@@ -4590,7 +4629,7 @@ func (s *Server) executeESQLQueryEngine(w http.ResponseWriter, r *http.Request, 
 					}
 					if strings.HasPrefix(colTypes[argClean], "aggregate_metric") || (colTypes[argClean] == "unsupported" && argClean != "*") {
 						writeESError(w, http.StatusBadRequest, "verification_exception",
-							fmt.Sprintf("Found 1 problem\nline 1:1: Unknown or unsupported column [%s] of type [%s] in [%s]", argClean, colTypes[argClean], fn))
+							fmt.Sprintf("Found 1 problem\nline 1:1: Cannot use field [%s] with unsupported type [aggregate_metric_double] or [%s] in [%s]", argClean, colTypes[argClean], fn))
 						return
 					}
 					if argClean != "" && argClean != "*" && !strings.ContainsAny(arg, "()+-*/'\"0123456789") && fromSummary.hasMappings && colTypes[argClean] == "" {
@@ -4822,6 +4861,11 @@ func (s *Server) executeESQLQueryEngine(w http.ResponseWriter, r *http.Request, 
 					continue
 				}
 				sc := sortClause{col: unquoteESQLIdent(toks[0])}
+				if strings.HasPrefix(sc.col, "@") && colTypes[sc.col] == "" {
+					writeESError(w, http.StatusBadRequest, "verification_exception",
+						fmt.Sprintf("Found 1 problem\nline 1:1: Unknown column [%s]", sc.col))
+					return
+				}
 				if ambMsg := fromSummary.ambiguousError[sc.col]; ambMsg != "" {
 					writeESError(w, http.StatusBadRequest, "verification_exception", "Found 1 problem\nline 1:1: "+ambMsg)
 					return

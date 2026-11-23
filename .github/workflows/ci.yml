@@ -57,7 +57,7 @@ jobs:
       - name: Fuzz seed regression
         run: go test -run='^Fuzz' ./...
 
-      - name: Merged coverage gate (>= 80.0%)
+      - name: Merged coverage gate (>= 82.0%)
         run: |
           rm -rf /tmp/covdata
           mkdir -p /tmp/covdata
@@ -66,7 +66,7 @@ jobs:
           TOTAL_LINE=$(go tool cover -func=coverage.out | tail -1)
           echo "$TOTAL_LINE"
           PCT=$(echo "$TOTAL_LINE" | awk '{gsub("%","",$3); print $3}')
-          awk -v pct="$PCT" 'BEGIN { if (pct + 0 < 80.0) { printf "Coverage %.1f%% is below 80.0%% threshold\n", pct; exit 1 } }'
+          awk -v pct="$PCT" 'BEGIN { if (pct + 0 < 82.0) { printf "Coverage %.1f%% is below 82.0%% threshold\n", pct; exit 1 } }'
 
   lint:
     name: Lint
@@ -151,7 +151,7 @@ jobs:
         run: |
           jq empty deploy/grafana/doris-es-proxy-dashboard.json
           docker build -t es2doris/doris-es-proxy:ci .
-          docker run --rm es2doris/doris-es-proxy:ci version | grep -q "v0.20.0"
+          docker run --rm es2doris/doris-es-proxy:ci version | grep -q "v0.21.0"
 
   elastic-conformance:
     name: Upstream Elastic Conformance & Go SDK v8
@@ -176,8 +176,8 @@ jobs:
       - name: Run upstream Elastic rest-api-spec & wire-schema conformance
         run: |
           CONFORMANCE_REQUIRE_UPSTREAM=1 \
-          CONFORMANCE_MIN_V7_PASSED=1975 \
-          CONFORMANCE_MIN_V8_PASSED=4150 \
+          CONFORMANCE_MIN_V7_PASSED=1980 \
+          CONFORMANCE_MIN_V8_PASSED=4500 \
           CONFORMANCE_SUMMARY_MD="$GITHUB_STEP_SUMMARY" \
           CONFORMANCE_OUT_JSON="/tmp/conformance-scorecard.json" \
             go test -race -count=1 -v ./pkg/compliance -run 'TestUpstream|TestSpecSchemaValidatorLiveUpstreamSchema'

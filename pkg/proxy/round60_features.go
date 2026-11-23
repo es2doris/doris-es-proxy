@@ -112,16 +112,52 @@ func (s *Server) getTargetESVersion() string {
 	return ver
 }
 
+// negotiateAcceptESCompatRound65 inspects Accept header media ranges with RFC 9110 quality
+// weights (ignoring q=0 entries) and returns the highest-weight `compatible-with` ES major version.
+func negotiateAcceptESCompatRound65(acceptVals []string) (string, bool) {
+	bestCompat := ""
+	hasCompat := false
+	bestQ := -1.0
+	for _, rawAccept := range acceptVals {
+		for _, mediaPart := range strings.Split(rawAccept, ",") {
+			semi := strings.Split(strings.TrimSpace(mediaPart), ";")
+			mt := strings.ToLower(strings.TrimSpace(semi[0]))
+			if mt == "" {
+				continue
+			}
+			q := parseMediaQualityWeightR63(semi[1:])
+			if q <= 0 {
+				continue
+			}
+			partCompat, hasPartCompat := extractCompatibleWithParam(mediaPart)
+			if !hasPartCompat || (partCompat != "7" && partCompat != "8") {
+				continue
+			}
+			if !hasCompat || q > bestQ || (q == bestQ && partCompat == "8") {
+				bestCompat = partCompat
+				hasCompat = true
+				bestQ = q
+			}
+		}
+	}
+	return bestCompat, hasCompat
+}
+
 // isES8Mode reports whether the server or the inbound request negotiated ES 8 compatibility.
 func (s *Server) isES8Mode(r *http.Request) bool {
 	if r != nil {
-		accept := r.Header.Get("Accept")
-		ct := r.Header.Get("Content-Type")
-		if strings.Contains(accept, "compatible-with=8") || strings.Contains(ct, "compatible-with=8") {
-			return true
+		if accCompat, hasAccCompat := negotiateAcceptESCompatRound65(r.Header.Values("Accept")); hasAccCompat {
+			return accCompat == "8"
 		}
-		if strings.Contains(accept, "compatible-with=7") || strings.Contains(ct, "compatible-with=7") {
-			return false
+		for _, rawCT := range r.Header.Values("Content-Type") {
+			if ctCompat, hasCTCompat := extractCompatibleWithParam(rawCT); hasCTCompat {
+				if ctCompat == "8" {
+					return true
+				}
+				if ctCompat == "7" {
+					return false
+				}
+			}
 		}
 		if !s.hasExplicitTargetESVersion() {
 			clientMeta := r.Header.Get("X-Elastic-Client-Meta")
@@ -234,6 +270,7 @@ func (s *Server) validateWireAcceptAndCompatHeadersRound60(w http.ResponseWriter
 
 	var accESCompat string
 	hasAccESCompat := false
+	accBestQ := -1.0
 	for _, rawAccept := range acceptVals {
 		for _, mediaPart := range strings.Split(rawAccept, ",") {
 			semi := strings.Split(strings.TrimSpace(mediaPart), ";")
@@ -241,26 +278,30 @@ func (s *Server) validateWireAcceptAndCompatHeadersRound60(w http.ResponseWriter
 			if mt == "" {
 				continue
 			}
+			q := parseMediaQualityWeightR63(semi[1:])
 			partCompat, hasPartCompat := extractCompatibleWithParam(mediaPart)
 			if strings.HasPrefix(mt, "application/vnd.elasticsearch+") {
-				if hasPartCompat && partCompat != "7" && partCompat != "8" {
+				if hasPartCompat && partCompat != "7" && partCompat != "8" && q > 0 {
 					w.Header().Set("Content-Type", "application/json; charset=UTF-8")
 					writeESError(w, http.StatusNotAcceptable, "not_acceptable_exception",
 						fmt.Sprintf("Compatible-with version [%s] is not supported; must be 7 or 8", partCompat))
 					return false
 				}
-				if hasPartCompat && parseMediaQualityWeightR63(semi[1:]) > 0 {
-					accESCompat = partCompat
-					hasAccESCompat = true
+				if hasPartCompat && q > 0 && (partCompat == "7" || partCompat == "8") {
+					if !hasAccESCompat || q > accBestQ || (q == accBestQ && partCompat == "8") {
+						accESCompat = partCompat
+						hasAccESCompat = true
+						accBestQ = q
+					}
 				}
 			} else if strings.HasPrefix(mt, "application/vnd.opensearch+") {
-				if hasPartCompat && partCompat != "2" && partCompat != "1" && partCompat != "3" {
+				if hasPartCompat && partCompat != "2" && partCompat != "1" && partCompat != "3" && q > 0 {
 					w.Header().Set("Content-Type", "application/json; charset=UTF-8")
 					writeESError(w, http.StatusNotAcceptable, "not_acceptable_exception",
 						fmt.Sprintf("Compatible-with version [%s] is not supported; must be 2", partCompat))
 					return false
 				}
-			} else if hasPartCompat && partCompat != "7" && partCompat != "8" {
+			} else if hasPartCompat && partCompat != "7" && partCompat != "8" && q > 0 {
 				w.Header().Set("Content-Type", "application/json; charset=UTF-8")
 				writeESError(w, http.StatusNotAcceptable, "not_acceptable_exception",
 					fmt.Sprintf("Compatible-with version [%s] is not supported; must be 7 or 8", partCompat))
@@ -2694,6 +2735,11 @@ func (s *Server) serveNodesInfoRound60(w http.ResponseWriter, r *http.Request, n
 				"lang-expression", "lang-mustache", "lang-painless",
 				"mapper-extras", "parent-join", "percolator", "rank-eval", "reindex",
 				"repository-url", "transport-netty4",
+				"x-pack-ccr", "x-pack-core", "x-pack-deprecation", "x-pack-downsample",
+				"x-pack-enrich", "x-pack-esql", "x-pack-graph", "x-pack-ilm",
+				"x-pack-logstash", "x-pack-ml", "x-pack-monitoring", "x-pack-rollup",
+				"x-pack-security", "x-pack-spatial", "x-pack-sql", "x-pack-stack",
+				"x-pack-transform", "x-pack-watcher",
 			}
 			mods := make([]any, 0, len(modNames))
 			for _, mn := range modNames {
@@ -3202,27 +3248,27 @@ func (s *Server) serveNodesStatsRound60(w http.ResponseWriter, r *http.Request, 
 
 	nodesMap := map[string]any{}
 	totalNodes := 0
-	if dorisTel != nil && len(dorisTel.Backends) > 0 {
-		if localNodeMatchesFilterRound60(nodeFilter) {
-			for idx, be := range dorisTel.Backends {
-				nodeID := fmt.Sprintf("doris-be-%s", be.BackendID)
-				if be.BackendID == "" {
-					nodeID = fmt.Sprintf("doris-be-%d", idx+1)
+	if localNodeMatchesFilterRound60(nodeFilter) {
+		var totalCap, freeCap int64
+		var totalCores int
+		if dorisTel != nil && len(dorisTel.Backends) > 0 {
+			for _, be := range dorisTel.Backends {
+				totalCap += be.TotalCapacityBytes
+				free := be.AvailCapacityBytes
+				if free <= 0 && be.DataUsedCapacityBytes < be.TotalCapacityBytes {
+					free = be.TotalCapacityBytes - be.DataUsedCapacityBytes
 				}
-				host := be.Host
-				if host == "" {
-					host = "127.0.0.1"
-				}
-				freeCap := be.AvailCapacityBytes
-				if freeCap <= 0 && be.DataUsedCapacityBytes < be.TotalCapacityBytes {
-					freeCap = be.TotalCapacityBytes - be.DataUsedCapacityBytes
-				}
-				nodesMap[nodeID] = buildSingleNodeStats(nodeID, host, host, be.TotalCapacityBytes, freeCap, be.CpuCores)
+				freeCap += free
+				totalCores += be.CpuCores
 			}
-			totalNodes = len(nodesMap)
+			if totalCap <= 0 && dorisTel.TotalCapacityBytes > 0 {
+				totalCap = dorisTel.TotalCapacityBytes
+			}
+			if freeCap <= 0 && dorisTel.AvailCapacityBytes > 0 {
+				freeCap = dorisTel.AvailCapacityBytes
+			}
 		}
-	} else if localNodeMatchesFilterRound60(nodeFilter) {
-		nodesMap[taskLocalNodeID] = buildSingleNodeStats("doris-es-proxy", "localhost", "127.0.0.1", 0, 0, 0)
+		nodesMap[taskLocalNodeID] = buildSingleNodeStats("doris-es-proxy", "localhost", "127.0.0.1", totalCap, freeCap, totalCores)
 		totalNodes = 1
 	}
 
@@ -3680,6 +3726,7 @@ func (s *Server) handleClusterStatsRound60(w http.ResponseWriter, r *http.Reques
 			"ingest":                nodeCnt,
 			"master":                nodeCnt,
 			"remote_cluster_client": nodeCnt,
+			"voting_only":           0,
 		},
 		"versions": []string{esVer},
 		"os": map[string]any{

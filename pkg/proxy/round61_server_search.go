@@ -894,22 +894,26 @@ func canonicalizeSyntheticIPsInMapR61Search(dst map[string]any, idxSchema *schem
 				setNestedMapPathR61Search(dst, segs, addr.Unmap().String())
 			}
 		case []any:
-			canon := make([]string, 0, len(tv))
+			valid := make([]string, 0, len(tv))
+			malformed := make([]any, 0)
 			for _, elem := range tv {
 				if s, ok := elem.(string); ok {
 					if addr, err := netip.ParseAddr(strings.TrimSpace(s)); err == nil {
-						canon = append(canon, addr.Unmap().String())
+						valid = append(valid, addr.Unmap().String())
+						continue
 					}
 				}
+				malformed = append(malformed, elem)
 			}
-			if len(canon) == 1 {
-				setNestedMapPathR61Search(dst, segs, canon[0])
-			} else if len(canon) > 1 {
-				sort.Strings(canon)
-				arr := make([]any, len(canon))
-				for i, c := range canon {
-					arr[i] = c
-				}
+			sort.Strings(valid)
+			arr := make([]any, 0, len(valid)+len(malformed))
+			for _, c := range valid {
+				arr = append(arr, c)
+			}
+			arr = append(arr, malformed...)
+			if len(arr) == 1 {
+				setNestedMapPathR61Search(dst, segs, arr[0])
+			} else if len(arr) > 1 {
 				setNestedMapPathR61Search(dst, segs, arr)
 			}
 		}
@@ -3709,7 +3713,18 @@ func formatDateNanosExactR61Search(ns int64, requestedFormat string) any {
 	eff := strings.TrimSpace(strings.Split(requestedFormat, "||")[0])
 	switch strings.ToLower(eff) {
 	case "", "strict_date_optional_time_nanos", "date_optional_time_nanos":
-		return epochNanosToUTCTimeRound58(ns).Format("2006-01-02T15:04:05.000000000Z")
+		tUTC := epochNanosToUTCTimeRound58(ns)
+		rem := ns % 1_000_000_000
+		if rem < 0 {
+			rem += 1_000_000_000
+		}
+		if rem%1_000_000 == 0 {
+			return tUTC.Format("2006-01-02T15:04:05.000Z")
+		}
+		if rem%1_000 == 0 {
+			return tUTC.Format("2006-01-02T15:04:05.000000Z")
+		}
+		return tUTC.Format("2006-01-02T15:04:05.000000000Z")
 	case "epoch_nanos":
 		return ns
 	case "epoch_millis":
@@ -3861,7 +3876,7 @@ func stripAndApplyExactQuantilesR61Search(
 		parentKey, vals, ok := transpiler.ParseCollectedFloatValues(row.BucketKey)
 		if !ok {
 			spec := resolveAggSpecByPath(aggs, aggPath)
-			if (spec.Percentiles != nil && spec.Percentiles.HDR != nil) || (spec.PercentileRanks != nil && spec.PercentileRanks.HDR != nil) {
+			if !strings.Contains(row.BucketKey, "_vals:") && spec.Boxplot != nil {
 				parentKey = row.BucketKey
 				vals = []float64{row.Value}
 			} else {
@@ -4017,12 +4032,15 @@ func applyExactQuantilesWalkR61Search(
 					return err
 				}
 			}
+			applyMovingPercentilesFromRawBucketsR65(fullPath, parentBucketKey, subAggs, rawBuckets, rawByAggAndBucket, rawBucketSeen, isES8)
 		case []any:
+			var mapBuckets []map[string]any
 			for _, elem := range rawBuckets {
 				bMap, okB := elem.(map[string]any)
 				if !okB {
 					continue
 				}
+				mapBuckets = append(mapBuckets, bMap)
 				bKey := fmt.Sprintf("%v", bMap["key"])
 				nextParentKey := bKey
 				if parentBucketKey != "" {
@@ -4032,6 +4050,7 @@ func applyExactQuantilesWalkR61Search(
 					return err
 				}
 			}
+			applyMovingPercentilesFromRawBucketsR65(fullPath, parentBucketKey, subAggs, mapBuckets, rawByAggAndBucket, rawBucketSeen, isES8)
 		case map[string]any:
 			bKeys := make([]string, 0, len(rawBuckets))
 			for k := range rawBuckets {
@@ -4059,6 +4078,107 @@ func applyExactQuantilesWalkR61Search(
 		}
 	}
 	return nil
+}
+
+func applyMovingPercentilesFromRawBucketsR65(
+	fullPath string,
+	parentBucketKey string,
+	subAggs map[string]esast.AggSpec,
+	buckets []map[string]any,
+	rawByAggAndBucket map[string]map[string][]float64,
+	rawBucketSeen map[string]map[string]bool,
+	isES8 bool,
+) {
+	if len(buckets) == 0 || len(subAggs) == 0 {
+		return
+	}
+	subNames := make([]string, 0, len(subAggs))
+	for k := range subAggs {
+		subNames = append(subNames, k)
+	}
+	sort.Strings(subNames)
+	for _, mpName := range subNames {
+		spec := subAggs[mpName]
+		mp := spec.MovingPercentiles
+		if mp == nil {
+			continue
+		}
+		targetName := firstBucketsPathSeg(mp.EffectivePath())
+		targetPath := targetName
+		if fullPath != "" {
+			targetPath = fullPath + "." + targetName
+		}
+		seenMap := rawBucketSeen[targetPath]
+		if len(seenMap) == 0 {
+			continue
+		}
+		rawMap := rawByAggAndBucket[targetPath]
+		targetPctSpec := subAggs[targetName].Percentiles
+		percents := mp.EffectivePercents()
+		if len(percents) == 0 && targetPctSpec != nil {
+			percents = targetPctSpec.EffectivePercents()
+		}
+		if len(percents) == 0 {
+			percents = []float64{1, 5, 25, 50, 75, 95, 99}
+		}
+		keyed := true
+		if mp.Keyed != nil {
+			keyed = *mp.Keyed
+		} else if targetPctSpec != nil && targetPctSpec.Keyed != nil {
+			keyed = *targetPctSpec.Keyed
+		}
+		win := mp.EffectiveWindow()
+		shift := mp.EffectiveShift()
+		bucketVals := make([][]float64, len(buckets))
+		bucketValid := make([]bool, len(buckets))
+		for i, bMap := range buckets {
+			bKey := fmt.Sprintf("%v", bMap["key"])
+			curPK := bKey
+			if parentBucketKey != "" {
+				curPK = parentBucketKey + "\x1f" + bKey
+			}
+			vals, matched := lookupRawValuesForBucketR61Search(rawMap, seenMap, curPK, bMap)
+			if matched && len(vals) > 0 {
+				bucketVals[i] = vals
+				bucketValid[i] = true
+			}
+		}
+		synthPct := &esast.PercentilesAggSpec{
+			Percents: percents,
+			Keyed:    &keyed,
+			Format:   mp.Format,
+		}
+		if targetPctSpec != nil {
+			synthPct.TDigest = targetPctSpec.TDigest
+			synthPct.HDR = targetPctSpec.HDR
+		}
+		for i, bMap := range buckets {
+			delete(bMap, mpName)
+			endIdx := i - 1 + shift
+			if endIdx >= len(buckets) {
+				endIdx = len(buckets) - 1
+			}
+			if endIdx < 0 {
+				continue
+			}
+			startIdx := endIdx + 1 - win
+			if startIdx < 0 {
+				startIdx = 0
+			}
+			var combined []float64
+			for j := startIdx; j <= endIdx; j++ {
+				if bucketValid[j] {
+					combined = append(combined, bucketVals[j]...)
+				}
+			}
+			if len(combined) == 0 {
+				continue
+			}
+			if outObj, err := buildExactQuantileMetricObjectR61Search(esast.AggSpec{Percentiles: synthPct}, combined, isES8); err == nil && outObj != nil {
+				bMap[mpName] = outObj
+			}
+		}
+	}
 }
 
 func buildExactQuantileMetricObjectR61Search(spec esast.AggSpec, vals []float64, isES8 bool) (map[string]any, error) {
@@ -4131,7 +4251,7 @@ func buildExactQuantileMetricObjectR61Search(spec esast.AggSpec, vals []float64,
 		if spec.Boxplot.Compression != nil && *spec.Boxplot.Compression > 0 {
 			comp = *spec.Boxplot.Compression
 		}
-		bp := transpiler.ComputeESBoxplotWithVersion(vals, comp, isES8)
+		bp := transpiler.ComputeESBoxplotWithExecutionHint(vals, comp, isES8, spec.Boxplot.ExecutionHint)
 		ptrOrNil := func(p *float64) any {
 			if p == nil {
 				return nil
@@ -4209,6 +4329,8 @@ func isChildMultiBucketPipelineAggSpecR61Search(spec esast.AggSpec) (string, boo
 		return "moving_avg", true
 	case spec.MovingFn != nil:
 		return "moving_fn", true
+	case spec.MovingPercentiles != nil:
+		return "moving_percentiles", true
 	case spec.CumulativeSum != nil:
 		return "cumulative_sum", true
 	case spec.CumulativeCardinality != nil:
@@ -4314,6 +4436,8 @@ func extractAllBucketsPathsFromSpecR61Search(spec esast.AggSpec) []string {
 		addAny(spec.MovingAvg.BucketsPath)
 	case spec.MovingFn != nil:
 		addAny(spec.MovingFn.BucketsPath)
+	case spec.MovingPercentiles != nil:
+		addAny(spec.MovingPercentiles.BucketsPath)
 	case spec.SerialDiff != nil:
 		addAny(spec.SerialDiff.BucketsPath)
 	case spec.Normalize != nil:
@@ -4427,7 +4551,7 @@ func validatePipelineAggTreeR61Search(
 			}
 			if pipeType != "bucket_script" || (!allowSiblingBucketScript && !parentIsMultiBucket && !hasAncestorMultiBucket) {
 				if parentKind == "root" {
-					if pipeType == "derivative" || pipeType == "moving_fn" {
+					if pipeType == "derivative" || pipeType == "moving_fn" || pipeType == "moving_percentiles" || pipeType == "moving_avg" {
 						return http.StatusBadRequest,
 							"action_request_validation_exception",
 							fmt.Sprintf("Validation Failed: 1: %s aggregation [%s] must have a histogram, date_histogram or auto_date_histogram as parent but doesn't have a parent;", pipeType, name)
@@ -4440,6 +4564,11 @@ func validatePipelineAggTreeR61Search(
 					return http.StatusBadRequest,
 						"action_request_validation_exception",
 						fmt.Sprintf("Validation Failed: 1: %s aggregation [%s] must have a multi-bucket aggregation as parent, not [%s];", pipeType, name, parentKind)
+				}
+				if pipeType == "moving_percentiles" && parentKind != "histogram" && parentKind != "date_histogram" && parentKind != "auto_date_histogram" {
+					return http.StatusBadRequest,
+						"action_request_validation_exception",
+						fmt.Sprintf("Validation Failed: 1: moving_percentiles aggregation [%s] must have a histogram, date_histogram or auto_date_histogram as parent, got [%s];", name, parentKind)
 				}
 			}
 		}
@@ -4479,7 +4608,7 @@ func validatePipelineAggTreeR61Search(
 		}
 
 		// Validate `buckets_path` against referencing a multi-value metric (`stats`, `extended_stats`, `matrix_stats`, `percentiles`, `percentile_ranks`, `boxplot`) without a sub-metric selector!
-		if spec.BucketScript == nil && spec.BucketSelector == nil {
+		if spec.BucketScript == nil && spec.BucketSelector == nil && spec.MovingPercentiles == nil {
 			for _, bp := range extractAllBucketsPathsFromSpecR61Search(spec) {
 				if invalidMetric, bad := bucketsPathTargetsWholeMultiValueMetricR61Search(aggs, bp); bad {
 					return http.StatusBadRequest,
@@ -4494,8 +4623,49 @@ func validatePipelineAggTreeR61Search(
 			sbKind, isSB := isSingleBucketAggSpecR61Search(spec)
 			isMB := isMultiBucketParentAggSpecR61Search(spec)
 			childParentKind := name
-			if isSB {
+			switch {
+			case isSB:
 				childParentKind = sbKind
+			case spec.Histogram != nil:
+				childParentKind = "histogram"
+			case spec.DateHistogram != nil:
+				childParentKind = "date_histogram"
+			case spec.AutoDateHistogram != nil:
+				childParentKind = "auto_date_histogram"
+			case spec.VariableWidthHistogram != nil:
+				childParentKind = "variable_width_histogram"
+			case spec.EffectiveTerms() != nil:
+				childParentKind = "terms"
+			case spec.CountedTerms != nil:
+				childParentKind = "counted_terms"
+			case spec.RareTerms != nil:
+				childParentKind = "rare_terms"
+			case spec.MultiTerms != nil:
+				childParentKind = "multi_terms"
+			case spec.Range != nil:
+				childParentKind = "range"
+			case spec.DateRange != nil:
+				childParentKind = "date_range"
+			case spec.IPRange != nil:
+				childParentKind = "ip_range"
+			case spec.Filters != nil:
+				childParentKind = "filters"
+			case spec.AdjacencyMatrix != nil:
+				childParentKind = "adjacency_matrix"
+			case spec.Composite != nil:
+				childParentKind = "composite"
+			case spec.GeoDistance != nil:
+				childParentKind = "geo_distance"
+			case spec.GeohashGrid != nil:
+				childParentKind = "geohash_grid"
+			case spec.GeotileGrid != nil:
+				childParentKind = "geotile_grid"
+			case spec.GeoHexGrid != nil:
+				childParentKind = "geo_hex_grid"
+			case spec.IPPrefix != nil:
+				childParentKind = "ip_prefix"
+			case spec.TimeSeries != nil:
+				childParentKind = "time_series"
 			}
 			if status, errT, errR := validatePipelineAggTreeR61Search(subAggs, childParentKind, isSB, isMB, hasAncestorMultiBucket || isMB); status != 0 {
 				return status, errT, errR
@@ -5912,6 +6082,18 @@ func validateHighlightRequestR61Search(
 	for _, fn := range fieldNames {
 		rawFieldCfg := hl.Fields[fn]
 		fSpec := hl.FieldSpec(fn)
+		reqFieldMatch := true
+		if hl.RequireFieldMatch != nil {
+			reqFieldMatch = *hl.RequireFieldMatch
+		}
+		if fSpec.RequireFieldMatch != nil {
+			reqFieldMatch = *fSpec.RequireFieldMatch
+		}
+		if !reqFieldMatch && len(fSpec.MatchedFields) > 0 {
+			return http.StatusBadRequest,
+				"illegal_argument_exception",
+				"Matched fields are not supported when [require_field_match] is set to [false]"
+		}
 		hasRawPre, hasRawPost := rawFieldHasPrePostTagsKeysR61Search(rawFieldCfg)
 		if status, errT, errR := validateHighlightTagsPairR61Search(fSpec.PreTags, fSpec.PostTags, hasRawPre || fSpec.PreTags != nil, hasRawPost || fSpec.PostTags != nil); status != 0 {
 			return status, errT, errR
@@ -9318,6 +9500,10 @@ func aggsMapHasBucketPrunerR61Search(aggs map[string]esast.AggSpec) bool {
 }
 
 func reEvaluatePipelineAggsTreeR61Search(aggs map[string]esast.AggSpec, aggsOut map[string]any) error {
+	return reEvaluatePipelineAggsTreeInnerR61Search(aggs, aggsOut, false)
+}
+
+func reEvaluatePipelineAggsTreeInnerR61Search(aggs map[string]esast.AggSpec, aggsOut map[string]any, isMultiBucketChild bool) error {
 	if len(aggs) == 0 || len(aggsOut) == 0 {
 		return nil
 	}
@@ -9335,7 +9521,7 @@ func reEvaluatePipelineAggsTreeR61Search(aggs map[string]esast.AggSpec, aggsOut 
 		switch rawB := subMap["buckets"].(type) {
 		case []map[string]any:
 			for _, b := range rawB {
-				if err := reEvaluatePipelineAggsTreeR61Search(subAggs, b); err != nil {
+				if err := reEvaluatePipelineAggsTreeInnerR61Search(subAggs, b, true); err != nil {
 					return err
 				}
 			}
@@ -9361,7 +9547,7 @@ func reEvaluatePipelineAggsTreeR61Search(aggs map[string]esast.AggSpec, aggsOut 
 			conv := make([]map[string]any, 0, len(rawB))
 			for _, item := range rawB {
 				if m, okM := item.(map[string]any); okM {
-					if err := reEvaluatePipelineAggsTreeR61Search(subAggs, m); err != nil {
+					if err := reEvaluatePipelineAggsTreeInnerR61Search(subAggs, m, true); err != nil {
 						return err
 					}
 					conv = append(conv, m)
@@ -9388,20 +9574,20 @@ func reEvaluatePipelineAggsTreeR61Search(aggs map[string]esast.AggSpec, aggsOut 
 		case map[string]any:
 			for _, item := range rawB {
 				if m, okM := item.(map[string]any); okM {
-					if err := reEvaluatePipelineAggsTreeR61Search(subAggs, m); err != nil {
+					if err := reEvaluatePipelineAggsTreeInnerR61Search(subAggs, m, true); err != nil {
 						return err
 					}
 				}
 			}
 		default:
-			if err := reEvaluatePipelineAggsTreeR61Search(subAggs, subMap); err != nil {
+			if err := reEvaluatePipelineAggsTreeInnerR61Search(subAggs, subMap, false); err != nil {
 				return err
 			}
 		}
 	}
 	if hasQuantiles {
 		evaluateSiblingPipelineAggs(aggs, aggsOut)
-		if !aggsMapHasBucketPrunerR61Search(aggs) {
+		if !isMultiBucketChild && !aggsMapHasBucketPrunerR61Search(aggs) {
 			_ = evaluateChildPipelineAggs([]map[string]any{aggsOut}, aggs)
 		}
 		attachAllAggMetasRound60(aggsOut, aggs)

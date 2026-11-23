@@ -21,6 +21,8 @@ import (
 	"encoding/json"
 	"testing"
 	"time"
+
+	"github.com/es2doris/doris-es-proxy/pkg/esast"
 )
 
 func FuzzParseESDateMath(f *testing.F) {
@@ -78,6 +80,41 @@ func FuzzInferAndShredDocument(f *testing.F) {
 		var out map[string]any
 		if uErr := json.Unmarshal(shredded, &out); uErr != nil {
 			t.Fatalf("ShredDocument emitted invalid JSON %q: %v", string(shredded), uErr)
+		}
+	})
+}
+
+func FuzzValidateTSDBSettingsAndMappings(f *testing.F) {
+	type seed struct {
+		mode     string
+		endCur   string
+		endNext  string
+		settings string
+		mapping  string
+		docID    string
+	}
+	seeds := []seed{
+		{"time_series", "2026-10-25T12:00:00Z", "2026-10-25T13:00:00Z", `{"index":{"mode":"time_series","routing_path":["host"],"time_series":{"start_time":"2026-10-25T00:00:00Z","end_time":"2026-10-25T12:00:00Z"}}}`, `{"properties":{"@timestamp":{"type":"date"},"host":{"type":"keyword","time_series_dimension":true},"cpu":{"type":"double","time_series_metric":"gauge"}}}`, "ts-id-1"},
+		{"time_series", "2026-10-25T12:00:00Z", "2026-10-24T12:00:00Z", `{"index":{"mode":"time_series","sort":{"field":"@timestamp"}}}`, `{"properties":{"@timestamp":{"type":"date"},"dim":{"type":"keyword"}}}`, "bad"},
+		{"standard", "", "", `{"index":{"routing_path":["host"]}}`, `{"_source":{"mode":"synthetic"},"properties":{"k":{"type":"keyword"}}}`, ""},
+		{"logsdb", "", "", `{"index":{"mode":"logsdb","lookahead_time":"30m"}}`, `{"properties":{"msg":{"type":"text"}}}`, "doc-99"},
+	}
+	for _, s := range seeds {
+		f.Add(s.mode, s.endCur, s.endNext, []byte(s.settings), []byte(s.mapping), s.docID)
+	}
+	f.Fuzz(func(t *testing.T, mode, endCur, endNext string, rawSettings, rawMapping []byte, docID string) {
+		if len(rawSettings) > 8192 || len(rawMapping) > 8192 || len(mode) > 64 || len(docID) > 512 {
+			return
+		}
+		var settings map[string]any
+		_ = json.Unmarshal(rawSettings, &settings)
+		_ = ValidateIndexModeSettings(mode, settings)
+		_ = ValidateTSDBEndTimeUpdate(endCur, endNext)
+		_ = ValidateTSDBDocID(docID, "ts_idx")
+
+		var m esast.MappingSpec
+		if json.Unmarshal(rawMapping, &m) == nil {
+			_ = ValidateTSDBMapping(&m, []string{"host"})
 		}
 	})
 }

@@ -1441,6 +1441,7 @@ type IngestWriteResultRound61 struct {
 	IfSeqNo           int64
 	HasIfPrimaryTerm  bool
 	IfPrimaryTerm     int64
+	DynamicTemplates  map[string]string
 }
 
 // applyWritePipelinesFullRound61 runs the full ingest chain (explicit/default pipeline,
@@ -1519,6 +1520,9 @@ func (s *Server) applyWritePipelinesFullRound61(
 		if pt, ok := toInt64(ingestMeta["__mutated_if_primary_term"]); ok {
 			res.HasIfPrimaryTerm = true
 			res.IfPrimaryTerm = pt
+		}
+		if dt, ok := ingestMeta["__mutated_dynamic_templates"].(map[string]string); ok && len(dt) > 0 {
+			res.DynamicTemplates = dt
 		}
 	}
 	if dropped {

@@ -1642,8 +1642,11 @@ func TestRound52_ProxyAndIngestFeatures(t *testing.T) {
 	if c, _, _ := doRound48Req(t, handler, http.MethodPut, "/_autoscaling/policy/a_bad", `{"roles":[]}`); c != http.StatusBadRequest {
 		t.Fatalf("expected 400 on empty autoscaling roles, got %d", c)
 	}
-	if c, _, _ := doRound48Req(t, handler, http.MethodPut, "/_autoscaling/policy/a_bad", `{"roles":["data_hot"]}`); c != http.StatusBadRequest {
-		t.Fatalf("expected 400 on missing autoscaling deciders, got %d", c)
+	if c, _, _ := doRound48Req(t, handler, http.MethodPut, "/_autoscaling/policy/a_roles_only", `{"roles":["data_hot"]}`); c != http.StatusOK {
+		t.Fatalf("expected 200 on roles-only autoscaling policy, got %d", c)
+	}
+	if c, _, _ := doRound48Req(t, handler, http.MethodPut, "/_autoscaling/policy/a_bad", `{"roles":["data_hot"],"deciders":{"does_not_exist":{}}}`); c != http.StatusBadRequest {
+		t.Fatalf("expected 400 on unknown autoscaling decider, got %d", c)
 	}
 	_, _, _ = doRound48Req(t, handler, http.MethodPut, "/_autoscaling/policy/a_cov", `{"roles":["data_hot"],"deciders":{}}`)
 	if c, _, _ := doRound48Req(t, handler, http.MethodGet, "/_autoscaling/policy", ``); c != http.StatusOK {

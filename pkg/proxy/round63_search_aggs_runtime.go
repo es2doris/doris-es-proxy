@@ -783,6 +783,49 @@ func extractSigHeuristicForAggFromRawR63(raw []byte, fullAggName string) sigHeur
 	return sigHeuristicSpecR62Search{kind: "jlh"}
 }
 
+func aggHasShowDistributionFromRawR65(raw []byte, fullAggName string) bool {
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return false
+	}
+	var root map[string]any
+	if json.Unmarshal(raw, &root) != nil || root == nil {
+		return false
+	}
+	segs := strings.Split(fullAggName, ".")
+	cur := root
+	for i, seg := range segs {
+		aggsObj, _ := cur["aggs"].(map[string]any)
+		if aggsObj == nil {
+			aggsObj, _ = cur["aggregations"].(map[string]any)
+		}
+		if aggsObj == nil {
+			return false
+		}
+		next, ok := aggsObj[seg].(map[string]any)
+		if !ok || next == nil {
+			return false
+		}
+		cur = next
+		if i == len(segs)-1 {
+			ssMap, _ := cur["string_stats"].(map[string]any)
+			if ssMap == nil {
+				return false
+			}
+			rawSD, okSD := ssMap["show_distribution"]
+			if !okSD || rawSD == nil {
+				return false
+			}
+			switch v := rawSD.(type) {
+			case bool:
+				return v
+			case string:
+				return strings.EqualFold(strings.TrimSpace(v), "true")
+			}
+		}
+	}
+	return false
+}
+
 func formatTermsBucketKeyAndStringWithScopeR63(
 	scope *activeSearchScope,
 	rawKey string,
@@ -2722,7 +2765,7 @@ func clusterVariableWidthHistogramR63(
 
 func aggsHaveSignificantTextR63(aggs map[string]esast.AggSpec) bool {
 	for _, spec := range aggs {
-		if spec.SignificantText != nil {
+		if spec.SignificantText != nil || (spec.IsSignificantTerms() && spec.EffectiveTerms() != nil && spec.EffectiveTerms().BackgroundFilter != nil) {
 			return true
 		}
 		if aggsHaveSignificantTextR63(spec.SubAggs()) {
@@ -3078,7 +3121,7 @@ func buildHighlightedSnippetsModeAwareWithFieldTypeR63(
 			}
 			sb.WriteString(esc(val[pos:]))
 			frag := sb.String()
-			if numFrags > 0 && strings.TrimSpace(preTag) == "" && strings.TrimSpace(postTag) == "" {
+			if numFrags > 0 {
 				frag = strings.TrimSpace(frag)
 			}
 			out = append(out, frag)
@@ -3096,7 +3139,7 @@ func buildHighlightedSnippetsModeAwareWithFieldTypeR63(
 	// Fix trailing sentence punctuation inside tag on analyzed text fields (`<em>... life.</em>` -> `<em>... life</em>.`)
 	// while keeping full value inside tags for `keyword` fields (`50_synthetic_source.yml :: keyword multi unified`),
 	// and trim outer whitespace when passage tags are empty/whitespace and `numFrags > 0` (`510_fragment_trimming_fix.yml`).
-	trimOuterSpaces := numFrags > 0 && strings.TrimSpace(preTag) == "" && strings.TrimSpace(postTag) == ""
+	trimOuterSpaces := numFrags > 0
 	for i, f := range frags {
 		if !isKeywordField {
 			for _, punct := range []string{".", "!", "?", ",", ";", ":"} {
@@ -3121,15 +3164,26 @@ func emitRawBodyDeprecationWarningsR63(w http.ResponseWriter, s *Server, r *http
 	hasDateHistoCand := bytes.Contains(bodyBytes, []byte("date_histogram")) && bytes.Contains(bodyBytes, []byte(`"interval"`))
 	hasCommonCand := bytes.Contains(bodyBytes, []byte(`"common"`))
 	hasCutoffCand := bytes.Contains(bodyBytes, []byte(`"cutoff_frequency"`))
-	if !hasDateHistoCand && !hasCommonCand && !hasCutoffCand {
+	hasGeoBBoxCand := bytes.Contains(bodyBytes, []byte(`"geo_bounding_box"`))
+	if !hasDateHistoCand && !hasCommonCand && !hasCutoffCand && !hasGeoBBoxCand {
 		return
 	}
 	var root map[string]any
 	if json.Unmarshal(bodyBytes, &root) != nil || root == nil {
 		return
 	}
+	isTargetES8 := s.hasExplicitTargetESVersion() && strings.HasPrefix(s.getTargetESVersion(), "8.")
 	if hasCommonCand || hasCutoffCand {
-		var foundCommon, foundMatchCutoff, foundMultiMatchCutoff bool
+		if isTargetES8 {
+			hasCommonCand = false
+			hasCutoffCand = false
+		}
+	}
+	if !isTargetES8 {
+		hasGeoBBoxCand = false
+	}
+	if hasCommonCand || hasCutoffCand || hasGeoBBoxCand {
+		var foundCommon, foundMatchCutoff, foundMultiMatchCutoff, foundGeoBBoxType bool
 		hasCutoff := func(m map[string]any) bool {
 			_, ok := m["cutoff_frequency"]
 			return ok
@@ -3140,6 +3194,11 @@ func emitRawBodyDeprecationWarningsR63(w http.ResponseWriter, s *Server, r *http
 			case map[string]any:
 				if _, ok := tv["common"].(map[string]any); ok {
 					foundCommon = true
+				}
+				if gb, ok := tv["geo_bounding_box"].(map[string]any); ok {
+					if _, hasType := gb["type"]; hasType {
+						foundGeoBBoxType = true
+					}
 				}
 				if m, ok := tv["match"].(map[string]any); ok {
 					if hasCutoff(m) {
@@ -3174,6 +3233,9 @@ func emitRawBodyDeprecationWarningsR63(w http.ResponseWriter, s *Server, r *http
 		}
 		if foundMultiMatchCutoff {
 			emitESDeprecationWarningRound61(w, s, r, "Deprecated field [cutoff_frequency] used, replaced by [you can omit this option, the [multi_match] query can skip block of documents efficiently if the total number of hits is not tracked]")
+		}
+		if foundGeoBBoxType {
+			emitESDeprecationWarningRound61(w, s, r, "Deprecated parameter [type] used, it should no longer be specified.")
 		}
 	}
 	if !hasDateHistoCand {
@@ -3670,13 +3732,13 @@ func checkWeightedAvgMultiWeightOnDocsR63(aggs map[string]esast.AggSpec, hits []
 	return nil
 }
 
-func detectCrossIndexTermsValueTypeShardFailuresR63(
+func detectCrossIndexTermsValueTypeShardFailureMapR65(
 	targets []string,
 	schemasByIndex map[string]*schema.IndexSchema,
 	aggs map[string]esast.AggSpec,
-) (int, []map[string]any) {
+) map[string]string {
 	if len(targets) <= 1 || len(aggs) == 0 {
-		return 0, nil
+		return nil
 	}
 	var termsSpecs []*esast.TermsAggSpec
 	var walk func(m map[string]esast.AggSpec)
@@ -3690,7 +3752,7 @@ func detectCrossIndexTermsValueTypeShardFailuresR63(
 	}
 	walk(aggs)
 	if len(termsSpecs) == 0 {
-		return 0, nil
+		return nil
 	}
 	isNumericVT := func(vt string) bool {
 		switch strings.ToLower(strings.TrimSpace(vt)) {
@@ -3719,12 +3781,31 @@ func detectCrossIndexTermsValueTypeShardFailuresR63(
 				continue
 			}
 			ft := strings.ToLower(strings.TrimSpace(b.ESType))
-			if (isNumericVT(vt) && isStringVT(ft)) || (isStringVT(vt) && isNumericVT(ft) && vt != "string") {
+			mismatch := (isNumericVT(vt) && isStringVT(ft)) || (isStringVT(vt) && isNumericVT(ft) && vt != "string")
+			if !mismatch && vt == "ip" && ft != "" && ft != "ip" {
+				mismatch = true
+			}
+			if !mismatch && ft == "ip" && vt != "" && vt != "ip" && vt != "string" {
+				mismatch = true
+			}
+			if mismatch {
 				failedIdx[tName] = fmt.Sprintf("Value type [%s] is not compatible with field [%s] of type [%s]", ts.ValueType, ts.Field, b.ESType)
 			}
 		}
 	}
 	if len(failedIdx) == 0 || len(failedIdx) >= len(targets) {
+		return nil
+	}
+	return failedIdx
+}
+
+func detectCrossIndexTermsValueTypeShardFailuresR63(
+	targets []string,
+	schemasByIndex map[string]*schema.IndexSchema,
+	aggs map[string]esast.AggSpec,
+) (int, []map[string]any) {
+	failedIdx := detectCrossIndexTermsValueTypeShardFailureMapR65(targets, schemasByIndex, aggs)
+	if len(failedIdx) == 0 {
 		return 0, nil
 	}
 	var failures []map[string]any
@@ -3835,8 +3916,8 @@ func (s *Server) handleCacheClearR63(w http.ResponseWriter, r *http.Request) {
 }
 
 func extractTopHitsSourceMetricR63(subMap map[string]any, tail []string) (float64, bool) {
-	if len(tail) < 2 || tail[0] != "_source" {
-		return 0, false
+	if len(tail) == 1 && strings.HasPrefix(tail[0], "_source.") {
+		tail = append([]string{"_source"}, strings.Split(strings.TrimPrefix(tail[0], "_source."), ".")...)
 	}
 	hitsEnv, okH := subMap["hits"].(map[string]any)
 	if !okH {
@@ -3854,6 +3935,31 @@ func extractTopHitsSourceMetricR63(subMap map[string]any, tail []string) (float6
 		}
 	}
 	if firstHit == nil {
+		return 0, false
+	}
+	if len(tail) == 1 {
+		switch tail[0] {
+		case "_sort":
+			switch sv := firstHit["sort"].(type) {
+			case []any:
+				if len(sv) > 0 {
+					return toFloat64(sv[0])
+				}
+			case []float64:
+				if len(sv) > 0 {
+					return sv[0], true
+				}
+			}
+			return 0, false
+		case "_score":
+			if sc, ok := firstHit["_score"]; ok && sc != nil {
+				return toFloat64(sc)
+			}
+			return 0, false
+		}
+		return 0, false
+	}
+	if len(tail) < 2 || tail[0] != "_source" {
 		return 0, false
 	}
 	var srcMap map[string]any

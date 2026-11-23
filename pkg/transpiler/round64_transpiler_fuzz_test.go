@@ -152,6 +152,9 @@ func isBalancedBackticksAndParensR64(sqlStr string) bool {
 }
 
 func hasOneArgJSONTypeR64(sqlStr string) bool {
+	if !reFuzzR64JSONType.MatchString(sqlStr) {
+		return false
+	}
 	inSingle, inDouble, inBacktick := false, false, false
 	for i := 0; i < len(sqlStr); {
 		ch := sqlStr[i]
@@ -203,6 +206,10 @@ func hasOneArgJSONTypeR64(sqlStr string) bool {
 			continue
 		case '`':
 			inBacktick = true
+			i++
+			continue
+		}
+		if ch != 'j' && ch != 'J' {
 			i++
 			continue
 		}
@@ -274,8 +281,9 @@ func hasOneArgJSONTypeR64(sqlStr string) bool {
 	return false
 }
 
-func hasMatchInFromBaseMatchedR64(sqlStr string) bool {
+func extractFromBaseMatchedSegmentsR64(sqlStr string) []string {
 	locs := reFuzzR64FromBaseMatched.FindAllStringIndex(sqlStr, -1)
+	segs := make([]string, 0, len(locs))
 	for _, loc := range locs {
 		tail := sqlStr[loc[1]:]
 		depth := 0
@@ -329,13 +337,19 @@ func hasMatchInFromBaseMatchedR64(sqlStr string) bool {
 			case ')':
 				if depth == 0 {
 					end = i
-					goto checkSeg
+					goto doneSeg
 				}
 				depth--
 			}
 		}
-	checkSeg:
-		seg := stripQuotedSQLSegmentsR64(tail[:end])
+	doneSeg:
+		segs = append(segs, stripQuotedSQLSegmentsR64(tail[:end]))
+	}
+	return segs
+}
+
+func hasMatchInFromBaseMatchedR64(sqlStr string) bool {
+	for _, seg := range extractFromBaseMatchedSegmentsR64(sqlStr) {
 		if reFuzzR64MatchPredicate.MatchString(seg) {
 			return true
 		}
@@ -589,6 +603,115 @@ func hasUnparenthesizedOrderByInUnionAllR64(sqlStr string) bool {
 	return false
 }
 
+var (
+	reFuzzR65ScoreCall        = regexp.MustCompile(`(?i)\bscore\s*\(\s*\)`)
+	reFuzzR65CastCoalesce     = regexp.MustCompile(`(?i)\bCAST\s*\(\s*COALESCE\s*\(`)
+	reFuzzR65MatchAllKinds    = regexp.MustCompile(`(?i)\bMATCH_(?:ALL|ANY|PHRASE|PHRASE_PREFIX|REGEXP|BOOL_PREFIX)\b`)
+	reFuzzR65RawUntrustedCast = regexp.MustCompile("(?i)\\bCAST\\s*\\(\\s*(?:`?(?:_nel|_elem|_x|_sub_elem(?:_\\d+)?|_helem)`?|json_extract_string\\([^)]*\\))\\s+AS\\s+(?:DOUBLE|BIGINT|LARGEINT|INT)\\b")
+)
+
+func hasScoreInFromBaseMatchedR65(sqlStr string) bool {
+	for _, seg := range extractFromBaseMatchedSegmentsR64(sqlStr) {
+		if reFuzzR65ScoreCall.MatchString(seg) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasMatchInCastCoalesceR65(sqlStr string) bool {
+	i := 0
+	for i < len(sqlStr) {
+		loc := reFuzzR65CastCoalesce.FindStringIndex(sqlStr[i:])
+		if loc == nil {
+			return false
+		}
+		start := i + loc[0]
+		openIdx := strings.IndexByte(sqlStr[start:], '(')
+		if openIdx < 0 {
+			return false
+		}
+		j := start + openIdx
+		depth := 0
+		inS, inD, inB := false, false, false
+		end := len(sqlStr)
+		for j < len(sqlStr) {
+			c := sqlStr[j]
+			if inS {
+				if c == '\\' && j+1 < len(sqlStr) {
+					j += 2
+					continue
+				}
+				if c == '\'' {
+					if j+1 < len(sqlStr) && sqlStr[j+1] == '\'' {
+						j += 2
+						continue
+					}
+					inS = false
+				}
+				j++
+				continue
+			}
+			if inD {
+				if c == '\\' && j+1 < len(sqlStr) {
+					j += 2
+					continue
+				}
+				if c == '"' {
+					inD = false
+				}
+				j++
+				continue
+			}
+			if inB {
+				if c == '`' {
+					if j+1 < len(sqlStr) && sqlStr[j+1] == '`' {
+						j += 2
+						continue
+					}
+					inB = false
+				}
+				j++
+				continue
+			}
+			switch c {
+			case '\'':
+				inS = true
+			case '"':
+				inD = true
+			case '`':
+				inB = true
+			case '(':
+				depth++
+			case ')':
+				depth--
+				if depth == 0 {
+					end = j + 1
+					goto checkBody
+				}
+			}
+			j++
+		}
+	checkBody:
+		if reFuzzR65MatchAllKinds.MatchString(stripQuotedSQLSegmentsR64(sqlStr[start:end])) {
+			return true
+		}
+		i = start + openIdx + 1
+	}
+	return false
+}
+
+func hasRawUntrustedCastR65(sqlStr string) bool {
+	locs := reFuzzR65RawUntrustedCast.FindAllStringIndex(sqlStr, -1)
+	for _, loc := range locs {
+		if loc[0] >= 4 && strings.EqualFold(sqlStr[loc[0]-4:loc[0]], "TRY_") {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
 func sanitizeFuzzyTextTokenR64(s string) string {
 	var b strings.Builder
 	for i := 0; i < len(s) && b.Len() < 32; i++ {
@@ -609,6 +732,10 @@ func FuzzNormalizeDorisSQL(f *testing.F) {
 	f.Add(uint8(2), uint8(2), "status:active", uint64(100))
 	f.Add(uint8(3), uint8(3), "u4pruydqqvj", uint64(5000))
 	f.Add(uint8(4), uint8(4), "quick fox", uint64(42))
+	f.Add(uint8(6), uint8(5), "ab pizza", uint64(3))
+	f.Add(uint8(7), uint8(6), "ny", uint64(9))
+	f.Add(uint8(8), uint8(0), "x", uint64(15))
+	f.Add(uint8(9), uint8(5), "laptop", uint64(21))
 
 	var spec esast.MappingSpec
 	if err := json.Unmarshal([]byte(`{
@@ -619,6 +746,7 @@ func FuzzNormalizeDorisSQL(f *testing.F) {
 			"ck":      {"type": "constant_keyword", "value": "pinned"},
 			"uid":     {"type": "unsigned_long"},
 			"price":   {"type": "double"},
+			"scores":  {"type": "double"},
 			"loc":     {"type": "geo_point"},
 			"shape":   {"type": "geo_shape", "index": false},
 			"dyn":     {"type": "object", "dynamic": true},
@@ -635,6 +763,12 @@ func FuzzNormalizeDorisSQL(f *testing.F) {
 		f.Fatalf("unmarshal fuzz mapping: %v", err)
 	}
 	sch := schema.CompileIndexSchema("db", "fuzz_r64_idx", &spec)
+	if fb, ok := sch.Fields["scores"]; ok {
+		fb.Kind = schema.StoragePromotedArray
+		fb.IsMultiValued = true
+		fb.ColumnName = "arr__scores"
+		sch.Fields["scores"] = fb
+	}
 	cfg, err := analysis.ParseIndexAnalysisConfig(map[string]any{
 		"analysis": map[string]any{
 			"filter": map[string]any{
@@ -659,9 +793,9 @@ func FuzzNormalizeDorisSQL(f *testing.F) {
 	f.Fuzz(func(t *testing.T, qMode uint8, aggMode uint8, rawTok string, numSeed uint64) {
 		tok := sanitizeFuzzyTextTokenR64(rawTok)
 		var qJSON string
-		switch qMode % 6 {
+		switch qMode % 10 {
 		case 0:
-			qJSON = fmt.Sprintf(`{"match": {"title": %q}}`, tok)
+			qJSON = fmt.Sprintf(`{"match": {"title": {"query": %q, "fuzziness": "AUTO", "minimum_should_match": "2<75%%"}}}`, "a "+tok)
 		case 1:
 			qJSON = fmt.Sprintf(`{"term": {"tag": %q}}`, tok)
 		case 2:
@@ -670,12 +804,20 @@ func FuzzNormalizeDorisSQL(f *testing.F) {
 			qJSON = fmt.Sprintf(`{"nested": {"path": "items", "query": {"term": {"items.sku": %q}}}}`, tok)
 		case 4:
 			qJSON = `{"geo_grid": {"loc": {"geohash": "u4p"}}}`
-		default:
+		case 5:
 			qJSON = fmt.Sprintf(`{"script_score": {"query": {"match": {"title": %q}}, "script": {"source": "_score - 5.0"}}}`, tok)
+		case 6:
+			qJSON = fmt.Sprintf(`{"match_bool_prefix": {"title": {"query": %q, "fuzziness": "AUTO", "minimum_should_match": 1}}}`, tok+" xy")
+		case 7:
+			qJSON = fmt.Sprintf(`{"common": {"title": {"query": %q, "cutoff_frequency": 0.001, "low_freq_operator": "and", "minimum_should_match": 1}}}`, tok+" ab")
+		case 8:
+			qJSON = fmt.Sprintf(`{"bool": {"must": [{"match": {"title": {"query": %q, "fuzziness": "AUTO"}}}], "should": [{"match_bool_prefix": {"title": %q}}]}}`, "x "+tok, tok)
+		default:
+			qJSON = fmt.Sprintf(`{"function_score": {"query": {"match_bool_prefix": {"title": %q}}, "gauss": {"scores": {"origin": 50, "scale": 10}}}}`, tok)
 		}
 
 		var aggJSON string
-		switch aggMode % 5 {
+		switch aggMode % 7 {
 		case 0:
 			aggJSON = fmt.Sprintf(`{
 				"by_tag": {"terms": {"field": "tag", "size": 5}},
@@ -695,27 +837,65 @@ func FuzzNormalizeDorisSQL(f *testing.F) {
 			}`, tok, tok)
 		case 3:
 			aggJSON = `{
-				"nested_items": {"nested": {"path": "items"}, "aggs": {"avg_qty": {"avg": {"field": "items.qty"}}}}
+				"nested_items": {
+					"nested": {"path": "items"},
+					"aggs": {
+						"avg_qty": {"avg": {"field": "items.qty"}},
+						"qty_box": {"boxplot": {"field": "items.qty"}},
+						"qty_pct": {"percentiles": {"field": "items.qty"}}
+					}
+				}
 			}`
-		default:
+		case 4:
 			aggJSON = fmt.Sprintf(`{
 				"by_tag": {"terms": {"field": "tag", "size": 5}},
 				"sig": {"significant_terms": {"field": "tag", "background_filter": {"match": {"title": %q}}}}
 			}`, tok)
+		case 5:
+			aggJSON = `{
+				"all_docs": {"global": {}, "aggs": {"sc_box": {"boxplot": {"field": "scores"}}}},
+				"sc_pct": {"percentiles": {"field": "scores", "percents": [50, 95]}},
+				"sc_ranks": {"percentile_ranks": {"field": "scores", "values": [10, 50]}}
+			}`
+		default:
+			aggJSON = fmt.Sprintf(`{
+				"mt": {"multi_terms": {"terms": [{"field": "uid", "value_type": "unsigned_long"}, {"field": "tag"}], "min_doc_count": 1, "order": [{"_count": "asc"}]}},
+				"flt": {"filter": {"common": {"title": %q}}}
+			}`, tok)
 		}
 
+		minScoreFrag := ""
+		if numSeed%3 == 0 {
+			minScoreFrag = `"min_score": 0.25,`
+		}
 		reqJSON := fmt.Sprintf(`{
 			"size": 5,
+			%s
 			"query": %s,
 			"post_filter": {"match": {"title": %q}},
 			"aggs": %s
-		}`, qJSON, tok, aggJSON)
+		}`, minScoreFrag, qJSON, tok, aggJSON)
 
 		var req esast.SearchRequest
 		if err := json.Unmarshal([]byte(reqJSON), &req); err != nil {
 			t.Fatalf("unmarshal fuzzed SearchRequest failed: %v\npayload=%s", err, reqJSON)
 		}
-		tr := NewTranspiler(sch, TranspilerOptions{})
+		tr := NewTranspiler(sch, TranspilerOptions{UseDoris4SearchFunc: numSeed%2 == 1})
+		if req.Query != nil {
+			cq := tr.CompileQuery(req.Query, true, nil)
+			if reFuzzR65MatchAllKinds.MatchString(stripQuotedSQLSegmentsR64(cq.ScoreSQL)) {
+				t.Fatalf("MATCH_* predicate leaked into ScoreSQL: %s\npayload=%s", cq.ScoreSQL, reqJSON)
+			}
+			if reFuzzR65MatchAllKinds.MatchString(stripQuotedSQLSegmentsR64(cq.SafeWhereSQL)) {
+				t.Fatalf("MATCH_* predicate leaked into SafeWhereSQL: %s\npayload=%s", cq.SafeWhereSQL, reqJSON)
+			}
+			if reFuzzR65MatchAllKinds.MatchString(stripQuotedSQLSegmentsR64(cq.WhereSQL)) && !cq.UsesFulltextMatch {
+				t.Fatalf("MATCH_* emitted in WhereSQL without UsesFulltextMatch=true: %s\npayload=%s", cq.WhereSQL, reqJSON)
+			}
+			if hasMatchInCastCoalesceR65(cq.ScoreSQL) || hasMatchInCastCoalesceR65(cq.WhereSQL) {
+				t.Fatalf("MATCH_* inside CAST(COALESCE(...)) in CompileQuery:\npayload=%s\nwhere=%s\nscore=%s", reqJSON, cq.WhereSQL, cq.ScoreSQL)
+			}
+		}
 		plan, err := tr.BuildSearchPlan(&req)
 		if err != nil {
 			return
@@ -732,6 +912,15 @@ func FuzzNormalizeDorisSQL(f *testing.F) {
 			}
 			if hasMatchInFromBaseMatchedR64(sqlOut) {
 				t.Fatalf("MATCH_* predicate inside FROM base_matched consumer:\n%s", sqlOut)
+			}
+			if hasScoreInFromBaseMatchedR65(sqlOut) {
+				t.Fatalf("score() call inside FROM base_matched consumer:\n%s", sqlOut)
+			}
+			if hasMatchInCastCoalesceR65(sqlOut) {
+				t.Fatalf("MATCH_* inside CAST(COALESCE(...)):\n%s", sqlOut)
+			}
+			if hasRawUntrustedCastR65(sqlOut) {
+				t.Fatalf("raw CAST on untrusted array/json expression:\n%s", sqlOut)
 			}
 			if hasUnparenthesizedOrderByInUnionAllR64(sqlOut) {
 				t.Fatalf("unparenthesized ORDER BY ... LIMIT inside UNION ALL branch:\n%s", sqlOut)

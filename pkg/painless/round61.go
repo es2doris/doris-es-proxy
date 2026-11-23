@@ -991,10 +991,12 @@ func geoRingShoelaceSignedCentroidRound61(ring [][2]float64) (lat, lon, absArea 
 		j := (i + 1) % len(ring)
 		x0, y0 := ring[i][1], ring[i][0]
 		x1, y1 := ring[j][1], ring[j][0]
-		cross := x0*y1 - x1*y0
+		p0 := float64(x0 * y1)
+		p1 := float64(x1 * y0)
+		cross := p0 - p1
 		twiceArea += cross
-		cxSum += (x0 + x1) * cross
-		cySum += (y0 + y1) * cross
+		cxSum += float64((x0 + x1) * cross)
+		cySum += float64((y0 + y1) * cross)
 	}
 	if math.Abs(twiceArea) <= 1e-18 {
 		var sLat, sLon float64
@@ -1362,7 +1364,7 @@ func parseGeoCoordPairRound61(v any) (lat, lon float64, ok bool) {
 		}
 		return y, x, true
 	case []float64:
-		if len(tv) < 2 {
+		if len(tv) < 2 || math.IsNaN(tv[0]) || math.IsNaN(tv[1]) || math.IsInf(tv[0], 0) || math.IsInf(tv[1], 0) {
 			return 0, 0, false
 		}
 		return tv[1], tv[0], true
@@ -1438,7 +1440,7 @@ func parseWKTPointSeqRound61(seq string) ([][2]float64, error) {
 		}
 		lon, errX := strconv.ParseFloat(fields[0], 64)
 		lat, errY := strconv.ParseFloat(fields[1], 64)
-		if errX != nil || errY != nil || math.IsNaN(lat) || math.IsNaN(lon) {
+		if errX != nil || errY != nil || math.IsNaN(lat) || math.IsNaN(lon) || math.IsInf(lat, 0) || math.IsInf(lon, 0) {
 			return nil, &painlessExceptionError{exType: "IllegalArgumentException", message: fmt.Sprintf("invalid WKT numeric coordinate %q", part)}
 		}
 		pts = append(pts, [2]float64{lat, lon})
@@ -1609,7 +1611,7 @@ func parseWKTGeoShapeRound61(wkt string, quantize bool) (*GeoShapeDocValues, err
 		var coords [4]float64
 		for i, p := range parts {
 			v, err := strconv.ParseFloat(strings.TrimSpace(p), 64)
-			if err != nil || math.IsNaN(v) {
+			if err != nil || math.IsNaN(v) || math.IsInf(v, 0) {
 				return nil, &painlessExceptionError{exType: "IllegalArgumentException", message: fmt.Sprintf("invalid coordinate %q in %s", p, typ)}
 			}
 			coords[i] = v
@@ -1659,14 +1661,14 @@ func parseWKTGeoShapeRound61(wkt string, quantize bool) (*GeoShapeDocValues, err
 func parseRadiusMetersRound61(raw any) (float64, bool) {
 	switch tv := raw.(type) {
 	case float64:
-		return tv, !math.IsNaN(tv) && tv >= 0
+		return tv, !math.IsNaN(tv) && !math.IsInf(tv, 0) && tv >= 0
 	case int64:
 		return float64(tv), tv >= 0
 	case int:
 		return float64(tv), tv >= 0
 	case json.Number:
 		f, err := tv.Float64()
-		return f, err == nil && f >= 0
+		return f, err == nil && !math.IsNaN(f) && !math.IsInf(f, 0) && f >= 0
 	case string:
 		s := strings.ToLower(strings.TrimSpace(tv))
 		mult := 1.0
@@ -1681,7 +1683,7 @@ func parseRadiusMetersRound61(raw any) (float64, bool) {
 			s = strings.TrimSpace(strings.TrimSuffix(s, "m"))
 		}
 		f, err := strconv.ParseFloat(s, 64)
-		return f * mult, err == nil && f >= 0
+		return f * mult, err == nil && !math.IsNaN(f) && !math.IsInf(f, 0) && f >= 0
 	}
 	return 0, false
 }
@@ -2639,11 +2641,41 @@ func DecodeHexSignedByteVector(hexStr string) ([]int8, []float32, error) {
 	return i8, f32, nil
 }
 
+func byteVectorElemFromFloatRound61(f float64, idx int, raw any) (int8, error) {
+	if math.IsNaN(f) || math.IsInf(f, 0) {
+		return 0, &painlessExceptionError{
+			exType:  "IllegalArgumentException",
+			message: fmt.Sprintf("byte vector element out of range [-128, 127] at index %d: %v", idx, raw),
+		}
+	}
+	iv := int64(f)
+	if float64(iv) != f || iv < -128 || iv > 127 {
+		return 0, &painlessExceptionError{
+			exType:  "IllegalArgumentException",
+			message: fmt.Sprintf("byte vector element out of range [-128, 127] at index %d: %v", idx, raw),
+		}
+	}
+	return int8(iv), nil
+}
+
 func parseVectorValueRound61(val any, elemType string) ([]float32, []int8, error) {
 	if val == nil {
 		return nil, nil, nil
 	}
+	normType := strings.ToLower(strings.TrimSpace(elemType))
+	needBytes := normType == "byte" || normType == "bit"
 	if dvv, ok := val.(*DenseVectorVal); ok && dvv != nil {
+		if needBytes && len(dvv.Bytes) == 0 && len(dvv.Floats) > 0 {
+			i8 := make([]int8, len(dvv.Floats))
+			for i, v := range dvv.Floats {
+				b, err := byteVectorElemFromFloatRound61(float64(v), i, v)
+				if err != nil {
+					return nil, nil, err
+				}
+				i8[i] = b
+			}
+			return dvv.Floats, i8, nil
+		}
 		return dvv.Floats, dvv.Bytes, nil
 	}
 	if s, ok := val.(string); ok {
@@ -2657,28 +2689,83 @@ func parseVectorValueRound61(val any, elemType string) ([]float32, []int8, error
 	switch tv := val.(type) {
 	case []any:
 		elems = tv
+	case []int8:
+		f32 := make([]float32, len(tv))
+		var i8 []int8
+		if needBytes {
+			i8 = make([]int8, len(tv))
+			copy(i8, tv)
+		}
+		for i, v := range tv {
+			f32[i] = float32(v)
+		}
+		return f32, i8, nil
+	case []int:
+		f32 := make([]float32, len(tv))
+		var i8 []int8
+		if needBytes {
+			i8 = make([]int8, len(tv))
+		}
+		for i, v := range tv {
+			if needBytes {
+				b, err := byteVectorElemFromFloatRound61(float64(v), i, v)
+				if err != nil {
+					return nil, nil, err
+				}
+				i8[i] = b
+			}
+			f32[i] = float32(v)
+		}
+		return f32, i8, nil
+	case []int64:
+		f32 := make([]float32, len(tv))
+		var i8 []int8
+		if needBytes {
+			i8 = make([]int8, len(tv))
+		}
+		for i, v := range tv {
+			if needBytes {
+				if v < -128 || v > 127 {
+					return nil, nil, &painlessExceptionError{
+						exType:  "IllegalArgumentException",
+						message: fmt.Sprintf("byte vector element out of range [-128, 127] at index %d: %v", i, v),
+					}
+				}
+				i8[i] = int8(v)
+			}
+			f32[i] = float32(v)
+		}
+		return f32, i8, nil
 	case []float32:
 		f32 := make([]float32, len(tv))
 		copy(f32, tv)
 		var i8 []int8
-		if elemType == "byte" || elemType == "bit" {
+		if needBytes {
 			i8 = make([]int8, len(tv))
 			for i, v := range tv {
-				i8[i] = int8(v)
+				b, err := byteVectorElemFromFloatRound61(float64(v), i, v)
+				if err != nil {
+					return nil, nil, err
+				}
+				i8[i] = b
 			}
 		}
 		return f32, i8, nil
 	case []float64:
 		f32 := make([]float32, len(tv))
 		var i8 []int8
-		if elemType == "byte" || elemType == "bit" {
+		if needBytes {
 			i8 = make([]int8, len(tv))
 		}
 		for i, v := range tv {
-			f32[i] = float32(v)
-			if i8 != nil {
-				i8[i] = int8(v)
+			if needBytes {
+				b, err := byteVectorElemFromFloatRound61(v, i, v)
+				if err != nil {
+					return nil, nil, err
+				}
+				i8[i] = b
 			}
+			f32[i] = float32(v)
 		}
 		return f32, i8, nil
 	default:
@@ -2688,7 +2775,6 @@ func parseVectorValueRound61(val any, elemType string) ([]float32, []int8, error
 		}
 	}
 	f32 := make([]float32, len(elems))
-	needBytes := elemType == "byte" || elemType == "bit"
 	var i8 []int8
 	if needBytes {
 		i8 = make([]int8, len(elems))
@@ -2702,15 +2788,12 @@ func parseVectorValueRound61(val any, elemType string) ([]float32, []int8, error
 			}
 		}
 		if needBytes {
-			iv := int64(f)
-			if float64(iv) != f || iv < -128 || iv > 127 {
-				return nil, nil, &painlessExceptionError{
-					exType:  "IllegalArgumentException",
-					message: fmt.Sprintf("byte vector element out of range [-128, 127] at index %d: %v", i, elem),
-				}
+			b, err := byteVectorElemFromFloatRound61(f, i, elem)
+			if err != nil {
+				return nil, nil, err
 			}
-			i8[i] = int8(iv)
-			f32[i] = float32(int8(iv))
+			i8[i] = b
+			f32[i] = float32(b)
 		} else {
 			f32[i] = float32(f)
 		}
@@ -2719,11 +2802,24 @@ func parseVectorValueRound61(val any, elemType string) ([]float32, []int8, error
 }
 
 func resolveVectorElementTypeFromMapsRound61(sourceMap, params map[string]any, fieldName string) string {
+	cleanName := strings.ReplaceAll(fieldName, "\x00", ".")
 	for _, m := range []map[string]any{params, sourceMap} {
-		if m != nil {
-			if etMap, ok := m["__vector_element_types"].(map[string]string); ok && etMap != nil {
-				if et := etMap[fieldName]; et != "" {
+		if m == nil {
+			continue
+		}
+		if etMap, ok := m["__vector_element_types"].(map[string]string); ok && etMap != nil {
+			for _, k := range []string{fieldName, cleanName} {
+				if et := strings.ToLower(strings.TrimSpace(etMap[k])); et != "" {
 					return et
+				}
+			}
+		}
+		if etMap, ok := m["__vector_element_types"].(map[string]any); ok && etMap != nil {
+			for _, k := range []string{fieldName, cleanName} {
+				if etStr, isStr := etMap[k].(string); isStr {
+					if et := strings.ToLower(strings.TrimSpace(etStr)); et != "" {
+						return et
+					}
 				}
 			}
 		}
@@ -2732,23 +2828,24 @@ func resolveVectorElementTypeFromMapsRound61(sourceMap, params map[string]any, f
 }
 
 func extractDocVectorRound61(sourceMap, params map[string]any, fieldName string) ([]float32, []int8, string, bool, error) {
-	if err := checkStrictDocFieldMappingRound60(sourceMap, params, fieldName); err != nil {
+	cleanName := strings.ReplaceAll(fieldName, "\x00", ".")
+	if err := checkStrictDocFieldMappingRound60(sourceMap, params, cleanName); err != nil {
 		return nil, nil, "", false, err
 	}
-	if err := checkDocValuesAccessGuardRound61(params, fieldName); err != nil {
+	if err := checkDocValuesAccessGuardRound61(params, cleanName); err != nil {
 		return nil, nil, "", false, err
 	}
-	if err := checkDocValuesAccessGuardRound61(sourceMap, fieldName); err != nil {
+	if err := checkDocValuesAccessGuardRound61(sourceMap, cleanName); err != nil {
 		return nil, nil, "", false, err
 	}
-	elemType := resolveVectorElementTypeFromMapsRound61(sourceMap, params, fieldName)
-	raw := resolveParamPath(sourceMap, strings.Split(fieldName, "."))
+	elemType := resolveVectorElementTypeFromMapsRound61(sourceMap, params, cleanName)
+	raw := resolveParamPath(sourceMap, strings.Split(cleanName, "."))
 	if raw == nil && sourceMap != nil {
-		raw = sourceMap[fieldName]
+		raw = sourceMap[cleanName]
 	}
 	if raw == nil {
 		if rawSrc, ok := rawSourceFromSourceMapPainless(sourceMap); ok && rawSrc != nil {
-			raw = resolveParamPath(rawSrc, strings.Split(fieldName, "."))
+			raw = resolveParamPath(rawSrc, strings.Split(cleanName, "."))
 		}
 	}
 	if raw == nil {
@@ -2996,39 +3093,46 @@ func (f *DenseVectorFieldVal) String() string {
 
 func resolveDenseVectorFieldValRound61(name string, sourceMap, params map[string]any) (*DenseVectorFieldVal, bool, error) {
 	isDenseVec := false
+	cleanName := strings.ReplaceAll(name, "\x00", ".")
 	for _, m := range []map[string]any{params, sourceMap} {
 		if m == nil {
 			continue
 		}
-		if ftMap, ok := m["__field_types"].(map[string]string); ok && ftMap != nil && ftMap[name] == "dense_vector" {
+		if ftMap, ok := m["__field_types"].(map[string]string); ok && ftMap != nil && (ftMap[name] == "dense_vector" || ftMap[cleanName] == "dense_vector") {
 			isDenseVec = true
 		}
-		if etMap, ok := m["__vector_element_types"].(map[string]string); ok && etMap != nil && etMap[name] != "" {
+		if ftMap, ok := m["__field_types"].(map[string]any); ok && ftMap != nil && (ftMap[name] == "dense_vector" || ftMap[cleanName] == "dense_vector") {
+			isDenseVec = true
+		}
+		if etMap, ok := m["__vector_element_types"].(map[string]string); ok && etMap != nil && (etMap[name] != "" || etMap[cleanName] != "") {
+			isDenseVec = true
+		}
+		if etMap, ok := m["__vector_element_types"].(map[string]any); ok && etMap != nil && (etMap[name] != nil || etMap[cleanName] != nil) {
 			isDenseVec = true
 		}
 	}
 	if !isDenseVec {
 		return nil, false, nil
 	}
-	if err := checkStrictDocFieldMappingRound60(sourceMap, params, name); err != nil {
+	if err := checkStrictDocFieldMappingRound60(sourceMap, params, cleanName); err != nil {
 		return nil, true, err
 	}
-	if err := checkFieldsAPIAccessGuardRound61(params, name); err != nil {
+	if err := checkFieldsAPIAccessGuardRound61(params, cleanName); err != nil {
 		return nil, true, err
 	}
-	if err := checkFieldsAPIAccessGuardRound61(sourceMap, name); err != nil {
+	if err := checkFieldsAPIAccessGuardRound61(sourceMap, cleanName); err != nil {
 		return nil, true, err
 	}
-	elemType := resolveVectorElementTypeFromMapsRound61(sourceMap, params, name)
+	elemType := resolveVectorElementTypeFromMapsRound61(sourceMap, params, cleanName)
 	var raw any
 	if rawSrc, ok := rawSourceFromSourceMapPainless(sourceMap); ok && rawSrc != nil {
-		raw = resolveParamPath(rawSrc, strings.Split(name, "."))
+		raw = resolveParamPath(rawSrc, strings.Split(cleanName, "."))
 	}
 	if raw == nil {
-		raw = resolveParamPath(sourceMap, strings.Split(name, "."))
+		raw = resolveParamPath(sourceMap, strings.Split(cleanName, "."))
 	}
 	if raw == nil && sourceMap != nil {
-		raw = sourceMap[name]
+		raw = sourceMap[cleanName]
 	}
 	if raw == nil {
 		return &DenseVectorFieldVal{Name: name, ElemType: elemType, Present: false}, true, nil
