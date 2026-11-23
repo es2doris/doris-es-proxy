@@ -118,6 +118,10 @@ func (w *gzipResponseWriter) Flush() {
 	}
 }
 
+func (w *gzipResponseWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
+}
+
 func (w *gzipResponseWriter) Close() {
 	if w.gz != nil {
 		if w.gzInitialized {
@@ -137,48 +141,305 @@ type esResponseFormatOptions struct {
 
 type esFormatResponseWriter struct {
 	http.ResponseWriter
-	opts esResponseFormatOptions
+	opts        esResponseFormatOptions
+	yamlFormat  bool
+	isHead      bool
+	statusCode  int
+	wroteHeader bool
+	passThrough bool
+	yamlBuf     bytes.Buffer
+}
+
+func (fw *esFormatResponseWriter) Unwrap() http.ResponseWriter {
+	return fw.ResponseWriter
+}
+
+func (fw *esFormatResponseWriter) WriteHeader(status int) {
+	if !fw.yamlFormat || fw.passThrough {
+		fw.ResponseWriter.WriteHeader(status)
+		return
+	}
+	if !fw.wroteHeader {
+		fw.wroteHeader = true
+		fw.statusCode = status
+	}
+	ct := strings.ToLower(strings.TrimSpace(fw.ResponseWriter.Header().Get("Content-Type")))
+	if ct != "" && !strings.Contains(ct, "json") {
+		fw.passThrough = true
+		if fw.yamlBuf.Len() > 0 {
+			fw.ResponseWriter.WriteHeader(fw.statusCode)
+			_, _ = fw.ResponseWriter.Write(fw.yamlBuf.Bytes()) // #nosec G705 -- pass-through non-JSON API response payload
+			fw.yamlBuf.Reset()
+			return
+		}
+		fw.ResponseWriter.WriteHeader(status)
+	}
+}
+
+func (fw *esFormatResponseWriter) Write(b []byte) (int, error) {
+	if !fw.yamlFormat || fw.passThrough {
+		return fw.ResponseWriter.Write(b)
+	}
+	if !fw.wroteHeader {
+		fw.WriteHeader(http.StatusOK)
+		if fw.passThrough {
+			return fw.ResponseWriter.Write(b)
+		}
+	}
+	if fw.isHead {
+		return len(b), nil
+	}
+	return fw.yamlBuf.Write(b)
 }
 
 func (fw *esFormatResponseWriter) Flush() {
+	if fw.yamlFormat && !fw.passThrough {
+		fw.Finalize()
+	}
 	if fl, ok := fw.ResponseWriter.(http.Flusher); ok {
 		fl.Flush()
 	}
 }
 
-func extractESResponseFormatOptions(w http.ResponseWriter) (esResponseFormatOptions, bool) {
-	if gw, ok := w.(*gzipResponseWriter); ok {
-		w = gw.ResponseWriter
+func (fw *esFormatResponseWriter) Finalize() {
+	if !fw.yamlFormat || fw.passThrough || !fw.wroteHeader {
+		return
 	}
-	if fw, ok := w.(*esFormatResponseWriter); ok {
-		return fw.opts, true
+	fw.passThrough = true
+	status := fw.statusCode
+	if status == 0 {
+		status = http.StatusOK
+	}
+	ct := strings.ToLower(strings.TrimSpace(fw.ResponseWriter.Header().Get("Content-Type")))
+	if ct != "" && !strings.Contains(ct, "json") {
+		fw.ResponseWriter.WriteHeader(status)
+		if !fw.isHead && fw.yamlBuf.Len() > 0 {
+			_, _ = fw.ResponseWriter.Write(fw.yamlBuf.Bytes())
+		}
+		fw.yamlBuf.Reset()
+		return
+	}
+	if fw.isHead {
+		fw.ResponseWriter.Header().Set("Content-Type", "application/yaml; charset=UTF-8")
+		fw.ResponseWriter.Header().Set("X-Content-Type-Options", "nosniff")
+		fw.ResponseWriter.Header().Del("Content-Length")
+		fw.ResponseWriter.WriteHeader(status)
+		fw.yamlBuf.Reset()
+		return
+	}
+	raw := bytes.TrimSpace(fw.yamlBuf.Bytes())
+	fw.yamlBuf.Reset()
+	var outBytes []byte
+	if len(raw) > 0 {
+		var decoded any
+		dec := json.NewDecoder(bytes.NewReader(raw))
+		dec.UseNumber()
+		if err := dec.Decode(&decoded); err == nil {
+			outBytes = marshalGenericYAMLWireR64(decoded)
+		} else {
+			outBytes = raw
+			fw.ResponseWriter.WriteHeader(status)
+			_, _ = fw.ResponseWriter.Write(outBytes)
+			return
+		}
+	} else {
+		outBytes = []byte("--- {}\n")
+	}
+	fw.ResponseWriter.Header().Set("Content-Type", "application/yaml; charset=UTF-8")
+	fw.ResponseWriter.Header().Set("X-Content-Type-Options", "nosniff")
+	if fw.ResponseWriter.Header().Get("Content-Encoding") == "" {
+		fw.ResponseWriter.Header().Set("Content-Length", strconv.Itoa(len(outBytes)))
+	} else {
+		fw.ResponseWriter.Header().Del("Content-Length")
+	}
+	fw.ResponseWriter.WriteHeader(status)
+	_, _ = fw.ResponseWriter.Write(outBytes)
+}
+
+func marshalGenericYAMLWireR64(v any) []byte {
+	var buf strings.Builder
+	buf.WriteString("---\n")
+	writeYAMLValueWireR64(&buf, v, 0, false)
+	return []byte(buf.String())
+}
+
+func writeYAMLValueWireR64(buf *strings.Builder, v any, indent int, inSeq bool) {
+	pad := strings.Repeat("  ", indent)
+	switch tv := v.(type) {
+	case nil:
+		if inSeq {
+			buf.WriteString("null\n")
+		} else {
+			buf.WriteString("null\n")
+		}
+	case bool:
+		fmt.Fprintf(buf, "%t\n", tv)
+	case json.Number:
+		buf.WriteString(tv.String())
+		buf.WriteByte('\n')
+	case int, int64, int32, float64, float32:
+		fmt.Fprintf(buf, "%v\n", tv)
+	case string:
+		raw, _ := json.Marshal(tv)
+		buf.Write(raw)
+		buf.WriteByte('\n')
+	case map[string]any:
+		if len(tv) == 0 {
+			buf.WriteString("{}\n")
+			return
+		}
+		keys := make([]string, 0, len(tv))
+		for k := range tv {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for idx, k := range keys {
+			if !inSeq || idx > 0 {
+				buf.WriteString(pad)
+			}
+			keyStr := k
+			if keyStr == "" || strings.ContainsAny(keyStr, ": \t\n\"'#&*!|>{}%@`") {
+				kb, _ := json.Marshal(keyStr)
+				keyStr = string(kb)
+			}
+			val := tv[k]
+			switch cv := val.(type) {
+			case map[string]any:
+				if len(cv) == 0 {
+					fmt.Fprintf(buf, "%s: {}\n", keyStr)
+				} else {
+					fmt.Fprintf(buf, "%s:\n", keyStr)
+					writeYAMLValueWireR64(buf, cv, indent+1, false)
+				}
+			case []any:
+				if len(cv) == 0 {
+					fmt.Fprintf(buf, "%s: []\n", keyStr)
+				} else {
+					fmt.Fprintf(buf, "%s:\n", keyStr)
+					writeYAMLValueWireR64(buf, cv, indent+1, false)
+				}
+			default:
+				fmt.Fprintf(buf, "%s: ", keyStr)
+				writeYAMLValueWireR64(buf, val, indent+1, false)
+			}
+		}
+	case []any:
+		if len(tv) == 0 {
+			buf.WriteString("[]\n")
+			return
+		}
+		for _, el := range tv {
+			buf.WriteString(pad)
+			buf.WriteString("- ")
+			switch cm := el.(type) {
+			case map[string]any:
+				if len(cm) == 0 {
+					buf.WriteString("{}\n")
+				} else {
+					writeYAMLValueWireR64(buf, cm, indent+1, true)
+				}
+			case []any:
+				if len(cm) == 0 {
+					buf.WriteString("[]\n")
+				} else {
+					buf.WriteByte('\n')
+					writeYAMLValueWireR64(buf, cm, indent+1, false)
+				}
+			default:
+				writeYAMLValueWireR64(buf, el, indent+1, false)
+			}
+		}
+	default:
+		b, err := json.Marshal(tv)
+		if err != nil {
+			fmt.Fprintf(buf, "%q\n", fmt.Sprintf("%v", tv))
+			return
+		}
+		var norm any
+		dec := json.NewDecoder(bytes.NewReader(b))
+		dec.UseNumber()
+		if dec.Decode(&norm) == nil {
+			writeYAMLValueWireR64(buf, norm, indent, inSeq)
+			return
+		}
+		buf.Write(b)
+		buf.WriteByte('\n')
+	}
+}
+
+func extractESResponseFormatOptions(w http.ResponseWriter) (esResponseFormatOptions, bool) {
+	for w != nil {
+		switch tw := w.(type) {
+		case *esFormatResponseWriter:
+			return tw.opts, true
+		case *gzipResponseWriter:
+			w = tw.ResponseWriter
+		case *headResponseWriterR64:
+			w = tw.ResponseWriter
+		case *translogWarningFilterWriterR63:
+			w = tw.ResponseWriter
+		default:
+			if uw, ok := w.(interface{ Unwrap() http.ResponseWriter }); ok {
+				w = uw.Unwrap()
+			} else {
+				return esResponseFormatOptions{}, false
+			}
+		}
 	}
 	return esResponseFormatOptions{}, false
 }
 
 func parseESResponseFormatOptions(r *http.Request) (esResponseFormatOptions, bool) {
-	if r == nil || r.URL == nil || r.URL.RawQuery == "" {
-		return esResponseFormatOptions{}, false
+	return parseESResponseFormatOptionsRound61(r)
+}
+
+func setESCompatHeadersWireR64(w http.ResponseWriter, r *http.Request) {
+	if w == nil {
+		return
 	}
-	q := r.URL.Query()
-	var opts esResponseFormatOptions
-	if q.Has("pretty") {
-		if pv := strings.ToLower(q.Get("pretty")); pv == "" || pv == "true" {
-			opts.pretty = true
+	w.Header().Set("X-Elastic-Product", "Elasticsearch")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, HEAD, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, Accept, X-Opaque-Id, X-Request-ID, traceparent, tracestate, X-Elastic-Client-Meta, kbn-xsrf")
+	w.Header().Set("Access-Control-Expose-Headers", "X-Elastic-Product, Warning, X-Opaque-Id, X-Request-ID, traceparent")
+	if r == nil {
+		return
+	}
+	if opaqueID := r.Header.Get("X-Opaque-Id"); opaqueID != "" {
+		w.Header().Set("X-Opaque-Id", opaqueID)
+	}
+	if reqID := r.Header.Get("X-Request-ID"); reqID != "" {
+		w.Header().Set("X-Request-ID", reqID)
+	}
+	if tp := r.Header.Get("traceparent"); tp != "" {
+		w.Header().Set("traceparent", tp)
+	}
+	accept := strings.ToLower(strings.Join(r.Header.Values("Accept"), ", "))
+	reqCT := strings.ToLower(strings.Join(r.Header.Values("Content-Type"), ", "))
+	switch {
+	case strings.Contains(accept, "application/vnd.opensearch+json"):
+		if cw, hasCW := extractCompatibleWithParam(accept); hasCW && cw != "" {
+			w.Header().Set("Content-Type", "application/vnd.opensearch+json; compatible-with="+cw)
+		} else {
+			w.Header().Set("Content-Type", "application/vnd.opensearch+json; charset=UTF-8")
 		}
-	}
-	if q.Has("error_trace") {
-		if ev := strings.ToLower(q.Get("error_trace")); ev == "" || ev == "true" {
-			opts.errorTrace = true
+	case strings.Contains(accept, "compatible-with=8"):
+		w.Header().Set("Content-Type", "application/vnd.elasticsearch+json; compatible-with=8")
+	case strings.Contains(accept, "compatible-with=7"):
+		w.Header().Set("Content-Type", "application/vnd.elasticsearch+json; compatible-with=7")
+	case strings.Contains(reqCT, "application/vnd.opensearch+"):
+		if cw, hasCW := extractCompatibleWithParam(reqCT); hasCW && cw != "" {
+			w.Header().Set("Content-Type", "application/vnd.opensearch+json; compatible-with="+cw)
+		} else {
+			w.Header().Set("Content-Type", "application/vnd.opensearch+json; charset=UTF-8")
 		}
+	case strings.Contains(reqCT, "compatible-with=8"):
+		w.Header().Set("Content-Type", "application/vnd.elasticsearch+json; compatible-with=8")
+	case strings.Contains(reqCT, "compatible-with=7"):
+		w.Header().Set("Content-Type", "application/vnd.elasticsearch+json; compatible-with=7")
+	default:
+		w.Header().Set("Content-Type", "application/json; charset=UTF-8")
 	}
-	if fp := strings.TrimSpace(q.Get("filter_path")); fp != "" {
-		opts.filterPaths = append(opts.filterPaths, splitFilterPathExpressions(fp)...)
-	}
-	if !opts.pretty && !opts.errorTrace && len(opts.filterPaths) == 0 {
-		return esResponseFormatOptions{}, false
-	}
-	return opts, true
 }
 
 func advanceFilterPatterns(patterns [][]string, key string) [][]string {
@@ -267,6 +528,39 @@ func filterIncludeNode(node any, patterns [][]string) (any, bool) {
 	}
 }
 
+type vendorMediaTypeGuardWriterR64 struct {
+	http.ResponseWriter
+	negotiatedCT string
+	wroteHeader  bool
+}
+
+func (vw *vendorMediaTypeGuardWriterR64) Unwrap() http.ResponseWriter {
+	return vw.ResponseWriter
+}
+
+func (vw *vendorMediaTypeGuardWriterR64) WriteHeader(status int) {
+	if !vw.wroteHeader {
+		vw.wroteHeader = true
+		if vw.negotiatedCT != "" && strings.EqualFold(strings.TrimSpace(vw.ResponseWriter.Header().Get("Content-Type")), "application/json; charset=utf-8") {
+			vw.ResponseWriter.Header().Set("Content-Type", vw.negotiatedCT)
+		}
+	}
+	vw.ResponseWriter.WriteHeader(status)
+}
+
+func (vw *vendorMediaTypeGuardWriterR64) Write(b []byte) (int, error) {
+	if !vw.wroteHeader {
+		vw.WriteHeader(http.StatusOK)
+	}
+	return vw.ResponseWriter.Write(b)
+}
+
+func (vw *vendorMediaTypeGuardWriterR64) Flush() {
+	if fl, ok := vw.ResponseWriter.(http.Flusher); ok {
+		fl.Flush()
+	}
+}
+
 // withWireMiddleware wraps the proxy router with:
 // 1. CORS headers & global OPTIONS preflight handling for browser GUIs (Elasticvue, Cerebro, Kibana)
 // 2. Bounded request body size (`http.MaxBytesReader`)
@@ -274,7 +568,7 @@ func filterIncludeNode(node any, patterns [][]string) (any, bool) {
 // 4. Optional `Accept-Encoding: gzip` outbound response compression
 func (s *Server) withWireMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		setESCompatHeaders(w, r)
+		setESCompatHeadersWireR64(w, r)
 
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusOK)
@@ -285,20 +579,56 @@ func (s *Server) withWireMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
+		negotiatedCT := w.Header().Get("Content-Type")
+		lowerNegCT := strings.ToLower(negotiatedCT)
+		if strings.HasPrefix(lowerNegCT, "application/vnd.elasticsearch+") || strings.HasPrefix(lowerNegCT, "application/vnd.opensearch+") {
+			w = &vendorMediaTypeGuardWriterR64{
+				ResponseWriter: w,
+				negotiatedCT:   negotiatedCT,
+			}
+		}
+
 		disableRespGzip, okComp := extractHTTPCompressionQueryParamR63Wire(w, r)
 		if !okComp {
 			return
-		}
-
-		if fmtOpts, ok := parseESResponseFormatOptions(r); ok {
-			w = &esFormatResponseWriter{ResponseWriter: w, opts: fmtOpts}
 		}
 
 		if !validateGlobalWireQueryParamsRound59(w, r) {
 			return
 		}
 
-		if !s.checkInboundAuth(w, r) {
+		trimmedPath := strings.Trim(r.URL.Path, "/")
+		wantYAML := false
+		if r.URL != nil {
+			fmtQ := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("format")))
+			if (fmtQ == "yaml" || fmtQ == "yml") &&
+				trimmedPath != "_cat" && !strings.HasPrefix(trimmedPath, "_cat/") &&
+				!strings.HasPrefix(trimmedPath, "_sql") &&
+				!strings.HasPrefix(trimmedPath, "_query") &&
+				!strings.HasSuffix(trimmedPath, "_doris_ddl") {
+				wantYAML = true
+			}
+		}
+		fmtOpts, hasFmtOpts := parseESResponseFormatOptions(r)
+
+		authW := w
+		var authFW *esFormatResponseWriter
+		if hasFmtOpts || wantYAML {
+			authFW = &esFormatResponseWriter{
+				ResponseWriter: authW,
+				opts:           fmtOpts,
+				yamlFormat:     wantYAML,
+				isHead:         r.Method == http.MethodHead,
+			}
+			authW = authFW
+		}
+		if r.Method == http.MethodHead {
+			authW = &headResponseWriterR64{ResponseWriter: authW}
+		}
+		if !s.checkInboundAuth(authW, r) {
+			if authFW != nil && wantYAML {
+				authFW.Finalize()
+			}
 			return
 		}
 
@@ -326,19 +656,34 @@ func (s *Server) withWireMiddleware(next http.Handler) http.Handler {
 			defer cleanupDecomp()
 		}
 
-		if !validateRequestContentTypeRound59(w, r) {
+		if !validateRequestContentTypeRound59(authW, r) {
+			if authFW != nil && wantYAML {
+				authFW.Finalize()
+			}
 			return
 		}
 
-		if r.Method != http.MethodHead && !disableRespGzip && acceptsGzipEncodingR63Wire(r.Header.Get("Accept-Encoding")) {
+		if r.Method != http.MethodHead && !disableRespGzip && acceptsGzipEncodingR63Wire(strings.Join(r.Header.Values("Accept-Encoding"), ", ")) {
 			gz := gzipWriterPool.Get().(*gzip.Writer)
 			gzw := &gzipResponseWriter{ResponseWriter: w, gz: gz}
 			defer gzw.Close()
 			w = gzw
 		}
 
+		if hasFmtOpts || wantYAML {
+			fw := &esFormatResponseWriter{
+				ResponseWriter: w,
+				opts:           fmtOpts,
+				yamlFormat:     wantYAML,
+				isHead:         r.Method == http.MethodHead,
+			}
+			if wantYAML {
+				defer fw.Finalize()
+			}
+			w = fw
+		}
+
 		atomic.AddInt64(&s.totalHTTPRequests, 1)
-		trimmedPath := strings.Trim(r.URL.Path, "/")
 		if trimmedPath == "_component_template" || strings.HasPrefix(trimmedPath, "_component_template/") {
 			if r.Method == http.MethodGet {
 				s.serveGetComponentTemplateR62Admin(w, r)
@@ -350,7 +695,11 @@ func (s *Server) withWireMiddleware(next http.Handler) http.Handler {
 			}
 			return
 		}
-		if s.tryHandleAdminWireR63(w, r, next) {
+		wireW := w
+		if r.Method == http.MethodHead {
+			wireW = &headResponseWriterR64{ResponseWriter: w}
+		}
+		if s.tryHandleAdminWireR63(wireW, r, next) {
 			return
 		}
 		next.ServeHTTP(w, r)
@@ -1234,7 +1583,7 @@ func isSupportedIngestProcessorType(procType string) bool {
 		"dedup", "dedupe", "fingerprint", "redact", "attachment", "csv", "user_agent",
 		"uri_parts", "registered_domain", "network_direction", "community_id",
 		"geoip", "enrich", "foreach", "script", "inference", "set_security_user",
-		"circle", "reroute", "terminate":
+		"circle", "geo_grid", "reroute", "terminate":
 		return true
 	}
 	return false
@@ -1556,6 +1905,12 @@ func isAllowedIngestProcessorPropertyRound60(procType, prop string) bool {
 	case "circle":
 		switch prop {
 		case "field", "target_field", "error_distance", "shape_type", "ignore_missing":
+			return true
+		}
+	case "geo_grid":
+		switch prop {
+		case "field", "tile_type", "target_format", "target_field", "parent_field",
+			"children_field", "non_children_field", "precision_field", "ignore_missing":
 			return true
 		}
 	case "reroute":
@@ -2246,6 +2601,10 @@ func validateIngestPipelineProcessors(procs []any) error {
 				if st != "geo_shape" && st != "shape" {
 					return wrapIngestProcErrRound60(procType, effTag, "shape_type", fmt.Errorf("illegal_argument_exception: invalid shape_type [%s], must be [geo_shape] or [shape]", st))
 				}
+			case "geo_grid":
+				if err := ValidateGeoGridProcessorR64(specMap); err != nil {
+					return wrapIngestProcErrRound60(procType, effTag, "", err)
+				}
 			case "terminate":
 				// Optional if/tag/description/ignore_failure/on_failure
 			case "reroute":
@@ -2551,6 +2910,76 @@ func (s *Server) applyEffectiveAndFinalPipelinesWithRoutingAndExecuted(indexName
 }
 
 func (s *Server) applyEffectiveAndFinalPipelinesWithMetaRound61(indexName, docID, reqPipeline, defaultPipeline, initialRouting string, raw json.RawMessage) (json.RawMessage, string, string, string, bool, []string, map[string]any, error) {
+	resolveSettingDef := func(target string) (val string, explicitNone bool) {
+		if s == nil || target == "" {
+			return "", false
+		}
+		checkSettings := func(idx string) (string, bool) {
+			if cs := s.indexCustomSettings[idx]; cs != nil {
+				for _, k := range []string{"default_pipeline", "index.default_pipeline"} {
+					if raw, ok := cs[k].(string); ok {
+						raw = strings.TrimSpace(raw)
+						if raw == "_none" || raw == "none" {
+							return "", true
+						}
+						if raw != "" {
+							return raw, false
+						}
+					}
+				}
+			}
+			return "", false
+		}
+		s.mu.RLock()
+		if dp, ok := s.indexDefaultPipelines[target]; ok {
+			dp = strings.TrimSpace(dp)
+			s.mu.RUnlock()
+			if dp == "_none" || dp == "none" {
+				return "", true
+			}
+			if dp != "" {
+				return dp, false
+			}
+		} else {
+			if sv, expNone := checkSettings(target); sv != "" || expNone {
+				s.mu.RUnlock()
+				return sv, expNone
+			}
+			s.mu.RUnlock()
+		}
+		if resolved, _, wErr := s.resolveWriteIndexWithFilter(target); wErr == nil && resolved != "" && resolved != target {
+			s.mu.RLock()
+			if dp, ok := s.indexDefaultPipelines[resolved]; ok {
+				dp = strings.TrimSpace(dp)
+				s.mu.RUnlock()
+				if dp == "_none" || dp == "none" {
+					return "", true
+				}
+				if dp != "" {
+					return dp, false
+				}
+			} else {
+				if sv, expNone := checkSettings(resolved); sv != "" || expNone {
+					s.mu.RUnlock()
+					return sv, expNone
+				}
+				s.mu.RUnlock()
+			}
+		}
+		s.mu.RLock()
+		_, tplDef, hasTplDef, _, _, _ := s.matchingTemplateConfigLocked(target)
+		s.mu.RUnlock()
+		if hasTplDef {
+			tplDef = strings.TrimSpace(tplDef)
+			if tplDef == "_none" || tplDef == "none" {
+				return "", true
+			}
+			if tplDef != "" {
+				return tplDef, false
+			}
+		}
+		return "", false
+	}
 	resolveDef := func(target, reqP, defP string) string {
 		if s == nil {
 			if reqP != "" && reqP != "_none" {
@@ -2570,6 +2999,11 @@ func (s *Server) applyEffectiveAndFinalPipelinesWithMetaRound61(indexName, docID
 				if resolved := s.resolveIndexName(target); resolved != "" && resolved != target {
 					eff = s.resolveEffectivePipeline(resolved, reqP, defP)
 				}
+			}
+		}
+		if eff == "" && strings.TrimSpace(reqP) == "" && strings.TrimSpace(defP) == "" {
+			if sv, expNone := resolveSettingDef(target); !expNone && sv != "" {
+				eff = sv
 			}
 		}
 		return eff
@@ -2671,8 +3105,9 @@ func (s *Server) applyEffectiveAndFinalPipelinesWithMetaRound61(indexName, docID
 
 	effPipeline := resolveDef(curIndex, reqPipeline, defaultPipeline)
 	evaledDefForIndex := curIndex
-	lastDefPipeline := effPipeline
+	visitedDefTargets := make(map[string]bool, 4)
 	if effPipeline != "" {
+		visitedDefTargets[curIndex+"\x00"+effPipeline] = true
 		next, nextIdx, nextID, nextRouting, dropped, nextIngestMeta, err := runStep(effPipeline, false, cur, curIndex, curID, curRouting, nil)
 		if err != nil || dropped {
 			finalizeChainStats(next, dropped, err)
@@ -2689,14 +3124,18 @@ func (s *Server) applyEffectiveAndFinalPipelinesWithMetaRound61(indexName, docID
 		curIngestMeta = nextIngestMeta
 	}
 
+	skipDefaultForExplicitNone := strings.EqualFold(strings.TrimSpace(reqPipeline), "_none") ||
+		strings.EqualFold(strings.TrimSpace(reqPipeline), "none") ||
+		(strings.TrimSpace(reqPipeline) == "" && (strings.EqualFold(strings.TrimSpace(defaultPipeline), "_none") || strings.EqualFold(strings.TrimSpace(defaultPipeline), "none")))
 	evaledFinalForIndex := ""
 	for hop := 0; hop < 16; hop++ {
 		progressed := false
-		for defHop := 0; defHop < 16 && curIndex != evaledDefForIndex && reqPipeline != "_none" && defaultPipeline != "_none"; defHop++ {
+		for defHop := 0; defHop < 16 && curIndex != evaledDefForIndex && !skipDefaultForExplicitNone; defHop++ {
 			evaledDefForIndex = curIndex
 			destDef := resolveDef(curIndex, "", "")
-			if destDef != "" && (destDef != lastDefPipeline || defHop > 0) {
-				lastDefPipeline = destDef
+			visitKey := curIndex + "\x00" + destDef
+			if destDef != "" && !visitedDefTargets[visitKey] {
+				visitedDefTargets[visitKey] = true
 				progressed = true
 				next, nextIdx, nextID, nextRouting, dropped, nextIngestMeta, err := runStep(destDef, false, cur, curIndex, curID, curRouting, curIngestMeta)
 				if err != nil || dropped {
@@ -3262,7 +3701,12 @@ var (
 	reGrokNamedCapture = regexp.MustCompile(`\(\?P?<([A-Za-z0-9_.\-\[\]@]+)(?::(int|integer|long|float|double|boolean|bool|string))?>`)
 )
 
+const maxExpandedGrokRegexLen = 65536
+
 func compileIngestJavaRegex(pattern string) (*regexp.Regexp, error) {
+	if len(pattern) > maxExpandedGrokRegexLen {
+		return nil, fmt.Errorf("illegal_argument_exception: regex pattern length [%d] exceeds maximum [%d]", len(pattern), maxExpandedGrokRegexLen)
+	}
 	return getOrCompileCachedIngestRegexRound61(pattern, compileIngestJavaRegexUncachedRound61)
 }
 
@@ -3465,11 +3909,18 @@ func compileGrokRegex(pat string, customDefs map[string]any) (*regexp.Regexp, ma
 	groupSeq := 0
 	expanded := pat
 	for pass := 0; pass < 16; pass++ {
+		if len(expanded) > maxExpandedGrokRegexLen {
+			return nil, nil, nil, fmt.Errorf("illegal_argument_exception: expanded grok pattern length [%d] exceeds maximum [%d]", len(expanded), maxExpandedGrokRegexLen)
+		}
 		if !strings.Contains(expanded, "%{") {
 			break
 		}
 		var resolveErr error
+		cumLen := len(expanded)
 		expanded = reGrokToken.ReplaceAllStringFunc(expanded, func(m string) string {
+			if resolveErr != nil {
+				return m
+			}
 			sub := reGrokToken.FindStringSubmatch(m)
 			if len(sub) < 2 {
 				return m
@@ -3490,6 +3941,7 @@ func compileGrokRegex(pat string, customDefs map[string]any) (*regexp.Regexp, ma
 				resolveErr = fmt.Errorf("grok pattern [%s] is not defined", patName)
 				return m
 			}
+			var repl string
 			if fieldName != "" {
 				groupSeq++
 				grpID := fmt.Sprintf("g%d", groupSeq)
@@ -3497,12 +3949,22 @@ func compileGrokRegex(pat string, customDefs map[string]any) (*regexp.Regexp, ma
 				if fieldType != "" {
 					groupTypes[grpID] = fieldType
 				}
-				return fmt.Sprintf("(?P<%s>%s)", grpID, rawRegex)
+				repl = fmt.Sprintf("(?P<%s>%s)", grpID, rawRegex)
+			} else {
+				repl = "(?:" + rawRegex + ")"
 			}
-			return "(?:" + rawRegex + ")"
+			cumLen += len(repl) - len(m)
+			if cumLen > maxExpandedGrokRegexLen {
+				resolveErr = fmt.Errorf("illegal_argument_exception: expanded grok pattern exceeds maximum length [%d]", maxExpandedGrokRegexLen)
+				return m
+			}
+			return repl
 		})
 		if resolveErr != nil {
 			return nil, nil, nil, resolveErr
+		}
+		if len(expanded) > maxExpandedGrokRegexLen {
+			return nil, nil, nil, fmt.Errorf("illegal_argument_exception: expanded grok pattern length [%d] exceeds maximum [%d]", len(expanded), maxExpandedGrokRegexLen)
 		}
 	}
 	if reGrokToken.MatchString(expanded) {
@@ -3524,7 +3986,18 @@ func compileGrokRegex(pat string, customDefs map[string]any) (*regexp.Regexp, ma
 		}
 		return fmt.Sprintf("(?P<%s>", grpID)
 	})
-	re, err := compileIngestJavaRegex(expanded)
+	if len(expanded) > maxExpandedGrokRegexLen {
+		return nil, nil, nil, fmt.Errorf("illegal_argument_exception: expanded grok pattern length [%d] exceeds maximum [%d]", len(expanded), maxExpandedGrokRegexLen)
+	}
+	var (
+		re  *regexp.Regexp
+		err error
+	)
+	if len(expanded) > maxRegexPatternLen {
+		re, err = compileIngestJavaRegexUncachedRound61(expanded)
+	} else {
+		re, err = compileIngestJavaRegex(expanded)
+	}
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -7838,6 +8311,11 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		}
 		setIngestPath(doc, targetField, polyVal)
 		mutated = true
+	case "geo_grid":
+		if ggErr := ApplyGeoGridProcessorR64(doc, specMap); ggErr != nil {
+			return false, false, procType, procTag, specMap, ggErr
+		}
+		mutated = true
 	case "terminate":
 		doc["__internal_ingest_terminated"] = true
 	case "reroute":
@@ -10154,6 +10632,12 @@ func (s *Server) handleResolveCluster(w http.ResponseWriter, r *http.Request) {
 	}
 
 	verStr := s.effectiveClusterESVersionNumber(r)
+	verObj := map[string]any{
+		"number":                              verStr,
+		"build_flavor":                        "default",
+		"minimum_wire_compatibility_version":  "7.17.0",
+		"minimum_index_compatibility_version": "7.0.0",
+	}
 	out := make(map[string]any)
 
 	if len(localExprs) > 0 {
@@ -10230,7 +10714,7 @@ func (s *Server) handleResolveCluster(w http.ResponseWriter, r *http.Request) {
 			localEntry["error"] = localErr
 		} else {
 			localEntry["matching_indices"] = hasOpenMatch
-			localEntry["version"] = map[string]any{"number": verStr}
+			localEntry["version"] = verObj
 		}
 		out["(local)"] = localEntry
 	}
@@ -10266,7 +10750,7 @@ func (s *Server) handleResolveCluster(w http.ResponseWriter, r *http.Request) {
 				remEntry["error"] = remErr
 			} else {
 				remEntry["matching_indices"] = remMatched
-				remEntry["version"] = map[string]any{"number": verStr}
+				remEntry["version"] = verObj
 			}
 		}
 		out[alias] = remEntry
@@ -12138,8 +12622,58 @@ func (s *Server) handleValidateQuery(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
+func anyMapHasKeyRecursiveR64(v any, targetKey string) bool {
+	switch tv := v.(type) {
+	case map[string]any:
+		for k, val := range tv {
+			if k == targetKey || strings.HasSuffix(k, "."+targetKey) {
+				return true
+			}
+			if anyMapHasKeyRecursiveR64(val, targetKey) {
+				return true
+			}
+		}
+	case []any:
+		for _, el := range tv {
+			if anyMapHasKeyRecursiveR64(el, targetKey) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // handleAnalyze implements `GET/POST /_analyze` and `GET/POST /{index}/_analyze`.
 func (s *Server) handleAnalyze(w http.ResponseWriter, r *http.Request) {
+	if s != nil && r != nil && s.hasExplicitTargetESVersion() {
+		emitWarn := false
+		if r.Body != nil && r.Body != http.NoBody {
+			if bodyBytes, ok := readRequestBody(w, r); !ok {
+				return
+			} else {
+				if bytes.Contains(bodyBytes, []byte(`"unicodeSetFilter"`)) {
+					emitWarn = true
+				}
+				r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+				r.ContentLength = int64(len(bodyBytes))
+			}
+		}
+		if !emitWarn {
+			rawIdx := strings.TrimSpace(r.PathValue("index"))
+			if rawIdx != "" {
+				resolved := s.resolveIndexName(rawIdx)
+				s.mu.RLock()
+				cs := s.indexCustomSettings[resolved]
+				if cs != nil && anyMapHasKeyRecursiveR64(cs, "unicodeSetFilter") {
+					emitWarn = true
+				}
+				s.mu.RUnlock()
+			}
+		}
+		if emitWarn {
+			emitESDeprecationWarningRound61(w, s, r, "[unicodeSetFilter] has been deprecated in favor of [unicode_set_filter]")
+		}
+	}
 	s.serveAnalyzeR62Admin(w, r)
 }
 
@@ -12706,6 +13240,24 @@ func (s *Server) handleTermsEnum(w http.ResponseWriter, r *http.Request) {
 	if limit <= 0 {
 		limit = 10
 	}
+	allowedTargets := make([]string, 0, len(targets))
+	for _, tgt := range targets {
+		if s.FilterTermsEnumByDLSR64(r, []string{tgt}, req.Field) {
+			allowedTargets = append(allowedTargets, tgt)
+		}
+	}
+	if len(allowedTargets) == 0 && len(targets) > 0 {
+		writeJSONWithRequest(w, r, http.StatusOK, map[string]any{
+			"_shards":  map[string]any{"total": len(targets), "successful": len(targets), "failed": 0},
+			"terms":    []any{},
+			"complete": true,
+		})
+		return
+	}
+	searchTarget := r.PathValue("index")
+	if len(allowedTargets) > 0 && len(allowedTargets) < len(targets) {
+		searchTarget = strings.Join(allowedTargets, ",")
+	}
 	aggSize := 10000
 	if limit > aggSize {
 		aggSize = limit * 2
@@ -12724,7 +13276,7 @@ func (s *Server) handleTermsEnum(w http.ResponseWriter, r *http.Request) {
 			},
 		},
 	}
-	resp, status, errType, errReason := s.executeSearchRequest(r.Context(), r.PathValue("index"), &searchReq)
+	resp, status, errType, errReason := s.executeSearchRequest(r.Context(), searchTarget, &searchReq)
 	if errType != "" {
 		writeESError(w, status, errType, errReason)
 		return
@@ -13782,6 +14334,25 @@ func executeGeoIPProcessor(doc map[string]any, specMap map[string]any) (bool, er
 	return false, nil
 }
 
+var enrichExecSearchesRegistryMuR64 sync.RWMutex
+var enrichExecSearchesRegistryR64 = make(map[*Server]*atomic.Int64)
+
+func getEnrichExecSearchesCounterR64(s *Server) *atomic.Int64 {
+	enrichExecSearchesRegistryMuR64.RLock()
+	c := enrichExecSearchesRegistryR64[s]
+	enrichExecSearchesRegistryMuR64.RUnlock()
+	if c != nil {
+		return c
+	}
+	enrichExecSearchesRegistryMuR64.Lock()
+	defer enrichExecSearchesRegistryMuR64.Unlock()
+	if c = enrichExecSearchesRegistryR64[s]; c == nil {
+		c = &atomic.Int64{}
+		enrichExecSearchesRegistryR64[s] = c
+	}
+	return c
+}
+
 func (s *Server) handleEnrichAPI(w http.ResponseWriter, r *http.Request) {
 	_ = s.syncCatalogFromBackend(r.Context())
 	if strings.HasSuffix(r.URL.Path, "/_stats") || strings.HasSuffix(r.URL.Path, "/stats") {
@@ -13794,10 +14365,19 @@ func (s *Server) handleEnrichAPI(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusOK)
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{
+		execSearches := getEnrichExecSearchesCounterR64(s).Load()
+		writeJSONWithRequest(w, r, http.StatusOK, map[string]any{
 			"executing_policies": []any{},
-			"coordinator_stats":  []any{},
-			"cache_stats":        []any{},
+			"coordinator_stats": []any{
+				map[string]any{
+					"node_id":                 taskLocalNodeID,
+					"queue_size":              0,
+					"remote_requests_current": 0,
+					"remote_requests_total":   0,
+					"executed_searches_total": execSearches,
+				},
+			},
+			"cache_stats": []any{},
 		})
 		return
 	}
@@ -13814,6 +14394,7 @@ func (s *Server) handleEnrichAPI(w http.ResponseWriter, r *http.Request) {
 			writeESError(w, http.StatusNotFound, "resource_not_found_exception", "enrich policy ["+name+"] not found")
 			return
 		}
+		getEnrichExecSearchesCounterR64(s).Add(1)
 		pIdx, _, _, _, pQuery := extractEnrichPolicyMeta(pol)
 		snapshotDocs := make([]map[string]any, 0)
 		for _, idxPat := range pIdx {
@@ -13901,6 +14482,7 @@ func (s *Server) handleEnrichAPI(w http.ResponseWriter, r *http.Request) {
 		}
 		var matchedType string
 		var innerMap map[string]any
+		hasESVersion := false
 		for k, v := range body {
 			switch k {
 			case "match", "geo_match", "range":
@@ -13915,6 +14497,8 @@ func (s *Server) handleEnrichAPI(w http.ResponseWriter, r *http.Request) {
 				}
 				matchedType = k
 				innerMap = m
+			case "elasticsearch_version":
+				hasESVersion = true
 			default:
 				writeESError(w, http.StatusBadRequest, "parse_exception", fmt.Sprintf("unknown field [%s] in enrich policy", k))
 				return
@@ -13923,6 +14507,12 @@ func (s *Server) handleEnrichAPI(w http.ResponseWriter, r *http.Request) {
 		if matchedType == "" || innerMap == nil {
 			writeESError(w, http.StatusBadRequest, "parse_exception", "enrich policy must specify one of [match, geo_match, range]")
 			return
+		}
+		if _, hasInnerVer := innerMap["elasticsearch_version"]; hasInnerVer {
+			hasESVersion = true
+		}
+		if hasESVersion && s.isES8Mode(r) {
+			emitESDeprecationWarningRound61(w, s, r, "the [elasticsearch_version] field of an enrich policy has no effect and will be removed in Elasticsearch 9.0")
 		}
 		if matchedType == "geo_match" {
 			if rawSR, hasSR := innerMap["shape_relation"]; hasSR && rawSR != nil {

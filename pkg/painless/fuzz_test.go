@@ -33,6 +33,17 @@ func FuzzPainlessEval(f *testing.F) {
 		{`{"views":5}`, `ctx._source.views += params.inc; if (!(ctx._source.views < 0)) { ctx._source.valid = true; }`},
 		{`{"status":"archived"}`, `if (ctx._source.status == 'archived') { ctx.op = 'delete'; }`},
 		{`{"status":"same"}`, `ctx.op = 'noop'`},
+		{`{"s":"abc"}`, `ctx._source.r = ctx._source.s.repeat(1L << 62)`},
+		{`{"v":1}`, `ctx._source.bd = new BigDecimal('1e2147483647')`},
+		{`{"v":1}`, `ctx._source.bd = new BigDecimal('1').movePointLeft(100000).toPlainString()`},
+		{`{"v":1}`, `ctx._source.bd = new BigDecimal('2').pow(100000)`},
+		{`{"v":1}`, `ctx._source.bi = BigInteger.valueOf(2).pow(100000)`},
+		{`{"v":1}`, `ctx._source.bi = BigInteger.ONE.shiftLeft(100000)`},
+		{`{"v":1}`, `ctx._source.bi = BigInteger.ZERO.setBit(100000)`},
+		{`{"v":1}`, `BitSet bs = new BitSet(); bs.set(1 << 25); ctx._source.bs = bs.toString()`},
+		{`{"v":1}`, `BitSet bs = new BitSet(); bs.set(0, 20000); ctx._source.bs = bs.cardinality()`},
+		{`{"v":1}`, `BitSet bs = new BitSet(); bs.flip(0, 20000); ctx._source.bs = bs.cardinality()`},
+		{`{"n":null}`, `ctx._source.nan_bi = field('n').asBigInteger(0L)`},
 	}
 	for _, s := range seeds {
 		f.Add(s.doc, s.script)

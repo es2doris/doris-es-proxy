@@ -23,6 +23,7 @@ import (
 	"sort"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 )
 
 func buildCompoundTokenFilter(displayName string, normType string, def map[string]any, bctx filterBuildContext) (*compiledTokenFilter, error) {
@@ -218,6 +219,9 @@ func buildCompoundTokenFilter(displayName string, normType string, def map[strin
 			}
 			if raw, ok := def["max_subword_size"]; ok {
 				if n, valid := extractInt(raw); valid && n >= 1 {
+					if n > maxAllowedSubwordSize {
+						return nil, newIllegalArgError(fmt.Sprintf("max_subword_size [%d] must be <= %d", n, maxAllowedSubwordSize))
+					}
 					maxSub = n
 				} else {
 					return nil, newIllegalArgError("max_subword_size must be >= 1")
@@ -954,31 +958,83 @@ func applyCommonGrams(tokens []Token, commonSet map[string]bool, ignoreCase bool
 
 // Decompounder Filter
 
+const (
+	maxAllowedSubwordSize        = 128
+	maxDecompounderStepsPerToken = 65536
+	maxDecompounderStepsTotal    = 1000000
+)
+
 func applyDecompounder(tokens []Token, dict map[string]bool, minWord, minSub, maxSub int, onlyLongest bool, budget *tokenStreamBudget) ([]Token, error) {
+	maxDictRuneLen := 0
+	for w := range dict {
+		if rl := utf8.RuneCountInString(w); rl > maxDictRuneLen {
+			maxDictRuneLen = rl
+		}
+	}
+	effMaxSub := maxSub
+	if effMaxSub > maxAllowedSubwordSize {
+		effMaxSub = maxAllowedSubwordSize
+	}
+	if maxDictRuneLen > 0 && effMaxSub > maxDictRuneLen {
+		effMaxSub = maxDictRuneLen
+	}
+	effMinSub := minSub
+	if effMinSub < 1 {
+		effMinSub = 1
+	}
+
 	var out []Token
+	totalSteps := 0
 	for _, tok := range tokens {
 		orig := tok.clone()
 		if err := budget.addToken(orig); err != nil {
 			return nil, err
 		}
 		out = append(out, orig)
-		rs := []rune(tok.Term)
-		n := len(rs)
-		if n < minWord || len(dict) == 0 {
+		n := utf8.RuneCountInString(tok.Term)
+		if n < minWord || len(dict) == 0 || effMaxSub < effMinSub {
 			continue
 		}
-		lowerRs := []rune(strings.ToLower(tok.Term))
-		if len(lowerRs) != n {
-			lowerRs = rs
+
+		origOff := make([]int, 0, n+1)
+		for idx := range tok.Term {
+			origOff = append(origOff, idx)
 		}
+		origOff = append(origOff, len(tok.Term))
+		if len(origOff) != n+1 {
+			continue
+		}
+
+		lowerStr := strings.ToLower(tok.Term)
+		lowerOff := origOff
+		if lowerStr != tok.Term {
+			if utf8.RuneCountInString(lowerStr) == n {
+				lowerOff = make([]int, 0, n+1)
+				for idx := range lowerStr {
+					lowerOff = append(lowerOff, idx)
+				}
+				lowerOff = append(lowerOff, len(lowerStr))
+			}
+			if len(lowerOff) != n+1 {
+				lowerStr = tok.Term
+				lowerOff = origOff
+			}
+		}
+
+		tokSteps := 0
 		for i := 0; i < n; i++ {
 			longestEnd := -1
-			limit := i + maxSub
+			limit := i + effMaxSub
 			if limit > n {
 				limit = n
 			}
-			for end := i + minSub; end <= limit; end++ {
-				cand := string(lowerRs[i:end])
+			for end := i + effMinSub; end <= limit; end++ {
+				tokSteps++
+				totalSteps++
+				if tokSteps > maxDecompounderStepsPerToken || totalSteps > maxDecompounderStepsTotal {
+					return nil, newIllegalArgError(fmt.Sprintf("decompounder work limit exceeded [%d steps]", totalSteps))
+				}
+				cand := lowerStr[lowerOff[i]:lowerOff[end]]
 				if dict[cand] {
 					if onlyLongest {
 						longestEnd = end
@@ -987,7 +1043,7 @@ func applyDecompounder(tokens []Token, dict map[string]bool, minWord, minSub, ma
 							return nil, err
 						}
 						cp := tok.clone()
-						cp.Term = string(rs[i:end])
+						cp.Term = tok.Term[origOff[i]:origOff[end]]
 						if err := budget.addToken(cp); err != nil {
 							return nil, err
 						}
@@ -1000,7 +1056,7 @@ func applyDecompounder(tokens []Token, dict map[string]bool, minWord, minSub, ma
 					return nil, err
 				}
 				cp := tok.clone()
-				cp.Term = string(rs[i:longestEnd])
+				cp.Term = tok.Term[origOff[i]:origOff[longestEnd]]
 				if err := budget.addToken(cp); err != nil {
 					return nil, err
 				}
@@ -1184,8 +1240,9 @@ func buildSynonymPhraseAnalyzer(def map[string]any, bctx filterBuildContext) (fu
 }
 
 const (
-	maxTermsPerSynonymRule     = 1024
-	maxCompiledSynonymMappings = 65536
+	maxTermsPerSynonymRule        = 1024
+	maxCompiledSynonymMappings    = 65536
+	maxSynonymOutputTokensPerRule = 4096
 )
 
 func compileSynonymEntries(lines []string, format string, expand, lenient bool, analyzePhrase func(string) ([]string, error)) ([]synonymEntry, error) {
@@ -1193,10 +1250,11 @@ func compileSynonymEntries(lines []string, format string, expand, lenient bool, 
 		return compileWordNetSynonyms(lines, expand, lenient, analyzePhrase)
 	}
 	type mergedRule struct {
-		src         []string
-		targets     [][]string
-		seenTargets map[string]bool
-		keepOrig    bool
+		src               []string
+		targets           [][]string
+		seenTargets       map[string]bool
+		keepOrig          bool
+		totalTargetTokens int
 	}
 	var order []string
 	byKey := make(map[string]*mergedRule)
@@ -1213,8 +1271,8 @@ func compileSynonymEntries(lines []string, format string, expand, lenient bool, 
 			}
 			byKey[key] = mr
 			order = append(order, key)
-		} else if !keepOrig {
-			mr.keepOrig = false
+		} else if keepOrig {
+			mr.keepOrig = true
 		}
 		if slicesEqualStr(src, dst) {
 			if !mr.keepOrig {
@@ -1230,7 +1288,11 @@ func compileSynonymEntries(lines []string, format string, expand, lenient bool, 
 		if totalMappings > maxCompiledSynonymMappings {
 			return newIllegalArgError(fmt.Sprintf("Synonym rules exceed maximum compiled mappings [%d]", maxCompiledSynonymMappings))
 		}
+		if mr.totalTargetTokens+len(dst) > maxSynonymOutputTokensPerRule {
+			return newIllegalArgError(fmt.Sprintf("Synonym rules for [%s] exceed maximum output tokens [%d]", strings.Join(src, " "), maxSynonymOutputTokensPerRule))
+		}
 		mr.seenTargets[dstKey] = true
+		mr.totalTargetTokens += len(dst)
 		mr.targets = append(mr.targets, dst)
 		return nil
 	}
@@ -1491,8 +1553,49 @@ func applySynonymFlat(tokens []Token, entries []synonymEntry, budget *tokenStrea
 	var out []Token
 	n := len(tokens)
 	posShift := 0
+	var pending map[int][]Token
+	var pendingPositions []int
+
+	pushPending := func(pos int, tok Token) {
+		if pending == nil {
+			pending = make(map[int][]Token)
+		}
+		if _, exists := pending[pos]; !exists {
+			pendingPositions = append(pendingPositions, pos)
+			if len(pendingPositions) > 1 && pendingPositions[len(pendingPositions)-1] < pendingPositions[len(pendingPositions)-2] {
+				sort.Ints(pendingPositions)
+			}
+		}
+		pending[pos] = append(pending[pos], tok)
+	}
+	flushPendingUpTo := func(maxPos int) {
+		if len(pendingPositions) == 0 {
+			return
+		}
+		cut := 0
+		for cut < len(pendingPositions) && pendingPositions[cut] <= maxPos {
+			p := pendingPositions[cut]
+			out = append(out, pending[p]...)
+			delete(pending, p)
+			cut++
+		}
+		if cut > 0 {
+			pendingPositions = pendingPositions[cut:]
+		}
+	}
+	flushAllPending := func() {
+		for _, p := range pendingPositions {
+			out = append(out, pending[p]...)
+			delete(pending, p)
+		}
+		pendingPositions = pendingPositions[:0]
+	}
+
+	lastOrigPos := -1
+	lastOutPos := 0
 
 	for i := 0; i < n; {
+		isStacked := i > 0 && tokens[i].Position == lastOrigPos
 		matchedIdx := -1
 		for eIdx, ent := range entries {
 			m := len(ent.src)
@@ -1503,10 +1606,17 @@ func applySynonymFlat(tokens []Token, entries []synonymEntry, budget *tokenStrea
 		}
 		if matchedIdx < 0 {
 			cp := tokens[i].clone()
-			cp.Position += posShift
+			if isStacked {
+				cp.Position = lastOutPos
+			} else {
+				cp.Position += posShift
+				lastOrigPos = tokens[i].Position
+				lastOutPos = cp.Position
+			}
 			if err := budget.addToken(cp); err != nil {
 				return nil, err
 			}
+			flushPendingUpTo(cp.Position)
 			out = append(out, cp)
 			i++
 			continue
@@ -1515,30 +1625,30 @@ func applySynonymFlat(tokens []Token, entries []synonymEntry, budget *tokenStrea
 		ent := entries[matchedIdx]
 		m := len(ent.src)
 		basePos := tokens[i].Position + posShift
+		if isStacked {
+			basePos = lastOutPos
+		}
 		startOff := tokens[i].StartOffset
 		endOff := tokens[i+m-1].EndOffset
 
 		if ent.keepOrig {
-			type posBucket struct {
-				toks []Token
-			}
 			maxLen := m
 			for _, tgt := range ent.targets {
 				if len(tgt) > maxLen {
 					maxLen = len(tgt)
 				}
 			}
-			buckets := make([]posBucket, maxLen)
+			buckets := make([][]Token, maxLen)
 			for k := 0; k < m; k++ {
 				cp := tokens[i+k].clone()
 				cp.Position = basePos + k
-				buckets[k].toks = append(buckets[k].toks, cp)
+				if err := budget.addToken(cp); err != nil {
+					return nil, err
+				}
+				buckets[k] = append(buckets[k], cp)
 			}
 			for _, tgt := range ent.targets {
 				for k, term := range tgt {
-					if err := budget.canAddOne(); err != nil {
-						return nil, err
-					}
 					pl := 1
 					if len(tgt) == 1 && m > 1 {
 						pl = m
@@ -1552,17 +1662,23 @@ func applySynonymFlat(tokens []Token, entries []synonymEntry, budget *tokenStrea
 						PositionLength: pl,
 						TermFrequency:  1,
 					}
-					buckets[k].toks = append(buckets[k].toks, synTok)
-				}
-			}
-			for _, b := range buckets {
-				for _, bt := range b.toks {
-					if err := budget.addToken(bt); err != nil {
+					if err := budget.addToken(synTok); err != nil {
 						return nil, err
 					}
-					out = append(out, bt)
+					buckets[k] = append(buckets[k], synTok)
 				}
 			}
+			for k := 0; k < m; k++ {
+				flushPendingUpTo(basePos + k)
+				out = append(out, buckets[k]...)
+			}
+			for k := m; k < maxLen; k++ {
+				for _, bt := range buckets[k] {
+					pushPending(basePos+k, bt)
+				}
+			}
+			lastOrigPos = tokens[i+m-1].Position
+			lastOutPos = basePos
 			i += m
 			continue
 		}
@@ -1577,10 +1693,7 @@ func applySynonymFlat(tokens []Token, entries []synonymEntry, budget *tokenStrea
 		buckets := make([][]Token, maxTgtLen)
 		for _, tgt := range ent.targets {
 			for k, term := range tgt {
-				if err := budget.canAddOne(); err != nil {
-					return nil, err
-				}
-				buckets[k] = append(buckets[k], Token{
+				synTok := Token{
 					Term:           term,
 					StartOffset:    startOff,
 					EndOffset:      endOff,
@@ -1588,20 +1701,25 @@ func applySynonymFlat(tokens []Token, entries []synonymEntry, budget *tokenStrea
 					Position:       basePos + k,
 					PositionLength: 1,
 					TermFrequency:  1,
-				})
-			}
-		}
-		for _, b := range buckets {
-			for _, bt := range b {
-				if err := budget.addToken(bt); err != nil {
+				}
+				if err := budget.addToken(synTok); err != nil {
 					return nil, err
 				}
-				out = append(out, bt)
+				buckets[k] = append(buckets[k], synTok)
 			}
 		}
-		posShift += maxTgtLen - m
+		for k, b := range buckets {
+			flushPendingUpTo(basePos + k)
+			out = append(out, b...)
+		}
+		if !isStacked {
+			posShift += maxTgtLen - m
+			lastOrigPos = tokens[i+m-1].Position
+			lastOutPos = basePos
+		}
 		i += m
 	}
+	flushAllPending()
 	return out, nil
 }
 
@@ -1614,9 +1732,28 @@ func applySynonymGraph(tokens []Token, entries []synonymEntry, budget *tokenStre
 		curNode = tokens[0].Position
 	}
 
+	type origSpanTrack struct {
+		outIdx  int
+		origEnd int
+	}
+	var trackSpans []origSpanTrack
+	var nodeOutPos map[int]int
+	recordNodeOut := func(origNode, outNode int) {
+		if nodeOutPos == nil {
+			nodeOutPos = make(map[int]int, n+1)
+		}
+		nodeOutPos[origNode] = outNode
+	}
+
+	lastOrigPos := -1
+	sawStacked := false
+
 	for i := 0; i < n; {
-		if i > 0 {
-			gap := tokens[i].Position - tokens[i-1].Position - 1
+		isStacked := i > 0 && tokens[i].Position == lastOrigPos
+		if isStacked {
+			sawStacked = true
+		} else if i > 0 {
+			gap := tokens[i].Position - lastOrigPos - 1
 			if gap > 0 {
 				curNode += gap
 			}
@@ -1632,13 +1769,30 @@ func applySynonymGraph(tokens []Token, entries []synonymEntry, budget *tokenStre
 		}
 		if matchedIdx < 0 {
 			cp := tokens[i].clone()
-			cp.Position = curNode
-			cp.PositionLength = 1
+			outPos, stackedHit := nodeOutPos[tokens[i].Position]
+			if isStacked && stackedHit {
+				// Stacked at the same input position as a previously emitted token.
+			} else {
+				outPos = curNode
+				lastOrigPos = tokens[i].Position
+				curNode++
+			}
+			origPL := cp.PositionLength
+			if origPL < 1 {
+				origPL = 1
+			}
+			cp.Position = outPos
+			cp.PositionLength = origPL
 			if err := budget.addToken(cp); err != nil {
 				return nil, err
 			}
+			recordNodeOut(tokens[i].Position, outPos)
+			outIdx := len(out)
 			out = append(out, cp)
-			curNode++
+			trackSpans = append(trackSpans, origSpanTrack{
+				outIdx:  outIdx,
+				origEnd: tokens[i].Position + origPL,
+			})
 			i++
 			continue
 		}
@@ -1646,62 +1800,69 @@ func applySynonymGraph(tokens []Token, entries []synonymEntry, budget *tokenStre
 		ent := entries[matchedIdx]
 		m := len(ent.src)
 		startNode := curNode
+		nextNode := startNode + 1
+		if prevOut, stackedHit := nodeOutPos[tokens[i].Position]; isStacked && stackedHit {
+			startNode = prevOut
+			if curNode > nextNode {
+				nextNode = curNode
+			}
+		}
 		startOff := tokens[i].StartOffset
 		endOff := tokens[i+m-1].EndOffset
 
-		// Allocate internal graph nodes: first for each multi-word target path, then for original path (if keepOrig).
-		nextNode := startNode + 1
-		targetInternalNodes := make([][]int, len(ent.targets))
-		for tIdx, tgt := range ent.targets {
+		internalCount := 0
+		matchTokens := 0
+		for _, tgt := range ent.targets {
+			matchTokens += len(tgt)
 			if len(tgt) > 1 {
-				nodes := make([]int, len(tgt)-1)
-				for k := 0; k < len(tgt)-1; k++ {
-					nodes[k] = nextNode
-					nextNode++
-				}
-				targetInternalNodes[tIdx] = nodes
+				internalCount += len(tgt) - 1
 			}
 		}
-		var origInternalNodes []int
-		if ent.keepOrig && m > 1 {
-			origInternalNodes = make([]int, m-1)
-			for k := 0; k < m-1; k++ {
-				origInternalNodes[k] = nextNode
-				nextNode++
+		if ent.keepOrig {
+			matchTokens += m
+			if m > 1 {
+				internalCount += m - 1
 			}
 		}
-		endNode := nextNode
+		if budget != nil && budget.curTokens+matchTokens > budget.maxTokens {
+			return nil, checkMaxTokenLimit(budget.curTokens+matchTokens, budget.maxTokens)
+		}
+		endNode := nextNode + internalCount
 
 		type graphOrderedTok struct {
 			tok       Token
 			pathOrder int
 		}
-		var batch []graphOrderedTok
+		batch := make([]graphOrderedTok, 0, matchTokens)
 
 		for tIdx, tgt := range ent.targets {
-			intNodes := targetInternalNodes[tIdx]
+			tgtLen := len(tgt)
 			for k, term := range tgt {
-				if err := budget.canAddOne(); err != nil {
-					return nil, err
-				}
 				u := startNode
 				if k > 0 {
-					u = intNodes[k-1]
+					u = nextNode - 1
 				}
-				v := endNode
-				if k < len(tgt)-1 {
-					v = intNodes[k]
+				var v int
+				if k < tgtLen-1 {
+					v = nextNode
+					nextNode++
+				} else {
+					v = endNode
+				}
+				synTok := Token{
+					Term:           term,
+					StartOffset:    startOff,
+					EndOffset:      endOff,
+					Type:           "SYNONYM",
+					Position:       u,
+					PositionLength: v - u,
+					TermFrequency:  1,
+				}
+				if err := budget.addToken(synTok); err != nil {
+					return nil, err
 				}
 				batch = append(batch, graphOrderedTok{
-					tok: Token{
-						Term:           term,
-						StartOffset:    startOff,
-						EndOffset:      endOff,
-						Type:           "SYNONYM",
-						Position:       u,
-						PositionLength: v - u,
-						TermFrequency:  1,
-					},
+					tok:       synTok,
 					pathOrder: tIdx,
 				})
 			}
@@ -1712,15 +1873,22 @@ func applySynonymGraph(tokens []Token, entries []synonymEntry, budget *tokenStre
 			for k := 0; k < m; k++ {
 				u := startNode
 				if k > 0 {
-					u = origInternalNodes[k-1]
+					u = nextNode - 1
 				}
-				v := endNode
+				var v int
 				if k < m-1 {
-					v = origInternalNodes[k]
+					v = nextNode
+					nextNode++
+				} else {
+					v = endNode
 				}
 				cp := tokens[i+k].clone()
 				cp.Position = u
 				cp.PositionLength = v - u
+				if err := budget.addToken(cp); err != nil {
+					return nil, err
+				}
+				recordNodeOut(tokens[i+k].Position, u)
 				batch = append(batch, graphOrderedTok{
 					tok:       cp,
 					pathOrder: origOrder,
@@ -1735,14 +1903,35 @@ func applySynonymGraph(tokens []Token, entries []synonymEntry, budget *tokenStre
 			return batch[a].pathOrder < batch[b].pathOrder
 		})
 		for _, item := range batch {
-			if err := budget.addToken(item.tok); err != nil {
-				return nil, err
-			}
 			out = append(out, item.tok)
 		}
 
-		curNode = endNode
+		lastTok := tokens[i+m-1]
+		lastPL := lastTok.PositionLength
+		if lastPL < 1 {
+			lastPL = 1
+		}
+		recordNodeOut(tokens[i].Position, startNode)
+		recordNodeOut(lastTok.Position+lastPL, endNode)
+		lastOrigPos = lastTok.Position
+		if endNode > curNode {
+			curNode = endNode
+		}
 		i += m
+	}
+
+	for _, sp := range trackSpans {
+		if endOut, ok := nodeOutPos[sp.origEnd]; ok {
+			newPL := endOut - out[sp.outIdx].Position
+			if newPL >= 1 {
+				out[sp.outIdx].PositionLength = newPL
+			}
+		}
+	}
+	if sawStacked && len(out) > 1 {
+		sort.SliceStable(out, func(i, j int) bool {
+			return out[i].Position < out[j].Position
+		})
 	}
 	return out, nil
 }

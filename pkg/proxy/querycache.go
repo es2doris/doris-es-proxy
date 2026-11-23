@@ -31,7 +31,11 @@ import (
 	"github.com/es2doris/doris-es-proxy/pkg/esast"
 )
 
-const defaultShardRequestCacheMaxEntriesR63 = 512
+const (
+	defaultShardRequestCacheMaxEntriesR63    = 512
+	defaultShardRequestCacheMaxBytesR63      = 64 << 20 // 64 MiB total payload budget
+	defaultShardRequestCacheMaxEntryBytesR63 = 1 << 20  // 1 MiB per-entry payload cap
+)
 
 type shardRequestCacheEntryR63 struct {
 	payload        []byte
@@ -44,6 +48,9 @@ type shardRequestCacheStoreR63 struct {
 	entries        map[string]shardRequestCacheEntryR63
 	order          []string
 	maxSize        int
+	maxBytes       int64
+	maxEntryBytes  int64
+	totalBytes     int64
 	hitsByIdx      map[string]int64
 	missesByIdx    map[string]int64
 	evictionsByIdx map[string]int64
@@ -66,6 +73,8 @@ func (s *Server) getOrCreateShardRequestCacheR63() *shardRequestCacheStoreR63 {
 		st = &shardRequestCacheStoreR63{
 			entries:        make(map[string]shardRequestCacheEntryR63),
 			maxSize:        defaultShardRequestCacheMaxEntriesR63,
+			maxBytes:       defaultShardRequestCacheMaxBytesR63,
+			maxEntryBytes:  defaultShardRequestCacheMaxEntryBytesR63,
 			hitsByIdx:      make(map[string]int64),
 			missesByIdx:    make(map[string]int64),
 			evictionsByIdx: make(map[string]int64),
@@ -89,6 +98,8 @@ func (s *Server) invalidateShardRequestCacheR63() {
 	st.mu.Lock()
 	clear(st.entries)
 	st.order = st.order[:0]
+	st.totalBytes = 0
+	clear(st.bytesByIdx)
 	st.mu.Unlock()
 }
 
@@ -286,14 +297,35 @@ func (s *Server) buildShardRequestCacheKeyR63(
 	return hex.EncodeToString(h.Sum(nil))
 }
 
+func (st *shardRequestCacheStoreR63) removeFromOrderLocked(key string) {
+	for i, k := range st.order {
+		if k == key {
+			st.order = append(st.order[:i], st.order[i+1:]...)
+			return
+		}
+	}
+}
+
+func (st *shardRequestCacheStoreR63) touchOrderLocked(key string) {
+	n := len(st.order)
+	if n == 0 || st.order[n-1] == key {
+		return
+	}
+	st.removeFromOrderLocked(key)
+	st.order = append(st.order, key)
+}
+
 func (s *Server) lookupShardRequestCacheR63(key string) (map[string]any, []string, bool) {
 	st := s.getOrCreateShardRequestCacheR63()
 	if st == nil || key == "" {
 		return nil, nil, false
 	}
-	st.mu.RLock()
+	st.mu.Lock()
 	entry, ok := st.entries[key]
-	st.mu.RUnlock()
+	if ok && len(entry.payload) > 0 {
+		st.touchOrderLocked(key)
+	}
+	st.mu.Unlock()
 	if !ok || len(entry.payload) == 0 {
 		return nil, nil, false
 	}
@@ -337,33 +369,55 @@ func (s *Server) storeAndRecordShardRequestCacheMissR63(key string, targets []st
 		}
 	}
 	if prev, exists := st.entries[key]; exists {
+		prevBytes := int64(len(prev.payload))
+		st.totalBytes -= prevBytes
+		if st.totalBytes < 0 {
+			st.totalBytes = 0
+		}
 		for _, pt := range prev.targets {
-			st.bytesByIdx[pt] -= int64(len(prev.payload))
+			st.bytesByIdx[pt] -= prevBytes
 			if st.bytesByIdx[pt] < 0 {
 				st.bytesByIdx[pt] = 0
 			}
 		}
-	} else {
-		if len(st.order) >= st.maxSize && st.maxSize > 0 {
-			evictKey := st.order[0]
-			st.order = st.order[1:]
-			if evicted, hadEv := st.entries[evictKey]; hadEv {
-				for _, et := range evicted.targets {
-					st.evictionsByIdx[et]++
-					st.bytesByIdx[et] -= int64(len(evicted.payload))
-					if st.bytesByIdx[et] < 0 {
-						st.bytesByIdx[et] = 0
-					}
+		delete(st.entries, key)
+		st.removeFromOrderLocked(key)
+	}
+
+	entryBytes := int64(len(encoded))
+	if (st.maxEntryBytes > 0 && entryBytes > st.maxEntryBytes) ||
+		(st.maxBytes > 0 && entryBytes > st.maxBytes) {
+		return
+	}
+
+	for len(st.order) > 0 &&
+		((st.maxSize > 0 && len(st.order) >= st.maxSize) ||
+			(st.maxBytes > 0 && st.totalBytes+entryBytes > st.maxBytes)) {
+		evictKey := st.order[0]
+		st.order = st.order[1:]
+		if evicted, hadEv := st.entries[evictKey]; hadEv {
+			evBytes := int64(len(evicted.payload))
+			st.totalBytes -= evBytes
+			if st.totalBytes < 0 {
+				st.totalBytes = 0
+			}
+			for _, et := range evicted.targets {
+				st.evictionsByIdx[et]++
+				st.bytesByIdx[et] -= evBytes
+				if st.bytesByIdx[et] < 0 {
+					st.bytesByIdx[et] = 0
 				}
 			}
 			delete(st.entries, evictKey)
 		}
-		st.order = append(st.order, key)
 	}
+
+	st.order = append(st.order, key)
+	st.totalBytes += entryBytes
 	cpTargets := append([]string(nil), targets...)
 	for _, t := range cpTargets {
 		if t != "" {
-			st.bytesByIdx[t] += int64(len(encoded))
+			st.bytesByIdx[t] += entryBytes
 		}
 	}
 	st.entries[key] = shardRequestCacheEntryR63{
@@ -388,6 +442,7 @@ func (s *Server) clearShardRequestCacheEntriesR63(targets []string) {
 		}
 		clear(st.entries)
 		st.order = st.order[:0]
+		st.totalBytes = 0
 		clear(st.bytesByIdx)
 		return
 	}
@@ -411,9 +466,14 @@ func (s *Server) clearShardRequestCacheEntriesR63(targets []string) {
 			}
 		}
 		if matched {
+			entryBytes := int64(len(entry.payload))
+			st.totalBytes -= entryBytes
+			if st.totalBytes < 0 {
+				st.totalBytes = 0
+			}
 			for _, et := range entry.targets {
 				st.evictionsByIdx[et]++
-				st.bytesByIdx[et] -= int64(len(entry.payload))
+				st.bytesByIdx[et] -= entryBytes
 				if st.bytesByIdx[et] < 0 {
 					st.bytesByIdx[et] = 0
 				}

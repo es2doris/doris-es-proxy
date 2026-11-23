@@ -941,8 +941,8 @@ func TestSDKWireCompatDynamicMappingAutoPromoteAndPIT_E2E(t *testing.T) {
 	if len(explainObj.UnindexedVariant) != 0 {
 		t.Fatalf("expected 0 unindexed variant fields after dynamic mapping inference, got %v (SQL: %s)", explainObj.UnindexedVariant, explainObj.HitsSQL)
 	}
-	if !strings.Contains(explainObj.HitsSQL, "`f__service`") || !strings.Contains(explainObj.HitsSQL, "`f__meta__region`") {
-		t.Fatalf("expected hits_sql to use dynamically inferred promoted columns `f__service` and `f__meta__region`, got %s", explainObj.HitsSQL)
+	if !strings.Contains(explainObj.HitsSQL, "`f__service__keyword`") || !strings.Contains(explainObj.HitsSQL, "`f__meta__region__keyword`") {
+		t.Fatalf("expected hits_sql to use dynamically inferred promoted columns `f__service__keyword` and `f__meta__region__keyword`, got %s", explainObj.HitsSQL)
 	}
 
 	// 3. Test Point-in-Time (`POST /{index}/_pit`, `/_search` with `pit`, `DELETE /_pit`)

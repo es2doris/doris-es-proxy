@@ -2877,6 +2877,7 @@ type Query struct {
 	GeoBoundingBox    *GeoBoundingBoxQuery        `json:"geo_bounding_box,omitempty"`
 	GeoPolygon        *GeoPolygonQuery            `json:"geo_polygon,omitempty"`
 	GeoShape          *GeoShapeQuery              `json:"geo_shape,omitempty"`
+	GeoGrid           *GeoGridQuery               `json:"geo_grid,omitempty"`
 	Wrapper           *WrapperQuery               `json:"wrapper,omitempty"`
 	Pinned            *PinnedQuery                `json:"pinned,omitempty"`
 	MoreLikeThis      *MoreLikeThisQuery          `json:"more_like_this,omitempty"`
@@ -3160,6 +3161,7 @@ var knownQueryClauses = map[string]bool{
 	"geo_bounding_box":    true,
 	"geo_polygon":         true,
 	"geo_shape":           true,
+	"geo_grid":            true,
 	"wrapper":             true,
 	"pinned":              true,
 	"more_like_this":      true,
@@ -3549,6 +3551,12 @@ func (q *Query) UnmarshalJSON(data []byte) error {
 			}
 			return nil
 		}(),
+		func() *float64 {
+			if alias.GeoGrid != nil {
+				return alias.GeoGrid.Boost
+			}
+			return nil
+		}(),
 	} {
 		if ptrBoost != nil && (*ptrBoost < 0 || math.IsNaN(*ptrBoost) || math.IsInf(*ptrBoost, 0)) {
 			return fmt.Errorf("parsing_exception: [boost] must be a non-negative number")
@@ -3720,6 +3728,9 @@ func (q *Query) UnmarshalJSON(data []byte) error {
 	}
 	if alias.Name == "" && alias.SparseVector != nil && alias.SparseVector.Name != "" {
 		alias.Name = alias.SparseVector.Name
+	}
+	if alias.Name == "" && alias.GeoGrid != nil && alias.GeoGrid.Name != "" {
+		alias.Name = alias.GeoGrid.Name
 	}
 	*q = Query(alias)
 	return nil
@@ -6229,6 +6240,8 @@ type PercolateQuery struct {
 	Document       map[string]any   `json:"document,omitempty"`
 	Documents      []map[string]any `json:"documents,omitempty"`
 	Index          string           `json:"index,omitempty"`
+	Type           string           `json:"type,omitempty"`
+	DocumentType   string           `json:"document_type,omitempty"`
 	ID             string           `json:"id,omitempty"`
 	Routing        string           `json:"routing,omitempty"`
 	Preference     string           `json:"preference,omitempty"`
@@ -6249,7 +6262,7 @@ func (pq *PercolateQuery) UnmarshalJSON(data []byte) error {
 	}
 	for k := range rawMap {
 		switch k {
-		case "field", "document", "documents", "index", "id", "routing", "preference", "version", "ignore_unmapped", "boost", "_name", "name":
+		case "field", "document", "documents", "index", "type", "document_type", "id", "routing", "preference", "version", "ignore_unmapped", "boost", "_name", "name":
 		default:
 			return fmt.Errorf("parsing_exception: [percolate] unknown field [%s]", k)
 		}
@@ -8159,19 +8172,21 @@ func (r *RegexpEntry) UnmarshalJSON(data []byte) error {
 }
 
 type MatchEntry struct {
-	Query               any     `json:"query"`
-	Operator            string  `json:"operator,omitempty"`
-	Analyzer            string  `json:"analyzer,omitempty"`
-	Boost               float64 `json:"boost,omitempty"`
-	ZeroTermsQuery      string  `json:"zero_terms_query,omitempty"`
-	MinimumShouldMatch  any     `json:"minimum_should_match,omitempty"`
-	Fuzziness           any     `json:"fuzziness,omitempty"`
-	PrefixLength        int     `json:"prefix_length,omitempty"`
-	MaxExpansions       int     `json:"max_expansions,omitempty"`
-	FuzzyTranspositions *bool   `json:"fuzzy_transpositions,omitempty"`
-	FuzzyRewrite        string  `json:"fuzzy_rewrite,omitempty"`
-	Lenient             *bool   `json:"lenient,omitempty"`
-	HasBoost            bool    `json:"-"`
+	Query                           any     `json:"query"`
+	Operator                        string  `json:"operator,omitempty"`
+	Analyzer                        string  `json:"analyzer,omitempty"`
+	Boost                           float64 `json:"boost,omitempty"`
+	CutoffFrequency                 float64 `json:"cutoff_frequency,omitempty"`
+	ZeroTermsQuery                  string  `json:"zero_terms_query,omitempty"`
+	MinimumShouldMatch              any     `json:"minimum_should_match,omitempty"`
+	Fuzziness                       any     `json:"fuzziness,omitempty"`
+	PrefixLength                    int     `json:"prefix_length,omitempty"`
+	MaxExpansions                   int     `json:"max_expansions,omitempty"`
+	FuzzyTranspositions             *bool   `json:"fuzzy_transpositions,omitempty"`
+	FuzzyRewrite                    string  `json:"fuzzy_rewrite,omitempty"`
+	Lenient                         *bool   `json:"lenient,omitempty"`
+	AutoGenerateSynonymsPhraseQuery *bool   `json:"auto_generate_synonyms_phrase_query,omitempty"`
+	HasBoost                        bool    `json:"-"`
 }
 
 func (m MatchEntry) MarshalJSON() ([]byte, error) {
@@ -8181,31 +8196,35 @@ func (m MatchEntry) MarshalJSON() ([]byte, error) {
 		boostPtr = &b
 	}
 	return json.Marshal(struct {
-		Query               any      `json:"query"`
-		Operator            string   `json:"operator,omitempty"`
-		Analyzer            string   `json:"analyzer,omitempty"`
-		Boost               *float64 `json:"boost,omitempty"`
-		ZeroTermsQuery      string   `json:"zero_terms_query,omitempty"`
-		MinimumShouldMatch  any      `json:"minimum_should_match,omitempty"`
-		Fuzziness           any      `json:"fuzziness,omitempty"`
-		PrefixLength        int      `json:"prefix_length,omitempty"`
-		MaxExpansions       int      `json:"max_expansions,omitempty"`
-		FuzzyTranspositions *bool    `json:"fuzzy_transpositions,omitempty"`
-		FuzzyRewrite        string   `json:"fuzzy_rewrite,omitempty"`
-		Lenient             *bool    `json:"lenient,omitempty"`
+		Query                           any      `json:"query"`
+		Operator                        string   `json:"operator,omitempty"`
+		Analyzer                        string   `json:"analyzer,omitempty"`
+		Boost                           *float64 `json:"boost,omitempty"`
+		CutoffFrequency                 float64  `json:"cutoff_frequency,omitempty"`
+		ZeroTermsQuery                  string   `json:"zero_terms_query,omitempty"`
+		MinimumShouldMatch              any      `json:"minimum_should_match,omitempty"`
+		Fuzziness                       any      `json:"fuzziness,omitempty"`
+		PrefixLength                    int      `json:"prefix_length,omitempty"`
+		MaxExpansions                   int      `json:"max_expansions,omitempty"`
+		FuzzyTranspositions             *bool    `json:"fuzzy_transpositions,omitempty"`
+		FuzzyRewrite                    string   `json:"fuzzy_rewrite,omitempty"`
+		Lenient                         *bool    `json:"lenient,omitempty"`
+		AutoGenerateSynonymsPhraseQuery *bool    `json:"auto_generate_synonyms_phrase_query,omitempty"`
 	}{
-		Query:               m.Query,
-		Operator:            m.Operator,
-		Analyzer:            m.Analyzer,
-		Boost:               boostPtr,
-		ZeroTermsQuery:      m.ZeroTermsQuery,
-		MinimumShouldMatch:  m.MinimumShouldMatch,
-		Fuzziness:           m.Fuzziness,
-		PrefixLength:        m.PrefixLength,
-		MaxExpansions:       m.MaxExpansions,
-		FuzzyTranspositions: m.FuzzyTranspositions,
-		FuzzyRewrite:        m.FuzzyRewrite,
-		Lenient:             m.Lenient,
+		Query:                           m.Query,
+		Operator:                        m.Operator,
+		Analyzer:                        m.Analyzer,
+		Boost:                           boostPtr,
+		CutoffFrequency:                 m.CutoffFrequency,
+		ZeroTermsQuery:                  m.ZeroTermsQuery,
+		MinimumShouldMatch:              m.MinimumShouldMatch,
+		Fuzziness:                       m.Fuzziness,
+		PrefixLength:                    m.PrefixLength,
+		MaxExpansions:                   m.MaxExpansions,
+		FuzzyTranspositions:             m.FuzzyTranspositions,
+		FuzzyRewrite:                    m.FuzzyRewrite,
+		Lenient:                         m.Lenient,
+		AutoGenerateSynonymsPhraseQuery: m.AutoGenerateSynonymsPhraseQuery,
 	})
 }
 
@@ -8232,18 +8251,20 @@ func (m *MatchEntry) UnmarshalJSON(data []byte) error {
 			return fmt.Errorf("parsing_exception: [match] missing required [query] field")
 		}
 		var full struct {
-			Query               any             `json:"query"`
-			Operator            string          `json:"operator"`
-			Analyzer            string          `json:"analyzer"`
-			Boost               json.RawMessage `json:"boost"`
-			ZeroTermsQuery      string          `json:"zero_terms_query"`
-			MinimumShouldMatch  any             `json:"minimum_should_match"`
-			Fuzziness           any             `json:"fuzziness"`
-			PrefixLength        int             `json:"prefix_length"`
-			MaxExpansions       int             `json:"max_expansions"`
-			FuzzyTranspositions *bool           `json:"fuzzy_transpositions"`
-			FuzzyRewrite        string          `json:"fuzzy_rewrite"`
-			Lenient             any             `json:"lenient"`
+			Query                           any             `json:"query"`
+			Operator                        string          `json:"operator"`
+			Analyzer                        string          `json:"analyzer"`
+			Boost                           json.RawMessage `json:"boost"`
+			CutoffFrequency                 float64         `json:"cutoff_frequency"`
+			ZeroTermsQuery                  string          `json:"zero_terms_query"`
+			MinimumShouldMatch              any             `json:"minimum_should_match"`
+			Fuzziness                       any             `json:"fuzziness"`
+			PrefixLength                    int             `json:"prefix_length"`
+			MaxExpansions                   int             `json:"max_expansions"`
+			FuzzyTranspositions             *bool           `json:"fuzzy_transpositions"`
+			FuzzyRewrite                    string          `json:"fuzzy_rewrite"`
+			Lenient                         any             `json:"lenient"`
+			AutoGenerateSynonymsPhraseQuery any             `json:"auto_generate_synonyms_phrase_query"`
 		}
 		if err := json.Unmarshal(trimmed, &full); err != nil {
 			return err
@@ -8253,6 +8274,7 @@ func (m *MatchEntry) UnmarshalJSON(data []byte) error {
 		}
 		m.Query = full.Query
 		m.Analyzer = strings.TrimSpace(full.Analyzer)
+		m.CutoffFrequency = full.CutoffFrequency
 		if full.Operator != "" {
 			if err := validateQueryOperator(full.Operator, "match"); err != nil {
 				return err
@@ -8299,6 +8321,13 @@ func (m *MatchEntry) UnmarshalJSON(data []byte) error {
 				return err
 			}
 			m.Lenient = &ln
+		}
+		if full.AutoGenerateSynonymsPhraseQuery != nil {
+			ag, err := parseFlexibleBool(full.AutoGenerateSynonymsPhraseQuery)
+			if err != nil {
+				return fmt.Errorf("parsing_exception: [match] [auto_generate_synonyms_phrase_query] %w", err)
+			}
+			m.AutoGenerateSynonymsPhraseQuery = &ag
 		}
 		return nil
 	}
@@ -8605,21 +8634,23 @@ func (p *PhraseEntry) UnmarshalJSON(data []byte) error {
 }
 
 type MultiMatchQuery struct {
-	Query               any      `json:"query"`
-	Fields              []string `json:"fields,omitempty"`
-	Type                string   `json:"type,omitempty"`
-	Operator            string   `json:"operator,omitempty"`
-	Analyzer            string   `json:"analyzer,omitempty"`
-	Slop                int      `json:"slop,omitempty"`
-	MinimumShouldMatch  any      `json:"minimum_should_match,omitempty"`
-	TieBreaker          *float64 `json:"tie_breaker,omitempty"`
-	ZeroTermsQuery      string   `json:"zero_terms_query,omitempty"`
-	Fuzziness           any      `json:"fuzziness,omitempty"`
-	PrefixLength        int      `json:"prefix_length,omitempty"`
-	MaxExpansions       int      `json:"max_expansions,omitempty"`
-	FuzzyTranspositions *bool    `json:"fuzzy_transpositions,omitempty"`
-	Lenient             *bool    `json:"lenient,omitempty"`
-	Boost               *float64 `json:"boost,omitempty"`
+	Query                           any      `json:"query"`
+	Fields                          []string `json:"fields,omitempty"`
+	Type                            string   `json:"type,omitempty"`
+	Operator                        string   `json:"operator,omitempty"`
+	Analyzer                        string   `json:"analyzer,omitempty"`
+	Slop                            int      `json:"slop,omitempty"`
+	MinimumShouldMatch              any      `json:"minimum_should_match,omitempty"`
+	TieBreaker                      *float64 `json:"tie_breaker,omitempty"`
+	ZeroTermsQuery                  string   `json:"zero_terms_query,omitempty"`
+	CutoffFrequency                 float64  `json:"cutoff_frequency,omitempty"`
+	Fuzziness                       any      `json:"fuzziness,omitempty"`
+	PrefixLength                    int      `json:"prefix_length,omitempty"`
+	MaxExpansions                   int      `json:"max_expansions,omitempty"`
+	FuzzyTranspositions             *bool    `json:"fuzzy_transpositions,omitempty"`
+	Lenient                         *bool    `json:"lenient,omitempty"`
+	AutoGenerateSynonymsPhraseQuery *bool    `json:"auto_generate_synonyms_phrase_query,omitempty"`
+	Boost                           *float64 `json:"boost,omitempty"`
 }
 
 func (mmq *MultiMatchQuery) UnmarshalJSON(data []byte) error {
@@ -8647,10 +8678,11 @@ func (mmq *MultiMatchQuery) UnmarshalJSON(data []byte) error {
 	type plain MultiMatchQuery
 	var raw struct {
 		plain
-		Fields              any             `json:"fields"`
-		FuzzyTranspositions any             `json:"fuzzy_transpositions"`
-		Lenient             any             `json:"lenient"`
-		Boost               json.RawMessage `json:"boost"`
+		Fields                          any             `json:"fields"`
+		FuzzyTranspositions             any             `json:"fuzzy_transpositions"`
+		Lenient                         any             `json:"lenient"`
+		AutoGenerateSynonymsPhraseQuery any             `json:"auto_generate_synonyms_phrase_query"`
+		Boost                           json.RawMessage `json:"boost"`
 	}
 	if err := json.Unmarshal(trimmed, &raw); err != nil {
 		return err
@@ -8672,6 +8704,13 @@ func (mmq *MultiMatchQuery) UnmarshalJSON(data []byte) error {
 			return err
 		}
 		mmq.Lenient = &ln
+	}
+	if raw.AutoGenerateSynonymsPhraseQuery != nil {
+		ag, err := parseFlexibleBool(raw.AutoGenerateSynonymsPhraseQuery)
+		if err != nil {
+			return fmt.Errorf("parsing_exception: [multi_match] [auto_generate_synonyms_phrase_query] %w", err)
+		}
+		mmq.AutoGenerateSynonymsPhraseQuery = &ag
 	}
 	if len(raw.Boost) > 0 {
 		b, err := parseOptionalNonNegativeBoost(raw.Boost)
@@ -9647,6 +9686,7 @@ var knownAggTypeKeys = map[string]bool{
 	"geo_distance":              true,
 	"geohash_grid":              true,
 	"geotile_grid":              true,
+	"geohex_grid":               true,
 	"bucket_sort":               true,
 	"cumulative_sum":            true,
 	"cumulative_cardinality":    true,
@@ -9734,6 +9774,7 @@ type AggSpec struct {
 	GeoDistance             *GeoDistanceAggSpec            `json:"geo_distance,omitempty"`
 	GeohashGrid             *GeoGridAggSpec                `json:"geohash_grid,omitempty"`
 	GeotileGrid             *GeoGridAggSpec                `json:"geotile_grid,omitempty"`
+	GeoHexGrid              *GeoHexGridAggSpec             `json:"geohex_grid,omitempty"`
 	BucketSort              *BucketSortAggSpec             `json:"bucket_sort,omitempty"`
 	CumulativeSum           *PipelineAggSpec               `json:"cumulative_sum,omitempty"`
 	CumulativeCardinality   *PipelineAggSpec               `json:"cumulative_cardinality,omitempty"`
@@ -10956,6 +10997,14 @@ func (a *AggSpec) UnmarshalJSON(data []byte) error {
 		}
 		if p.GeotileGrid.Precision != nil && (*p.GeotileGrid.Precision < 0 || *p.GeotileGrid.Precision > 29) {
 			return fmt.Errorf("illegal_argument_exception: [geotile_grid] [precision] must be between 0 and 29")
+		}
+	}
+	if p.GeoHexGrid != nil {
+		if p.GeoHexGrid.precisionWasDistString {
+			return fmt.Errorf("parsing_exception: [geohex_grid] [precision] must be an integer between 0 and 15")
+		}
+		if p.GeoHexGrid.Precision != nil && (*p.GeoHexGrid.Precision < 0 || *p.GeoHexGrid.Precision > 15) {
+			return fmt.Errorf("illegal_argument_exception: [geohex_grid] [precision] must be between 0 and 15")
 		}
 	}
 	if p.MovingFn != nil {
@@ -14710,6 +14759,7 @@ type FieldProperty struct {
 	SearchQuoteAnalyzer      string                   `json:"search_quote_analyzer,omitempty"`
 	Normalizer               string                   `json:"normalizer,omitempty"`
 	Format                   string                   `json:"format,omitempty"`
+	Locale                   string                   `json:"locale,omitempty"`
 	TimeZone                 string                   `json:"time_zone,omitempty"`
 	Dims                     int                      `json:"dims,omitempty"`
 	Dimension                int                      `json:"dimension,omitempty"`

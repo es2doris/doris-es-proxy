@@ -63,6 +63,35 @@ func (s *Server) getOrCreateWave3PolishStateR63() *wave3ServerPolishStateR63 {
 	return st
 }
 
+func (s *Server) cleanupWave3PolishStateR63() {
+	if s == nil {
+		return
+	}
+	wave3ServerPolishMuR63.Lock()
+	delete(wave3ServerPolishStatesR63, s)
+	wave3ServerPolishMuR63.Unlock()
+}
+
+func (s *Server) clearWave3PolishIndexStateR63(indexName string) {
+	if s == nil || indexName == "" {
+		return
+	}
+	if indexName == "*" {
+		s.cleanupWave3PolishStateR63()
+		return
+	}
+	wave3ServerPolishMuR63.Lock()
+	st := wave3ServerPolishStatesR63[s]
+	wave3ServerPolishMuR63.Unlock()
+	if st == nil {
+		return
+	}
+	st.mu.Lock()
+	delete(st.dynamicTextFieldsByIdx, indexName)
+	delete(st.dynamicFloatFieldsIdx, indexName)
+	st.mu.Unlock()
+}
+
 func (s *Server) recordDynamicallyInferredFieldsWave3R63(
 	indexName string,
 	prevSpec *esast.MappingSpec,
@@ -769,10 +798,14 @@ func (s *Server) buildCustomNGramAnalyzerHighlightSnippetsWave3R63(
 		if err != nil || vResp == nil || len(vResp.Tokens) == 0 {
 			continue
 		}
+		u16ToByte := utf16OffsetsToByteOffsetsR64(val)
 		var spans [][2]int
 		for _, tk := range vResp.Tokens {
-			if qTermSet[tk.Token] && tk.StartOffset >= 0 && tk.EndOffset > tk.StartOffset && tk.EndOffset <= len(val) {
-				spans = append(spans, [2]int{tk.StartOffset, tk.EndOffset})
+			if !qTermSet[tk.Token] {
+				continue
+			}
+			if bStart, bEnd, okSpan := resolveUTF16HighlightSpanBytesR64(u16ToByte, tk.StartOffset, tk.EndOffset); okSpan {
+				spans = append(spans, [2]int{bStart, bEnd})
 			}
 		}
 		if len(spans) == 0 {
@@ -937,20 +970,23 @@ func emitCreateIndexWave3DeprecationWarningsR63(
 		emitESDeprecationWarningRound61(w, s, r, "[unicodeSetFilter] has been deprecated in favor of [unicode_set_filter]")
 	}
 	if mappings != nil && len(mappings.Properties) > 0 {
-		var hasAggMetricMultifield func(props map[string]esast.FieldProperty) bool
-		hasAggMetricMultifield = func(props map[string]esast.FieldProperty) bool {
+		var hasMultifieldForType func(props map[string]esast.FieldProperty, targetType string) bool
+		hasMultifieldForType = func(props map[string]esast.FieldProperty, targetType string) bool {
 			for _, p := range props {
-				if strings.EqualFold(strings.TrimSpace(p.Type), "aggregate_metric_double") && len(p.Fields) > 0 {
+				if strings.EqualFold(strings.TrimSpace(p.Type), targetType) && len(p.Fields) > 0 {
 					return true
 				}
-				if len(p.Properties) > 0 && hasAggMetricMultifield(p.Properties) {
+				if len(p.Properties) > 0 && hasMultifieldForType(p.Properties, targetType) {
 					return true
 				}
 			}
 			return false
 		}
-		if hasAggMetricMultifield(mappings.Properties) {
+		if hasMultifieldForType(mappings.Properties, "aggregate_metric_double") {
 			emitESDeprecationWarningRound61(w, s, r, "Adding multifields to [aggregate_metric_double] mappers has no effect and will be forbidden in future")
+		}
+		if hasMultifieldForType(mappings.Properties, "constant_keyword") {
+			emitESDeprecationWarningRound61(w, s, r, "Adding multifields to [constant_keyword] mappers has no effect and will be forbidden in future")
 		}
 	}
 }

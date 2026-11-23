@@ -37,14 +37,30 @@ test:
 bench:
 	go test -bench=. -benchmem -run=^$$ ./pkg/...
 
+FUZZTIME ?= 5s
+
 fuzz:
-	go test -fuzz='^FuzzBuildSearchPlan$$' -fuzztime=5s ./pkg/transpiler
-	go test -fuzz='^FuzzBuildSearchPlanWithDoris4SearchFn$$' -fuzztime=5s ./pkg/transpiler
-	go test -fuzz='^FuzzEvalPainless$$' -fuzztime=5s ./pkg/painless
-	go test -fuzz='^FuzzPainlessEval$$' -fuzztime=5s ./pkg/painless
-	go test -fuzz='^FuzzShredDocument$$' -fuzztime=5s ./pkg/schema
-	go test -fuzz='^FuzzParseBulkNDJSON$$' -fuzztime=5s ./pkg/esast
-	go test -fuzz='^FuzzAnalyze$$' -fuzztime=5s ./pkg/analysis
+	go test -fuzz='^FuzzAnalyze$$' -fuzztime=$(FUZZTIME) ./pkg/analysis
+	go test -fuzz='^FuzzEvalPainless$$' -fuzztime=$(FUZZTIME) ./pkg/painless
+	go test -fuzz='^FuzzPainlessEval$$' -fuzztime=$(FUZZTIME) ./pkg/painless
+	go test -fuzz='^FuzzParseESDateMath$$' -fuzztime=$(FUZZTIME) ./pkg/schema
+	go test -fuzz='^FuzzInferAndShredDocument$$' -fuzztime=$(FUZZTIME) ./pkg/schema
+	go test -fuzz='^FuzzShredDocument$$' -fuzztime=$(FUZZTIME) ./pkg/schema
+	go test -fuzz='^FuzzBulkNDJSONInvariants$$' -fuzztime=$(FUZZTIME) ./pkg/esast
+	go test -fuzz='^FuzzUnmarshalSearchRequest$$' -fuzztime=$(FUZZTIME) ./pkg/esast
+	go test -fuzz='^FuzzParseBulkNDJSON$$' -fuzztime=$(FUZZTIME) ./pkg/esast
+	go test -fuzz='^FuzzLuceneQueryStringBalancedSQL$$' -fuzztime=$(FUZZTIME) ./pkg/transpiler
+	go test -fuzz='^FuzzBuildSearchPlanBalancedSQL$$' -fuzztime=$(FUZZTIME) ./pkg/transpiler
+	go test -fuzz='^FuzzParseLuceneQueryString$$' -fuzztime=$(FUZZTIME) ./pkg/transpiler
+	go test -fuzz='^FuzzBuildSearchPlan$$' -fuzztime=$(FUZZTIME) ./pkg/transpiler
+	go test -fuzz='^FuzzNormalizeDorisSQL$$' -fuzztime=$(FUZZTIME) ./pkg/transpiler
+	go test -fuzz='^FuzzCompileGrokAndDissect$$' -fuzztime=$(FUZZTIME) ./pkg/proxy
+	go test -fuzz='^FuzzRenderMustacheTemplate$$' -fuzztime=$(FUZZTIME) ./pkg/proxy
+	go test -fuzz='^FuzzDecompressRequestBody$$' -fuzztime=$(FUZZTIME) ./pkg/proxy
+	go test -fuzz='^FuzzNormalizeDorisSQL$$' -fuzztime=$(FUZZTIME) ./pkg/proxy
+	go test -fuzz='^FuzzStreamLoadRedirect$$' -fuzztime=$(FUZZTIME) ./pkg/proxy
+	go test -fuzz='^FuzzExtractIngestAttachment$$' -fuzztime=$(FUZZTIME) ./pkg/proxy
+	go test -fuzz='^FuzzESQLAndEQL$$' -fuzztime=$(FUZZTIME) ./pkg/proxy
 
 test-e2e:
 	DORIS_E2E_DSN="$(DORIS_E2E_DSN)" DORIS_E2E_HTTP="$(DORIS_E2E_HTTP)" go test -race -count=1 -v ./e2e -run TestLiveApacheDoris_E2E
@@ -57,7 +73,7 @@ test-sdk-conformance:
 
 test-conformance:
 	bash scripts/fetch-conformance-specs.sh
-	CONFORMANCE_REQUIRE_UPSTREAM=1 CONFORMANCE_MIN_V7_PASSED=1940 CONFORMANCE_MIN_V8_PASSED=3680 go test -race -count=1 -v ./pkg/compliance -run 'TestUpstream|TestSpecSchemaValidatorLiveUpstreamSchema'
+	CONFORMANCE_REQUIRE_UPSTREAM=1 CONFORMANCE_MIN_V7_PASSED=1975 CONFORMANCE_MIN_V8_PASSED=4150 go test -race -count=1 -v ./pkg/compliance -run 'TestUpstream|TestSpecSchemaValidatorLiveUpstreamSchema'
 	go -C e2e/sdkconformance test -race -count=1 -v ./...
 
 lint:

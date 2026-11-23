@@ -49,20 +49,21 @@ type round61SearchGroupCounters struct {
 }
 
 type round61FieldUsageCounters struct {
-	anyCount        int64
-	terms           int64
-	postings        int64
-	proximity       int64
-	storedFields    int64
-	docValues       int64
-	points          int64
-	norms           int64
-	termVectors     int64
-	knnVectors      int64
-	termFrequencies int64
-	positions       int64
-	offsets         int64
-	payloads        int64
+	anyCount             int64
+	terms                int64
+	postings             int64
+	proximity            int64
+	storedFields         int64
+	docValues            int64
+	points               int64
+	norms                int64
+	termVectors          int64
+	knnVectors           int64
+	termFrequencies      int64
+	positions            int64
+	offsets              int64
+	payloads             int64
+	globalOrdinalsLoaded bool
 }
 
 type round61DocTypeCounters struct {
@@ -344,6 +345,7 @@ func recordFieldUsageAccessRound61(s *Server, indexNames []string, fields []stri
 			}
 			fc.anyCount++
 			fc.docValues++
+			fc.globalOrdinalsLoaded = true
 		}
 	}
 }
@@ -594,6 +596,48 @@ func recordSearchFieldUsageRound61(s *Server, indexNames []string, bodyBytes []b
 		}
 	}
 
+	var globalOrdAggFields []string
+	var walkAggs func(node any)
+	walkAggs = func(node any) {
+		m, ok := node.(map[string]any)
+		if !ok || m == nil {
+			return
+		}
+		for _, rawAgg := range m {
+			aggDef, okA := rawAgg.(map[string]any)
+			if !okA || aggDef == nil {
+				continue
+			}
+			for _, aggKey := range []string{"terms", "significant_terms"} {
+				if spec, okT := aggDef[aggKey].(map[string]any); okT && spec != nil {
+					hint := ""
+					if h, okH := spec["execution_hint"].(string); okH {
+						hint = strings.ToLower(strings.TrimSpace(h))
+					}
+					if hint != "map" && hint != "direct" {
+						if f, okF := spec["field"].(string); okF && strings.TrimSpace(f) != "" {
+							globalOrdAggFields = append(globalOrdAggFields, strings.TrimSpace(f))
+						}
+					}
+				}
+			}
+			if sub := aggDef["aggs"]; sub != nil {
+				walkAggs(sub)
+			}
+			if sub := aggDef["aggregations"]; sub != nil {
+				walkAggs(sub)
+			}
+		}
+	}
+	if root != nil {
+		if a := root["aggs"]; a != nil {
+			walkAggs(a)
+		}
+		if a := root["aggregations"]; a != nil {
+			walkAggs(a)
+		}
+	}
+
 	fetchSource := true
 	hasExplicitFields := root != nil && (root["fields"] != nil || root["docvalue_fields"] != nil)
 	if root != nil {
@@ -634,6 +678,12 @@ func recordSearchFieldUsageRound61(s *Server, indexNames []string, bodyBytes []b
 			fc := ensureFC(sf)
 			fc.anyCount++
 			fc.docValues++
+		}
+		for _, af := range globalOrdAggFields {
+			fc := ensureFC(af)
+			fc.anyCount++
+			fc.docValues++
+			fc.globalOrdinalsLoaded = true
 		}
 		for _, tc := range touches {
 			esType := lookupFieldESTypeRound61(idxSchema, tc.field)
@@ -1008,7 +1058,7 @@ var validClusterInfoTargetsRound61 = map[string]bool{
 var supportedIngestProcessorTypesRound61 = []string{
 	"append", "attachment", "bytes", "circle", "community_id", "compact",
 	"convert", "csv", "date", "date_index_name", "dedup", "dissect",
-	"dot_expander", "drop", "enrich", "fail", "fingerprint", "foreach",
+	"dot_expander", "drop", "enrich", "fail", "fingerprint", "foreach", "geo_grid",
 	"geoip", "grok", "gsub", "html_strip", "inference", "join", "json",
 	"kv", "lowercase", "network_direction", "pipeline", "redact",
 	"registered_domain", "remove", "rename", "reroute", "script", "set",
@@ -1163,6 +1213,7 @@ func (s *Server) handleClusterInfoRound61(w http.ResponseWriter, r *http.Request
 			"current_open": len(clients),
 			"total_opened": totalOpened,
 			"clients":      clients,
+			"routes":       map[string]any{},
 		}
 	}
 
@@ -1455,11 +1506,11 @@ func (s *Server) buildHealthReportResponseRound61(r *http.Request, segs []string
 			},
 		}, nil, nil),
 		"disk": mkInd("green", "The cluster has enough available disk space.", map[string]any{
-			"indices_with_readonly_block": 0,
-			"nodes_with_enough_disk":      1,
-			"nodes_over_high_watermark":   0,
-			"nodes_over_flood_stage":      0,
-			"nodes_with_unknown_disk":     0,
+			"indices_with_readonly_block":      0,
+			"nodes_with_enough_disk_space":     1,
+			"nodes_over_high_watermark":        0,
+			"nodes_over_flood_stage_watermark": 0,
+			"nodes_with_unknown_disk_status":   0,
 		}, nil, nil),
 		"ilm": mkInd("green", "Index Lifecycle Management is running", map[string]any{
 			"policies":       ilmPolicyCount,
@@ -3436,6 +3487,44 @@ func normalizeIndexFilterQueryNumbersRound61(q *esast.Query) {
 	}
 }
 
+func preserveEmptyFilterMapsRound64(dst, src *esast.Query) {
+	if dst == nil || src == nil {
+		return
+	}
+	if src.MatchNone != nil && dst.MatchNone == nil {
+		dst.MatchNone = map[string]any{}
+	}
+	if src.MatchAll != nil && dst.MatchAll == nil {
+		dst.MatchAll = map[string]any{}
+	}
+	if src.Bool != nil && dst.Bool != nil {
+		for i := 0; i < len(src.Bool.Must) && i < len(dst.Bool.Must); i++ {
+			preserveEmptyFilterMapsRound64(&dst.Bool.Must[i], &src.Bool.Must[i])
+		}
+		for i := 0; i < len(src.Bool.Filter) && i < len(dst.Bool.Filter); i++ {
+			preserveEmptyFilterMapsRound64(&dst.Bool.Filter[i], &src.Bool.Filter[i])
+		}
+		for i := 0; i < len(src.Bool.Should) && i < len(dst.Bool.Should); i++ {
+			preserveEmptyFilterMapsRound64(&dst.Bool.Should[i], &src.Bool.Should[i])
+		}
+		for i := 0; i < len(src.Bool.MustNot) && i < len(dst.Bool.MustNot); i++ {
+			preserveEmptyFilterMapsRound64(&dst.Bool.MustNot[i], &src.Bool.MustNot[i])
+		}
+	}
+	if src.ConstantScore != nil && dst.ConstantScore != nil {
+		preserveEmptyFilterMapsRound64(&dst.ConstantScore.Filter, &src.ConstantScore.Filter)
+	}
+	if src.Boosting != nil && dst.Boosting != nil {
+		preserveEmptyFilterMapsRound64(&dst.Boosting.Positive, &src.Boosting.Positive)
+		preserveEmptyFilterMapsRound64(&dst.Boosting.Negative, &src.Boosting.Negative)
+	}
+	if src.DisMax != nil && dst.DisMax != nil {
+		for i := 0; i < len(src.DisMax.Queries) && i < len(dst.DisMax.Queries); i++ {
+			preserveEmptyFilterMapsRound64(&dst.DisMax.Queries[i], &src.DisMax.Queries[i])
+		}
+	}
+}
+
 // handleFieldCapsRound61 implements full ES 7 / ES 8 `GET/POST /_field_caps` and `/{index}/_field_caps` (Wave-2 `server.go` hook).
 func (s *Server) handleFieldCapsRound61(w http.ResponseWriter, r *http.Request) {
 	rawIndex := strings.TrimSpace(r.PathValue("index"))
@@ -3631,6 +3720,7 @@ func (s *Server) handleFieldCapsRound61(w http.ResponseWriter, r *http.Request) 
 			qCopyBytes, _ := json.Marshal(indexFilter)
 			var qCopy esast.Query
 			_ = json.Unmarshal(qCopyBytes, &qCopy)
+			preserveEmptyFilterMapsRound64(&qCopy, indexFilter)
 
 			s.mu.RLock()
 			idxSchema := s.indices[idxName]
@@ -3940,7 +4030,18 @@ func (s *Server) handleFieldCapsRound61(w http.ResponseWriter, r *http.Request) 
 				}
 			}
 		}
-		if idxSchema.RawMapping != nil && len(idxSchema.RawMapping.Properties) > 0 {
+		isTimeSeriesMode := strings.EqualFold(strings.TrimSpace(idxSchema.IndexMode), "time_series")
+		if !isTimeSeriesMode {
+			if cs := s.indexCustomSettings[idxName]; cs != nil {
+				for _, k := range []string{"mode", "index.mode"} {
+					if mv, okM := cs[k].(string); okM && strings.EqualFold(strings.TrimSpace(mv), "time_series") {
+						isTimeSeriesMode = true
+						break
+					}
+				}
+			}
+		}
+		if isTimeSeriesMode && idxSchema.RawMapping != nil && len(idxSchema.RawMapping.Properties) > 0 {
 			rawPropMeta(idxSchema.RawMapping.Properties, "", tsDims, tsMetrics)
 		}
 
@@ -4217,17 +4318,20 @@ func (s *Server) handleFieldCapsRound61(w http.ResponseWriter, r *http.Request) 
 
 	for field, byType := range caps {
 		for esType, entry := range byType {
-			allIdxForType := indicesByFieldType[field][esType]
+			allIdxForType := append([]string(nil), indicesByFieldType[field][esType]...)
+			sort.Strings(allIdxForType)
 			if len(byType) > 1 && len(allIdxForType) > 0 {
 				entry["indices"] = allIdxForType
 			}
 			if mm := metaByFieldType[field][esType]; len(mm) > 0 {
 				entry["meta"] = mm
 			}
-			if nonS := nonSearchableByFieldType[field][esType]; len(nonS) > 0 && len(nonS) < len(allIdxForType) {
+			if nonS := append([]string(nil), nonSearchableByFieldType[field][esType]...); len(nonS) > 0 && len(nonS) < len(allIdxForType) {
+				sort.Strings(nonS)
 				entry["non_searchable_indices"] = nonS
 			}
-			if nonA := nonAggregatableByFieldType[field][esType]; len(nonA) > 0 && len(nonA) < len(allIdxForType) {
+			if nonA := append([]string(nil), nonAggregatableByFieldType[field][esType]...); len(nonA) > 0 && len(nonA) < len(allIdxForType) {
+				sort.Strings(nonA)
 				entry["non_aggregatable_indices"] = nonA
 			}
 			if dimIdx := dimIndicesByFieldType[field][esType]; len(dimIdx) > 0 {
@@ -4244,6 +4348,7 @@ func (s *Server) handleFieldCapsRound61(w http.ResponseWriter, r *http.Request) 
 						}
 					}
 					if len(nonDim) > 0 {
+						sort.Strings(nonDim)
 						entry["non_dimension_indices"] = nonDim
 					}
 				}
@@ -4254,18 +4359,7 @@ func (s *Server) handleFieldCapsRound61(w http.ResponseWriter, r *http.Request) 
 						if len(mIndices) == len(allIdxForType) {
 							entry["time_series_metric"] = mType
 						} else {
-							var conflict []string
-							mSet := make(map[string]bool, len(mIndices))
-							for _, mi := range mIndices {
-								mSet[mi] = true
-							}
-							for _, ai := range allIdxForType {
-								if !mSet[ai] {
-									conflict = append(conflict, ai)
-								}
-							}
 							entry["metric_conflicts_indices"] = allIdxForType
-							_ = conflict
 						}
 					}
 				} else {

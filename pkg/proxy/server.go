@@ -49,20 +49,23 @@ import (
 
 // HitRow represents a single matched document returned by Doris for Query 1 (HitsSQL).
 type HitRow struct {
-	Index         string
-	ID            string
-	Routing       string
-	Version       int64
-	SeqNo         int64
-	HasSeqNo      bool
-	Source        json.RawMessage
-	RawSource     json.RawMessage
-	Score         float64
-	TotalHits     int64
-	Schema        *schema.IndexSchema
-	Query         *esast.Query
-	RuntimeFields map[string]any
-	SearchScope   *activeSearchScope
+	Index              string
+	ID                 string
+	Routing            string
+	Version            int64
+	SeqNo              int64
+	HasSeqNo           bool
+	Source             json.RawMessage
+	RawSource          json.RawMessage
+	Score              float64
+	TotalHits          int64
+	Schema             *schema.IndexSchema
+	Query              *esast.Query
+	RuntimeFields      map[string]any
+	SearchScope        *activeSearchScope
+	HasPreRescoreScore bool
+	PreRescoreScore    float64
+	RescoreWindowFlags []bool
 }
 
 // EffectiveSource returns the original unfiltered document JSON when RawSource is set,
@@ -403,6 +406,7 @@ func (s *Server) Close(ctx context.Context) error {
 	err := s.coalescer.Close(ctx)
 	s.cleanupGlobalServerRegistriesR62Search()
 	s.clearTSDBIndexTombstonesR63("*")
+	s.cleanupWave3PolishStateR63()
 	s.cleanupShardRequestCacheR63()
 	return err
 }
@@ -1134,16 +1138,15 @@ func (s *Server) Handler() http.Handler {
 		if r.URL == nil || (r.URL.Path != "/_info" && !strings.HasPrefix(r.URL.Path, "/_info/")) {
 			recordHTTPClientRequestRound61(s, r, r.ContentLength)
 		}
-		refreshFormatOptionsMultiFilterPathR61Admin(w, r)
+		w = refreshFormatOptionsMultiFilterPathR64(w, r)
+		if r.Method == http.MethodHead {
+			w = &headResponseWriterR64{ResponseWriter: w}
+		}
 		rawTrimmed := strings.Trim(r.URL.EscapedPath(), "/")
 		if rawTrimmed == "" && strings.Trim(r.URL.Path, "/") != "" {
 			rawTrimmed = strings.Trim(r.URL.Path, "/")
 		}
 		if rawTrimmed == "" {
-			if r.Method == http.MethodHead {
-				w.WriteHeader(http.StatusOK)
-				return
-			}
 			s.handleRootHandshake(w, r)
 			return
 		}
@@ -1430,6 +1433,22 @@ func (s *Server) Handler() http.Handler {
 				s.handleDanglingIndices(w, r)
 			case "_capabilities":
 				s.handleCapabilitiesR61Admin(w, r)
+			case "_script_context":
+				if r.Method == http.MethodHead {
+					rc := *r
+					rc.Method = http.MethodGet
+					s.handleScriptsContextRound57(w, &rc)
+				} else {
+					s.handleScriptsContextRound57(w, r)
+				}
+			case "_script_language", "_script_languages":
+				if r.Method == http.MethodHead {
+					rc := *r
+					rc.Method = http.MethodGet
+					s.handleScriptsLanguagesRound57(w, &rc)
+				} else {
+					s.handleScriptsLanguagesRound57(w, r)
+				}
 			default:
 				r.SetPathValue("index", segs[0])
 				switch r.Method {
@@ -2913,6 +2932,18 @@ func (s *Server) handleILMPolicy(w http.ResponseWriter, r *http.Request) {
 		if polObj == nil {
 			polObj = map[string]any{"policy": map[string]any{"phases": map[string]any{}}}
 		}
+		polInner, okInner := polObj["policy"].(map[string]any)
+		if _, hasPolKey := polObj["policy"]; hasPolKey && !okInner {
+			writeESError(w, http.StatusBadRequest, "parsing_exception", "[policy] must be an object")
+			return
+		}
+		if !okInner {
+			polInner = polObj
+		}
+		if msg, validPol := validateILMPolicyBodyR64(polInner); !validPol {
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", msg)
+			return
+		}
 		s.mu.Lock()
 		if s.ilmPolicies == nil {
 			s.ilmPolicies = make(map[string]map[string]any)
@@ -2922,10 +2953,6 @@ func (s *Server) handleILMPolicy(w http.ResponseWriter, r *http.Request) {
 			if v, okV := toInt64(existing["version"]); okV && v > 0 {
 				ver = int(v) + 1
 			}
-		}
-		polInner, okInner := polObj["policy"].(map[string]any)
-		if !okInner {
-			polInner = polObj
 		}
 		storedPol := map[string]any{
 			"version":       ver,
@@ -2952,6 +2979,15 @@ func (s *Server) handleILMPolicy(w http.ResponseWriter, r *http.Request) {
 		} else if _, exists := s.ilmPolicies[policy]; exists {
 			toDelete = []string{policy}
 		}
+		sort.Strings(toDelete)
+		for _, k := range toDelete {
+			if usedBy := s.collectIndicesUsingILMPolicyLockedR64(k); len(usedBy) > 0 {
+				s.mu.Unlock()
+				writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
+					fmt.Sprintf("Cannot delete policy [%s]. It is in use by one or more indices: [%s]", k, strings.Join(usedBy, ", ")))
+				return
+			}
+		}
 		for _, k := range toDelete {
 			delete(s.ilmPolicies, k)
 		}
@@ -2965,6 +3001,10 @@ func (s *Server) handleILMPolicy(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
 	case http.MethodHead:
+		if hasMultiWildcardPatternListR64(policy) {
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "wildcard only supports a single value, please use comma-separated values or a single wildcard value")
+			return
+		}
 		if policy != "" {
 			s.mu.RLock()
 			exists := false
@@ -2986,6 +3026,10 @@ func (s *Server) handleILMPolicy(w http.ResponseWriter, r *http.Request) {
 		}
 		w.WriteHeader(http.StatusOK)
 	case http.MethodGet, "":
+		if hasMultiWildcardPatternListR64(policy) {
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "wildcard only supports a single value, please use comma-separated values or a single wildcard value")
+			return
+		}
 		s.mu.RLock()
 		if policy != "" && policy != "_all" && policy != "*" {
 			if strings.ContainsAny(policy, "*?,") || strings.HasPrefix(policy, "-") {
@@ -3036,6 +3080,9 @@ func (s *Server) handleILMExplain(w http.ResponseWriter, r *http.Request) {
 		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
 		return
 	}
+	_ = s.syncCatalogFromBackend(r.Context())
+	onlyManaged := isTruthyBoolQueryParam(r, "only_managed")
+	onlyErrors := isTruthyBoolQueryParam(r, "only_errors")
 	rawIndex := strings.TrimSpace(r.PathValue("index"))
 	var targets []string
 	if rawIndex != "" {
@@ -3045,15 +3092,31 @@ func (s *Server) handleILMExplain(w http.ResponseWriter, r *http.Request) {
 		}
 		targets = validTargets
 	} else {
-		targets = s.resolveTargetIndices("")
+		targets = s.collectAllILMExplainTargetsR64()
 	}
 	indices := make(map[string]any, len(targets))
+	s.mu.RLock()
 	for _, idx := range targets {
-		indices[idx] = map[string]any{
-			"index":   idx,
-			"managed": false,
+		var owningDS map[string]any
+		if dsName := s.findOwningDataStreamLockedR62Search(idx); dsName != "" {
+			owningDS = s.dataStreams[dsName]
 		}
+		entry, managed, hasError := buildILMExplainIndexEntryR64(
+			idx,
+			s.indexCustomSettings[idx],
+			owningDS,
+			s.indices[idx],
+			s.ilmPolicies,
+		)
+		if onlyManaged && !managed {
+			continue
+		}
+		if onlyErrors && !hasError {
+			continue
+		}
+		indices[idx] = entry
 	}
+	s.mu.RUnlock()
 	writeJSON(w, http.StatusOK, map[string]any{"indices": indices})
 }
 
@@ -3431,9 +3494,15 @@ func (s *Server) handleCatRoot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ensureESCompatHeaders(w, r)
+	body := []byte("=^.^=\n" + strings.Join(endpoints, "\n") + "\n")
 	w.Header().Set("Content-Type", "text/plain; charset=UTF-8")
+	if r != nil && r.Method == http.MethodHead {
+		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+		w.WriteHeader(http.StatusOK)
+		return
+	}
 	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte("=^.^=\n" + strings.Join(endpoints, "\n") + "\n"))
+	_, _ = w.Write(body)
 }
 
 func (s *Server) handleRefresh(w http.ResponseWriter, r *http.Request) {
@@ -5585,6 +5654,10 @@ func (s *Server) handleGetSource(w http.ResponseWriter, r *http.Request) {
 		st.getExistsTotal.Add(1)
 	}
 	if r.Method == http.MethodHead {
+		filteredSrc, _ := filterDocumentSourceRound59(hit.Source, idxSchema, extractURLSourceFilter(r))
+		w.Header().Set("Content-Type", "application/json; charset=UTF-8")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("Content-Length", strconv.Itoa(len(filteredSrc)))
 		w.WriteHeader(http.StatusOK)
 		return
 	}
@@ -5594,7 +5667,7 @@ func (s *Server) handleGetSource(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	filteredSrc, _ := filterDocumentSourceRound59(hit.Source, idxSchema, urlSF)
-	if opts, ok := extractESResponseFormatOptions(w); ok && (opts.pretty || len(opts.filterPaths) > 0) {
+	if opts, ok := extractESResponseFormatOptionsR64(w); ok && (opts.pretty || len(opts.filterPaths) > 0) {
 		dec := json.NewDecoder(bytes.NewReader(filteredSrc))
 		dec.UseNumber()
 		var doc any
@@ -9654,7 +9727,6 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	bodyBytes = s.rewriteSearchBodyQueryRules(bodyBytes)
-	bodyBytes = expandSearchBodySynonymsRound61(s, s.resolveTargetIndices(r.PathValue("index")), bodyBytes)
 	bodyBytes, ok = s.preprocessSearchBodyRound57(w, r.PathValue("index"), bodyBytes)
 	if !ok {
 		return
@@ -9926,9 +9998,7 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		emitESDeprecationWarningRound61(w, s, r, depWarn)
 	}
 	s.emitSystemIndexTasksWarningIfNeededRound61(w, r, append(append([]string(nil), resolvedSearchTargets...), rawIndex))
-	if !bytes.Contains(bodyBytes, []byte(`"execution_hint"`)) || !bytes.Contains(bodyBytes, []byte(`"map"`)) {
-		recordSearchFieldUsageRound61(s, resolvedSearchTargets, bodyBytes)
-	}
+	recordSearchFieldUsageRound61(s, resolvedSearchTargets, bodyBytes)
 	if qStats := r.URL.Query()["stats"]; len(qStats) > 0 {
 		recordSearchStatsGroupsRound61(s, resolvedSearchTargets, qStats)
 	}
@@ -10358,7 +10428,6 @@ func (s *Server) handleMSearch(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		bodyLine = s.rewriteSearchBodyQueryRules(bodyLine)
-		bodyLine = expandSearchBodySynonymsRound61(s, s.resolveTargetIndices(targetIdx), bodyLine)
 		isNegOneAccurate, tthErr := validateRestTotalHitsAsIntWithRawBody(r, bodyLine, effRestTotalHits)
 		if tthErr != "" {
 			if isTruthyBoolQueryParam(r, "rest_total_hits_as_int") && !hasHdrRestTotalHits {
@@ -10681,10 +10750,46 @@ func (s *Server) executeSearchRequest(
 		if pipeSt, pipeType, pipeReason := validatePipelineAndSamplerAggsR61Search(req.EffectiveAggs()); pipeSt != 0 {
 			return nil, pipeSt, pipeType, pipeReason
 		}
+		if spSt, spType, spReason := validateSpatialAndTimeSeriesAggTreeR64(req.EffectiveAggs(), false); spSt != 0 {
+			return nil, spSt, spType, spReason
+		}
+		var rawAggsForDownsampleVal map[string]any
+		if len(req.EffectiveAggs()) > 0 {
+			if len(rawSearchBody) > 0 {
+				var rawBodyMap map[string]any
+				if json.Unmarshal(rawSearchBody, &rawBodyMap) == nil {
+					if a, okA := rawBodyMap["aggs"].(map[string]any); okA && len(a) > 0 {
+						rawAggsForDownsampleVal = a
+					} else if a2, okA2 := rawBodyMap["aggregations"].(map[string]any); okA2 && len(a2) > 0 {
+						rawAggsForDownsampleVal = a2
+					}
+				}
+			}
+			if rawAggsForDownsampleVal == nil {
+				if b, mErr := json.Marshal(req.EffectiveAggs()); mErr == nil {
+					_ = json.Unmarshal(b, &rawAggsForDownsampleVal)
+				}
+			}
+		}
 		for _, sc := range rawSchemasForVal {
+			if qErrSt, qErrType, qErrReason := validateGeoGridQueryFieldsR64(sc, req.Query); qErrSt != 0 {
+				return nil, qErrSt, qErrType, qErrReason
+			}
+			if pfErrSt, pfErrType, pfErrReason := validateGeoGridQueryFieldsR64(sc, req.PostFilter); pfErrSt != 0 {
+				return nil, pfErrSt, pfErrType, pfErrReason
+			}
 			if tsAggErr := validateTSDBPositionMetricAggsR63(sc, req.EffectiveAggs()); tsAggErr != nil {
 				et, er := splitSchemaErrorPrefixR61CRUD(tsAggErr, "illegal_argument_exception")
 				return nil, http.StatusBadRequest, et, er
+			}
+			if len(rawAggsForDownsampleVal) > 0 {
+				if dsErrVal := ValidateDownsampleAggsSpecMapR64(rawAggsForDownsampleVal, sc); dsErrVal != nil {
+					var dsErr *DownsampleAggValidationErrorR64
+					if errors.As(dsErrVal, &dsErr) && dsErr != nil {
+						return nil, dsErr.Status, dsErr.Type, dsErr.Reason
+					}
+					return nil, http.StatusBadRequest, "unsupported_aggregation_on_downsampled_index", dsErrVal.Error()
+				}
 			}
 		}
 		if errMsg := validatePipelineAggs(req.EffectiveAggs()); errMsg != "" {
@@ -10764,7 +10869,8 @@ func (s *Server) executeSearchRequest(
 	}
 
 	bypassCache := (execMeta != nil && (execMeta.forceSyntheticSource || execMeta.includeNamedQueriesScore)) ||
-		(req != nil && (req.Profile || req.PIT != nil))
+		(req != nil && (req.Profile || req.PIT != nil)) ||
+		(httpReq != nil && httpReq.URL != nil && (httpReq.URL.Query().Has("pre_filter_shard_size") || httpReq.URL.Query().Has("batched_reduce_size")))
 
 	cacheTargets := targets
 	aliasHasNow := false
@@ -10845,7 +10951,7 @@ func (s *Server) executeSearchRequest(
 			}
 		}
 	}
-	needsRuntimeScriptEval := req.Slice != nil || reqHasRuntimeMappings || queryHasRuntimeScript(req.Query) || aliasFiltersHaveRuntimeScript(aliasFilters) || queryHasRuntimeScript(req.PostFilter) || sortsHaveScript(req.Sort) || aggsHaveRuntimeScript(req.EffectiveAggs()) || aggsHaveAutoDateOrSignificantTextR62Search(req.EffectiveAggs()) || aggsHaveHDRPercentilesRound60(req.EffectiveAggs()) || (schemasHaveDocCountFieldR63(rawSchemasForVal) && len(req.EffectiveAggs()) > 0) || queryHasMinScore(req.Query) || aliasFiltersHaveMinScore(aliasFilters) || (req.MinScore != nil && (size == 0 || queryHasRuntimeScript(req.Query) || aliasFiltersHaveRuntimeScript(aliasFilters) || queryHasNestedScoring(req.Query) || len(req.IndicesBoost) > 0)) || (queryHasNestedScoring(req.Query) && (req.Collapse != nil || len(req.SearchAfter) > 0))
+	needsRuntimeScriptEval := req.Slice != nil || reqHasRuntimeMappings || queryHasRuntimeScript(req.Query) || aliasFiltersHaveRuntimeScript(aliasFilters) || queryHasRuntimeScript(req.PostFilter) || sortsHaveScript(req.Sort) || aggsHaveRuntimeScript(req.EffectiveAggs()) || aggsHaveAutoDateOrSignificantTextR62Search(req.EffectiveAggs()) || aggsHaveHDRPercentilesRound60(req.EffectiveAggs()) || (schemasHaveDocCountFieldR63(rawSchemasForVal) && len(req.EffectiveAggs()) > 0) || searchReqNeedsSpatialEvalR64(targets, rawSchemasForVal, req, aliasFilters) || queryHasMinScore(req.Query) || aliasFiltersHaveMinScore(aliasFilters) || (req.MinScore != nil && (size == 0 || queryHasRuntimeScript(req.Query) || aliasFiltersHaveRuntimeScript(aliasFilters) || queryHasNestedScoring(req.Query) || len(req.IndicesBoost) > 0)) || (queryHasNestedScoring(req.Query) && (req.Collapse != nil || len(req.SearchAfter) > 0))
 
 	var allHits []HitRow
 	var allFetchedHits []HitRow
@@ -10853,6 +10959,9 @@ func (s *Server) executeSearchRequest(
 	var allAggRows []AggRow
 	var totalHitsSum int64
 	var totalQueryHitsSum int64
+	perIdxQueryTotal := make(map[string]int64, len(targets))
+	hasIdxTermsZero := req != nil && aggsHaveIndexTermsMinDocCountZeroR64(req.EffectiveAggs())
+	perIdxHasDocs := make(map[string]bool, len(targets))
 	var terminatedEarly bool
 	var primarySchema *schema.IndexSchema
 	schemasByIndex := make(map[string]*schema.IndexSchema, len(targets))
@@ -10903,6 +11012,7 @@ func (s *Server) executeSearchRequest(
 			return nil, http.StatusBadRequest, "search_phase_execution_exception",
 				fmt.Sprintf("illegal_argument_exception: Rescore window [%d] is too large. It must be less than [%d].", rescoreWin, maxWin)
 		}
+		idxNeedsSpatial := queryNeedsRuntimeSpatialEvalR64(req.Query, idxSchema) || queryNeedsRuntimeSpatialEvalR64(aliasFilters[indexName], idxSchema) || queryNeedsRuntimeSpatialEvalR64(req.PostFilter, idxSchema)
 		subReq := *req
 		if needsRuntimeScriptEval {
 			zero := 0
@@ -10918,6 +11028,14 @@ func (s *Server) executeSearchRequest(
 				subReq.Sort = nil
 				subReq.Aggs = nil
 				subReq.Aggregations = nil
+			} else if idxNeedsSpatial {
+				valReq := applyIndexAliasFilter(&subReq, aliasFilters[indexName])
+				valTr := transpiler.NewTranspiler(idxSchema, s.effectiveTranspileOptsForIndexR62Search(httpReq, indexName, idxSchema, req.RuntimeMappings))
+				if _, valErr := valTr.BuildSearchPlan(valReq); valErr != nil {
+					return nil, http.StatusBadRequest, "search_phase_execution_exception", rewriteTranspilerMaxRegexLengthErrorR63(valErr.Error())
+				}
+				subReq.Query = nil
+				subReq.PostFilter = nil
 			}
 		} else if len(targets) > 1 && size > 0 {
 			zero := 0
@@ -10972,7 +11090,7 @@ func (s *Server) executeSearchRequest(
 			subReq.Size = &fetchSize
 		}
 		var subReqPtr *esast.SearchRequest
-		if hasRuntimeMappings {
+		if hasRuntimeMappings || idxNeedsSpatial {
 			subReqPtr = &subReq
 		} else {
 			subReqPtr = applyIndexAliasFilter(&subReq, aliasFilters[indexName])
@@ -11205,6 +11323,9 @@ func (s *Server) executeSearchRequest(
 				for _, h := range hits {
 					doc := decodeHitDocMapRound60(h)
 					baseSc := h.Score
+					if math.IsNaN(baseSc) || math.IsInf(baseSc, 0) || baseSc <= -1e307 {
+						baseSc = 1.0
+					}
 					if evalReq.Query != nil && ((evalReq.Query.ScriptScore != nil && evalReq.Query.ScriptScore.Query == nil) || (evalReq.Query.FunctionScore != nil && evalReq.Query.FunctionScore.Query == nil)) {
 						baseSc = 1.0
 					}
@@ -11225,7 +11346,7 @@ func (s *Server) executeSearchRequest(
 			hits, aggRows, idxTotal, matchedQueryHits, postFilteredHits = applyRuntimeSearchScriptsWithMatchedAndGlobal(hits, globalHits, aggRows, idxTotal, evalReq, idxSchema, len(targets) > 1)
 			allFetchedHits = append(allFetchedHits, matchedQueryHits...)
 			allPostFilterHits = append(allPostFilterHits, postFilteredHits...)
-			hasQueryLevelFilter := req.Slice != nil || queryHasRuntimeScript(req.Query) || queryHasRuntimeScript(aliasFilters[indexName]) || req.MinScore != nil || queryHasMinScore(req.Query) || queryHasMinScore(aliasFilters[indexName])
+			hasQueryLevelFilter := req.Slice != nil || idxNeedsSpatial || queryHasRuntimeScript(req.Query) || queryHasRuntimeScript(aliasFilters[indexName]) || req.MinScore != nil || queryHasMinScore(req.Query) || queryHasMinScore(aliasFilters[indexName])
 			if hasQueryLevelFilter && !hasRuntimeMappings && plan.AggsSQL != "" && len(req.EffectiveAggs()) > 0 {
 				matchedIDs := make([]string, 0, len(matchedQueryHits))
 				for _, mh := range matchedQueryHits {
@@ -11513,6 +11634,28 @@ func (s *Server) executeSearchRequest(
 		}
 		totalHitsSum += idxTotal
 		totalQueryHitsSum += idxQueryTotal
+		perIdxQueryTotal[indexName] = idxQueryTotal
+		if idxQueryTotal > 0 {
+			perIdxHasDocs[indexName] = true
+		} else if hasIdxTermsZero && rawIdxSchema != nil {
+			zero := 0
+			cntReq := esast.SearchRequest{From: &zero, Size: &zero, AliasFilter: aliasFilters[indexName]}
+			var idxAllDocs int64
+			if cntPlan, cErr := tr.BuildSearchPlan(&cntReq); cErr == nil && cntPlan.AggsSQL != "" {
+				if cntRows, qErr := s.backend.QueryAggs(ctx, cntPlan.AggsSQL); qErr == nil {
+					for _, cr := range cntRows {
+						if cr.AggName == "__meta_total" {
+							idxAllDocs = cr.effectiveCount()
+							break
+						}
+					}
+				}
+			}
+			_, _, idxAllDocs = s.overlayUnrefreshedDocsOnHitsRound60(ctx, indexName, rawIdxSchema, cntReq.Query, 0, nil, nil, idxAllDocs)
+			if idxAllDocs > 0 {
+				perIdxHasDocs[indexName] = true
+			}
+		}
 	}
 
 	effSorts := transpiler.EffectiveSortsForRequest(req)
@@ -11852,6 +11995,10 @@ func (s *Server) executeSearchRequest(
 	if req != nil && len(req.EffectiveAggs()) > 0 {
 		if len(targets) > 1 {
 			allAggRows = recomputeMultiIndexMatrixStatsRowsWave3R63(s, req.EffectiveAggs(), allFetchedHits, schemasByIndex, primarySchema, allAggRows)
+			allAggRows = recomputeMultiIndexSpatialAggsR64(req.EffectiveAggs(), allFetchedHits, schemasByIndex, primarySchema, allAggRows)
+		}
+		if hasIdxTermsZero {
+			allAggRows = injectZeroIndexTermsAggRowsR64("", req.EffectiveAggs(), targets, perIdxHasDocs, allAggRows)
 		}
 		if waErr := checkWeightedAvgMultiWeightOnDocsR63(req.EffectiveAggs(), allFetchedHits, schemasByIndex, primarySchema); waErr != nil {
 			eType, eReason := splitESExceptionErrorR61Search(waErr, "illegal_argument_exception")
@@ -11861,6 +12008,9 @@ func (s *Server) executeSearchRequest(
 			partialFailedShards += vtFailed
 			partialShardFailures = append(partialShardFailures, vtFailures...)
 		}
+	}
+	if searchScope != nil {
+		searchScope.schemasByIndex = schemasByIndex
 	}
 	resp := buildESResponseWithSchemas(primaryIndex, primarySchema, schemasByIndex, req, allHits, allAggRows, tookMs, docLookup)
 	if req != nil && len(req.EffectiveAggs()) > 0 {
@@ -11960,16 +12110,33 @@ func (s *Server) executeSearchRequest(
 		}
 	}
 	totalTargetShards := 0
+	zeroHitShards := 0
 	for _, tName := range targets {
 		nShards, _, _ := s.getIndexShardAndReplicaCounts(tName)
 		totalTargetShards += nShards
+		if perIdxQueryTotal[tName] == 0 {
+			zeroHitShards += nShards
+		}
 	}
 	if totalTargetShards > 0 {
+		preFilterShardSize := 128
+		if httpReq != nil && httpReq.URL != nil && httpReq.URL.Query().Has("pre_filter_shard_size") {
+			if pfN, errPF := strconv.Atoi(strings.TrimSpace(httpReq.URL.Query().Get("pre_filter_shard_size"))); errPF == nil && pfN >= 1 {
+				preFilterShardSize = pfN
+			}
+		}
+		skippedShards := 0
+		if totalTargetShards > preFilterShardSize && zeroHitShards > 0 && req != nil && req.Query != nil && !isPureMatchAllQueryR64(req.Query) && !aggsHaveMinDocCountZeroR64(req.EffectiveAggs()) && !queryUsesUnindexedFieldR64(req.Query, schemasByIndex, primarySchema) {
+			skippedShards = zeroHitShards
+			if skippedShards >= totalTargetShards {
+				skippedShards = totalTargetShards - 1
+			}
+		}
 		succShards := totalTargetShards - partialFailedShards
 		if succShards < 0 {
 			succShards = 0
 		}
-		shardsObj := map[string]any{"total": totalTargetShards, "successful": succShards, "skipped": 0, "failed": partialFailedShards}
+		shardsObj := map[string]any{"total": totalTargetShards, "successful": succShards, "skipped": skippedShards, "failed": partialFailedShards}
 		if len(partialShardFailures) > 0 {
 			shardsObj["failures"] = partialShardFailures
 		}
@@ -12252,6 +12419,12 @@ func (s *Server) resolveTermsLookupsInSearchRequest(ctx context.Context, req *es
 	if req == nil {
 		return nil
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if ctx.Value(termsLookupDocCacheKey{}) == nil {
+		ctx = context.WithValue(ctx, termsLookupDocCacheKey{}, make(map[string]*cachedTermsLookupEntry))
+	}
 	origAliasFilter := req.AliasFilter
 	origRouting := req.Routing
 	if raw, err := json.Marshal(req); err == nil {
@@ -12346,6 +12519,12 @@ func (s *Server) resolveTermsLookupsInAliasFilters(ctx context.Context, aliasFil
 }
 
 type termsLookupDepthKey struct{}
+type termsLookupDocCacheKey struct{}
+
+type cachedTermsLookupEntry struct {
+	hit   *HitRow
+	found bool
+}
 
 func (s *Server) resolveTermsLookupsInInnerHits(ctx context.Context, ih *esast.InnerHitsSpec) {
 	if ih == nil {
@@ -12448,15 +12627,43 @@ func (s *Server) resolveTermsLookupsInQuery(ctx context.Context, q *esast.Query)
 		if q.Terms.Fields == nil {
 			q.Terms.Fields = make(map[string][]any, len(q.Terms.Lookups))
 		}
+		var docCache map[string]*cachedTermsLookupEntry
+		if c, ok := ctx.Value(termsLookupDocCacheKey{}).(map[string]*cachedTermsLookupEntry); ok {
+			docCache = c
+		}
 		for field, lookup := range q.Terms.Lookups {
 			var resolvedVals []any
 			lookupIdx, aliasFilter, readErr := s.resolveReadDocIndexWithFilter(lookup.Index)
 			if readErr == nil {
 				lookupSchema := s.getOrCompileReadOnlySchema(ctx, lookupIdx)
 				if lookupSchema != nil {
-					_ = s.coalescer.FlushTable(ctx, lookupSchema.DorisTable)
-					if hit, found, err := s.backend.GetDocByID(ctx, lookupSchema.DorisDB, lookupSchema.DorisTable, lookup.ID); err == nil && found && hit != nil && len(hit.Source) > 0 && s.docMatchesAliasFilter(ctx, lookupIdx, lookup.ID, hit.Source, aliasFilter) && (lookup.Routing == "" || s.docMatchesRequestRouting(lookupIdx, lookup.ID, lookup.Routing)) {
-						dec := json.NewDecoder(bytes.NewReader(hit.Source))
+					cacheKey := lookupIdx + "\x00" + lookup.ID
+					var entry *cachedTermsLookupEntry
+					if docCache != nil {
+						entry = docCache[cacheKey]
+					}
+					if entry == nil {
+						_ = s.coalescer.FlushTable(ctx, lookupSchema.DorisTable)
+						hit, found, err := s.backend.GetDocByID(ctx, lookupSchema.DorisDB, lookupSchema.DorisTable, lookup.ID)
+						if err == nil {
+							if st := s.getOrCreateIndexLiveStats(lookupIdx); st != nil {
+								st.getTotal.Add(1)
+								if found {
+									st.getExistsTotal.Add(1)
+								} else {
+									st.getMissingTotal.Add(1)
+								}
+							}
+							entry = &cachedTermsLookupEntry{hit: hit, found: found}
+						} else {
+							entry = &cachedTermsLookupEntry{}
+						}
+						if docCache != nil {
+							docCache[cacheKey] = entry
+						}
+					}
+					if entry.found && entry.hit != nil && len(entry.hit.Source) > 0 && s.docMatchesAliasFilter(ctx, lookupIdx, lookup.ID, entry.hit.Source, aliasFilter) && (lookup.Routing == "" || s.docMatchesRequestRouting(lookupIdx, lookup.ID, lookup.Routing)) {
+						dec := json.NewDecoder(bytes.NewReader(entry.hit.Source))
 						dec.UseNumber()
 						var doc map[string]any
 						if err := dec.Decode(&doc); err == nil {
@@ -13277,7 +13484,7 @@ func aggTypePrefix(spec esast.AggSpec) string {
 		return "significant_text"
 	case spec.IsSignificantTerms():
 		return "sterms"
-	case spec.EffectiveTerms() != nil:
+	case spec.EffectiveTerms() != nil || spec.CountedTerms != nil:
 		return "sterms"
 	case spec.DateHistogram != nil:
 		return "date_histogram"
@@ -13389,12 +13596,20 @@ func aggTypePrefix(spec esast.AggSpec) string {
 		return "geo_bounds"
 	case spec.GeoCentroid != nil:
 		return "geo_centroid"
+	case spec.CartesianBounds != nil:
+		return "cartesian_bounds"
+	case spec.CartesianCentroid != nil:
+		return "cartesian_centroid"
+	case spec.GeoLine != nil:
+		return "geo_line"
 	case spec.GeoDistance != nil:
 		return "geo_distance"
 	case spec.GeohashGrid != nil:
 		return "geohash_grid"
 	case spec.GeotileGrid != nil:
 		return "geotile_grid"
+	case spec.GeoHexGrid != nil:
+		return "geohex_grid"
 	case spec.AdjacencyMatrix != nil:
 		return "adjacency_matrix"
 	case spec.MatrixStats != nil:
@@ -14487,6 +14702,7 @@ func deriveNestedEvalSchema(base *schema.IndexSchema, nestedPath string) *schema
 			}
 		}
 	}
+	cp.NestedEvalRoot = nestedPath
 	return &cp
 }
 
@@ -14556,10 +14772,20 @@ func collectCollapseCandidateValues(h HitRow, field string, idxSchema *schema.In
 	out := make([]any, 0, len(rawVals))
 	for _, v := range rawVals {
 		if jsonNum, ok := v.(json.Number); ok {
-			if iv, err := jsonNum.Int64(); err == nil {
-				v = iv
-			} else if fv, err := jsonNum.Float64(); err == nil {
-				v = fv
+			if idxSchema != nil {
+				bNum := idxSchema.ResolveField(field)
+				if bNum.ESType == "unsigned_long" || bNum.DorisType == schema.DorisLargeInt {
+					if uv, err := strconv.ParseUint(jsonNum.String(), 10, 64); err == nil {
+						v = uv
+					}
+				}
+			}
+			if _, stillNum := v.(json.Number); stillNum {
+				if iv, err := jsonNum.Int64(); err == nil {
+					v = iv
+				} else if fv, err := jsonNum.Float64(); err == nil {
+					v = fv
+				}
 			}
 		}
 		if idxSchema != nil {
@@ -15311,8 +15537,11 @@ func buildAggsMapWithSchema(
 		}
 		rows := bucketsByAgg[fullKey]
 		switch {
-		case spec.EffectiveTerms() != nil:
+		case spec.EffectiveTerms() != nil || spec.CountedTerms != nil:
 			termsSpec := spec.EffectiveTerms()
+			if termsSpec == nil {
+				termsSpec = spec.CountedTerms
+			}
 			isSig := spec.IsSignificantTerms()
 			isSigText := spec.SignificantText != nil
 			subAggs := spec.SubAggs()
@@ -15402,11 +15631,11 @@ func buildAggsMapWithSchema(
 				groupedSubAggs := make(map[string]esast.AggSpec)
 				for sn, ss := range subAggs {
 					switch {
-					case ss.EffectiveTerms() != nil, ss.Cardinality != nil, ss.ValueCount != nil,
+					case ss.EffectiveTerms() != nil, ss.CountedTerms != nil, ss.Cardinality != nil, ss.ValueCount != nil,
 						ss.Avg != nil, ss.Sum != nil, ss.Min != nil, ss.Max != nil,
 						ss.EffectiveStats() != nil, ss.StringStats != nil, ss.Percentiles != nil,
 						ss.PercentileRanks != nil, ss.Boxplot != nil, ss.ReverseNested != nil,
-						ss.ScriptedMetric != nil:
+						ss.ScriptedMetric != nil, ss.CartesianBounds != nil, ss.CartesianCentroid != nil, ss.GeoLine != nil:
 						directSubAggs[sn] = ss
 					default:
 						groupedSubAggs[sn] = ss
@@ -15989,10 +16218,11 @@ func buildAggsMapWithSchema(
 		case spec.TimeSeries != nil:
 			aggsOut[aggName] = buildTimeSeriesAggObjectR62Search(indexName, fullKey, "", spec.TimeSeries, spec.SubAggs(), rows, bucketsByAgg, docLookup, idxSchema)
 		case spec.RareTerms != nil || spec.MultiTerms != nil || spec.AutoDateHistogram != nil || spec.VariableWidthHistogram != nil ||
-			spec.GeoDistance != nil || spec.GeohashGrid != nil || spec.GeotileGrid != nil || spec.AdjacencyMatrix != nil:
+			spec.GeoDistance != nil || spec.GeohashGrid != nil || spec.GeotileGrid != nil || spec.GeoHexGrid != nil || spec.AdjacencyMatrix != nil:
 			aggsOut[aggName] = formatRuntimeBucketAggObjectWithSchema(indexName, fullKey, "", spec, rows, bucketsByAgg, docLookup, idxSchema)
 		case spec.WeightedAvg != nil || spec.MedianAbsoluteDeviation != nil || spec.GeoBounds != nil ||
-			spec.GeoCentroid != nil || spec.MatrixStats != nil || spec.TTest != nil:
+			spec.GeoCentroid != nil || spec.CartesianBounds != nil || spec.CartesianCentroid != nil ||
+			spec.GeoLine != nil || spec.MatrixStats != nil || spec.TTest != nil:
 			aggsOut[aggName] = formatRuntimeJSONMetricAggObject("", spec, rows)
 		}
 	}
@@ -17332,22 +17562,22 @@ func matchesTermsFilterPrecompiled(key string, filter any, precompiled *regexp.R
 }
 
 func isBucketAggSpec(spec esast.AggSpec) bool {
-	return spec.EffectiveTerms() != nil || spec.RareTerms != nil || spec.MultiTerms != nil || spec.Histogram != nil ||
+	return spec.EffectiveTerms() != nil || spec.CountedTerms != nil || spec.RareTerms != nil || spec.MultiTerms != nil || spec.Histogram != nil ||
 		spec.DateHistogram != nil || spec.AutoDateHistogram != nil || spec.VariableWidthHistogram != nil ||
 		spec.Filters != nil || spec.AdjacencyMatrix != nil || spec.Range != nil || spec.DateRange != nil ||
 		spec.IPRange != nil || spec.IPPrefix != nil || spec.TimeSeries != nil ||
-		spec.GeoDistance != nil || spec.GeohashGrid != nil || spec.GeotileGrid != nil ||
+		spec.GeoDistance != nil || spec.GeohashGrid != nil || spec.GeotileGrid != nil || spec.GeoHexGrid != nil ||
 		spec.Composite != nil || spec.Filter != nil || spec.Missing != nil || spec.Nested != nil ||
 		spec.ReverseNested != nil || spec.Global != nil || spec.EffectiveSampler() != nil ||
 		spec.RandomSampler != nil || spec.Children != nil || spec.Parent != nil
 }
 
 func isMultiBucketAggSpec(spec esast.AggSpec) bool {
-	return spec.EffectiveTerms() != nil || spec.RareTerms != nil || spec.MultiTerms != nil || spec.Histogram != nil ||
+	return spec.EffectiveTerms() != nil || spec.CountedTerms != nil || spec.RareTerms != nil || spec.MultiTerms != nil || spec.Histogram != nil ||
 		spec.DateHistogram != nil || spec.AutoDateHistogram != nil || spec.VariableWidthHistogram != nil ||
 		spec.Filters != nil || spec.AdjacencyMatrix != nil || spec.Range != nil || spec.DateRange != nil ||
 		spec.IPRange != nil || spec.IPPrefix != nil || spec.TimeSeries != nil ||
-		spec.GeoDistance != nil || spec.GeohashGrid != nil || spec.GeotileGrid != nil ||
+		spec.GeoDistance != nil || spec.GeohashGrid != nil || spec.GeotileGrid != nil || spec.GeoHexGrid != nil ||
 		spec.Composite != nil
 }
 
@@ -20899,8 +21129,11 @@ func attachSubAggsToBucketWithSchema(
 					bucketMap[subName] = map[string]any{"buckets": bucketsMap}
 				}
 			}
-		case subSpec.EffectiveTerms() != nil:
+		case subSpec.EffectiveTerms() != nil || subSpec.CountedTerms != nil:
 			tSpec := subSpec.EffectiveTerms()
+			if tSpec == nil {
+				tSpec = subSpec.CountedTerms
+			}
 			isSig := subSpec.IsSignificantTerms()
 			isSigText := subSpec.SignificantText != nil
 			var matchingRows []AggRow
@@ -21028,10 +21261,11 @@ func attachSubAggsToBucketWithSchema(
 		case subSpec.TimeSeries != nil:
 			bucketMap[subName] = buildTimeSeriesAggObjectR62Search(indexName, subFullKey, parentBucketKey, subSpec.TimeSeries, subSpec.SubAggs(), subRows, bucketsByAgg, docLookup, idxSchema)
 		case subSpec.RareTerms != nil || subSpec.MultiTerms != nil || subSpec.AutoDateHistogram != nil || subSpec.VariableWidthHistogram != nil ||
-			subSpec.GeoDistance != nil || subSpec.GeohashGrid != nil || subSpec.GeotileGrid != nil || subSpec.AdjacencyMatrix != nil:
+			subSpec.GeoDistance != nil || subSpec.GeohashGrid != nil || subSpec.GeotileGrid != nil || subSpec.GeoHexGrid != nil || subSpec.AdjacencyMatrix != nil:
 			bucketMap[subName] = formatRuntimeBucketAggObjectWithSchema(indexName, subFullKey, parentBucketKey, subSpec, subRows, bucketsByAgg, docLookup, idxSchema)
 		case subSpec.WeightedAvg != nil || subSpec.MedianAbsoluteDeviation != nil || subSpec.GeoBounds != nil ||
-			subSpec.GeoCentroid != nil || subSpec.MatrixStats != nil || subSpec.TTest != nil:
+			subSpec.GeoCentroid != nil || subSpec.CartesianBounds != nil || subSpec.CartesianCentroid != nil ||
+			subSpec.GeoLine != nil || subSpec.MatrixStats != nil || subSpec.TTest != nil:
 			bucketMap[subName] = formatRuntimeJSONMetricAggObject(parentBucketKey, subSpec, subRows)
 		}
 	}
@@ -21620,6 +21854,8 @@ func extractHitSortValues(h HitRow, sorts []esast.SortSpec, idxSchema *schema.In
 		switch s.Entry.Field {
 		case "_score":
 			out = append(out, h.Score)
+		case "_index":
+			out = append(out, h.Index)
 		case "_id", "_doc", "_shard_doc":
 			out = append(out, h.ID)
 		case "_script":
@@ -21702,12 +21938,18 @@ func extractHitSortValues(h HitRow, sorts []esast.SortSpec, idxSchema *schema.In
 				}
 			}
 			var rawVals []any
+			var sortB schema.FieldBinding
+			if idxSchema != nil {
+				sortB = idxSchema.ResolveField(resolvedSortField)
+			}
 			if idxSchema != nil && idxSchema.IsDynamicFalseUnmappedField(resolvedSortField) {
+				rawVals = nil
+			} else if s.Entry.Nested == nil && idxSchema != nil && sortB.Kind == schema.StorageNestedSubfield && (idxSchema.NestedEvalRoot == "" || sortB.NestedPath != idxSchema.NestedEvalRoot) {
 				rawVals = nil
 			} else if s.Entry.Nested != nil && s.Entry.Nested.Filter != nil {
 				nestedPath := deepestNestedSortPathLocal(s.Entry.Nested)
 				if nestedPath == "" && idxSchema != nil {
-					nestedPath = idxSchema.ResolveField(resolvedSortField).NestedPath
+					nestedPath = sortB.NestedPath
 				}
 				if nestedPath != "" && strings.HasPrefix(cleanField, nestedPath+".") {
 					nestedSegs := strings.Split(nestedPath, ".")
@@ -21724,14 +21966,32 @@ func extractHitSortValues(h HitRow, sorts []esast.SortSpec, idxSchema *schema.In
 				}
 			} else {
 				rawVals = collectSchemaAwareScalarValues(doc, resolvedSortField, pathSegs, idxSchema)
+				if len(rawVals) == 0 && idxSchema != nil && idxSchema.NestedEvalRoot != "" && sortB.NestedPath == idxSchema.NestedEvalRoot {
+					rootSegs := strings.Split(idxSchema.NestedEvalRoot, ".")
+					fullSegs := append(rootSegs, pathSegs...)
+					rawVals = collectSchemaAwareScalarValues(doc, resolvedSortField, fullSegs, idxSchema)
+					if len(rawVals) == 0 && len(sortB.RelativeJSONPath) > 0 {
+						rawVals = collectSchemaAwareScalarValues(doc, resolvedSortField, sortB.RelativeJSONPath, idxSchema)
+					}
+				}
 			}
 			normVals := make([]any, 0, len(rawVals))
 			for _, v := range rawVals {
 				if jsonNum, ok := v.(json.Number); ok {
-					if iv, err := jsonNum.Int64(); err == nil {
-						v = iv
-					} else if fv, err := jsonNum.Float64(); err == nil {
-						v = fv
+					if idxSchema != nil {
+						bNum := idxSchema.ResolveField(resolvedSortField)
+						if bNum.ESType == "unsigned_long" || bNum.DorisType == schema.DorisLargeInt {
+							if uv, err := strconv.ParseUint(jsonNum.String(), 10, 64); err == nil {
+								v = uv
+							}
+						}
+					}
+					if _, stillNum := v.(json.Number); stillNum {
+						if iv, err := jsonNum.Int64(); err == nil {
+							v = iv
+						} else if fv, err := jsonNum.Float64(); err == nil {
+							v = fv
+						}
 					}
 				}
 				if idxSchema != nil {
@@ -21753,6 +22013,23 @@ func extractHitSortValues(h HitRow, sorts []esast.SortSpec, idxSchema *schema.In
 					} else if b.ESType == "date_nanos" {
 						if ns, ok := parseDateNanosValueRound58(v, b.Format); ok {
 							v = ns
+						}
+					} else if b.ESType == "unsigned_long" || b.DorisType == schema.DorisLargeInt {
+						if strVal, ok := v.(string); ok {
+							trimmedUL := strings.TrimSpace(strVal)
+							if trimmedUL == "" {
+								if b.NullValue != nil {
+									if uv, err := strconv.ParseUint(strings.TrimSpace(fmt.Sprintf("%v", b.NullValue)), 10, 64); err == nil {
+										v = uv
+									} else {
+										continue
+									}
+								} else {
+									continue
+								}
+							} else if uv, err := strconv.ParseUint(trimmedUL, 10, 64); err == nil {
+								v = uv
+							}
 						}
 					} else if strVal, ok := v.(string); ok {
 						if b.EffectiveLowercase(true) {
@@ -21783,7 +22060,19 @@ func extractHitSortValues(h HitRow, sorts []esast.SortSpec, idxSchema *schema.In
 				}
 			} else if s.Entry.Missing != "" {
 				mStr := s.Entry.Missing
-				if !strings.EqualFold(mStr, "_last") && !strings.EqualFold(mStr, "_first") {
+				if strings.EqualFold(mStr, "_last") || strings.EqualFold(mStr, "_first") {
+					if idxSchema != nil {
+						b := idxSchema.ResolveField(resolvedSortField)
+						if b.ESType == "unsigned_long" || b.DorisType == schema.DorisLargeInt {
+							desc := strings.EqualFold(s.Entry.Order, "desc")
+							if (strings.EqualFold(mStr, "_last") && !desc) || (strings.EqualFold(mStr, "_first") && desc) {
+								val = uint64(math.MaxUint64)
+							} else {
+								val = uint64(0)
+							}
+						}
+					}
+				} else {
 					if strings.EqualFold(s.Entry.Type, "boolean") {
 						switch strings.ToLower(strings.TrimSpace(mStr)) {
 						case "true", "1":
@@ -21808,6 +22097,14 @@ func extractHitSortValues(h HitRow, sorts []esast.SortSpec, idxSchema *schema.In
 						} else if b.ESType == "date" || b.DorisType == schema.DorisBigInt {
 							if ms, ok := schema.ParseESDateToEpochMillis(mStr, time.Now().UTC()); ok {
 								val = ms
+							}
+						}
+					}
+					if val == nil && idxSchema != nil {
+						b := idxSchema.ResolveField(resolvedSortField)
+						if b.ESType == "unsigned_long" || b.DorisType == schema.DorisLargeInt {
+							if uv, err := strconv.ParseUint(strings.TrimSpace(mStr), 10, 64); err == nil {
+								val = uv
 							}
 						}
 					}
@@ -24246,7 +24543,7 @@ func (s *Server) evalRuntimeMappingsOnHitRows(idxSchema *schema.IndexSchema, req
 			}
 			p["_source"] = doc
 			var rawVals []any
-			if emitCtx, okCtx := runtimeFieldTypeToEmitContextRound60(prop.Type); okCtx && strings.Contains(scriptSrc, "emit(") {
+			if emitCtx, okCtx := runtimeFieldTypeToEmitContextR64(prop.Type); okCtx && strings.Contains(scriptSrc, "emit(") {
 				emitted, errEmit := painless.EvalEmitContext(scriptSrc, emitCtx, evalDoc, doc, p, extractSchemaFieldTypesMapRound60(idxSchema))
 				if errEmit == nil && len(emitted) > 0 {
 					rawVals = emitted
@@ -24361,6 +24658,10 @@ func (s *Server) evalRuntimeMappingsOnHitRows(idxSchema *schema.IndexSchema, req
 						} else {
 							coercedVals = append(coercedVals, sv)
 						}
+					}
+				case "geo_shape", "shape":
+					if norm, ok := normalizeGeoShapeValueToGeoJSONR64(rv, false); ok && norm != nil {
+						coercedVals = append(coercedVals, norm)
 					}
 				default:
 					coercedVals = append(coercedVals, painless.FormatValueSafe(rv))
@@ -24782,49 +25083,30 @@ func matchWildcardPattern(pattern, target string) bool {
 	return pIdx == len(pattern)
 }
 
-func setESCompatHeaders(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("X-Elastic-Product", "Elasticsearch")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, HEAD, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, Accept, X-Opaque-Id, X-Request-ID, traceparent, tracestate, X-Elastic-Client-Meta, kbn-xsrf")
-	w.Header().Set("Access-Control-Expose-Headers", "X-Elastic-Product, Warning, X-Opaque-Id, X-Request-ID, traceparent")
-	if opaqueID := r.Header.Get("X-Opaque-Id"); opaqueID != "" {
-		w.Header().Set("X-Opaque-Id", opaqueID)
-	}
-	if reqID := r.Header.Get("X-Request-ID"); reqID != "" {
-		w.Header().Set("X-Request-ID", reqID)
-	}
-	if tp := r.Header.Get("traceparent"); tp != "" {
-		w.Header().Set("traceparent", tp)
-	}
-	accept := r.Header.Get("Accept")
-	reqCT := r.Header.Get("Content-Type")
-	switch {
-	case strings.Contains(accept, "compatible-with=8") || strings.Contains(reqCT, "compatible-with=8"):
-		w.Header().Set("Content-Type", "application/vnd.elasticsearch+json; compatible-with=8")
-	case strings.Contains(accept, "compatible-with=7") || strings.Contains(reqCT, "compatible-with=7"):
-		w.Header().Set("Content-Type", "application/vnd.elasticsearch+json; compatible-with=7")
-	default:
-		w.Header().Set("Content-Type", "application/json; charset=UTF-8")
-	}
-}
-
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	if w.Header().Get("Content-Type") == "" {
 		w.Header().Set("Content-Type", "application/json; charset=UTF-8")
 	}
 	w.Header().Set("X-Elastic-Product", "Elasticsearch")
-	opts, _ := extractESResponseFormatOptions(w)
+	opts, _, isHead := unwrapResponseFormatAndHeadR64(w)
 	if len(opts.filterPaths) > 0 {
 		v = applyFilterPathRound61(v, opts.filterPaths)
 	}
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
 	if opts.pretty {
 		enc.SetIndent("", "  ")
 	}
 	if err := enc.Encode(v); err != nil {
 		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", err.Error())
+		return
+	}
+	if isHead {
+		if status == http.StatusOK && w.Header().Get("Content-Length") == "" && w.Header().Get("Content-Encoding") == "" {
+			w.Header().Set("Content-Length", strconv.Itoa(buf.Len()))
+		}
+		w.WriteHeader(status)
 		return
 	}
 	w.WriteHeader(status)
@@ -24844,7 +25126,13 @@ func writeESError(w http.ResponseWriter, status int, errType, reason string) {
 	for errType != "" && strings.HasPrefix(reason, errType+": ") {
 		reason = strings.TrimPrefix(reason, errType+": ")
 	}
-	opts, _ := extractESResponseFormatOptions(w)
+	opts, _, isHead := unwrapResponseFormatAndHeadR64(w)
+	if isHead {
+		w.Header().Set("Content-Type", "application/json; charset=UTF-8")
+		w.Header().Set("X-Elastic-Product", "Elasticsearch")
+		w.WriteHeader(status)
+		return
+	}
 	if strings.HasPrefix(reason, "all_shards_failed|") {
 		parts := strings.SplitN(reason, "|", 3)
 		if len(parts) == 3 {
@@ -25220,12 +25508,16 @@ func queryHasMinScore(q *esast.Query) bool {
 func aggSpecHasDirectRuntimeScript(spec esast.AggSpec) bool {
 	if spec.SignificantText != nil || spec.RareTerms != nil || spec.MultiTerms != nil || spec.AutoDateHistogram != nil || spec.VariableWidthHistogram != nil ||
 		spec.WeightedAvg != nil || spec.MedianAbsoluteDeviation != nil ||
-		spec.GeoBounds != nil || spec.GeoCentroid != nil || spec.GeoDistance != nil ||
-		spec.GeohashGrid != nil || spec.GeotileGrid != nil ||
+		spec.GeoBounds != nil || spec.GeoCentroid != nil || spec.CartesianBounds != nil || spec.CartesianCentroid != nil ||
+		spec.GeoLine != nil || spec.GeoDistance != nil ||
+		spec.GeohashGrid != nil || spec.GeotileGrid != nil || spec.GeoHexGrid != nil ||
 		spec.AdjacencyMatrix != nil || spec.MatrixStats != nil || spec.TTest != nil {
 		return true
 	}
 	if t := spec.EffectiveTerms(); t != nil && t.Script != nil {
+		return true
+	}
+	if spec.CountedTerms != nil && spec.CountedTerms.Script != nil {
 		return true
 	}
 	if spec.Histogram != nil && spec.Histogram.Script != nil {
@@ -25620,6 +25912,10 @@ func marshalDocAndExtractEvalID(doc map[string]any, defaultID string) ([]byte, s
 }
 
 func docMatchesNonScriptClause(idxSchema *schema.IndexSchema, doc map[string]any, q *esast.Query) bool {
+	return evalDocWithSpatialFallbackR64(idxSchema, doc, q)
+}
+
+func docMatchesNonScriptClauseNoSpatialR64(idxSchema *schema.IndexSchema, doc map[string]any, q *esast.Query) bool {
 	if q == nil {
 		return true
 	}
@@ -25639,7 +25935,23 @@ func docMatchesNonScriptClause(idxSchema *schema.IndexSchema, doc map[string]any
 		return false
 	}
 	row["_doc"] = doc
-	t := transpiler.NewTranspiler(effSchema, transpiler.TranspilerOptions{ES8Compat: effSchema == nil || effSchema.ES8Mode})
+	trOpts := transpiler.TranspilerOptions{ES8Compat: effSchema == nil || effSchema.ES8Mode}
+	activeStoredScriptsServerMu.RLock()
+	srv := activeStoredScriptsServer
+	activeStoredScriptsServerMu.RUnlock()
+	if srv != nil {
+		idxName := ""
+		if effSchema != nil {
+			idxName = effSchema.IndexName
+		}
+		if idxName != "" {
+			trOpts = srv.effectiveTranspileOptsForIndexR62Search(nil, idxName, effSchema, nil)
+		} else {
+			trOpts.StrictTextTermRouting = srv.hasExplicitTargetESVersion()
+		}
+		trOpts.ES8Compat = effSchema == nil || effSchema.ES8Mode
+	}
+	t := transpiler.NewTranspiler(effSchema, trOpts)
 	cq := t.CompileQuery(q, false, nil)
 	whereExpr := strings.TrimSpace(cq.WhereSQL)
 	if whereExpr == "" || whereExpr == "1=1" || strings.EqualFold(whereExpr, "TRUE") {
@@ -26135,6 +26447,9 @@ func evalRandomScoreOnDoc(doc map[string]any, rs *esast.RandomScoreSpec) float64
 }
 
 func evalQueryScriptScoreOnDocWithSchema(idxSchema *schema.IndexSchema, doc map[string]any, q *esast.Query, baseScore float64) float64 {
+	if math.IsNaN(baseScore) || math.IsInf(baseScore, 0) || baseScore <= -1e307 {
+		baseScore = 1.0
+	}
 	if q == nil {
 		return baseScore
 	}
@@ -27193,9 +27508,15 @@ func emitRuntimeMetricAggRows(
 	case subSpec.MedianAbsoluteDeviation != nil:
 		emitRuntimeMADAggRows(fullAggName, metricBucketKey, subSpec.MedianAbsoluteDeviation, bDocs, out)
 	case subSpec.GeoBounds != nil:
-		emitRuntimeGeoBoundsAggRows(fullAggName, metricBucketKey, subSpec.GeoBounds, bDocs, out)
+		emitRuntimeGeoBoundsAggRowsR64(fullAggName, metricBucketKey, subSpec.GeoBounds, bDocs, out)
 	case subSpec.GeoCentroid != nil:
-		emitRuntimeGeoCentroidAggRows(fullAggName, metricBucketKey, subSpec.GeoCentroid, bDocs, out)
+		emitRuntimeGeoCentroidAggRowsR64(fullAggName, metricBucketKey, subSpec.GeoCentroid, bDocs, out)
+	case subSpec.CartesianBounds != nil:
+		emitRuntimeCartesianBoundsAggRowsR64(fullAggName, metricBucketKey, subSpec.CartesianBounds, bDocs, out)
+	case subSpec.CartesianCentroid != nil:
+		emitRuntimeCartesianCentroidAggRowsR64(fullAggName, metricBucketKey, subSpec.CartesianCentroid, bDocs, out)
+	case subSpec.GeoLine != nil:
+		emitRuntimeGeoLineAggRowsR64(fullAggName, metricBucketKey, subSpec.GeoLine, bDocs, nil, out)
 	case subSpec.MatrixStats != nil:
 		emitRuntimeMatrixStatsAggRows(fullAggName, metricBucketKey, subSpec.MatrixStats, bDocs, out)
 	case subSpec.TTest != nil:
@@ -27344,111 +27665,6 @@ func extractDocGeoPoints(md runtimeMatchedDoc, field string) [][2]float64 {
 		}
 	}
 	return collectGeoPointsAtPath(md.doc, pathSegs)
-}
-
-func emitRuntimeGeoBoundsAggRows(fullAggName, metricBucketKey string, spec *esast.GeoBoundsAggSpec, bDocs []runtimeMatchedDoc, out *[]AggRow) {
-	if spec == nil {
-		return
-	}
-	var pts [][2]float64
-	for _, md := range bDocs {
-		pts = append(pts, extractDocGeoPoints(md, spec.Field)...)
-	}
-	if len(pts) == 0 {
-		emitRuntimeJSONMetricRow(fullAggName, metricBucketKey, map[string]any{}, 0, out)
-		return
-	}
-	minLat, maxLat := pts[0][0], pts[0][0]
-	minLon, maxLon := pts[0][1], pts[0][1]
-	var posMinLon, posMaxLon float64 = 180, -180
-	var negMinLon, negMaxLon float64 = 180, -180
-	hasPos, hasNeg := false, false
-	for _, pt := range pts {
-		lat, lon := pt[0], pt[1]
-		if lat < minLat {
-			minLat = lat
-		}
-		if lat > maxLat {
-			maxLat = lat
-		}
-		if lon < minLon {
-			minLon = lon
-		}
-		if lon > maxLon {
-			maxLon = lon
-		}
-		if lon >= 0 {
-			hasPos = true
-			if lon < posMinLon {
-				posMinLon = lon
-			}
-			if lon > posMaxLon {
-				posMaxLon = lon
-			}
-		} else {
-			hasNeg = true
-			if lon < negMinLon {
-				negMinLon = lon
-			}
-			if lon > negMaxLon {
-				negMaxLon = lon
-			}
-		}
-	}
-	wrap := true
-	if spec.WrapLongitude != nil {
-		wrap = *spec.WrapLongitude
-	}
-	leftLon, rightLon := minLon, maxLon
-	if wrap && hasPos && hasNeg {
-		unwrappedSpan := maxLon - minLon
-		wrappedSpan := (180.0 - posMinLon) + (negMaxLon + 180.0)
-		if wrappedSpan < unwrappedSpan {
-			leftLon = posMinLon
-			rightLon = negMaxLon
-		}
-	}
-	obj := map[string]any{
-		"bounds": map[string]any{
-			"top_left": map[string]any{
-				"lat": maxLat,
-				"lon": leftLon,
-			},
-			"bottom_right": map[string]any{
-				"lat": minLat,
-				"lon": rightLon,
-			},
-		},
-	}
-	emitRuntimeJSONMetricRow(fullAggName, metricBucketKey, obj, float64(len(pts)), out)
-}
-
-func emitRuntimeGeoCentroidAggRows(fullAggName, metricBucketKey string, spec *esast.MetricAggSpec, bDocs []runtimeMatchedDoc, out *[]AggRow) {
-	if spec == nil {
-		return
-	}
-	var sumLat, sumLon float64
-	var cnt int64
-	for _, md := range bDocs {
-		pts := extractDocGeoPoints(md, spec.Field)
-		for _, pt := range pts {
-			sumLat += pt[0]
-			sumLon += pt[1]
-			cnt++
-		}
-	}
-	if cnt == 0 {
-		emitRuntimeJSONMetricRow(fullAggName, metricBucketKey, map[string]any{"count": int64(0)}, 0, out)
-		return
-	}
-	obj := map[string]any{
-		"location": map[string]any{
-			"lat": sumLat / float64(cnt),
-			"lon": sumLon / float64(cnt),
-		},
-		"count": cnt,
-	}
-	emitRuntimeJSONMetricRow(fullAggName, metricBucketKey, obj, float64(cnt), out)
 }
 
 func emitRuntimeMatrixStatsAggRows(fullAggName, metricBucketKey string, spec *esast.MatrixStatsAggSpec, bDocs []runtimeMatchedDoc, out *[]AggRow) {
@@ -28300,95 +28516,6 @@ func encodeGeotile(lat, lon float64, zoom int) string {
 	return fmt.Sprintf("%d/%d/%d", zoom, xtile, ytile)
 }
 
-func emitRuntimeGeoGridAggRows(
-	fullAggName string,
-	parentBucketKey string,
-	aggSpec esast.AggSpec,
-	docs []runtimeMatchedDoc,
-	out *[]AggRow,
-	idxSchema *schema.IndexSchema,
-) {
-	isTile := aggSpec.GeotileGrid != nil
-	spec := aggSpec.GeohashGrid
-	if isTile {
-		spec = aggSpec.GeotileGrid
-	}
-	if spec == nil {
-		return
-	}
-	prec := 5
-	if isTile {
-		prec = 7
-	}
-	if spec.Precision != nil && *spec.Precision > 0 {
-		prec = *spec.Precision
-	}
-	var bTopLat, bLeftLon, bBotLat, bRightLon float64
-	hasBounds := false
-	if spec.Bounds != nil {
-		bTopLat, bLeftLon, bBotLat, bRightLon, hasBounds = extractGeoBoundingBoxMapCoords(spec.Bounds)
-	}
-	byBucket := make(map[string][]runtimeMatchedDoc)
-	var keys []string
-	for _, md := range docs {
-		pts := extractDocGeoPoints(md, spec.Field)
-		seenCell := make(map[string]bool, len(pts))
-		for _, pt := range pts {
-			if hasBounds && !geoPointInBox(pt[0], pt[1], bTopLat, bLeftLon, bBotLat, bRightLon) {
-				continue
-			}
-			var cell string
-			if isTile {
-				cell = encodeGeotile(pt[0], pt[1], prec)
-			} else {
-				cell = encodeGeohash(pt[0], pt[1], prec)
-			}
-			if !seenCell[cell] {
-				seenCell[cell] = true
-				if _, exists := byBucket[cell]; !exists {
-					keys = append(keys, cell)
-				}
-				byBucket[cell] = append(byBucket[cell], md)
-			}
-		}
-	}
-	sort.Slice(keys, func(i, j int) bool {
-		ci, cj := len(byBucket[keys[i]]), len(byBucket[keys[j]])
-		if ci != cj {
-			return ci > cj
-		}
-		if isTile {
-			return compareGeotileStringsR62Search(keys[i], keys[j]) < 0
-		}
-		return keys[i] < keys[j]
-	})
-	maxSize := 10000
-	if spec.Size > 0 {
-		maxSize = spec.Size
-	}
-	if len(keys) > maxSize {
-		keys = keys[:maxSize]
-	}
-	subAggs := aggSpec.SubAggs()
-	for _, k := range keys {
-		bDocs := byBucket[k]
-		rowKey := k
-		if parentBucketKey != "" {
-			rowKey = parentBucketKey + "\x1f" + k
-		}
-		cnt := int64(len(bDocs))
-		*out = append(*out, AggRow{
-			AggName:   fullAggName,
-			BucketKey: rowKey,
-			DocCount:  cnt,
-			Value:     float64(cnt),
-		})
-		if len(subAggs) > 0 {
-			emitRuntimeAllSubAggRows(fullAggName, rowKey, subAggs, bDocs, out, idxSchema)
-		}
-	}
-}
-
 func emitRuntimeAdjacencyMatrixAggRows(
 	fullAggName string,
 	parentBucketKey string,
@@ -28464,9 +28591,26 @@ func formatRuntimeJSONMetricAggObject(parentBucketKey string, aggSpec esast.AggS
 		expectedLogical = "_metric"
 	}
 	for _, r := range rows {
-		logicalBucket, reducedVal, _, ok := parseScriptedMetricBucketKey(r.BucketKey)
-		if !ok || (logicalBucket != expectedLogical && logicalBucket != parentBucketKey) {
-			continue
+		var reducedVal any
+		matched := false
+		for _, cand := range []string{expectedLogical, parentBucketKey} {
+			if cand != "" && strings.HasPrefix(r.BucketKey, cand+"\x00") {
+				rest := r.BucketKey[len(cand)+1:]
+				if idx2 := strings.IndexByte(rest, '\x00'); idx2 >= 0 {
+					_ = json.Unmarshal([]byte(rest[:idx2]), &reducedVal)
+				} else {
+					_ = json.Unmarshal([]byte(rest), &reducedVal)
+				}
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			logicalBucket, rVal, _, ok := parseScriptedMetricBucketKey(r.BucketKey)
+			if !ok || (logicalBucket != expectedLogical && logicalBucket != parentBucketKey) {
+				continue
+			}
+			reducedVal = rVal
 		}
 		if m, ok := reducedVal.(map[string]any); ok {
 			return m
@@ -28474,10 +28618,12 @@ func formatRuntimeJSONMetricAggObject(parentBucketKey string, aggSpec esast.AggS
 		return map[string]any{"value": reducedVal}
 	}
 	switch {
-	case aggSpec.GeoBounds != nil:
+	case aggSpec.GeoBounds != nil, aggSpec.CartesianBounds != nil:
 		return map[string]any{}
-	case aggSpec.GeoCentroid != nil:
+	case aggSpec.GeoCentroid != nil, aggSpec.CartesianCentroid != nil:
 		return map[string]any{"count": int64(0)}
+	case aggSpec.GeoLine != nil:
+		return emptyGeoLineFeatureObjectR64(aggSpec.GeoLine.IncludeSort != nil && *aggSpec.GeoLine.IncludeSort)
 	case aggSpec.MatrixStats != nil:
 		return map[string]any{"doc_count": int64(0), "fields": []any{}}
 	default:
@@ -29065,12 +29211,13 @@ func emitRuntimeRangeAggRows(
 }
 
 func isDirectUnprefixedNestedSubAgg(ss esast.AggSpec) bool {
-	return ss.EffectiveTerms() != nil || ss.Cardinality != nil || ss.ValueCount != nil ||
+	return ss.EffectiveTerms() != nil || ss.CountedTerms != nil || ss.Cardinality != nil || ss.ValueCount != nil ||
 		ss.Avg != nil || ss.Sum != nil || ss.Min != nil || ss.Max != nil ||
 		ss.EffectiveStats() != nil || ss.StringStats != nil || ss.Percentiles != nil ||
 		ss.PercentileRanks != nil || ss.Boxplot != nil || ss.ReverseNested != nil ||
 		ss.ScriptedMetric != nil || ss.WeightedAvg != nil || ss.MedianAbsoluteDeviation != nil ||
-		ss.GeoBounds != nil || ss.GeoCentroid != nil || ss.MatrixStats != nil || ss.TTest != nil
+		ss.GeoBounds != nil || ss.GeoCentroid != nil || ss.CartesianBounds != nil || ss.CartesianCentroid != nil ||
+		ss.GeoLine != nil || ss.MatrixStats != nil || ss.TTest != nil
 }
 
 func splitNestedSubAggsByBucketKeyMode(subAggs map[string]esast.AggSpec) (map[string]esast.AggSpec, map[string]esast.AggSpec) {
@@ -29182,6 +29329,8 @@ func emitRuntimeAllSubAggRowsWithGlobal(
 			emitRuntimeSignificantTextAggRowsR62Search(subFullKey, parentBucketKey, subSpec, bDocs, bgCorpus, out, idxSchema)
 		case subSpec.EffectiveTerms() != nil:
 			emitRuntimeTermsScriptAggRowsWithSchema(subFullKey, parentBucketKey, subSpec, bDocs, out, idxSchema)
+		case subSpec.CountedTerms != nil:
+			emitRuntimeCountedTermsAggRowsR64(subFullKey, parentBucketKey, subSpec, bDocs, out, idxSchema)
 		case subSpec.RareTerms != nil:
 			emitRuntimeRareTermsAggRows(subFullKey, parentBucketKey, subSpec, bDocs, out, idxSchema)
 		case subSpec.MultiTerms != nil:
@@ -29194,14 +29343,22 @@ func emitRuntimeAllSubAggRowsWithGlobal(
 			emitRuntimeAutoDateHistogramAggRowsR62Search(subFullKey, parentBucketKey, subSpec, bDocs, out, idxSchema)
 		case subSpec.IPPrefix != nil:
 			emitRuntimeIPPrefixAggRowsR62Search(subFullKey, parentBucketKey, subSpec, bDocs, out, idxSchema)
+		case subSpec.TimeSeries != nil:
+			emitRuntimeTimeSeriesAggRowsR64(subFullKey, parentBucketKey, subSpec, bDocs, out, idxSchema)
 		case subSpec.VariableWidthHistogram != nil:
 			emitRuntimeVariableWidthHistogramAggRows(subFullKey, parentBucketKey, subSpec, bDocs, out, idxSchema)
 		case subSpec.EffectiveRange() != nil:
 			emitRuntimeRangeAggRows(subFullKey, parentBucketKey, subSpec, bDocs, out, idxSchema)
 		case subSpec.GeoDistance != nil:
 			emitRuntimeGeoDistanceAggRows(subFullKey, parentBucketKey, subSpec, bDocs, out, idxSchema)
-		case subSpec.GeohashGrid != nil || subSpec.GeotileGrid != nil:
-			emitRuntimeGeoGridAggRows(subFullKey, parentBucketKey, subSpec, bDocs, out, idxSchema)
+		case subSpec.GeohashGrid != nil || subSpec.GeotileGrid != nil || subSpec.GeoHexGrid != nil:
+			emitRuntimeGeoGridAggRowsR64(subFullKey, parentBucketKey, subSpec, bDocs, out, idxSchema)
+		case subSpec.GeoLine != nil:
+			metricBucketKey := parentBucketKey
+			if metricBucketKey == "" {
+				metricBucketKey = "_metric"
+			}
+			emitRuntimeGeoLineAggRowsR64(subFullKey, metricBucketKey, subSpec.GeoLine, bDocs, idxSchema, out)
 		case subSpec.AdjacencyMatrix != nil:
 			emitRuntimeAdjacencyMatrixAggRows(subFullKey, parentBucketKey, subSpec, bDocs, out, idxSchema)
 		case subSpec.Composite != nil:
@@ -29746,6 +29903,9 @@ func partitionDocsByParentBucket(idxSchema *schema.IndexSchema, docs []runtimeMa
 	case spec.EffectiveTerms() != nil:
 		byB, _ := computeRuntimeTermsScriptBucketDocsWithSchema(idxSchema, docs, spec.EffectiveTerms())
 		return byB[leafKey]
+	case spec.CountedTerms != nil:
+		byB, _, _ := computeRuntimeCountedTermsBucketDocsR64(idxSchema, docs, spec.CountedTerms)
+		return byB[leafKey]
 	case spec.Histogram != nil:
 		hSpec := spec.Histogram
 		interval := hSpec.Interval
@@ -29853,6 +30013,9 @@ func applyRuntimeScriptAggsForMap(
 		case spec.EffectiveTerms() != nil && spec.EffectiveTerms().Script != nil:
 			aggRows = dropRuntimeAggRows(aggRows, fullKey, parentBucketKey)
 			emitRuntimeTermsScriptAggRowsWithSchema(fullKey, parentBucketKey, spec, docs, &aggRows, idxSchema)
+		case spec.CountedTerms != nil && (spec.CountedTerms.Script != nil || schemasHaveDocCountFieldR63([]*schema.IndexSchema{idxSchema})):
+			aggRows = dropRuntimeAggRows(aggRows, fullKey, parentBucketKey)
+			emitRuntimeCountedTermsAggRowsR64(fullKey, parentBucketKey, spec, docs, &aggRows, idxSchema)
 		case spec.RareTerms != nil:
 			aggRows = dropRuntimeAggRows(aggRows, fullKey, parentBucketKey)
 			emitRuntimeRareTermsAggRows(fullKey, parentBucketKey, spec, docs, &aggRows, idxSchema)
@@ -29868,6 +30031,9 @@ func applyRuntimeScriptAggsForMap(
 		case spec.AutoDateHistogram != nil:
 			aggRows = dropRuntimeAggRows(aggRows, fullKey, parentBucketKey)
 			emitRuntimeAutoDateHistogramAggRowsR62Search(fullKey, parentBucketKey, spec, docs, &aggRows, idxSchema)
+		case spec.TimeSeries != nil && (aggsHaveRuntimeScript(spec.SubAggs()) || schemasHaveDocCountFieldR63([]*schema.IndexSchema{idxSchema})):
+			aggRows = dropRuntimeAggRows(aggRows, fullKey, parentBucketKey)
+			emitRuntimeTimeSeriesAggRowsR64(fullKey, parentBucketKey, spec, docs, &aggRows, idxSchema)
 		case spec.VariableWidthHistogram != nil:
 			aggRows = dropRuntimeAggRows(aggRows, fullKey, parentBucketKey)
 			emitRuntimeVariableWidthHistogramAggRows(fullKey, parentBucketKey, spec, docs, &aggRows, idxSchema)
@@ -29877,9 +30043,9 @@ func applyRuntimeScriptAggsForMap(
 		case spec.GeoDistance != nil:
 			aggRows = dropRuntimeAggRows(aggRows, fullKey, parentBucketKey)
 			emitRuntimeGeoDistanceAggRows(fullKey, parentBucketKey, spec, docs, &aggRows, idxSchema)
-		case spec.GeohashGrid != nil || spec.GeotileGrid != nil:
+		case spec.GeohashGrid != nil || spec.GeotileGrid != nil || spec.GeoHexGrid != nil:
 			aggRows = dropRuntimeAggRows(aggRows, fullKey, parentBucketKey)
-			emitRuntimeGeoGridAggRows(fullKey, parentBucketKey, spec, docs, &aggRows, idxSchema)
+			emitRuntimeGeoGridAggRowsR64(fullKey, parentBucketKey, spec, docs, &aggRows, idxSchema)
 		case spec.AdjacencyMatrix != nil:
 			aggRows = dropRuntimeAggRows(aggRows, fullKey, parentBucketKey)
 			emitRuntimeAdjacencyMatrixAggRows(fullKey, parentBucketKey, spec, docs, &aggRows, idxSchema)
@@ -29924,7 +30090,7 @@ func applyRuntimeScriptAggsForMap(
 						fk := strconv.Itoa(i)
 						var fDocs []runtimeMatchedDoc
 						for docIdx, md := range docs {
-							if evalBranchMatchesDoc(idxSchema, md.doc, &q) {
+							if evalBranchMatchesDoc(md.EffectiveSchema(idxSchema), md.doc, &q) {
 								fDocs = append(fDocs, md)
 								matchedDocIdx[docIdx] = true
 							}
@@ -29940,7 +30106,7 @@ func applyRuntimeScriptAggsForMap(
 						q := fq
 						var fDocs []runtimeMatchedDoc
 						for docIdx, md := range docs {
-							if evalBranchMatchesDoc(idxSchema, md.doc, &q) {
+							if evalBranchMatchesDoc(md.EffectiveSchema(idxSchema), md.doc, &q) {
 								fDocs = append(fDocs, md)
 								matchedDocIdx[docIdx] = true
 							}
@@ -30249,6 +30415,8 @@ func applyRuntimeSearchScriptsWithMatchedAndGlobal(hits []HitRow, globalHits []H
 		aliasFilterQ = &q
 	}
 	hasAliasScript := queryHasRuntimeScript(aliasFilterQ)
+	hasQuerySpatial := queryNeedsRuntimeSpatialEvalR64(req.Query, idxSchema) || queryNeedsRuntimeSpatialEvalR64(aliasFilterQ, idxSchema)
+	hasPostSpatial := queryNeedsRuntimeSpatialEvalR64(req.PostFilter, idxSchema)
 	hasNestedMinScore := queryHasMinScore(req.Query) && (req.Query == nil || req.Query.FunctionScore == nil || queryHasMinScore(req.Query.FunctionScore.Query))
 	hasMinScore := req.MinScore != nil || queryHasMinScore(req.Query) || queryHasMinScore(aliasFilterQ)
 	hasPostScript := queryHasRuntimeScript(req.PostFilter)
@@ -30279,7 +30447,7 @@ func applyRuntimeSearchScriptsWithMatchedAndGlobal(hits []HitRow, globalHits []H
 		if h.Schema != nil {
 			hitSchema = h.Schema
 		}
-		if hasRuntimeMappings {
+		if hasRuntimeMappings || hasQuerySpatial {
 			if aliasFilterQ != nil && !evalBranchMatchesDoc(hitSchema, doc, aliasFilterQ) {
 				continue
 			}
@@ -30302,7 +30470,7 @@ func applyRuntimeSearchScriptsWithMatchedAndGlobal(hits []HitRow, globalHits []H
 		if req.Query != nil && ((req.Query.ScriptScore != nil && req.Query.ScriptScore.Query == nil) || (req.Query.FunctionScore != nil && req.Query.FunctionScore.Query == nil)) {
 			baseScore = 1.0
 		}
-		if hasRuntimeMappings {
+		if hasRuntimeMappings || hasQuerySpatial {
 			if hasQueryScript || hasNestedScoring {
 				h.Score = evalQueryScriptScoreOnDocWithSchema(hitSchema, doc, req.Query, baseScore)
 			} else if req.Query != nil {
@@ -30332,7 +30500,7 @@ func applyRuntimeSearchScriptsWithMatchedAndGlobal(hits []HitRow, globalHits []H
 		}
 		filteredQueryHits = append(filteredQueryHits, h)
 		if req.PostFilter != nil {
-			if hasPostScript || hasRuntimeMappings {
+			if hasPostScript || hasRuntimeMappings || hasPostSpatial {
 				if !evalBranchMatchesDoc(idxSchema, doc, req.PostFilter) {
 					continue
 				}
@@ -30346,7 +30514,7 @@ func applyRuntimeSearchScriptsWithMatchedAndGlobal(hits []HitRow, globalHits []H
 	var filteredGlobalHits []HitRow
 	if len(globalHits) > 0 {
 		for _, gh := range globalHits {
-			if hasAliasScript || (hasRuntimeMappings && aliasFilterQ != nil) || queryHasMinScore(aliasFilterQ) {
+			if hasAliasScript || ((hasRuntimeMappings || hasQuerySpatial) && aliasFilterQ != nil) || queryHasMinScore(aliasFilterQ) {
 				var gdoc map[string]any
 				src := gh.EffectiveSource()
 				if len(src) > 0 {
@@ -30358,7 +30526,7 @@ func applyRuntimeSearchScriptsWithMatchedAndGlobal(hits []HitRow, globalHits []H
 					gdoc = make(map[string]any)
 				}
 				gdoc["__meta_id"] = gh.ID
-				if hasRuntimeMappings {
+				if hasRuntimeMappings || hasQuerySpatial {
 					if !evalBranchMatchesDoc(idxSchema, gdoc, aliasFilterQ) {
 						continue
 					}
@@ -30370,7 +30538,7 @@ func applyRuntimeSearchScriptsWithMatchedAndGlobal(hits []HitRow, globalHits []H
 		}
 	}
 
-	if hasQueryScript || hasAliasScript || hasMinScore || hasRuntimeMappings || req.Slice != nil {
+	if hasQueryScript || hasAliasScript || hasMinScore || hasRuntimeMappings || hasQuerySpatial || req.Slice != nil {
 		idxTotal = int64(len(filteredQueryHits))
 	}
 	prePostQueryTotal := idxTotal
@@ -30518,7 +30686,12 @@ func (s *Server) applyRescoreToHits(
 		defaultWin = 10
 	}
 	effSorts := transpiler.EffectiveSortsForRequest(req)
-	for _, rs := range req.Rescore {
+	for i := range hits {
+		hits[i].PreRescoreScore = hits[i].Score
+		hits[i].HasPreRescoreScore = true
+		hits[i].RescoreWindowFlags = make([]bool, len(req.Rescore))
+	}
+	for rIdx, rs := range req.Rescore {
 		if rs.Query == nil || rs.Query.RescoreQuery == nil {
 			continue
 		}
@@ -30539,6 +30712,7 @@ func (s *Server) applyRescoreToHits(
 		}
 		mode := strings.ToLower(strings.TrimSpace(rs.Query.ScoreMode))
 		for i := 0; i < win; i++ {
+			hits[i].RescoreWindowFlags[rIdx] = true
 			hSchema := schemasByIndex[hits[i].Index]
 			if hSchema == nil {
 				hSchema = primarySchema
@@ -30562,6 +30736,9 @@ func (s *Server) applyRescoreToHits(
 			default: // "", "total"
 				hits[i].Score = weightedOrig + weightedRescore
 			}
+		}
+		for i := win; i < len(hits); i++ {
+			hits[i].Score *= qWeight
 		}
 		windowSlice := hits[:win]
 		sort.SliceStable(windowSlice, func(i, j int) bool {

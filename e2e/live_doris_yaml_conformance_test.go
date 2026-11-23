@@ -42,7 +42,7 @@ import (
 
 const liveDorisRemoteReindexWhitelistForTest = "127.0.0.1:*,[::1]:*,localhost:*,conformance.local:*"
 
-// liveDorisTier1UpstreamYAMLSpecs defines the curated 136-file Tier-1 upstream Elasticsearch v8.15.5
+// liveDorisTier1UpstreamYAMLSpecs defines the curated 206-file Tier-1 upstream Elasticsearch v8.15.5
 // YAML REST conformance corpus executed end-to-end against a live Apache Doris 4.1.3 FE+BE cluster.
 var liveDorisTier1UpstreamYAMLSpecs = []string{
 	// Bulk & Single-Doc CRUD (28)
@@ -193,6 +193,78 @@ var liveDorisTier1UpstreamYAMLSpecs = []string{
 	"wildcard/20_regexp.yml",
 	"rrf/100_rank_rrf.yml",
 	"rrf/300_rrf_retriever.yml",
+
+	// Round 64 Tier-1 Expansion: Clean Zero-Fail v8.15.5 Specs & F10-Unblocked Specs (70)
+	"cluster.desired_nodes/10_basic.yml",
+	"indices.stats/13_fields.yml",
+	"cat.aliases/10_basic.yml",
+	"nodes.info/50_metrics.yml",
+	"cluster.desired_nodes/11_old_format.yml",
+	"cluster.desired_balance/10_basic.yml",
+	"indices.delete_alias/all_path_options.yml",
+	"indices.put_index_template/15_composition.yml",
+	"cluster.state/20_filtering.yml",
+	"indices.stats/11_metric.yml",
+	"snapshot.get/10_basic.yml",
+	"cat.allocation/10_basic.yml",
+	"cat.templates/10_basic.yml",
+	"indices.get_mapping/50_wildcard_expansion.yml",
+	"indices.stats/10_index.yml",
+	"indices.stats/14_groups.yml",
+	"aggregations/moving_fn.yml",
+	"aggregations/bucket_sort.yml",
+	"aggregations/ip_prefix.yml",
+	"aggregations/scripted_metric_allow_list.yml",
+	"aggregations/typed_keys.yml",
+	"aggregations/percentiles_tdigest_metric.yml",
+	"aggregations/rare_terms.yml",
+	"aggregations/percentiles_hdr_metric.yml",
+	"aggregations/pipeline.yml",
+	"aggregations/max_bucket.yml",
+	"aggregations/min_bucket.yml",
+	"search/230_interval_query.yml",
+	"search.highlight/50_synthetic_source.yml",
+	"search/510_range_query_out_of_bounds.yml",
+	"search.vectors/41_knn_search_half_byte_quantized.yml",
+	"search.vectors/180_update_dense_vector_type.yml",
+	"search.vectors/45_knn_search_bit.yml",
+	"search.retrievers/10_standard_retriever.yml",
+	"search.vectors/42_knn_search_int4_flat.yml",
+	"search/400_synthetic_source.yml",
+	"painless/146_dense_vector_bit_basic.yml",
+	"painless/180_knn_and_binary_dv_fields_api.yml",
+	"painless/185_knn_and_binary_byte_dv_fields_api.yml",
+	"search.highlight/30_max_analyzed_offset.yml",
+	"search.vectors/42_knn_search_flat.yml",
+	"search/30_limits.yml",
+	"search/370_profile.yml",
+	"tsdb/10_settings.yml",
+	"tsdb/25_id_generation.yml",
+	"data_stream/150_tsdb.yml",
+	"logsdb/10_settings.yml",
+	"tsdb/40_search.yml",
+	"tsdb/120_counter_fields.yml",
+	"tsdb/90_unsupported_operations.yml",
+	"esql/40_tsdb.yml",
+	"data_stream/200_rollover_failure_store.yml",
+	"esql/110_insensitive_equals.yml",
+	"reindex/20_validation.yml",
+	"update_by_query/20_validation.yml",
+	"delete_by_query/20_validation.yml",
+	"ingest/190_script_processor.yml",
+	"update_by_query/80_scripting.yml",
+	"reindex/85_scripting.yml",
+	"reindex/90_remote.yml",
+	"search/160_exists_query.yml",
+	"painless/50_script_doc_values.yml",
+	"search/161_exists_query_within_nested_query.yml",
+	"search/390_doc_values_search.yml",
+	"vector-tile/10_basic.yml",
+	"nodes.stats/11_indices_metrics.yml",
+	"runtime_fields/90_loops.yml",
+	"tsdb/20_mapping.yml",
+	"aggregations/time_series.yml",
+	"runtime_fields/14_keyword_errors.yml",
 }
 
 type liveInProcessHandlerTransport struct {
@@ -391,15 +463,15 @@ func waitForLiveDorisBEReady(t *testing.T, db *sql.DB, dorisDB string) {
 }
 
 // TestLiveDorisTier1SpecList_ValidatesAgainstUpstreamCache verifies that when the gitignored
-// `.cache/es-v8.15.5` corpus is populated on disk, the curated Tier-1 list resolves to 130–150
-// (specifically 136) unique upstream YAML files whose `displayPath` matches `ScoreMatchingFiles`.
+// `.cache/es-v8.15.5` corpus is populated on disk, the curated Tier-1 list resolves to 200–220
+// (specifically 206) unique upstream YAML files whose `displayPath` matches `ScoreMatchingFiles`.
 func TestLiveDorisTier1SpecList_ValidatesAgainstUpstreamCache(t *testing.T) {
 	tier1Filter := buildTier1SpecFilter()
 	if len(tier1Filter) != len(liveDorisTier1UpstreamYAMLSpecs) {
 		t.Fatalf("duplicate entries in liveDorisTier1UpstreamYAMLSpecs: unique=%d total=%d", len(tier1Filter), len(liveDorisTier1UpstreamYAMLSpecs))
 	}
-	if len(tier1Filter) < 130 || len(tier1Filter) > 150 {
-		t.Fatalf("curated Tier-1 spec count = %d, want between 130 and 150", len(tier1Filter))
+	if len(tier1Filter) < 200 || len(tier1Filter) > 220 {
+		t.Fatalf("curated Tier-1 spec count = %d, want between 200 and 220", len(tier1Filter))
 	}
 
 	v8Root := filepath.Join(resolveE2EConformanceCacheDir(), "es-v8.15.5")
@@ -445,7 +517,7 @@ func TestLiveDorisTier1SpecList_ValidatesAgainstUpstreamCache(t *testing.T) {
 		t.Fatalf("curated Tier-1 specs missing from .cache/es-v8.15.5: %v", missing)
 	}
 
-	// Verify ScoreMatchingFiles agrees 100% on all 136 displayPath entries and yields >= 600 passed sections.
+	// Verify ScoreMatchingFiles agrees 100% on all 206 displayPath entries and yields >= 1400 passed sections.
 	memCard, scoreErr := compliance.ScoreMatchingFiles(
 		compliance.SuiteOptions{
 			CorpusName:                 "mem-tier1-validation",
@@ -474,14 +546,14 @@ func TestLiveDorisTier1SpecList_ValidatesAgainstUpstreamCache(t *testing.T) {
 	if memCard.ParseErrors != 0 {
 		t.Fatalf("ScoreMatchingFiles ParseErrors = %d, want 0", memCard.ParseErrors)
 	}
-	if memCard.SectionsPassed < 600 {
-		t.Fatalf("Tier-1 136-file suite SectionsPassed = %d, want >= 600", memCard.SectionsPassed)
+	if memCard.SectionsPassed < 1400 {
+		t.Fatalf("Tier-1 206-file suite SectionsPassed = %d, want >= 1400", memCard.SectionsPassed)
 	}
-	t.Logf("[Tier-1 136-File Precheck] files=%d sections=%d passed=%d failed=%d skipped=%d pass_rate=%.2f%%",
+	t.Logf("[Tier-1 206-File Precheck] files=%d sections=%d passed=%d failed=%d skipped=%d pass_rate=%.2f%%",
 		memCard.TotalFiles, memCard.SectionsTotal, memCard.SectionsPassed, memCard.SectionsFailed, memCard.SectionsSkipped, memCard.PassRatePct)
 }
 
-// TestLiveDorisUpstreamYAMLConformance_E2E executes the curated 136-file Tier-1 upstream
+// TestLiveDorisUpstreamYAMLConformance_E2E executes the curated 206-file Tier-1 upstream
 // Elasticsearch v8.15.5 YAML REST conformance suite against a live Apache Doris 4.1.3 cluster
 // via ScoreMatchingFiles, resetting Doris table/catalog state cleanly between sections.
 func TestLiveDorisUpstreamYAMLConformance_E2E(t *testing.T) {
@@ -589,7 +661,14 @@ func TestLiveDorisUpstreamYAMLConformance_E2E(t *testing.T) {
 		card.PassRatePct,
 	)
 
-	const maxLoggedFailures = 30
+	maxLoggedFailures := 100
+	if rawMaxFail := strings.TrimSpace(os.Getenv("DORIS_LIVE_YAML_MAX_FAILURE_SAMPLES")); rawMaxFail != "" {
+		parsedMaxFail, convErr := strconv.Atoi(rawMaxFail)
+		if convErr != nil || parsedMaxFail < 0 {
+			t.Fatalf("invalid DORIS_LIVE_YAML_MAX_FAILURE_SAMPLES=%q: %v", rawMaxFail, convErr)
+		}
+		maxLoggedFailures = parsedMaxFail
+	}
 	for i, f := range card.FailureSamples {
 		if i >= maxLoggedFailures {
 			t.Logf("[Live Doris YAML Failure] ... (%d additional failure samples omitted)", len(card.FailureSamples)-maxLoggedFailures)
@@ -604,7 +683,7 @@ func TestLiveDorisUpstreamYAMLConformance_E2E(t *testing.T) {
 		}
 	}
 
-	minPassed := 600
+	minPassed := 1400
 	if rawMin := strings.TrimSpace(os.Getenv("DORIS_LIVE_YAML_MIN_PASSED")); rawMin != "" {
 		parsedMin, convErr := strconv.Atoi(rawMin)
 		if convErr != nil {

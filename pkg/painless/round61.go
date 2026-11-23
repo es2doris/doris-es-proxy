@@ -20,6 +20,7 @@ package painless
 import (
 	"bytes"
 	"container/list"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -375,6 +376,47 @@ func FormatJavaFloat32(v float32) string {
 	return s
 }
 
+// FormatJavaFloat64 formats a float64 matching Java's Double.toString(double) contract:
+// NaN, Infinity, -Infinity, decimal with ".0" for whole numbers in [1e-3, 1e7) (and 0.0/-0.0),
+// and uppercase 'E' scientific notation outside [1e-3, 1e7).
+func FormatJavaFloat64(v float64) string {
+	if math.IsNaN(v) {
+		return "NaN"
+	}
+	if math.IsInf(v, 1) {
+		return "Infinity"
+	}
+	if math.IsInf(v, -1) {
+		return "-Infinity"
+	}
+	if v == 0 {
+		if math.Signbit(v) {
+			return "-0.0"
+		}
+		return "0.0"
+	}
+	abs := math.Abs(v)
+	if abs >= 1e-3 && abs < 1e7 {
+		s := strconv.FormatFloat(v, 'f', -1, 64)
+		if !strings.Contains(s, ".") {
+			s += ".0"
+		}
+		return s
+	}
+	s := strconv.FormatFloat(v, 'E', -1, 64)
+	if eIdx := strings.IndexByte(s, 'E'); eIdx > 0 {
+		mant := s[:eIdx]
+		if !strings.Contains(mant, ".") {
+			mant += ".0"
+		}
+		expPart := s[eIdx+1:]
+		if expInt, err := strconv.Atoi(expPart); err == nil {
+			return fmt.Sprintf("%sE%d", mant, expInt)
+		}
+	}
+	return s
+}
+
 func tokenizeStandardAnalyzerWordsRound61(s string) []string {
 	var tokens []string
 	var cur strings.Builder
@@ -685,6 +727,38 @@ func (b *GeoBoundingBoxVal) String() string {
 	return fmt.Sprintf("GeoBoundingBox{topLeft=%v, bottomRight=%v}", b.TopLeft, b.BottomRight)
 }
 
+// GetMinLat returns the southern latitude of the bounding box.
+func (b *GeoBoundingBoxVal) GetMinLat() float64 {
+	if b == nil || b.BottomRight == nil {
+		return 0.0
+	}
+	return b.BottomRight.Lat
+}
+
+// GetMaxLat returns the northern latitude of the bounding box.
+func (b *GeoBoundingBoxVal) GetMaxLat() float64 {
+	if b == nil || b.TopLeft == nil {
+		return 0.0
+	}
+	return b.TopLeft.Lat
+}
+
+// GetMinLon returns the western longitude of the bounding box.
+func (b *GeoBoundingBoxVal) GetMinLon() float64 {
+	if b == nil || b.TopLeft == nil {
+		return 0.0
+	}
+	return b.TopLeft.Lon
+}
+
+// GetMaxLon returns the eastern longitude of the bounding box.
+func (b *GeoBoundingBoxVal) GetMaxLon() float64 {
+	if b == nil || b.BottomRight == nil {
+		return 0.0
+	}
+	return b.BottomRight.Lon
+}
+
 func evalGeoBoundingBoxMethodRound61(b *GeoBoundingBoxVal, method string) (any, bool, error) {
 	if b == nil {
 		return nil, false, nil
@@ -694,30 +768,31 @@ func evalGeoBoundingBoxMethodRound61(b *GeoBoundingBoxVal, method string) (any, 
 		return b.TopLeft, true, nil
 	case "bottomRight", "getBottomRight":
 		return b.BottomRight, true, nil
-	case "top", "getTop":
-		if b.TopLeft != nil {
-			return b.TopLeft.Lat, true, nil
-		}
-		return 0.0, true, nil
-	case "bottom", "getBottom":
-		if b.BottomRight != nil {
-			return b.BottomRight.Lat, true, nil
-		}
-		return 0.0, true, nil
-	case "left", "getLeft":
-		if b.TopLeft != nil {
-			return b.TopLeft.Lon, true, nil
-		}
-		return 0.0, true, nil
-	case "right", "getRight":
-		if b.BottomRight != nil {
-			return b.BottomRight.Lon, true, nil
-		}
-		return 0.0, true, nil
+	case "top", "getTop", "maxLat", "getMaxLat":
+		return b.GetMaxLat(), true, nil
+	case "bottom", "getBottom", "minLat", "getMinLat":
+		return b.GetMinLat(), true, nil
+	case "left", "getLeft", "minLon", "getMinLon":
+		return b.GetMinLon(), true, nil
+	case "right", "getRight", "maxLon", "getMaxLon":
+		return b.GetMaxLon(), true, nil
 	case "toString":
 		return b.String(), true, nil
 	}
 	return nil, false, nil
+}
+
+const webMercatorHalfCircumferenceRound61 = 20037508.34
+
+func geoMercatorExtentMetersRound61(minLat, maxLat, minLon, maxLon float64) (mercWidth, mercHeight float64) {
+	mercX := func(lon float64) float64 {
+		return lon * webMercatorHalfCircumferenceRound61 / 180.0
+	}
+	mercY := func(lat float64) float64 {
+		clamped := math.Max(-85.05112877980659, math.Min(85.05112877980659, lat))
+		return math.Log(math.Tan((90.0+clamped)*math.Pi/360.0)) * (webMercatorHalfCircumferenceRound61 / math.Pi)
+	}
+	return math.Abs(mercX(maxLon) - mercX(minLon)), math.Abs(mercY(maxLat) - mercY(minLat))
 }
 
 func computeGeoSliceBoundsRound61(pts []*GeoPointVal) (topLeft, bottomRight, centroid *GeoPointVal, mercWidth, mercHeight float64) {
@@ -750,18 +825,1144 @@ func computeGeoSliceBoundsRound61(pts []*GeoPointVal) (topLeft, bottomRight, cen
 	if len(pts) == 1 {
 		return tl, br, &GeoPointVal{Lat: pts[0].Lat, Lon: pts[0].Lon}, 0.0, 0.0
 	}
-	mercY := func(lat float64) float64 {
-		rad := lat * math.Pi / 180.0
-		return math.Log(math.Tan(math.Pi/4.0 + rad/2.0))
-	}
-	mercWidth = (maxLon - minLon) * math.Pi / 180.0
-	mercHeight = math.Abs(mercY(maxLat) - mercY(minLat))
+	mercWidth, mercHeight = geoMercatorExtentMetersRound61(minLat, maxLat, minLon, maxLon)
 	return tl, br, c, mercWidth, mercHeight
+}
+
+// GeoShapeDocValues models Elasticsearch's GeoShapeDocValues (`doc['geo_shape']`)
+// and individual Geometry elements (`doc['geo_shape'].get(i)`), supporting centroid,
+// bounding box, label position, dimensional type, Mercator extent, collection indexing,
+// and `<unserializable>` serialization matching Elasticsearch 8.15.
+type GeoShapeDocValues struct {
+	ShapeType  string
+	Geometries []*GeoShapeDocValues
+	Points     [][2]float64
+	Lines      [][][2]float64
+	Rings      [][][2]float64
+	MultiRings [][][][2]float64
+	HasBBox    bool
+	MinLat     float64
+	MaxLat     float64
+	MinLon     float64
+	MaxLon     float64
+	DimType    int64
+	Quantize   bool
+	Raw        any
+}
+
+// String implements Painless/Java string representation for Geometry values (`<unserializable>`).
+func (g *GeoShapeDocValues) String() string {
+	return "<unserializable>"
+}
+
+// MarshalJSON serializes raw Geometry values as `"<unserializable>"`, matching ES script_fields.
+func (g *GeoShapeDocValues) MarshalJSON() ([]byte, error) {
+	if g == nil {
+		return []byte("null"), nil
+	}
+	return []byte(`"<unserializable>"`), nil
+}
+
+// Size returns the number of top-level geometries represented.
+func (g *GeoShapeDocValues) Size() int64 {
+	if g == nil {
+		return 0
+	}
+	if len(g.Geometries) > 0 {
+		return int64(len(g.Geometries))
+	}
+	if g.ShapeType == "" {
+		return 0
+	}
+	if len(g.Points) == 0 && len(g.Lines) == 0 && len(g.Rings) == 0 && len(g.MultiRings) == 0 && !g.HasBBox {
+		return 0
+	}
+	return 1
+}
+
+// IsEmpty returns true when no geometry value is present.
+func (g *GeoShapeDocValues) IsEmpty() bool {
+	return g.Size() == 0
+}
+
+// Get returns the geometry at index i (supporting doc['geo_shape'].get(0) and GeometryCollection.get(i)).
+func (g *GeoShapeDocValues) Get(idx int) (*GeoShapeDocValues, error) {
+	if g == nil {
+		return nil, &painlessExceptionError{exType: "IndexOutOfBoundsException", message: fmt.Sprintf("index %d out of bounds for length 0", idx)}
+	}
+	if len(g.Geometries) > 0 {
+		if idx < 0 || idx >= len(g.Geometries) {
+			return nil, &painlessExceptionError{exType: "IndexOutOfBoundsException", message: fmt.Sprintf("index %d out of bounds for length %d", idx, len(g.Geometries))}
+		}
+		return g.Geometries[idx], nil
+	}
+	n := int(g.Size())
+	if idx < 0 || idx >= n {
+		return nil, &painlessExceptionError{exType: "IndexOutOfBoundsException", message: fmt.Sprintf("index %d out of bounds for length %d", idx, n)}
+	}
+	return g, nil
+}
+
+// GetShapeType returns the canonical uppercase shape type name (e.g. "POLYGON", "POINT").
+func (g *GeoShapeDocValues) GetShapeType() string {
+	if g == nil {
+		return ""
+	}
+	return g.ShapeType
+}
+
+// GetDimensionalType returns Elasticsearch's integer topological dimension:
+// 0 for Point/MultiPoint, 1 for LineString/MultiLineString, 2 for Polygon/MultiPolygon/Envelope,
+// or the maximum dimension across child geometries in a GeometryCollection.
+func (g *GeoShapeDocValues) GetDimensionalType() int64 {
+	if g == nil {
+		return 0
+	}
+	if len(g.Geometries) > 0 {
+		maxDim := int64(0)
+		for _, ch := range g.Geometries {
+			if d := ch.GetDimensionalType(); d > maxDim {
+				maxDim = d
+			}
+		}
+		return maxDim
+	}
+	return g.DimType
+}
+
+// GetBoundingBox returns the (Lucene BKD-quantized when Quantize is true) bounding box.
+func (g *GeoShapeDocValues) GetBoundingBox() *GeoBoundingBoxVal {
+	if g == nil || !g.HasBBox {
+		z := &GeoPointVal{}
+		return &GeoBoundingBoxVal{TopLeft: z, BottomRight: &GeoPointVal{}}
+	}
+	tlLat, tlLon := g.MaxLat, g.MinLon
+	brLat, brLon := g.MinLat, g.MaxLon
+	if g.Quantize {
+		tlLat, tlLon = QuantizeLuceneGeoPoint(tlLat, tlLon)
+		brLat, brLon = QuantizeLuceneGeoPoint(brLat, brLon)
+	}
+	return &GeoBoundingBoxVal{
+		TopLeft:     &GeoPointVal{Lat: tlLat, Lon: tlLon},
+		BottomRight: &GeoPointVal{Lat: brLat, Lon: brLon},
+	}
+}
+
+// TopLeft returns the bounding box top-left (maxLat, minLon) GeoPoint.
+func (g *GeoShapeDocValues) TopLeft() *GeoPointVal {
+	return g.GetBoundingBox().TopLeft
+}
+
+// BottomRight returns the bounding box bottom-right (minLat, maxLon) GeoPoint.
+func (g *GeoShapeDocValues) BottomRight() *GeoPointVal {
+	return g.GetBoundingBox().BottomRight
+}
+
+// GetMercatorWidth returns the EPSG:3857 WebMercator width in meters of the bounding box.
+func (g *GeoShapeDocValues) GetMercatorWidth() float64 {
+	bb := g.GetBoundingBox()
+	w, _ := geoMercatorExtentMetersRound61(bb.BottomRight.Lat, bb.TopLeft.Lat, bb.TopLeft.Lon, bb.BottomRight.Lon)
+	return w
+}
+
+// GetMercatorHeight returns the EPSG:3857 WebMercator height in meters of the bounding box.
+func (g *GeoShapeDocValues) GetMercatorHeight() float64 {
+	bb := g.GetBoundingBox()
+	_, h := geoMercatorExtentMetersRound61(bb.BottomRight.Lat, bb.TopLeft.Lat, bb.TopLeft.Lon, bb.BottomRight.Lon)
+	return h
+}
+
+func geoRingShoelaceSignedCentroidRound61(ring [][2]float64) (lat, lon, absArea float64) {
+	if len(ring) == 0 {
+		return 0, 0, 0
+	}
+	if len(ring) < 3 {
+		var sLat, sLon float64
+		for _, p := range ring {
+			sLat += p[0]
+			sLon += p[1]
+		}
+		return sLat / float64(len(ring)), sLon / float64(len(ring)), 0
+	}
+	twiceArea := 0.0
+	cxSum := 0.0
+	cySum := 0.0
+	for i := 0; i < len(ring); i++ {
+		j := (i + 1) % len(ring)
+		x0, y0 := ring[i][1], ring[i][0]
+		x1, y1 := ring[j][1], ring[j][0]
+		cross := x0*y1 - x1*y0
+		twiceArea += cross
+		cxSum += (x0 + x1) * cross
+		cySum += (y0 + y1) * cross
+	}
+	if math.Abs(twiceArea) <= 1e-18 {
+		var sLat, sLon float64
+		for _, p := range ring {
+			sLat += p[0]
+			sLon += p[1]
+		}
+		return sLat / float64(len(ring)), sLon / float64(len(ring)), 0
+	}
+	return cySum / (3.0 * twiceArea), cxSum / (3.0 * twiceArea), math.Abs(twiceArea) / 2.0
+}
+
+func geoPolygonCentroidWeightedRound61(rings [][][2]float64) (lat, lon, area float64) {
+	if len(rings) == 0 {
+		return 0, 0, 0
+	}
+	extLat, extLon, extArea := geoRingShoelaceSignedCentroidRound61(rings[0])
+	if extArea == 0 {
+		return extLat, extLon, 0
+	}
+	sumArea := extArea
+	sumWX := extArea * extLon
+	sumWY := extArea * extLat
+	for h := 1; h < len(rings); h++ {
+		hLat, hLon, hArea := geoRingShoelaceSignedCentroidRound61(rings[h])
+		if hArea > 0 {
+			sumArea -= hArea
+			sumWX -= hArea * hLon
+			sumWY -= hArea * hLat
+		}
+	}
+	if sumArea > 1e-18 {
+		return sumWY / sumArea, sumWX / sumArea, sumArea
+	}
+	return extLat, extLon, extArea
+}
+
+func geoLineCentroidWeightedRound61(pts [][2]float64) (lat, lon, totalLen float64) {
+	if len(pts) == 0 {
+		return 0, 0, 0
+	}
+	if len(pts) == 1 {
+		return pts[0][0], pts[0][1], 0
+	}
+	var sumWX, sumWY float64
+	for i := 0; i < len(pts)-1; i++ {
+		dx := pts[i+1][1] - pts[i][1]
+		dy := pts[i+1][0] - pts[i][0]
+		segLen := math.Hypot(dx, dy)
+		totalLen += segLen
+		sumWX += segLen * ((pts[i][1] + pts[i+1][1]) / 2.0)
+		sumWY += segLen * ((pts[i][0] + pts[i+1][0]) / 2.0)
+	}
+	if totalLen > 1e-18 {
+		return sumWY / totalLen, sumWX / totalLen, totalLen
+	}
+	var sLat, sLon float64
+	for _, p := range pts {
+		sLat += p[0]
+		sLon += p[1]
+	}
+	return sLat / float64(len(pts)), sLon / float64(len(pts)), 0
+}
+
+func (g *GeoShapeDocValues) rawCentroidAndWeightRound61() (lat, lon, weight float64, dim int64) {
+	if g == nil {
+		return 0, 0, 0, 0
+	}
+	switch g.ShapeType {
+	case "POINT":
+		if len(g.Points) > 0 {
+			return g.Points[0][0], g.Points[0][1], 1, 0
+		}
+	case "MULTIPOINT":
+		if len(g.Points) > 0 {
+			var sLat, sLon float64
+			for _, p := range g.Points {
+				sLat += p[0]
+				sLon += p[1]
+			}
+			return sLat / float64(len(g.Points)), sLon / float64(len(g.Points)), float64(len(g.Points)), 0
+		}
+	case "LINESTRING":
+		cLat, cLon, l := geoLineCentroidWeightedRound61(g.Points)
+		return cLat, cLon, math.Max(l, 1e-12), 1
+	case "MULTILINESTRING":
+		var sumLen, sumWX, sumWY float64
+		for _, ln := range g.Lines {
+			cLat, cLon, l := geoLineCentroidWeightedRound61(ln)
+			if l > 0 {
+				sumLen += l
+				sumWX += l * cLon
+				sumWY += l * cLat
+			}
+		}
+		if sumLen > 0 {
+			return sumWY / sumLen, sumWX / sumLen, sumLen, 1
+		}
+		if len(g.Lines) > 0 && len(g.Lines[0]) > 0 {
+			return g.Lines[0][0][0], g.Lines[0][0][1], 1e-12, 1
+		}
+	case "POLYGON":
+		cLat, cLon, a := geoPolygonCentroidWeightedRound61(g.Rings)
+		if a == 0 && len(g.Rings) > 0 && len(g.Rings[0]) > 0 {
+			// Degenerate polygon fallback to line centroid
+			cLat, cLon, _ = geoLineCentroidWeightedRound61(g.Rings[0])
+		}
+		return cLat, cLon, math.Max(a, 1e-12), 2
+	case "MULTIPOLYGON":
+		var sumArea, sumWX, sumWY float64
+		for _, poly := range g.MultiRings {
+			cLat, cLon, a := geoPolygonCentroidWeightedRound61(poly)
+			if a > 0 {
+				sumArea += a
+				sumWX += a * cLon
+				sumWY += a * cLat
+			}
+		}
+		if sumArea > 0 {
+			return sumWY / sumArea, sumWX / sumArea, sumArea, 2
+		}
+		if len(g.MultiRings) > 0 && len(g.MultiRings[0]) > 0 && len(g.MultiRings[0][0]) > 0 {
+			cLat, cLon, _ := geoLineCentroidWeightedRound61(g.MultiRings[0][0])
+			return cLat, cLon, 1e-12, 2
+		}
+	case "ENVELOPE", "BBOX", "CIRCLE":
+		cLat := (g.MinLat + g.MaxLat) / 2.0
+		cLon := (g.MinLon + g.MaxLon) / 2.0
+		area := math.Max(0, (g.MaxLat-g.MinLat)*(g.MaxLon-g.MinLon))
+		return cLat, cLon, math.Max(area, 1e-12), 2
+	}
+	if len(g.Geometries) > 0 {
+		maxDim := g.GetDimensionalType()
+		var sumW, sumWX, sumWY float64
+		for _, ch := range g.Geometries {
+			cLat, cLon, w, cDim := ch.rawCentroidAndWeightRound61()
+			if cDim == maxDim && w > 0 {
+				sumW += w
+				sumWX += w * cLon
+				sumWY += w * cLat
+			}
+		}
+		if sumW > 0 {
+			return sumWY / sumW, sumWX / sumW, sumW, maxDim
+		}
+	}
+	if g.HasBBox {
+		return (g.MinLat + g.MaxLat) / 2.0, (g.MinLon + g.MaxLon) / 2.0, 1, g.DimType
+	}
+	return 0, 0, 0, 0
+}
+
+// GetCentroid returns the centroid GeoPoint (quantized when Quantize is true).
+func (g *GeoShapeDocValues) GetCentroid() *GeoPointVal {
+	lat, lon, _, _ := g.rawCentroidAndWeightRound61()
+	if g != nil && g.Quantize {
+		lat, lon = QuantizeLuceneGeoPoint(lat, lon)
+	}
+	return &GeoPointVal{Lat: lat, Lon: lon}
+}
+
+func pointInRingRayRound61(lat, lon float64, ring [][2]float64) bool {
+	inside := false
+	n := len(ring)
+	for i, j := 0, n-1; i < n; j, i = i, i+1 {
+		yi, xi := ring[i][0], ring[i][1]
+		yj, xj := ring[j][0], ring[j][1]
+		if (yi > lat) != (yj > lat) {
+			xIntersect := (xj-xi)*(lat-yi)/(yj-yi) + xi
+			if lon < xIntersect {
+				inside = !inside
+			}
+		}
+	}
+	return inside
+}
+
+func pointInPolygonRingsRound61(lat, lon float64, rings [][][2]float64) bool {
+	if len(rings) == 0 || !pointInRingRayRound61(lat, lon, rings[0]) {
+		return false
+	}
+	for h := 1; h < len(rings); h++ {
+		if pointInRingRayRound61(lat, lon, rings[h]) {
+			return false
+		}
+	}
+	return true
+}
+
+// GetLabelPosition returns a representative label GeoPoint inside the geometry when applicable.
+func (g *GeoShapeDocValues) GetLabelPosition() *GeoPointVal {
+	if g == nil {
+		return &GeoPointVal{}
+	}
+	lat, lon, _, _ := g.rawCentroidAndWeightRound61()
+	if g.ShapeType == "POLYGON" && len(g.Rings) > 0 && !pointInPolygonRingsRound61(lat, lon, g.Rings) {
+		// Try midpoints of bbox grid to find an interior point for concave polygons
+		bestLat, bestLon := lat, lon
+		found := false
+		for gy := 1; gy <= 8 && !found; gy++ {
+			candLat := g.MinLat + (g.MaxLat-g.MinLat)*float64(gy)/9.0
+			for gx := 1; gx <= 8; gx++ {
+				candLon := g.MinLon + (g.MaxLon-g.MinLon)*float64(gx)/9.0
+				if pointInPolygonRingsRound61(candLat, candLon, g.Rings) {
+					bestLat, bestLon = candLat, candLon
+					found = true
+					break
+				}
+			}
+		}
+		lat, lon = bestLat, bestLon
+	}
+	// If midpoint of LineString exists, ES uses centroid; fallback stays centroid.
+	if g.Quantize {
+		lat, lon = QuantizeLuceneGeoPoint(lat, lon)
+	}
+	return &GeoPointVal{Lat: lat, Lon: lon}
+}
+
+// ToGeoJSONMap converts GeoShapeDocValues to a GeoJSON map representation for runtime emit/source formatting.
+func (g *GeoShapeDocValues) ToGeoJSONMap() map[string]any {
+	if g == nil {
+		return nil
+	}
+	ringToSlice := func(ring [][2]float64) []any {
+		out := make([]any, len(ring))
+		for i, p := range ring {
+			out[i] = []any{p[1], p[0]}
+		}
+		return out
+	}
+	ringsToSlice := func(rings [][][2]float64) []any {
+		out := make([]any, len(rings))
+		for i, r := range rings {
+			out[i] = ringToSlice(r)
+		}
+		return out
+	}
+	switch g.ShapeType {
+	case "POINT":
+		if len(g.Points) > 0 {
+			return map[string]any{"type": "Point", "coordinates": []any{g.Points[0][1], g.Points[0][0]}}
+		}
+	case "MULTIPOINT":
+		return map[string]any{"type": "MultiPoint", "coordinates": ringToSlice(g.Points)}
+	case "LINESTRING":
+		return map[string]any{"type": "LineString", "coordinates": ringToSlice(g.Points)}
+	case "MULTILINESTRING":
+		return map[string]any{"type": "MultiLineString", "coordinates": ringsToSlice(g.Lines)}
+	case "POLYGON":
+		return map[string]any{"type": "Polygon", "coordinates": ringsToSlice(g.Rings)}
+	case "MULTIPOLYGON":
+		polys := make([]any, len(g.MultiRings))
+		for i, p := range g.MultiRings {
+			polys[i] = ringsToSlice(p)
+		}
+		return map[string]any{"type": "MultiPolygon", "coordinates": polys}
+	case "ENVELOPE", "BBOX":
+		return map[string]any{
+			"type":        "Envelope",
+			"coordinates": []any{[]any{g.MinLon, g.MaxLat}, []any{g.MaxLon, g.MinLat}},
+		}
+	case "GEOMETRYCOLLECTION":
+		ch := make([]any, 0, len(g.Geometries))
+		for _, sub := range g.Geometries {
+			if m := sub.ToGeoJSONMap(); m != nil {
+				ch = append(ch, m)
+			}
+		}
+		return map[string]any{"type": "GeometryCollection", "geometries": ch}
+	}
+	if m, ok := g.Raw.(map[string]any); ok {
+		return m
+	}
+	return map[string]any{
+		"type":        "Envelope",
+		"coordinates": []any{[]any{g.MinLon, g.MaxLat}, []any{g.MaxLon, g.MinLat}},
+	}
+}
+
+func (g *GeoShapeDocValues) updateBBoxFromPoint(lat, lon float64) {
+	if !g.HasBBox {
+		g.HasBBox = true
+		g.MinLat, g.MaxLat = lat, lat
+		g.MinLon, g.MaxLon = lon, lon
+		return
+	}
+	if lat < g.MinLat {
+		g.MinLat = lat
+	}
+	if lat > g.MaxLat {
+		g.MaxLat = lat
+	}
+	if lon < g.MinLon {
+		g.MinLon = lon
+	}
+	if lon > g.MaxLon {
+		g.MaxLon = lon
+	}
+}
+
+func (g *GeoShapeDocValues) finalizeBounds() {
+	g.HasBBox = false
+	for _, p := range g.Points {
+		g.updateBBoxFromPoint(p[0], p[1])
+	}
+	for _, ln := range g.Lines {
+		for _, p := range ln {
+			g.updateBBoxFromPoint(p[0], p[1])
+		}
+	}
+	for _, ring := range g.Rings {
+		for _, p := range ring {
+			g.updateBBoxFromPoint(p[0], p[1])
+		}
+	}
+	for _, poly := range g.MultiRings {
+		for _, ring := range poly {
+			for _, p := range ring {
+				g.updateBBoxFromPoint(p[0], p[1])
+			}
+		}
+	}
+	for _, ch := range g.Geometries {
+		if ch != nil && ch.HasBBox {
+			g.updateBBoxFromPoint(ch.MinLat, ch.MinLon)
+			g.updateBBoxFromPoint(ch.MaxLat, ch.MaxLon)
+		}
+	}
+}
+
+// NewGeoShapeDocValuesCollection aggregates multiple GeoShapeDocValues shapes into a single GeoShapeDocValues collection.
+func NewGeoShapeDocValuesCollection(shapes []*GeoShapeDocValues, quantize bool) *GeoShapeDocValues {
+	if len(shapes) == 1 && shapes[0] != nil {
+		return shapes[0]
+	}
+	gs := &GeoShapeDocValues{
+		ShapeType:  "GEOMETRYCOLLECTION",
+		Geometries: make([]*GeoShapeDocValues, 0, len(shapes)),
+		Quantize:   quantize,
+	}
+	for _, s := range shapes {
+		if s == nil {
+			continue
+		}
+		gs.Geometries = append(gs.Geometries, s)
+		if s.DimType > gs.DimType {
+			gs.DimType = s.DimType
+		}
+	}
+	gs.finalizeBounds()
+	return gs
+}
+
+func parseGeoCoordPairRound61(v any) (lat, lon float64, ok bool) {
+	switch tv := v.(type) {
+	case []any:
+		if len(tv) < 2 {
+			return 0, 0, false
+		}
+		x, okX := toFloat64WithRawPainless(tv[0])
+		y, okY := toFloat64WithRawPainless(tv[1])
+		if !okX || !okY || math.IsNaN(x) || math.IsNaN(y) || math.IsInf(x, 0) || math.IsInf(y, 0) {
+			return 0, 0, false
+		}
+		return y, x, true
+	case []float64:
+		if len(tv) < 2 {
+			return 0, 0, false
+		}
+		return tv[1], tv[0], true
+	case map[string]any:
+		if gp, gOk := parseGeoPointValRound60(tv); gOk {
+			return gp.Lat, gp.Lon, true
+		}
+	}
+	return 0, 0, false
+}
+
+func parseGeoCoordArray1DRound61(v any) ([][2]float64, bool) {
+	arr, ok := v.([]any)
+	if !ok {
+		return nil, false
+	}
+	pts := make([][2]float64, 0, len(arr))
+	for _, item := range arr {
+		lat, lon, pOk := parseGeoCoordPairRound61(item)
+		if !pOk {
+			return nil, false
+		}
+		pts = append(pts, [2]float64{lat, lon})
+	}
+	return pts, len(pts) > 0
+}
+
+func parseGeoCoordRingsRound61(v any) ([][][2]float64, bool) {
+	arr, ok := v.([]any)
+	if !ok {
+		return nil, false
+	}
+	rings := make([][][2]float64, 0, len(arr))
+	for _, item := range arr {
+		pts, pOk := parseGeoCoordArray1DRound61(item)
+		if !pOk {
+			return nil, false
+		}
+		rings = append(rings, pts)
+	}
+	return rings, len(rings) > 0
+}
+
+func parseWKTParenthesizedGroupsRound61(body string) []string {
+	var groups []string
+	depth := 0
+	start := -1
+	for i := 0; i < len(body); i++ {
+		switch body[i] {
+		case '(':
+			if depth == 0 {
+				start = i + 1
+			}
+			depth++
+		case ')':
+			depth--
+			if depth == 0 && start >= 0 {
+				groups = append(groups, strings.TrimSpace(body[start:i]))
+				start = -1
+			}
+		}
+	}
+	return groups
+}
+
+func parseWKTPointSeqRound61(seq string) ([][2]float64, error) {
+	parts := strings.Split(seq, ",")
+	pts := make([][2]float64, 0, len(parts))
+	for _, part := range parts {
+		fields := strings.Fields(strings.TrimSpace(part))
+		if len(fields) < 2 {
+			return nil, &painlessExceptionError{exType: "IllegalArgumentException", message: fmt.Sprintf("invalid WKT coordinate %q", part)}
+		}
+		lon, errX := strconv.ParseFloat(fields[0], 64)
+		lat, errY := strconv.ParseFloat(fields[1], 64)
+		if errX != nil || errY != nil || math.IsNaN(lat) || math.IsNaN(lon) {
+			return nil, &painlessExceptionError{exType: "IllegalArgumentException", message: fmt.Sprintf("invalid WKT numeric coordinate %q", part)}
+		}
+		pts = append(pts, [2]float64{lat, lon})
+	}
+	if len(pts) == 0 {
+		return nil, &painlessExceptionError{exType: "IllegalArgumentException", message: "empty WKT coordinate list"}
+	}
+	return pts, nil
+}
+
+func splitTopLevelWKTItemsRound61(body string) []string {
+	var items []string
+	depth := 0
+	start := 0
+	for i := 0; i < len(body); i++ {
+		switch body[i] {
+		case '(':
+			depth++
+		case ')':
+			if depth > 0 {
+				depth--
+			}
+		case ',':
+			if depth == 0 {
+				items = append(items, strings.TrimSpace(body[start:i]))
+				start = i + 1
+			}
+		}
+	}
+	if tail := strings.TrimSpace(body[start:]); tail != "" {
+		items = append(items, tail)
+	}
+	return items
+}
+
+func parseWKTGeoShapeRound61(wkt string, quantize bool) (*GeoShapeDocValues, error) {
+	s := strings.TrimSpace(wkt)
+	if s == "" {
+		return nil, &painlessExceptionError{exType: "IllegalArgumentException", message: "empty WKT geo_shape"}
+	}
+	if strings.EqualFold(s, "EMPTY") {
+		return &GeoShapeDocValues{ShapeType: "GEOMETRYCOLLECTION", Quantize: quantize}, nil
+	}
+	openIdx := strings.IndexByte(s, '(')
+	if openIdx < 0 {
+		upper := strings.ToUpper(s)
+		if strings.HasSuffix(upper, "EMPTY") {
+			typ := strings.TrimSpace(strings.TrimSuffix(upper, "EMPTY"))
+			dim := int64(0)
+			switch typ {
+			case "LINESTRING", "MULTILINESTRING":
+				dim = 1
+			case "POLYGON", "MULTIPOLYGON", "ENVELOPE", "BBOX":
+				dim = 2
+			}
+			return &GeoShapeDocValues{ShapeType: typ, DimType: dim, Quantize: quantize}, nil
+		}
+		return nil, &painlessExceptionError{exType: "IllegalArgumentException", message: fmt.Sprintf("invalid WKT geo_shape: %q", wkt)}
+	}
+	if !strings.HasSuffix(s, ")") {
+		return nil, &painlessExceptionError{exType: "IllegalArgumentException", message: fmt.Sprintf("unterminated WKT geo_shape: %q", wkt)}
+	}
+	typ := strings.ToUpper(strings.TrimSpace(s[:openIdx]))
+	// Strip optional Z / M / ZM suffix tokens (e.g. "POINT Z")
+	if fields := strings.Fields(typ); len(fields) > 1 {
+		typ = fields[0]
+	}
+	inner := strings.TrimSpace(s[openIdx+1 : len(s)-1])
+	switch typ {
+	case "POINT":
+		pts, err := parseWKTPointSeqRound61(inner)
+		if err != nil {
+			return nil, err
+		}
+		gs := &GeoShapeDocValues{ShapeType: "POINT", Points: pts[:1], DimType: 0, Quantize: quantize, Raw: wkt}
+		gs.finalizeBounds()
+		return gs, nil
+	case "MULTIPOINT":
+		groups := parseWKTParenthesizedGroupsRound61(inner)
+		var pts [][2]float64
+		if len(groups) > 0 {
+			for _, g := range groups {
+				sub, err := parseWKTPointSeqRound61(g)
+				if err != nil {
+					return nil, err
+				}
+				pts = append(pts, sub...)
+			}
+		} else {
+			sub, err := parseWKTPointSeqRound61(inner)
+			if err != nil {
+				return nil, err
+			}
+			pts = sub
+		}
+		gs := &GeoShapeDocValues{ShapeType: "MULTIPOINT", Points: pts, DimType: 0, Quantize: quantize, Raw: wkt}
+		gs.finalizeBounds()
+		return gs, nil
+	case "LINESTRING":
+		pts, err := parseWKTPointSeqRound61(inner)
+		if err != nil {
+			return nil, err
+		}
+		gs := &GeoShapeDocValues{ShapeType: "LINESTRING", Points: pts, DimType: 1, Quantize: quantize, Raw: wkt}
+		gs.finalizeBounds()
+		return gs, nil
+	case "MULTILINESTRING":
+		groups := parseWKTParenthesizedGroupsRound61(inner)
+		if len(groups) == 0 {
+			return nil, &painlessExceptionError{exType: "IllegalArgumentException", message: fmt.Sprintf("invalid MULTILINESTRING WKT: %q", wkt)}
+		}
+		lines := make([][][2]float64, 0, len(groups))
+		for _, g := range groups {
+			pts, err := parseWKTPointSeqRound61(g)
+			if err != nil {
+				return nil, err
+			}
+			lines = append(lines, pts)
+		}
+		gs := &GeoShapeDocValues{ShapeType: "MULTILINESTRING", Lines: lines, DimType: 1, Quantize: quantize, Raw: wkt}
+		gs.finalizeBounds()
+		return gs, nil
+	case "POLYGON":
+		groups := parseWKTParenthesizedGroupsRound61(inner)
+		if len(groups) == 0 {
+			return nil, &painlessExceptionError{exType: "IllegalArgumentException", message: fmt.Sprintf("invalid POLYGON WKT: %q", wkt)}
+		}
+		rings := make([][][2]float64, 0, len(groups))
+		for _, g := range groups {
+			pts, err := parseWKTPointSeqRound61(g)
+			if err != nil {
+				return nil, err
+			}
+			rings = append(rings, pts)
+		}
+		gs := &GeoShapeDocValues{ShapeType: "POLYGON", Rings: rings, DimType: 2, Quantize: quantize, Raw: wkt}
+		gs.finalizeBounds()
+		return gs, nil
+	case "MULTIPOLYGON":
+		polyGroups := parseWKTParenthesizedGroupsRound61(inner)
+		if len(polyGroups) == 0 {
+			return nil, &painlessExceptionError{exType: "IllegalArgumentException", message: fmt.Sprintf("invalid MULTIPOLYGON WKT: %q", wkt)}
+		}
+		multi := make([][][][2]float64, 0, len(polyGroups))
+		for _, pg := range polyGroups {
+			ringGroups := parseWKTParenthesizedGroupsRound61(pg)
+			if len(ringGroups) == 0 {
+				return nil, &painlessExceptionError{exType: "IllegalArgumentException", message: fmt.Sprintf("invalid polygon inside MULTIPOLYGON: %q", pg)}
+			}
+			rings := make([][][2]float64, 0, len(ringGroups))
+			for _, rg := range ringGroups {
+				pts, err := parseWKTPointSeqRound61(rg)
+				if err != nil {
+					return nil, err
+				}
+				rings = append(rings, pts)
+			}
+			multi = append(multi, rings)
+		}
+		gs := &GeoShapeDocValues{ShapeType: "MULTIPOLYGON", MultiRings: multi, DimType: 2, Quantize: quantize, Raw: wkt}
+		gs.finalizeBounds()
+		return gs, nil
+	case "ENVELOPE", "BBOX":
+		parts := strings.Split(inner, ",")
+		if len(parts) != 4 {
+			return nil, &painlessExceptionError{exType: "IllegalArgumentException", message: fmt.Sprintf("WKT %s requires 4 coordinates (minLon, maxLon, maxLat, minLat)", typ)}
+		}
+		var coords [4]float64
+		for i, p := range parts {
+			v, err := strconv.ParseFloat(strings.TrimSpace(p), 64)
+			if err != nil || math.IsNaN(v) {
+				return nil, &painlessExceptionError{exType: "IllegalArgumentException", message: fmt.Sprintf("invalid coordinate %q in %s", p, typ)}
+			}
+			coords[i] = v
+		}
+		minLon, maxLon := math.Min(coords[0], coords[1]), math.Max(coords[0], coords[1])
+		minLat, maxLat := math.Min(coords[2], coords[3]), math.Max(coords[2], coords[3])
+		gs := &GeoShapeDocValues{
+			ShapeType: typ,
+			HasBBox:   true,
+			MinLat:    minLat,
+			MaxLat:    maxLat,
+			MinLon:    minLon,
+			MaxLon:    maxLon,
+			DimType:   2,
+			Quantize:  quantize,
+			Raw:       wkt,
+		}
+		return gs, nil
+	case "GEOMETRYCOLLECTION":
+		items := splitTopLevelWKTItemsRound61(inner)
+		children := make([]*GeoShapeDocValues, 0, len(items))
+		var maxDim int64
+		for _, item := range items {
+			ch, err := parseWKTGeoShapeRound61(item, quantize)
+			if err != nil {
+				return nil, err
+			}
+			children = append(children, ch)
+			if d := ch.GetDimensionalType(); d > maxDim {
+				maxDim = d
+			}
+		}
+		gs := &GeoShapeDocValues{
+			ShapeType:  "GEOMETRYCOLLECTION",
+			Geometries: children,
+			DimType:    maxDim,
+			Quantize:   quantize,
+			Raw:        wkt,
+		}
+		gs.finalizeBounds()
+		return gs, nil
+	default:
+		return nil, &painlessExceptionError{exType: "IllegalArgumentException", message: fmt.Sprintf("unsupported WKT geometry type [%s]", typ)}
+	}
+}
+
+func parseRadiusMetersRound61(raw any) (float64, bool) {
+	switch tv := raw.(type) {
+	case float64:
+		return tv, !math.IsNaN(tv) && tv >= 0
+	case int64:
+		return float64(tv), tv >= 0
+	case int:
+		return float64(tv), tv >= 0
+	case json.Number:
+		f, err := tv.Float64()
+		return f, err == nil && f >= 0
+	case string:
+		s := strings.ToLower(strings.TrimSpace(tv))
+		mult := 1.0
+		switch {
+		case strings.HasSuffix(s, "km"):
+			mult = 1000.0
+			s = strings.TrimSpace(strings.TrimSuffix(s, "km"))
+		case strings.HasSuffix(s, "mi"):
+			mult = 1609.344
+			s = strings.TrimSpace(strings.TrimSuffix(s, "mi"))
+		case strings.HasSuffix(s, "m"):
+			s = strings.TrimSpace(strings.TrimSuffix(s, "m"))
+		}
+		f, err := strconv.ParseFloat(s, 64)
+		return f * mult, err == nil && f >= 0
+	}
+	return 0, false
+}
+
+// ParseGeoShapeDocValues parses a GeoJSON map, WKT string, GeoPointVal, GeoBoundingBoxVal,
+// or GeoShapeDocValues into a normalized, BKD-quantized *GeoShapeDocValues.
+func ParseGeoShapeDocValues(raw any) (*GeoShapeDocValues, error) {
+	return ParseGeoShapeDocValuesWithOpts(raw, true)
+}
+
+// ParseGeoShapeDocValuesWithOpts parses a geo_shape value with configurable BKD quantization.
+func ParseGeoShapeDocValuesWithOpts(raw any, quantize bool) (*GeoShapeDocValues, error) {
+	if raw == nil {
+		return nil, &painlessExceptionError{exType: "IllegalArgumentException", message: "null geo_shape"}
+	}
+	switch tv := raw.(type) {
+	case *GeoShapeDocValues:
+		if tv == nil {
+			return nil, &painlessExceptionError{exType: "IllegalArgumentException", message: "null geo_shape"}
+		}
+		return tv, nil
+	case *GeoPointVal:
+		if tv == nil {
+			return nil, &painlessExceptionError{exType: "IllegalArgumentException", message: "null geo_point"}
+		}
+		gs := &GeoShapeDocValues{ShapeType: "POINT", Points: [][2]float64{{tv.Lat, tv.Lon}}, DimType: 0, Quantize: quantize, Raw: tv}
+		gs.finalizeBounds()
+		return gs, nil
+	case *GeoBoundingBoxVal:
+		if tv == nil || tv.TopLeft == nil || tv.BottomRight == nil {
+			return nil, &painlessExceptionError{exType: "IllegalArgumentException", message: "invalid GeoBoundingBox"}
+		}
+		gs := &GeoShapeDocValues{
+			ShapeType: "ENVELOPE",
+			HasBBox:   true,
+			MinLat:    tv.GetMinLat(),
+			MaxLat:    tv.GetMaxLat(),
+			MinLon:    tv.GetMinLon(),
+			MaxLon:    tv.GetMaxLon(),
+			DimType:   2,
+			Quantize:  quantize,
+			Raw:       tv,
+		}
+		return gs, nil
+	case string:
+		return parseWKTGeoShapeRound61(tv, quantize)
+	case []any:
+		if lat, lon, ok := parseGeoCoordPairRound61(tv); ok {
+			gs := &GeoShapeDocValues{ShapeType: "POINT", Points: [][2]float64{{lat, lon}}, DimType: 0, Quantize: quantize, Raw: tv}
+			gs.finalizeBounds()
+			return gs, nil
+		}
+		shapes := make([]*GeoShapeDocValues, 0, len(tv))
+		for _, item := range tv {
+			ch, err := ParseGeoShapeDocValuesWithOpts(item, quantize)
+			if err != nil {
+				return nil, err
+			}
+			shapes = append(shapes, ch)
+		}
+		if len(shapes) == 0 {
+			return nil, &painlessExceptionError{exType: "IllegalArgumentException", message: "empty geo_shape array"}
+		}
+		return NewGeoShapeDocValuesCollection(shapes, quantize), nil
+	case map[string]any:
+		rawType, _ := tv["type"].(string)
+		typ := strings.ToUpper(strings.TrimSpace(rawType))
+		if typ == "" {
+			if gp, ok := parseGeoPointValRound60(tv); ok {
+				gs := &GeoShapeDocValues{ShapeType: "POINT", Points: [][2]float64{{gp.Lat, gp.Lon}}, DimType: 0, Quantize: quantize, Raw: tv}
+				gs.finalizeBounds()
+				return gs, nil
+			}
+			return nil, &painlessExceptionError{exType: "IllegalArgumentException", message: fmt.Sprintf("missing GeoJSON type in %v", tv)}
+		}
+		switch typ {
+		case "POINT":
+			lat, lon, ok := parseGeoCoordPairRound61(tv["coordinates"])
+			if !ok {
+				return nil, &painlessExceptionError{exType: "IllegalArgumentException", message: "invalid GeoJSON Point coordinates"}
+			}
+			gs := &GeoShapeDocValues{ShapeType: "POINT", Points: [][2]float64{{lat, lon}}, DimType: 0, Quantize: quantize, Raw: tv}
+			gs.finalizeBounds()
+			return gs, nil
+		case "MULTIPOINT":
+			pts, ok := parseGeoCoordArray1DRound61(tv["coordinates"])
+			if !ok {
+				return nil, &painlessExceptionError{exType: "IllegalArgumentException", message: "invalid GeoJSON MultiPoint coordinates"}
+			}
+			gs := &GeoShapeDocValues{ShapeType: "MULTIPOINT", Points: pts, DimType: 0, Quantize: quantize, Raw: tv}
+			gs.finalizeBounds()
+			return gs, nil
+		case "LINESTRING":
+			pts, ok := parseGeoCoordArray1DRound61(tv["coordinates"])
+			if !ok {
+				return nil, &painlessExceptionError{exType: "IllegalArgumentException", message: "invalid GeoJSON LineString coordinates"}
+			}
+			gs := &GeoShapeDocValues{ShapeType: "LINESTRING", Points: pts, DimType: 1, Quantize: quantize, Raw: tv}
+			gs.finalizeBounds()
+			return gs, nil
+		case "MULTILINESTRING":
+			lines, ok := parseGeoCoordRingsRound61(tv["coordinates"])
+			if !ok {
+				return nil, &painlessExceptionError{exType: "IllegalArgumentException", message: "invalid GeoJSON MultiLineString coordinates"}
+			}
+			gs := &GeoShapeDocValues{ShapeType: "MULTILINESTRING", Lines: lines, DimType: 1, Quantize: quantize, Raw: tv}
+			gs.finalizeBounds()
+			return gs, nil
+		case "POLYGON":
+			rings, ok := parseGeoCoordRingsRound61(tv["coordinates"])
+			if !ok {
+				return nil, &painlessExceptionError{exType: "IllegalArgumentException", message: "invalid GeoJSON Polygon coordinates"}
+			}
+			gs := &GeoShapeDocValues{ShapeType: "POLYGON", Rings: rings, DimType: 2, Quantize: quantize, Raw: tv}
+			gs.finalizeBounds()
+			return gs, nil
+		case "MULTIPOLYGON":
+			arr, ok := tv["coordinates"].([]any)
+			if !ok || len(arr) == 0 {
+				return nil, &painlessExceptionError{exType: "IllegalArgumentException", message: "invalid GeoJSON MultiPolygon coordinates"}
+			}
+			multi := make([][][][2]float64, 0, len(arr))
+			for _, item := range arr {
+				rings, rOk := parseGeoCoordRingsRound61(item)
+				if !rOk {
+					return nil, &painlessExceptionError{exType: "IllegalArgumentException", message: "invalid polygon in GeoJSON MultiPolygon"}
+				}
+				multi = append(multi, rings)
+			}
+			gs := &GeoShapeDocValues{ShapeType: "MULTIPOLYGON", MultiRings: multi, DimType: 2, Quantize: quantize, Raw: tv}
+			gs.finalizeBounds()
+			return gs, nil
+		case "ENVELOPE", "BBOX":
+			pts, ok := parseGeoCoordArray1DRound61(tv["coordinates"])
+			if !ok || len(pts) != 2 {
+				return nil, &painlessExceptionError{exType: "IllegalArgumentException", message: "GeoJSON Envelope requires 2 corner coordinates"}
+			}
+			gs := &GeoShapeDocValues{
+				ShapeType: typ,
+				HasBBox:   true,
+				MinLat:    math.Min(pts[0][0], pts[1][0]),
+				MaxLat:    math.Max(pts[0][0], pts[1][0]),
+				MinLon:    math.Min(pts[0][1], pts[1][1]),
+				MaxLon:    math.Max(pts[0][1], pts[1][1]),
+				DimType:   2,
+				Quantize:  quantize,
+				Raw:       tv,
+			}
+			return gs, nil
+		case "CIRCLE":
+			lat, lon, ok := parseGeoCoordPairRound61(tv["coordinates"])
+			if !ok {
+				return nil, &painlessExceptionError{exType: "IllegalArgumentException", message: "invalid GeoJSON Circle coordinates"}
+			}
+			radMeters, rOk := parseRadiusMetersRound61(tv["radius"])
+			if !rOk {
+				radMeters = 0
+			}
+			dLat := radMeters / 111319.49079327358
+			cosLat := math.Cos(lat * math.Pi / 180.0)
+			if math.Abs(cosLat) < 1e-6 {
+				cosLat = 1e-6
+			}
+			dLon := dLat / math.Abs(cosLat)
+			gs := &GeoShapeDocValues{
+				ShapeType: "CIRCLE",
+				HasBBox:   true,
+				MinLat:    math.Max(-90, lat-dLat),
+				MaxLat:    math.Min(90, lat+dLat),
+				MinLon:    math.Max(-180, lon-dLon),
+				MaxLon:    math.Min(180, lon+dLon),
+				DimType:   2,
+				Quantize:  quantize,
+				Raw:       tv,
+			}
+			return gs, nil
+		case "GEOMETRYCOLLECTION":
+			rawGeoms, ok := tv["geometries"].([]any)
+			if !ok {
+				return nil, &painlessExceptionError{exType: "IllegalArgumentException", message: "GeoJSON GeometryCollection requires geometries array"}
+			}
+			children := make([]*GeoShapeDocValues, 0, len(rawGeoms))
+			var maxDim int64
+			for _, rg := range rawGeoms {
+				ch, err := ParseGeoShapeDocValuesWithOpts(rg, quantize)
+				if err != nil {
+					return nil, err
+				}
+				children = append(children, ch)
+				if d := ch.GetDimensionalType(); d > maxDim {
+					maxDim = d
+				}
+			}
+			gs := &GeoShapeDocValues{
+				ShapeType:  "GEOMETRYCOLLECTION",
+				Geometries: children,
+				DimType:    maxDim,
+				Quantize:   quantize,
+				Raw:        tv,
+			}
+			gs.finalizeBounds()
+			return gs, nil
+		default:
+			return nil, &painlessExceptionError{exType: "IllegalArgumentException", message: fmt.Sprintf("unsupported GeoJSON shape type [%s]", rawType)}
+		}
+	default:
+		return nil, &painlessExceptionError{exType: "IllegalArgumentException", message: fmt.Sprintf("cannot parse %T as geo_shape", raw)}
+	}
+}
+
+func evalGeoShapeMethodRound61(gs *GeoShapeDocValues, method string) (any, bool, error) {
+	if gs == nil {
+		return nil, false, nil
+	}
+	switch method {
+	case "size", "length":
+		return gs.Size(), true, nil
+	case "isEmpty":
+		return gs.IsEmpty(), true, nil
+	case "get":
+		g0, err := gs.Get(0)
+		return g0, true, err
+	case "getCentroid":
+		if gs.IsEmpty() {
+			return nil, true, &painlessExceptionError{exType: "IllegalStateException", message: "A document doesn't have a value for a geo_shape field!"}
+		}
+		return gs.GetCentroid(), true, nil
+	case "getBoundingBox":
+		if gs.IsEmpty() {
+			return nil, true, &painlessExceptionError{exType: "IllegalStateException", message: "A document doesn't have a value for a geo_shape field!"}
+		}
+		return gs.GetBoundingBox(), true, nil
+	case "topLeft", "getTopLeft":
+		if gs.IsEmpty() {
+			return nil, true, &painlessExceptionError{exType: "IllegalStateException", message: "A document doesn't have a value for a geo_shape field!"}
+		}
+		return gs.TopLeft(), true, nil
+	case "bottomRight", "getBottomRight":
+		if gs.IsEmpty() {
+			return nil, true, &painlessExceptionError{exType: "IllegalStateException", message: "A document doesn't have a value for a geo_shape field!"}
+		}
+		return gs.BottomRight(), true, nil
+	case "minLat", "getMinLat":
+		return gs.GetBoundingBox().GetMinLat(), true, nil
+	case "maxLat", "getMaxLat":
+		return gs.GetBoundingBox().GetMaxLat(), true, nil
+	case "minLon", "getMinLon":
+		return gs.GetBoundingBox().GetMinLon(), true, nil
+	case "maxLon", "getMaxLon":
+		return gs.GetBoundingBox().GetMaxLon(), true, nil
+	case "getLabelPosition":
+		if gs.IsEmpty() {
+			return nil, true, &painlessExceptionError{exType: "IllegalStateException", message: "A document doesn't have a value for a geo_shape field!"}
+		}
+		return gs.GetLabelPosition(), true, nil
+	case "getDimensionalType":
+		if gs.IsEmpty() {
+			return nil, true, &painlessExceptionError{exType: "IllegalStateException", message: "A document doesn't have a value for a geo_shape field!"}
+		}
+		return gs.GetDimensionalType(), true, nil
+	case "getShapeType":
+		return gs.GetShapeType(), true, nil
+	case "getMercatorWidth":
+		if gs.IsEmpty() {
+			return nil, true, &painlessExceptionError{exType: "IllegalStateException", message: "A document doesn't have a value for a geo_shape field!"}
+		}
+		return gs.GetMercatorWidth(), true, nil
+	case "getMercatorHeight":
+		if gs.IsEmpty() {
+			return nil, true, &painlessExceptionError{exType: "IllegalStateException", message: "A document doesn't have a value for a geo_shape field!"}
+		}
+		return gs.GetMercatorHeight(), true, nil
+	case "toString":
+		return gs.String(), true, nil
+	}
+	return nil, false, nil
 }
 
 func evalDocFieldSliceGeoMethodRound61(ds []any, method string) (any, bool, error) {
 	switch method {
-	case "getCentroid", "getBoundingBox", "getLabelPosition", "getDimensionalType", "getMercatorWidth", "getMercatorHeight":
+	case "getCentroid", "getBoundingBox", "getLabelPosition", "getDimensionalType", "getShapeType", "getMercatorWidth", "getMercatorHeight", "topLeft", "getTopLeft", "bottomRight", "getBottomRight":
 	default:
 		return nil, false, nil
 	}
@@ -770,6 +1971,16 @@ func evalDocFieldSliceGeoMethodRound61(ds []any, method string) (any, bool, erro
 			exType:  "IllegalStateException",
 			message: "A document doesn't have a value for a geo_point field!",
 		}
+	}
+	var shapes []*GeoShapeDocValues
+	for _, item := range ds {
+		if gs, isGS := item.(*GeoShapeDocValues); isGS && gs != nil {
+			shapes = append(shapes, gs)
+		}
+	}
+	if len(shapes) > 0 {
+		combined := NewGeoShapeDocValuesCollection(shapes, shapes[0].Quantize)
+		return evalGeoShapeMethodRound61(combined, method)
 	}
 	pts := make([]*GeoPointVal, 0, len(ds))
 	for _, item := range ds {
@@ -791,14 +2002,179 @@ func evalDocFieldSliceGeoMethodRound61(ds []any, method string) (any, bool, erro
 		return centroid, true, nil
 	case "getBoundingBox":
 		return &GeoBoundingBoxVal{TopLeft: tl, BottomRight: br}, true, nil
+	case "topLeft", "getTopLeft":
+		return tl, true, nil
+	case "bottomRight", "getBottomRight":
+		return br, true, nil
 	case "getDimensionalType":
 		return int64(0), true, nil
+	case "getShapeType":
+		return "POINT", true, nil
 	case "getMercatorWidth":
 		return mW, true, nil
 	case "getMercatorHeight":
 		return mH, true, nil
 	}
 	return nil, false, nil
+}
+
+// ComputePainlessMurmur3Hash computes Elasticsearch's 64-bit Murmur3 hash
+// (lower 64 bits h1 of MurmurHash3_x64_128 with seed=0) as a signed int64,
+// matching Elasticsearch's `mapper-murmur3` `Murmur3FieldMapper`.
+func ComputePainlessMurmur3Hash(s string) int64 {
+	const (
+		c1 uint64 = 0x87c37b91114253d5
+		c2 uint64 = 0x4cf5ad432745937f
+	)
+	data := []byte(s)
+	nblocks := len(data) / 16
+	var h1, h2 uint64
+
+	for i := 0; i < nblocks; i++ {
+		off := i * 16
+		k1 := binary.LittleEndian.Uint64(data[off : off+8])
+		k2 := binary.LittleEndian.Uint64(data[off+8 : off+16])
+
+		k1 *= c1
+		k1 = bits.RotateLeft64(k1, 31)
+		k1 *= c2
+		h1 ^= k1
+
+		h1 = bits.RotateLeft64(h1, 27)
+		h1 += h2
+		h1 = h1*5 + 0x52dce729
+
+		k2 *= c2
+		k2 = bits.RotateLeft64(k2, 33)
+		k2 *= c1
+		h2 ^= k2
+
+		h2 = bits.RotateLeft64(h2, 31)
+		h2 += h1
+		h2 = h2*5 + 0x38495ab5
+	}
+
+	tail := data[nblocks*16:]
+	var k1, k2 uint64
+	switch len(tail) {
+	case 15:
+		k2 ^= uint64(tail[14]) << 48
+		fallthrough
+	case 14:
+		k2 ^= uint64(tail[13]) << 40
+		fallthrough
+	case 13:
+		k2 ^= uint64(tail[12]) << 32
+		fallthrough
+	case 12:
+		k2 ^= uint64(tail[11]) << 24
+		fallthrough
+	case 11:
+		k2 ^= uint64(tail[10]) << 16
+		fallthrough
+	case 10:
+		k2 ^= uint64(tail[9]) << 8
+		fallthrough
+	case 9:
+		k2 ^= uint64(tail[8])
+		k2 *= c2
+		k2 = bits.RotateLeft64(k2, 33)
+		k2 *= c1
+		h2 ^= k2
+		fallthrough
+	case 8:
+		k1 ^= uint64(tail[7]) << 56
+		fallthrough
+	case 7:
+		k1 ^= uint64(tail[6]) << 48
+		fallthrough
+	case 6:
+		k1 ^= uint64(tail[5]) << 40
+		fallthrough
+	case 5:
+		k1 ^= uint64(tail[4]) << 32
+		fallthrough
+	case 4:
+		k1 ^= uint64(tail[3]) << 24
+		fallthrough
+	case 3:
+		k1 ^= uint64(tail[2]) << 16
+		fallthrough
+	case 2:
+		k1 ^= uint64(tail[1]) << 8
+		fallthrough
+	case 1:
+		k1 ^= uint64(tail[0])
+		k1 *= c1
+		k1 = bits.RotateLeft64(k1, 31)
+		k1 *= c2
+		h1 ^= k1
+	}
+
+	h1 ^= uint64(len(data))
+	h2 ^= uint64(len(data))
+	h1 += h2
+	h2 += h1
+
+	fmix64 := func(k uint64) uint64 {
+		k ^= k >> 33
+		k *= 0xff51afd7ed558ccd
+		k ^= k >> 33
+		k *= 0xc4ceb9fe1a85ec53
+		k ^= k >> 33
+		return k
+	}
+	h1 = fmix64(h1)
+	h2 = fmix64(h2)
+	h1 += h2
+	return int64(h1) // #nosec G115 -- intentional signed 64-bit murmur3 doc value representation
+}
+
+func normalizeMurmur3DocValuesRound61(raw any, forceHash bool) []any {
+	items := flattenRawFieldItemsRound60(raw, false)
+	if len(items) == 0 {
+		return []any{}
+	}
+	hashes := make([]int64, 0, len(items))
+	for _, it := range items {
+		if it == nil {
+			continue
+		}
+		if _, isMap := it.(map[string]any); isMap {
+			continue
+		}
+		if !forceHash {
+			switch tv := it.(type) {
+			case int64:
+				hashes = append(hashes, tv)
+				continue
+			case int:
+				hashes = append(hashes, int64(tv))
+				continue
+			case int32:
+				hashes = append(hashes, int64(tv))
+				continue
+			case uint64:
+				hashes = append(hashes, int64(tv)) // #nosec G115 -- signed hash value
+				continue
+			case json.Number:
+				if iv, err := tv.Int64(); err == nil {
+					hashes = append(hashes, iv)
+					continue
+				}
+			}
+		}
+		hashes = append(hashes, ComputePainlessMurmur3Hash(fmt.Sprintf("%v", it)))
+	}
+	sort.Slice(hashes, func(i, j int) bool { return hashes[i] < hashes[j] })
+	out := make([]any, 0, len(hashes))
+	for i, h := range hashes {
+		if i > 0 && hashes[i-1] == h {
+			continue
+		}
+		out = append(out, h)
+	}
+	return out
 }
 
 // IPAddressVal models Elasticsearch's IPAddress wrapper in Painless (`new IPAddress(...)` and `field('ip')`).

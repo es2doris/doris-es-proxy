@@ -22,9 +22,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"net/netip"
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/es2doris/doris-es-proxy/pkg/esast"
 )
@@ -938,8 +940,8 @@ func reconstructSyntheticValue(
 			return nil, false
 		}
 		if b.HasConstantValue && b.ConstantValue != nil {
-			if s, isStr := b.ConstantValue.(string); isStr && b.LowercaseNormalizer {
-				return strings.ToLower(s), true
+			if s, isStr := b.ConstantValue.(string); isStr && (b.NormalizerName != "" || b.LowercaseNormalizer) {
+				return normalizeValueForBinding(s, b, idxSchema), true
 			}
 			return b.ConstantValue, true
 		}
@@ -963,16 +965,20 @@ func reconstructSyntheticValue(
 		return reconstructSyntheticAnnotatedTextValue(idxSchema, rawVal, fullPath, b)
 	}
 	if hasBinding && esType == "counted_keyword" {
-		return reconstructSyntheticCountedKeywordValue(rawVal, b)
+		return reconstructSyntheticCountedKeywordValue(idxSchema, rawVal, b)
 	}
 	if isCoordinateOrVectorESType(esType) {
-		if ignoredSet[fullPath] {
+		ignMalformed := isEffectiveIgnoreMalformedForSynthetic(idxSchema, b)
+		if ignoredSet[fullPath] && !ignMalformed {
 			return nil, false
 		}
-		if esType == "geo_point" && strings.EqualFold(strings.TrimSpace(b.TimeSeriesMetric), "position") {
-			if posObj, ok := reconstructSyntheticPositionGeoPoint(rawVal); ok {
-				return posObj, true
+		if esType == "geo_point" {
+			if strings.EqualFold(strings.TrimSpace(b.TimeSeriesMetric), "position") {
+				if posObj, ok := reconstructSyntheticPositionGeoPoint(rawVal); ok {
+					return posObj, true
+				}
 			}
+			return reconstructSyntheticGeoPointValue(idxSchema, rawVal, fullPath, b, ignMalformed)
 		}
 		if esType == "dense_vector" || esType == "knn_vector" {
 			elemT := strings.ToLower(strings.TrimSpace(b.VectorElementType))
@@ -1034,8 +1040,8 @@ func reconstructSyntheticValue(
 			}
 		}
 		if hasMaps {
-			if isNested || idxSchema == nil || hasExplicitStoreArraySourceAtPath(idxSchema, fullPath) {
-				// Preserve nested / store_array_source:true / schemaless array order
+			if isNested || idxSchema == nil || hasExplicitStoreArraySourceAtPath(idxSchema, fullPath) || shouldPreserveSyntheticObjectArray(idxSchema, fullPath, v) {
+				// Preserve nested / store_array_source:true / dynamic:false|runtime / schemaless array order
 				objs := make([]any, 0, len(v))
 				for _, elem := range v {
 					em, ok := elem.(map[string]any)
@@ -1059,6 +1065,7 @@ func reconstructSyntheticValue(
 		// Scalar array (flatten nested scalar arrays like `[[2, 1], [3]]` -> `[1, 2, 3]`)
 		preserveArrayOrder := hasBinding && ((b.StoreArraySource != nil && *b.StoreArraySource) || strings.EqualFold(b.SyntheticSourceKeep, "arrays"))
 		var scalars []any
+		var malformedScalars []any
 		var ignoredAboveScalars []any
 		var flattenScalars func(items []any)
 		flattenScalars = func(items []any) {
@@ -1081,15 +1088,28 @@ func reconstructSyntheticValue(
 						continue
 					}
 				}
-				normItem, ok := normalizeSyntheticScalar(idxSchema, item, fullPath, b, hasBinding, esType, ignoredSet)
-				if ok {
-					scalars = append(scalars, normItem)
+				normItem, isValid, keep := normalizeSyntheticScalarWithValidity(idxSchema, item, fullPath, b, hasBinding, esType, ignoredSet)
+				if keep {
+					if !isValid && !preserveArrayOrder {
+						malformedScalars = append(malformedScalars, normItem)
+					} else {
+						scalars = append(scalars, normItem)
+					}
 				}
 			}
 		}
 		flattenScalars(v)
 		if !preserveArrayOrder && len(scalars) > 1 {
 			sortSyntheticScalars(scalars, esType)
+			if hasBinding && isSyntheticDocValuesDedupType(esType) {
+				scalars = deduplicateSortedSyntheticScalars(scalars)
+			}
+		}
+		if len(malformedScalars) > 0 {
+			if len(malformedScalars) > 1 {
+				sortSyntheticScalars(malformedScalars, "")
+			}
+			scalars = append(scalars, malformedScalars...)
 		}
 		if len(ignoredAboveScalars) > 0 {
 			scalars = append(scalars, ignoredAboveScalars...)
@@ -1112,7 +1132,7 @@ func reconstructSyntheticValue(
 				return s, true
 			}
 		}
-		normVal, ok := normalizeSyntheticScalar(idxSchema, v, fullPath, b, hasBinding, esType, ignoredSet)
+		normVal, _, ok := normalizeSyntheticScalarWithValidity(idxSchema, v, fullPath, b, hasBinding, esType, ignoredSet)
 		if !ok {
 			return nil, false
 		}
@@ -1120,7 +1140,205 @@ func reconstructSyntheticValue(
 	}
 }
 
-func normalizeSyntheticScalar(
+func isEffectiveIgnoreMalformedForSynthetic(idxSchema *IndexSchema, b FieldBinding) bool {
+	if b.IgnoreMalformed != nil {
+		return *b.IgnoreMalformed
+	}
+	if idxSchema != nil && idxSchema.DefaultIgnoreMalformed != nil {
+		return *idxSchema.DefaultIgnoreMalformed
+	}
+	return false
+}
+
+func shouldPreserveSyntheticObjectArray(idxSchema *IndexSchema, fullPath string, elems []any) bool {
+	if idxSchema == nil || fullPath == "" {
+		return false
+	}
+	if idxSchema.RawMapping != nil {
+		if fp, ok := lookupRawFieldProperty(idxSchema.RawMapping.Properties, strings.Split(fullPath, ".")); ok {
+			dyn := normalizeDynamicMode(fp.Dynamic)
+			if dyn == "false" || dyn == "runtime" {
+				return true
+			}
+		}
+	}
+	if idxSchema.IgnoreDynamicBeyondLimit {
+		pfx := fullPath + "."
+		for _, elem := range elems {
+			em, ok := elem.(map[string]any)
+			if !ok {
+				continue
+			}
+			for k := range em {
+				subFull := pfx + k
+				if _, mapped := idxSchema.Fields[subFull]; mapped {
+					continue
+				}
+				hasChild := false
+				subPfx := subFull + "."
+				for fk := range idxSchema.Fields {
+					if strings.HasPrefix(fk, subPfx) {
+						hasChild = true
+						break
+					}
+				}
+				if !hasChild {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func reconstructSyntheticGeoPointValue(
+	idxSchema *IndexSchema,
+	rawVal any,
+	fullPath string,
+	b FieldBinding,
+	ignMalformed bool,
+) (any, bool) {
+	if rawVal == nil {
+		return nil, false
+	}
+	if arr, isArr := rawVal.([]any); isArr {
+		if len(arr) == 2 && isGeoNumericElem(arr[0]) && isGeoNumericElem(arr[1]) {
+			if _, lat, lon, ok := parseAndFormatGeoPointValue(arr); ok {
+				return map[string]any{"lat": lat, "lon": lon}, true
+			}
+			if ignMalformed {
+				norm, _ := reconstructIgnoredSourceValue(idxSchema, rawVal, fullPath)
+				return norm, true
+			}
+			return nil, false
+		}
+		type geoPtEntry struct {
+			lat float64
+			lon float64
+			obj map[string]any
+		}
+		var validPts []geoPtEntry
+		var malformed []any
+		var collectItems func(items []any)
+		collectItems = func(items []any) {
+			for _, item := range items {
+				if item == nil {
+					continue
+				}
+				if subArr, isSub := item.([]any); isSub && (len(subArr) != 2 || !isGeoNumericElem(subArr[0]) || !isGeoNumericElem(subArr[1])) {
+					collectItems(subArr)
+					continue
+				}
+				if _, lat, lon, ok := parseAndFormatGeoPointValue(item); ok {
+					validPts = append(validPts, geoPtEntry{
+						lat: lat,
+						lon: lon,
+						obj: map[string]any{"lat": lat, "lon": lon},
+					})
+				} else if ignMalformed {
+					if norm, okN := reconstructIgnoredSourceValue(idxSchema, item, fullPath); okN {
+						malformed = append(malformed, norm)
+					}
+				}
+			}
+		}
+		collectItems(arr)
+		preserveOrder := b.StoreArraySource != nil && *b.StoreArraySource
+		if !preserveOrder && len(validPts) > 1 {
+			sort.SliceStable(validPts, func(i, j int) bool {
+				if validPts[i].lon != validPts[j].lon {
+					return validPts[i].lon < validPts[j].lon
+				}
+				return validPts[i].lat < validPts[j].lat
+			})
+			dedup := validPts[:0]
+			for _, pt := range validPts {
+				if len(dedup) > 0 && dedup[len(dedup)-1].lat == pt.lat && dedup[len(dedup)-1].lon == pt.lon {
+					continue
+				}
+				dedup = append(dedup, pt)
+			}
+			validPts = dedup
+		}
+		out := make([]any, 0, len(validPts)+len(malformed))
+		for _, pt := range validPts {
+			out = append(out, pt.obj)
+		}
+		out = append(out, malformed...)
+		if len(out) == 0 {
+			return nil, false
+		}
+		if len(out) == 1 && !preserveOrder {
+			return out[0], true
+		}
+		return out, true
+	}
+	if _, lat, lon, ok := parseAndFormatGeoPointValue(rawVal); ok {
+		return map[string]any{"lat": lat, "lon": lon}, true
+	}
+	if ignMalformed {
+		norm, _ := reconstructIgnoredSourceValue(idxSchema, rawVal, fullPath)
+		return norm, true
+	}
+	return nil, false
+}
+
+func isSyntheticDocValuesDedupType(esType string) bool {
+	switch esType {
+	case "keyword", "constant_keyword", "wildcard", "version", "ip",
+		"long", "integer", "short", "byte", "unsigned_long",
+		"double", "float", "half_float", "scaled_float",
+		"date", "date_nanos", "boolean":
+		return true
+	default:
+		return false
+	}
+}
+
+func deduplicateSortedSyntheticScalars(scalars []any) []any {
+	if len(scalars) <= 1 {
+		return scalars
+	}
+	out := make([]any, 0, len(scalars))
+	for _, s := range scalars {
+		if len(out) > 0 && syntheticScalarsEqual(out[len(out)-1], s) {
+			continue
+		}
+		out = append(out, s)
+	}
+	return out
+}
+
+func syntheticScalarsEqual(a, b any) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	switch av := a.(type) {
+	case int64:
+		if bv, ok := b.(int64); ok {
+			return av == bv
+		}
+	case float64:
+		if bv, ok := b.(float64); ok {
+			return av == bv
+		}
+	case bool:
+		if bv, ok := b.(bool); ok {
+			return av == bv
+		}
+	case string:
+		if bv, ok := b.(string); ok {
+			return av == bv
+		}
+	case json.Number:
+		if bv, ok := b.(json.Number); ok {
+			return av.String() == bv.String()
+		}
+	}
+	return fmt.Sprintf("%T:%v", a, a) == fmt.Sprintf("%T:%v", b, b)
+}
+
+func normalizeSyntheticScalarWithValidity(
 	idxSchema *IndexSchema,
 	val any,
 	fullPath string,
@@ -1128,14 +1346,14 @@ func normalizeSyntheticScalar(
 	hasBinding bool,
 	esType string,
 	ignoredSet map[string]bool,
-) (any, bool) {
+) (any, bool, bool) {
 	if val == nil {
-		return nil, false
+		return nil, false, false
 	}
 	if hasBinding && b.IgnoreAbove > 0 {
 		s := fmt.Sprintf("%v", val)
 		if len([]rune(s)) > b.IgnoreAbove {
-			return nil, false
+			return nil, false, false
 		}
 	}
 	if hasBinding {
@@ -1143,31 +1361,59 @@ func normalizeSyntheticScalar(
 		if idxSchema != nil {
 			effB = idxSchema.withEffectiveDefaults(b)
 		}
+		ignMalformed := isEffectiveIgnoreMalformedForSynthetic(idxSchema, effB)
 		switch esType {
 		case "long", "integer", "short", "byte":
+			switch tv := val.(type) {
+			case int64:
+				return tv, true, true
+			case int:
+				return int64(tv), true, true
+			case uint64:
+				if tv <= math.MaxInt64 {
+					return int64(tv), true, true
+				}
+			case json.Number:
+				if !strings.ContainsAny(tv.String(), ".eE") {
+					if iv, err := tv.Int64(); err == nil {
+						return iv, true, true
+					}
+				}
+			case string:
+				if effB.EffectiveCoerceBool() {
+					if iv, err := strconv.ParseInt(strings.TrimSpace(tv), 10, 64); err == nil {
+						return iv, true, true
+					}
+				}
+			}
 			if f, ok := syntheticToFloat64(val); ok {
 				if !effB.EffectiveCoerceBool() {
 					if _, isStr := val.(string); isStr {
-						return nil, false
+						if ignoredSet[fullPath] && !ignMalformed {
+							return nil, false, false
+						}
+						return val, false, true
 					}
 				}
-				return int64(math.Trunc(f)), true
+				return int64(math.Trunc(f)), true, true
 			}
-			if ignoredSet[fullPath] {
-				return nil, false
+			if ignoredSet[fullPath] && !ignMalformed {
+				return nil, false, false
 			}
+			return val, false, ignMalformed || !ignoredSet[fullPath]
 		case "unsigned_long":
 			if sStr := fmt.Sprintf("%v", val); sStr != "" {
 				if u, err := strconv.ParseUint(strings.TrimSpace(sStr), 10, 64); err == nil {
 					if u <= math.MaxInt64 {
-						return int64(u), true
+						return int64(u), true, true
 					}
-					return json.Number(strconv.FormatUint(u, 10)), true
+					return json.Number(strconv.FormatUint(u, 10)), true, true
 				}
 			}
-			if ignoredSet[fullPath] {
-				return nil, false
+			if ignoredSet[fullPath] && !ignMalformed {
+				return nil, false, false
 			}
+			return val, false, ignMalformed || !ignoredSet[fullPath]
 		case "double", "float", "half_float", "scaled_float":
 			if f, ok := syntheticToFloat64(val); ok && !math.IsNaN(f) && !math.IsInf(f, 0) {
 				if esType == "scaled_float" && b.ScalingFactor > 0 {
@@ -1175,56 +1421,95 @@ func normalizeSyntheticScalar(
 				} else if esType == "float" {
 					f = normalizeCleanFloat32AsFloat64(f)
 				}
-				return f, true
+				return f, true, true
 			}
-			if ignoredSet[fullPath] {
-				return nil, false
+			if ignoredSet[fullPath] && !ignMalformed {
+				return nil, false, false
 			}
+			return val, false, ignMalformed || !ignoredSet[fullPath]
 		case "date":
-			return formatSyntheticDateValue(val, effB, ignoredSet, fullPath)
+			fmtVal, keep := formatSyntheticDateValue(val, effB, ignoredSet, fullPath)
+			if !keep {
+				if ignMalformed {
+					return val, false, true
+				}
+				return nil, false, false
+			}
+			_, okParsed := parseSyntheticEpochMillis(val, effB.Format, effB.Locale, time.Now().UTC())
+			return fmtVal, okParsed, true
 		case "boolean":
 			switch bv := val.(type) {
 			case bool:
-				return bv, true
+				return bv, true, true
 			case string:
 				switch strings.ToLower(strings.TrimSpace(bv)) {
 				case "true":
-					return true, true
+					return true, true, true
 				case "false":
-					return false, true
+					return false, true, true
 				}
 			}
-			if ignoredSet[fullPath] {
-				return nil, false
+			if ignoredSet[fullPath] && !ignMalformed {
+				return nil, false, false
 			}
-		case "keyword", "wildcard", "version":
+			return val, false, ignMalformed || !ignoredSet[fullPath]
+		case "ip":
+			if str, ok := val.(string); ok {
+				if addr, err := netip.ParseAddr(strings.TrimSpace(str)); err == nil {
+					return addr.Unmap().String(), true, true
+				}
+			}
+			if ignoredSet[fullPath] && !ignMalformed {
+				return nil, false, false
+			}
+			if n, isNum := val.(json.Number); isNum {
+				if !strings.ContainsAny(n.String(), ".eE") {
+					if i, err := n.Int64(); err == nil {
+						return i, false, ignMalformed || !ignoredSet[fullPath]
+					}
+				}
+			}
+			return val, false, ignMalformed || !ignoredSet[fullPath]
+		case "keyword", "wildcard":
+			if str, ok := val.(string); ok {
+				if b.NormalizerName != "" || b.LowercaseNormalizer {
+					return normalizeValueForBinding(str, b, idxSchema), true, true
+				}
+				return str, true, true
+			}
+			s := fmt.Sprintf("%v", val)
+			if b.NormalizerName != "" || b.LowercaseNormalizer {
+				s = normalizeValueForBinding(s, b, idxSchema)
+			}
+			return s, true, true
+		case "version":
 			if str, ok := val.(string); ok {
 				if b.LowercaseNormalizer {
-					return strings.ToLower(str), true
+					return strings.ToLower(str), true, true
 				}
-				return str, true
+				return str, true, true
 			}
 			s := fmt.Sprintf("%v", val)
 			if b.LowercaseNormalizer {
 				s = strings.ToLower(s)
 			}
-			return s, true
+			return s, true, true
 		}
 	}
 	if n, isNum := val.(json.Number); isNum {
 		if !strings.ContainsAny(n.String(), ".eE") {
 			if i, err := n.Int64(); err == nil {
-				return i, true
+				return i, true, true
 			}
 			if _, errU := strconv.ParseUint(n.String(), 10, 64); errU == nil {
-				return n, true
+				return n, true, true
 			}
 		}
 		if f, err := n.Float64(); err == nil {
-			return f, true
+			return f, true, true
 		}
 	}
-	return val, true
+	return val, true, true
 }
 
 func (b FieldBinding) EffectiveCoerceBool() bool {
@@ -1269,6 +1554,11 @@ func sortSyntheticScalars(scalars []any, esType string) {
 		return
 	}
 	sort.SliceStable(scalars, func(i, j int) bool {
+		if ia, okA := scalars[i].(int64); okA {
+			if ib, okB := scalars[j].(int64); okB {
+				return ia < ib
+			}
+		}
 		fi, okI := syntheticNumericOrderVal(scalars[i])
 		fj, okJ := syntheticNumericOrderVal(scalars[j])
 		if okI && okJ {

@@ -30,6 +30,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -1801,6 +1802,12 @@ func (s *Server) handleSQLTranslateRound57(w http.ResponseWriter, r *http.Reques
 	writeJSONWithRequest(w, r, http.StatusOK, out)
 }
 
+var sqlAsyncSeqR64 atomic.Uint64
+
+func nextSQLAsyncSearchIDR64() string {
+	return fmt.Sprintf("sql_%d", sqlAsyncSeqR64.Add(1))
+}
+
 func (s *Server) handleSQLQueryRound57(w http.ResponseWriter, r *http.Request, body map[string]any) {
 	queryStr, _ := body["query"].(string)
 	queryStr = strings.TrimSpace(queryStr)
@@ -2321,7 +2328,7 @@ func (s *Server) handleSQLQueryRound57(w http.ResponseWriter, r *http.Request, b
 	if s.sqlAsyncSearches == nil {
 		s.sqlAsyncSearches = make(map[string]map[string]any)
 	}
-	sqlID := fmt.Sprintf("sql_%d", len(s.sqlAsyncSearches)+1)
+	sqlID := nextSQLAsyncSearchIDR64()
 	var cursorID string
 	if fetchSize > 0 && len(rows) > fetchSize {
 		cursorID = sqlID + "_cur_1"
@@ -2350,6 +2357,7 @@ func (s *Server) handleSQLQueryRound57(w http.ResponseWriter, r *http.Request, b
 			if nextCurID != "" {
 				curObj["cursor"] = nextCurID
 			}
+			evictBoundedAsyncRegistryLockedR62Admin(s.sqlAsyncSearches)
 			s.sqlAsyncSearches[curID+"_cursor"] = curObj
 		}
 	}
@@ -2368,6 +2376,7 @@ func (s *Server) handleSQLQueryRound57(w http.ResponseWriter, r *http.Request, b
 	asyncStored["id"] = sqlID
 	asyncStored["is_partial"] = false
 	asyncStored["is_running"] = false
+	evictBoundedAsyncRegistryLockedR62Admin(s.sqlAsyncSearches)
 	s.sqlAsyncSearches[sqlID] = asyncStored
 	if hasWaitTimeout || !explicitTargetVer {
 		resp["id"] = sqlID
@@ -2712,6 +2721,25 @@ func evalESQLFuncRound57(name string, args []any) (any, bool) {
 	case "TO_IP":
 		if len(args) == 0 || args[0] == nil {
 			return nil, true
+		}
+		if arr, ok := args[0].([]any); ok {
+			out := make([]any, 0, len(arr))
+			for _, el := range arr {
+				if el == nil {
+					continue
+				}
+				sv := strings.TrimSpace(fmt.Sprintf("%v", el))
+				if ValidateESQLIPStringRound63(sv) {
+					out = append(out, sv)
+				}
+			}
+			if len(out) == 0 {
+				return nil, true
+			}
+			if len(out) == 1 {
+				return out[0], true
+			}
+			return out, true
 		}
 		sVal := strings.TrimSpace(fmt.Sprintf("%v", args[0]))
 		if ValidateESQLIPStringRound63(sVal) {
@@ -3114,6 +3142,38 @@ func evalESQLFuncRound57(name string, args []any) (any, bool) {
 			return diff.Milliseconds(), true
 		}
 		return nil, true
+
+	case "CIDR_MATCH":
+		if len(args) < 2 || args[0] == nil || args[1] == nil {
+			return nil, true
+		}
+		var cidrs []*net.IPNet
+		for _, cEl := range toESQLMultiValueSlice(args[1]) {
+			if cEl == nil {
+				continue
+			}
+			if _, ipNet, cErr := net.ParseCIDR(strings.TrimSpace(fmt.Sprintf("%v", cEl))); cErr == nil && ipNet != nil {
+				cidrs = append(cidrs, ipNet)
+			}
+		}
+		if len(cidrs) == 0 {
+			return false, true
+		}
+		for _, ipEl := range toESQLMultiValueSlice(args[0]) {
+			if ipEl == nil {
+				continue
+			}
+			ip := net.ParseIP(strings.TrimSpace(fmt.Sprintf("%v", ipEl)))
+			if ip == nil {
+				continue
+			}
+			for _, ipNet := range cidrs {
+				if ipNet.Contains(ip) {
+					return true, true
+				}
+			}
+		}
+		return false, true
 	}
 	return nil, false
 }
@@ -4547,7 +4607,15 @@ func evalEQLExpr(ex eqlExpr, doc map[string]any) (any, error) {
 	case *eqlLitExpr:
 		return e.val, nil
 	case *eqlFieldExpr:
-		return getNestedOrArrayDocValRound63(doc, e.name), nil
+		if v := getNestedOrArrayDocValRound63(doc, e.name); v != nil {
+			return v, nil
+		}
+		if strings.HasSuffix(e.name, ".keyword") {
+			if base := strings.TrimSuffix(e.name, ".keyword"); base != "" {
+				return getNestedOrArrayDocValRound63(doc, base), nil
+			}
+		}
+		return nil, nil
 	case *eqlNotExpr:
 		v, err := evalEQLExpr(e.sub, doc)
 		if err != nil {
@@ -5154,7 +5222,7 @@ func (s *Server) handleEQLSearchAPIRound57(w http.ResponseWriter, r *http.Reques
 		}
 
 		for _, cand := range candidates {
-			// Check `until` abort stage and `![...]` absent stages against in-flight sequences
+			// 1. Check `until` abort stage against in-flight sequences.
 			if ast.untilStage != nil {
 				uMatched, uErr := eqlMatchesStage(*ast.untilStage, cand.doc, catField)
 				if uErr != nil {
@@ -5171,41 +5239,10 @@ func (s *Server) handleEQLSearchAPIRound57(w http.ResponseWriter, r *http.Reques
 					}
 				}
 			}
-			for afterPos, absList := range ast.absentAfter {
-				for _, absSt := range absList {
-					aMatched, aErr := eqlMatchesStage(absSt, cand.doc, catField)
-					if aErr != nil {
-						writeESError(w, http.StatusBadRequest, "verification_exception", aErr.Error())
-						return
-					}
-					if aMatched {
-						aKeyExprs := absSt.byKeys
-						if len(aKeyExprs) == 0 {
-							aKeyExprs = stageKeysFor(0)
-						}
-						for _, tup := range extractEQLJoinKeyTuplesRound63(cand.doc, aKeyExprs) {
-							jk := tup.key
-							if progs := active[jk]; len(progs) > 0 {
-								kept := progs[:0]
-								for _, pr := range progs {
-									withinSpan := !ast.hasMaxspan || cand.ts-pr.startTS <= ast.maxspanMS
-									if len(pr.events) != afterPos || !withinSpan {
-										kept = append(kept, pr)
-									}
-								}
-								if len(kept) == 0 {
-									delete(active, jk)
-								} else {
-									active[jk] = kept
-								}
-							}
-						}
-					}
-				}
-			}
 
-			// Evaluate stages from highest partial stage down to stage 0 so a single event advances at most one partial sequence per join key (FIFO)
-			advancedKeys := make(map[string]bool)
+			// 2. Advance existing partial sequences from highest stage down to stage 1 so
+			// overlapping sequences share matching events without starving earlier starts.
+			advancedProgs := make(map[*seqProgress]bool)
 			for stIdx := len(ast.stages) - 1; stIdx >= 1; stIdx-- {
 				keyExprs := stageKeysFor(stIdx)
 				tuples := extractEQLJoinKeyTuplesRound63(cand.doc, keyExprs)
@@ -5216,9 +5253,6 @@ func (s *Server) handleEQLSearchAPIRound57(w http.ResponseWriter, r *http.Reques
 				stMatched := false
 				for _, tup := range tuples {
 					jk := tup.key
-					if advancedKeys[jk] {
-						continue
-					}
 					progs := active[jk]
 					if len(progs) == 0 {
 						continue
@@ -5239,7 +5273,7 @@ func (s *Server) handleEQLSearchAPIRound57(w http.ResponseWriter, r *http.Reques
 					}
 					targetIdxInQueue := -1
 					for qi, pr := range progs {
-						if len(pr.events) == stIdx {
+						if len(pr.events) == stIdx && !advancedProgs[pr] {
 							targetIdxInQueue = qi
 							break
 						}
@@ -5259,7 +5293,7 @@ func (s *Server) handleEQLSearchAPIRound57(w http.ResponseWriter, r *http.Reques
 					if stMatched {
 						prog := progs[targetIdxInQueue]
 						prog.events = append(prog.events, cand.hit)
-						advancedKeys[jk] = true
+						advancedProgs[prog] = true
 						if len(prog.events) == len(ast.stages) && len(ast.absentAfter[len(ast.stages)]) == 0 {
 							totalMatched++
 							if len(sequencesOut) < sizeVal {
@@ -5278,29 +5312,58 @@ func (s *Server) handleEQLSearchAPIRound57(w http.ResponseWriter, r *http.Reques
 					}
 				}
 			}
+
+			// 3. Check `![...]` absent stages only against sequences that did NOT just advance
+			// on this event (e.g., an event completing stage 1 does not trigger ![...] after stage 0).
+			for afterPos, absList := range ast.absentAfter {
+				for _, absSt := range absList {
+					aMatched, aErr := eqlMatchesStage(absSt, cand.doc, catField)
+					if aErr != nil {
+						writeESError(w, http.StatusBadRequest, "verification_exception", aErr.Error())
+						return
+					}
+					if aMatched {
+						aKeyExprs := absSt.byKeys
+						if len(aKeyExprs) == 0 {
+							aKeyExprs = stageKeysFor(0)
+						}
+						for _, tup := range extractEQLJoinKeyTuplesRound63(cand.doc, aKeyExprs) {
+							jk := tup.key
+							if progs := active[jk]; len(progs) > 0 {
+								kept := progs[:0]
+								for _, pr := range progs {
+									withinSpan := !ast.hasMaxspan || cand.ts-pr.startTS <= ast.maxspanMS
+									if advancedProgs[pr] || len(pr.events) != afterPos || !withinSpan {
+										kept = append(kept, pr)
+									}
+								}
+								if len(kept) == 0 {
+									delete(active, jk)
+								} else {
+									active[jk] = kept
+								}
+							}
+						}
+					}
+				}
+			}
+
+			// 4. Evaluate stage 0 independently so overlapping sequences start on any matching event.
 			keyExprs0 := stageKeysFor(0)
 			tuples0 := extractEQLJoinKeyTuplesRound63(cand.doc, keyExprs0)
 			if len(tuples0) > 0 {
-				var pendingTuples []eqlJoinKeyTupleRound63
-				for _, tup := range tuples0 {
-					if !advancedKeys[tup.key] {
-						pendingTuples = append(pendingTuples, tup)
-					}
+				st0Matched, sErr := eqlMatchesStage(ast.stages[0], cand.doc, catField)
+				if sErr != nil {
+					writeESError(w, http.StatusBadRequest, "verification_exception", sErr.Error())
+					return
 				}
-				if len(pendingTuples) > 0 {
-					st0Matched, sErr := eqlMatchesStage(ast.stages[0], cand.doc, catField)
-					if sErr != nil {
-						writeESError(w, http.StatusBadRequest, "verification_exception", sErr.Error())
-						return
-					}
-					if st0Matched {
-						for _, tup := range pendingTuples {
-							active[tup.key] = append(active[tup.key], &seqProgress{
-								joinKeys: tup.vals,
-								events:   []any{cand.hit},
-								startTS:  cand.ts,
-							})
-						}
+				if st0Matched {
+					for _, tup := range tuples0 {
+						active[tup.key] = append(active[tup.key], &seqProgress{
+							joinKeys: tup.vals,
+							events:   []any{cand.hit},
+							startTS:  cand.ts,
+						})
 					}
 				}
 			}
@@ -6180,41 +6243,41 @@ func (s *Server) handleSLMActionRound57(w http.ResponseWriter, r *http.Request, 
 func validateSynonymRuleString(synStr string) error {
 	trimmed := strings.TrimSpace(synStr)
 	if trimmed == "" {
-		return fmt.Errorf("synonym rule [synonyms] cannot be empty")
+		return fmt.Errorf("[synonyms] field can't be empty")
 	}
 	if strings.Contains(trimmed, "=>") {
 		parts := strings.Split(trimmed, "=>")
 		if len(parts) != 2 {
-			return fmt.Errorf("invalid synonym rule [%s]: more than one explicit mapping specified on the line", synStr)
+			return fmt.Errorf("More than one explicit mapping specified in the same synonyms rule") //nolint:staticcheck // ES upstream error capitalization
 		}
 		lhsRaw := strings.Split(parts[0], ",")
 		rhsRaw := strings.Split(parts[1], ",")
 		lhsCount := 0
 		for _, item := range lhsRaw {
 			if strings.TrimSpace(item) == "" {
-				return fmt.Errorf("invalid synonym rule [%s]: empty left-hand term in explicit mapping", synStr)
+				return fmt.Errorf("Incorrect syntax for [synonyms]") //nolint:staticcheck // ES upstream error capitalization
 			}
 			lhsCount++
 		}
 		rhsCount := 0
 		for _, item := range rhsRaw {
 			if strings.TrimSpace(item) == "" {
-				return fmt.Errorf("invalid synonym rule [%s]: empty right-hand term in explicit mapping", synStr)
+				return fmt.Errorf("Incorrect syntax for [synonyms]") //nolint:staticcheck // ES upstream error capitalization
 			}
 			rhsCount++
 		}
 		if lhsCount == 0 || rhsCount == 0 {
-			return fmt.Errorf("invalid synonym rule [%s]: explicit mapping requires non-empty left and right sides", synStr)
+			return fmt.Errorf("Incorrect syntax for [synonyms]") //nolint:staticcheck // ES upstream error capitalization
 		}
 		return nil
 	}
 	terms := strings.Split(trimmed, ",")
 	if len(terms) < 2 {
-		return fmt.Errorf("invalid synonym rule [%s]: equivalent synonyms require at least 2 comma-separated terms", synStr)
+		return fmt.Errorf("Incorrect syntax for [synonyms]") //nolint:staticcheck // ES upstream error capitalization
 	}
 	for _, item := range terms {
 		if strings.TrimSpace(item) == "" {
-			return fmt.Errorf("invalid synonym rule [%s]: empty term in synonym list", synStr)
+			return fmt.Errorf("Incorrect syntax for [synonyms]") //nolint:staticcheck // ES upstream error capitalization
 		}
 	}
 	return nil
@@ -6455,184 +6518,6 @@ func (s *Server) collectSynonymRulesFromFilterDefLocked(fDef map[string]any) []p
 	return parseSynonymRuleStrings(rawRules)
 }
 
-type analyzedToken struct {
-	token       string
-	startOffset int
-	endOffset   int
-	tokenType   string
-	position    int
-}
-
-func applySynonymFilterToTokens(tokens []analyzedToken, rules []parsedSynonymRule) []analyzedToken {
-	if len(tokens) == 0 || len(rules) == 0 {
-		return tokens
-	}
-	out := make([]analyzedToken, 0, len(tokens)*2)
-	for _, tok := range tokens {
-		tl := strings.ToLower(tok.token)
-		matchedExplicit := false
-		var explicitReplacements []string
-		var equivAdditions []string
-		seen := map[string]bool{tl: true}
-
-		for _, r := range rules {
-			if r.explicit {
-				for _, l := range r.lhs {
-					if l == tl {
-						matchedExplicit = true
-						for _, rhs := range r.rhs {
-							if !seen[rhs] || rhs != tl {
-								explicitReplacements = append(explicitReplacements, rhs)
-							}
-						}
-					}
-				}
-			} else {
-				inGroup := false
-				for _, eq := range r.equiv {
-					if eq == tl {
-						inGroup = true
-						break
-					}
-				}
-				if inGroup {
-					for _, eq := range r.equiv {
-						if !seen[eq] {
-							seen[eq] = true
-							equivAdditions = append(equivAdditions, eq)
-						}
-					}
-				}
-			}
-		}
-
-		if matchedExplicit {
-			dedup := make(map[string]bool)
-			for _, rep := range explicitReplacements {
-				if dedup[rep] {
-					continue
-				}
-				dedup[rep] = true
-				out = append(out, analyzedToken{
-					token:       rep,
-					startOffset: tok.startOffset,
-					endOffset:   tok.endOffset,
-					tokenType:   "SYNONYM",
-					position:    tok.position,
-				})
-			}
-		} else {
-			out = append(out, tok)
-			for _, syn := range equivAdditions {
-				out = append(out, analyzedToken{
-					token:       syn,
-					startOffset: tok.startOffset,
-					endOffset:   tok.endOffset,
-					tokenType:   "SYNONYM",
-					position:    tok.position,
-				})
-			}
-		}
-	}
-	return out
-}
-
-func lookupFieldSearchAnalyzerFromMappingSpec(ms *esast.MappingSpec, fieldPath string) string {
-	if ms == nil || fieldPath == "" {
-		return ""
-	}
-	parts := strings.Split(fieldPath, ".")
-	curProps := ms.Properties
-	for i, part := range parts {
-		if curProps == nil {
-			return ""
-		}
-		fp, ok := curProps[part]
-		if !ok {
-			return ""
-		}
-		if i == len(parts)-1 {
-			if fp.SearchAnalyzer != "" {
-				return fp.SearchAnalyzer
-			}
-			return fp.Analyzer
-		}
-		if fp.Properties != nil {
-			curProps = fp.Properties
-		} else {
-			curProps = fp.Fields
-		}
-	}
-	return ""
-}
-
-// collectIndexSynonymRulesForFieldLocked collects active synonym rules for a field (or index default search analyzer).
-func (s *Server) collectIndexSynonymRulesForFieldLocked(idxName, fieldName string, explicitAnalyzer string) []parsedSynonymRule {
-	analyzers, filters := extractIndexAnalysisMaps(s.indexCustomSettings[idxName])
-	if len(filters) == 0 {
-		return nil
-	}
-	targetAnalyzer := explicitAnalyzer
-	if targetAnalyzer == "" {
-		if sch := s.indices[idxName]; sch != nil && sch.RawMapping != nil && fieldName != "" {
-			targetAnalyzer = lookupFieldSearchAnalyzerFromMappingSpec(sch.RawMapping, fieldName)
-		}
-	}
-	if targetAnalyzer == "" {
-		if defSearch, okDS := s.indexCustomSettings[idxName]["analysis.analyzer.default_search.type"].(string); okDS && defSearch != "" {
-			targetAnalyzer = "default_search"
-		} else if analyzers["default_search"] != nil {
-			targetAnalyzer = "default_search"
-		} else if analyzers["default"] != nil {
-			targetAnalyzer = "default"
-		}
-	}
-
-	var rules []parsedSynonymRule
-	if targetAnalyzer != "" && analyzers[targetAnalyzer] != nil {
-		for _, fName := range extractStringSliceAny(analyzers[targetAnalyzer]["filter"]) {
-			if fDef := filters[fName]; fDef != nil {
-				ft := strings.ToLower(fmt.Sprintf("%v", fDef["type"]))
-				if ft == "synonym" || ft == "synonym_graph" || fDef["synonyms_set"] != nil || fDef["synonyms"] != nil {
-					rules = append(rules, s.collectSynonymRulesFromFilterDefLocked(fDef)...)
-				}
-			}
-		}
-	}
-	return rules
-}
-
-func expandQueryTermsWithSynonyms(queryText string, rules []parsedSynonymRule) []string {
-	if len(rules) == 0 || strings.TrimSpace(queryText) == "" {
-		return nil
-	}
-	words := strings.Fields(strings.ToLower(queryText))
-	if len(words) == 0 {
-		return nil
-	}
-	var initToks []analyzedToken
-	for i, w := range words {
-		clean := strings.Trim(w, ".,!?;:\"'()[]{}")
-		if clean == "" {
-			continue
-		}
-		initToks = append(initToks, analyzedToken{token: clean, position: i})
-	}
-	expanded := applySynonymFilterToTokens(initToks, rules)
-	seen := make(map[string]bool)
-	var terms []string
-	for _, tk := range expanded {
-		if !seen[tk.token] {
-			seen[tk.token] = true
-			terms = append(terms, tk.token)
-		}
-	}
-	if len(terms) <= 1 && (len(terms) == 0 || terms[0] == strings.ToLower(strings.TrimSpace(queryText))) {
-		return nil
-	}
-	return terms
-}
-
 // resolveTextEmbeddingFromEndpoint resolves model_id against s.inferenceEndpoints / built-in models.
 func (s *Server) resolveTextEmbeddingFromEndpointLocked(modelID, modelText string) ([]float64, int, string, string) {
 	modelID = strings.TrimSpace(modelID)
@@ -6683,7 +6568,6 @@ func (s *Server) resolveSparseEmbeddingFromEndpointLocked(infID, queryText strin
 // preprocessSearchBodyRound57 pre-rewrites search JSON bodies when needed for:
 // 1) knn query_vector_builder.text_embedding -> query_vector via _inference
 // 2) sparse_vector inference_id + query -> query_vector via _inference
-// 3) match / multi_match synonym expansion when target index uses custom synonym search analyzers
 // Returns (possiblyUpdatedBodyBytes, true) on success, or writes an ES error and returns (nil, false).
 func (s *Server) preprocessSearchBodyRound57(w http.ResponseWriter, rawIndex string, bodyBytes []byte) ([]byte, bool) {
 	if len(bytes.TrimSpace(bodyBytes)) == 0 {
@@ -6692,44 +6576,7 @@ func (s *Server) preprocessSearchBodyRound57(w http.ResponseWriter, rawIndex str
 	needsInferenceRewrite := bytes.Contains(bodyBytes, []byte("query_vector_builder")) ||
 		(bytes.Contains(bodyBytes, []byte("sparse_vector")) && (bytes.Contains(bodyBytes, []byte("inference_id")) || bytes.Contains(bodyBytes, []byte("model_id"))))
 
-	hasActiveSynonyms := false
-	var targetIndices []string
-	s.mu.RLock()
-	if rawIndex != "" && rawIndex != "*" && rawIndex != "_all" {
-		for _, part := range strings.Split(rawIndex, ",") {
-			part = strings.TrimSpace(part)
-			if part == "" {
-				continue
-			}
-			if s.indices[part] != nil {
-				targetIndices = append(targetIndices, part)
-			} else if tgts := s.aliases[part]; len(tgts) > 0 {
-				targetIndices = append(targetIndices, tgts...)
-			}
-		}
-	} else {
-		for idxName := range s.indices {
-			targetIndices = append(targetIndices, idxName)
-		}
-	}
-	for _, idxName := range targetIndices {
-		if cs := s.indexCustomSettings[idxName]; len(cs) > 0 {
-			_, fls := extractIndexAnalysisMaps(cs)
-			for _, fd := range fls {
-				ft := strings.ToLower(fmt.Sprintf("%v", fd["type"]))
-				if ft == "synonym" || ft == "synonym_graph" || fd["synonyms_set"] != nil || fd["synonyms"] != nil {
-					hasActiveSynonyms = true
-					break
-				}
-			}
-		}
-		if hasActiveSynonyms {
-			break
-		}
-	}
-	s.mu.RUnlock()
-
-	if !needsInferenceRewrite && !hasActiveSynonyms {
+	if !needsInferenceRewrite {
 		return bodyBytes, true
 	}
 
@@ -6823,72 +6670,6 @@ func (s *Server) preprocessSearchBodyRound57(w http.ResponseWriter, rawIndex str
 					delete(svMap, "query")
 					delete(svMap, "model_text")
 					mutated = true
-				}
-			}
-
-			// Synonym expansion for match / multi_match queries
-			if hasActiveSynonyms && len(tv) == 1 {
-				if matchBody, isMatch := tv["match"].(map[string]any); isMatch && len(matchBody) == 1 {
-					for fieldName, rawSpec := range matchBody {
-						var qText, explicitAn string
-						switch sp := rawSpec.(type) {
-						case string:
-							qText = sp
-						case map[string]any:
-							qText, _ = sp["query"].(string)
-							explicitAn, _ = sp["analyzer"].(string)
-						}
-						if qText != "" {
-							var rules []parsedSynonymRule
-							for _, idxName := range targetIndices {
-								rules = append(rules, s.collectIndexSynonymRulesForFieldLocked(idxName, fieldName, explicitAn)...)
-							}
-							if synTerms := expandQueryTermsWithSynonyms(qText, rules); len(synTerms) > 0 {
-								shouldClauses := make([]any, 0, len(synTerms))
-								for _, termStr := range synTerms {
-									shouldClauses = append(shouldClauses, map[string]any{
-										"match": map[string]any{fieldName: termStr},
-									})
-								}
-								mutated = true
-								return map[string]any{
-									"bool": map[string]any{
-										"should":               shouldClauses,
-										"minimum_should_match": 1,
-									},
-								}
-							}
-						}
-					}
-				}
-				if mmBody, isMM := tv["multi_match"].(map[string]any); isMM {
-					qText, _ := mmBody["query"].(string)
-					explicitAn, _ := mmBody["analyzer"].(string)
-					fields := extractStringSliceAny(mmBody["fields"])
-					if qText != "" && len(fields) > 0 {
-						var rules []parsedSynonymRule
-						for _, idxName := range targetIndices {
-							for _, fn := range fields {
-								cleanField := strings.Split(fn, "^")[0]
-								rules = append(rules, s.collectIndexSynonymRulesForFieldLocked(idxName, cleanField, explicitAn)...)
-							}
-						}
-						if synTerms := expandQueryTermsWithSynonyms(qText, rules); len(synTerms) > 0 {
-							shouldClauses := make([]any, 0, len(synTerms))
-							for _, termStr := range synTerms {
-								cpMM := deepCloneDocMap(mmBody)
-								cpMM["query"] = termStr
-								shouldClauses = append(shouldClauses, map[string]any{"multi_match": cpMM})
-							}
-							mutated = true
-							return map[string]any{
-								"bool": map[string]any{
-									"should":               shouldClauses,
-									"minimum_should_match": 1,
-								},
-							}
-						}
-					}
 				}
 			}
 

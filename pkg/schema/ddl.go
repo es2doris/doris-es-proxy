@@ -44,8 +44,8 @@ func GenerateCreateTableDDL(s *IndexSchema) string {
 	)
 
 	idxs = append(idxs,
-		"    INDEX `idx_doc_variant` (`_doc`) USING INVERTED PROPERTIES(\"parser\" = \"unicode\", \"support_phrase\" = \"true\")",
-		"    INDEX `idx_all_text` (`_all_text`) USING INVERTED PROPERTIES(\"parser\" = \"standard\", \"support_phrase\" = \"true\", \"lower_case\" = \"true\")",
+		"    INDEX `idx_doc_variant` (`_doc`) USING INVERTED PROPERTIES(\"parser\" = \"unicode\", \"support_phrase\" = \"true\", \"stopwords\" = \"none\")",
+		"    INDEX `idx_all_text` (`_all_text`) USING INVERTED PROPERTIES(\"parser\" = \"standard\", \"support_phrase\" = \"true\", \"lower_case\" = \"true\", \"stopwords\" = \"none\")",
 		"    INDEX `idx__ignored` (`_ignored`) USING INVERTED",
 	)
 
@@ -216,13 +216,35 @@ func GenerateAlterTableDDL(oldSchema, newSchema *IndexSchema) []string {
 		}
 		if existingCols[b.ColumnName] {
 			if oldSchema != nil {
-				if oldB, hadOld := oldSchema.Fields[k]; hadOld && oldB.NotIndexed && !b.NotIndexed {
-					_, idxDef := buildColumnAndIndexDDL(b)
-					if idxDef != "" {
+				if oldB, hadOld := oldSchema.Fields[k]; hadOld {
+					if oldB.DorisType == DorisVarchar && b.DorisType == DorisString {
+						if !oldB.NotIndexed {
+							stmts = append(stmts, fmt.Sprintf(
+								"ALTER TABLE `%s`.`%s` DROP INDEX `%s`;",
+								newDBIdent, newTblIdent, invertedIndexNameForColumn(b.ColumnName),
+							))
+						}
 						stmts = append(stmts, fmt.Sprintf(
-							"ALTER TABLE `%s`.`%s` ADD %s;",
-							newDBIdent, newTblIdent, idxDef,
+							"ALTER TABLE `%s`.`%s` MODIFY COLUMN `%s` %s NULL;",
+							newDBIdent, newTblIdent, b.ColumnName, b.DorisType,
 						))
+						if !b.NotIndexed {
+							_, idxDef := buildColumnAndIndexDDL(b)
+							if idxDef != "" {
+								stmts = append(stmts, fmt.Sprintf(
+									"ALTER TABLE `%s`.`%s` ADD %s;",
+									newDBIdent, newTblIdent, idxDef,
+								))
+							}
+						}
+					} else if oldB.NotIndexed && !b.NotIndexed {
+						_, idxDef := buildColumnAndIndexDDL(b)
+						if idxDef != "" {
+							stmts = append(stmts, fmt.Sprintf(
+								"ALTER TABLE `%s`.`%s` ADD %s;",
+								newDBIdent, newTblIdent, idxDef,
+							))
+						}
 					}
 				}
 			}
@@ -418,13 +440,18 @@ func escapeDDLComment(s string) string {
 	return s
 }
 
-func buildColumnAndIndexDDL(b FieldBinding) (string, string) {
-	idxName := "idx_" + b.ColumnName
+func invertedIndexNameForColumn(colName string) string {
+	idxName := "idx_" + colName
 	if len(idxName) > 60 {
 		h := fnv.New32a()
-		_, _ = h.Write([]byte(b.ColumnName))
+		_, _ = h.Write([]byte(colName))
 		idxName = fmt.Sprintf("%s_%08x", idxName[:51], h.Sum32())
 	}
+	return idxName
+}
+
+func buildColumnAndIndexDDL(b FieldBinding) (string, string) {
+	idxName := invertedIndexNameForColumn(b.ColumnName)
 
 	switch b.Kind {
 	case StoragePromotedVector:
@@ -451,8 +478,16 @@ func buildColumnAndIndexDDL(b FieldBinding) (string, string) {
 		}
 		if b.DorisType == DorisString {
 			parser := mapESAnalyzerToDorisParser(b.Analyzer)
+			aLower := strings.ToLower(strings.TrimSpace(b.Analyzer))
+			if aLower == "english" || aLower == "stop" {
+				idxDef := fmt.Sprintf(
+					"INDEX `%s` (`%s`) USING INVERTED PROPERTIES(\"parser\" = \"%s\", \"support_phrase\" = \"true\", \"lower_case\" = \"true\")",
+					idxName, b.ColumnName, parser,
+				)
+				return colDef, idxDef
+			}
 			idxDef := fmt.Sprintf(
-				"INDEX `%s` (`%s`) USING INVERTED PROPERTIES(\"parser\" = \"%s\", \"support_phrase\" = \"true\", \"lower_case\" = \"true\")",
+				"INDEX `%s` (`%s`) USING INVERTED PROPERTIES(\"parser\" = \"%s\", \"support_phrase\" = \"true\", \"lower_case\" = \"true\", \"stopwords\" = \"none\")",
 				idxName, b.ColumnName, parser,
 			)
 			return colDef, idxDef

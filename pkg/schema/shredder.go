@@ -29,8 +29,10 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
+	"github.com/es2doris/doris-es-proxy/pkg/analysis"
 	"github.com/es2doris/doris-es-proxy/pkg/esast"
 )
 
@@ -113,7 +115,7 @@ func ShredDocumentWithNow(
 		}
 		totalNestedObjs := 0
 		for _, parts := range nestedPaths {
-			totalNestedObjs += len(extractNestedElementMapsWithIDs(parsedDoc, parts, ""))
+			totalNestedObjs += len(extractNestedElementMapsWithSchemaAndIDs(s, parsedDoc, parts, "", ""))
 		}
 		if totalNestedObjs > s.MaxNestedObjects {
 			return nil, esWireError(fmt.Sprintf("illegal_argument_exception: The number of nested documents has exceeded the allowed limit of [%d]. This limit can be set by changing the [index.mapping.nested_objects.limit] index level setting.", s.MaxNestedObjects))
@@ -205,6 +207,17 @@ func ShredDocumentWithNow(
 			cleanBinding: &bc,
 		})
 	}
+	type deferredGeoNullSubst struct {
+		path    []string
+		nullVal any
+	}
+	var deferredGeoNulls []deferredGeoNullSubst
+	deferReplaceGeoNulls := func(path []string, nullVal any) {
+		deferredGeoNulls = append(deferredGeoNulls, deferredGeoNullSubst{
+			path:    path,
+			nullVal: nullVal,
+		})
+	}
 	if s != nil && len(s.Fields) > 0 {
 		aliasFieldKeys := make([]string, 0)
 		for k, b := range s.Fields {
@@ -230,7 +243,7 @@ func ShredDocumentWithNow(
 		sort.Strings(flattenedFieldKeys)
 		for _, k := range flattenedFieldKeys {
 			b := s.withEffectiveDefaults(s.Fields[k])
-			modified, err := validateAndNormalizeFlattenedFieldInDoc(parsedDoc, b.SourceJSONPath, b, recordIgnored)
+			modified, err := validateAndNormalizeFlattenedFieldInDocWithSchema(parsedDoc, b.SourceJSONPath, b, recordIgnored, s)
 			if err != nil {
 				if b.IgnoreMalformed != nil && *b.IgnoreMalformed {
 					recordIgnored(b.ESFieldPath)
@@ -336,10 +349,7 @@ func ShredDocumentWithNow(
 			hasConst := b.HasConstantValue || b.ConstantValue != nil
 			expectedStr := ""
 			if hasConst && b.ConstantValue != nil {
-				expectedStr = fmt.Sprintf("%v", b.ConstantValue)
-				if b.LowercaseNormalizer {
-					expectedStr = strings.ToLower(expectedStr)
-				}
+				expectedStr = normalizeValueForBinding(fmt.Sprintf("%v", b.ConstantValue), b, s)
 			}
 			rawLeafs := extractRawLeafValuesWithNull(parsedDoc, b.SourceJSONPath, b.NullValue)
 			var validLeafs []any
@@ -350,10 +360,7 @@ func ShredDocumentWithNow(
 				if rv == nil {
 					continue
 				}
-				sv := fmt.Sprintf("%v", rv)
-				if b.LowercaseNormalizer {
-					sv = strings.ToLower(sv)
-				}
+				sv := normalizeValueForBinding(fmt.Sprintf("%v", rv), b, s)
 				if hasConst {
 					if sv != expectedStr {
 						if b.IgnoreMalformed != nil && *b.IgnoreMalformed {
@@ -384,7 +391,7 @@ func ShredDocumentWithNow(
 			}
 			if b.Kind == StorageNestedSubfield {
 				if (hasConst || hasAdopted) && (!hadMalformed || len(validLeafs) > 0) {
-					if len(extractNestedElementMapsWithIDs(parsedDoc, strings.Split(b.NestedPath, "."), "")) > 0 {
+					if len(extractNestedElementMapsWithSchemaAndIDs(s, parsedDoc, strings.Split(b.NestedPath, "."), "", "")) > 0 {
 						row[b.ColumnName] = []string{storeStr}
 					}
 				}
@@ -427,7 +434,7 @@ func ShredDocumentWithNow(
 						return nil, compErr
 					}
 				} else {
-					strs = extractStringSliceValuesWithNull(parsedDoc, b.SourceJSONPath, b.LowercaseNormalizer, b.NullValue)
+					strs = extractStringSliceValuesWithNullForBinding(parsedDoc, b.SourceJSONPath, b, s)
 				}
 				if b.IgnoreAbove > 0 && len(strs) > 0 {
 					filtered := strs[:0]
@@ -450,7 +457,7 @@ func ShredDocumentWithNow(
 					}
 				}
 				if val != nil {
-					if coerced := coerceScalarBindingForDoris(val, b, getNow()); coerced != nil {
+					if coerced := coerceScalarBindingForDorisWithSchema(s, val, b, getNow()); coerced != nil {
 						row[b.ColumnName] = coerced
 					}
 				}
@@ -470,10 +477,7 @@ func ShredDocumentWithNow(
 			var rawLeafs []any
 			switch b.ESType {
 			case "geo_point":
-				rawLeafs = extractGeoPointCandidatesWithNull(parsedDoc, b.SourceJSONPath, nil)
-				if len(rawLeafs) == 0 && b.NullValue != nil {
-					rawLeafs = extractGeoPointCandidatesWithNull(parsedDoc, b.SourceJSONPath, b.NullValue)
-				}
+				rawLeafs = extractGeoPointCandidatesWithNull(parsedDoc, b.SourceJSONPath, b.NullValue)
 			case "token_count":
 				rawLeafs = extractRawLeafValuesWithNull(parsedDoc, b.SourceJSONPath, b.NullValue)
 			default:
@@ -498,7 +502,7 @@ func ShredDocumentWithNow(
 						totalTokens += countTokensForBinding(sv, b)
 						hasTokenVal = true
 						validLeafs = append(validLeafs, rv)
-					} else if coerced := coerceScalarBindingForDoris(rv, b, getNow()); coerced != nil {
+					} else if coerced := coerceScalarBindingForDorisWithSchema(s, rv, b, getNow()); coerced != nil {
 						switch iv := coerced.(type) {
 						case int64:
 							totalTokens += iv
@@ -532,6 +536,9 @@ func ShredDocumentWithNow(
 				if b.ESType == "geo_point" && strings.EqualFold(strings.TrimSpace(b.TimeSeriesMetric), "position") && len(rawLeafs) > 1 {
 					return nil, fmt.Errorf("mapper_parsing_exception: failed to parse: field type for [%s] does not accept more than single value", b.ESFieldPath)
 				}
+				if b.ESType == "geo_point" && b.NullValue != nil && isPrimaryFieldBinding(b) && hasExplicitNullAtPath(parsedDoc, b.SourceJSONPath) {
+					deferReplaceGeoNulls(b.SourceJSONPath, b.NullValue)
+				}
 				var firstVal any
 				var validLeafs []any
 				hadMalformed := hasObjAtPath
@@ -545,11 +552,14 @@ func ShredDocumentWithNow(
 							str = fmt.Sprintf("%v", rv)
 							ok = true
 						}
-						if ok && len([]rune(str)) > b.IgnoreAbove {
-							if isPrimaryFieldBinding(b) {
-								recordIgnored(b.ESFieldPath)
+						if ok {
+							str = normalizeValueForBinding(str, b, s)
+							if len([]rune(str)) > b.IgnoreAbove {
+								if isPrimaryFieldBinding(b) {
+									recordIgnored(b.ESFieldPath)
+								}
+								continue
 							}
-							continue
 						}
 					}
 					if strVal, isStr := rv.(string); isStr && strings.TrimSpace(strVal) == "" && b.ESType != "token_count" && b.ESType != "murmur3" && b.ESType != "rank_feature" && (b.Coerce == nil || *b.Coerce) && (b.ESType == "ip" || b.ESType == "geo_point" || (b.DorisType != DorisString && b.DorisType != DorisVarchar)) {
@@ -559,7 +569,7 @@ func ShredDocumentWithNow(
 							continue
 						}
 					}
-					coerced := coerceScalarBindingForDoris(rv, b, getNow())
+					coerced := coerceScalarBindingForDorisWithSchema(s, rv, b, getNow())
 					if coerced == nil {
 						if b.IgnoreMalformed != nil && *b.IgnoreMalformed {
 							recordIgnored(b.ESFieldPath)
@@ -584,12 +594,15 @@ func ShredDocumentWithNow(
 							str = fmt.Sprintf("%v", b.NullValue)
 							ok = true
 						}
-						if ok && len([]rune(str)) > b.IgnoreAbove {
-							nvAllowed = false
+						if ok {
+							str = normalizeValueForBinding(str, b, s)
+							if len([]rune(str)) > b.IgnoreAbove {
+								nvAllowed = false
+							}
 						}
 					}
 					if nvAllowed {
-						firstVal = coerceScalarBindingForDoris(b.NullValue, b, getNow())
+						firstVal = coerceScalarBindingForDorisWithSchema(s, b.NullValue, b, getNow())
 					}
 				}
 				if firstVal != nil {
@@ -609,22 +622,25 @@ func ShredDocumentWithNow(
 					str = fmt.Sprintf("%v", val)
 					ok = true
 				}
-				if ok && len([]rune(str)) > b.IgnoreAbove {
-					if isPrimaryFieldBinding(b) {
-						recordIgnored(b.ESFieldPath)
+				if ok {
+					str = normalizeValueForBinding(str, b, s)
+					if len([]rune(str)) > b.IgnoreAbove {
+						if isPrimaryFieldBinding(b) {
+							recordIgnored(b.ESFieldPath)
+						}
+						val = nil
 					}
-					val = nil
 				}
 			}
 			if val != nil {
 				if strVal, isStr := val.(string); isStr && strings.TrimSpace(strVal) == "" && b.ESType != "token_count" && b.ESType != "murmur3" && b.ESType != "rank_feature" && (b.Coerce == nil || *b.Coerce) && (b.ESType == "ip" || b.ESType == "geo_point" || (b.DorisType != DorisString && b.DorisType != DorisVarchar)) {
 					if b.NullValue != nil {
-						val = coerceScalarBindingForDoris(b.NullValue, b, getNow())
+						val = coerceScalarBindingForDorisWithSchema(s, b.NullValue, b, getNow())
 					} else {
 						val = nil
 					}
 				} else {
-					coerced := coerceScalarBindingForDoris(val, b, getNow())
+					coerced := coerceScalarBindingForDorisWithSchema(s, val, b, getNow())
 					if coerced == nil {
 						if b.IgnoreMalformed != nil && *b.IgnoreMalformed {
 							recordIgnored(b.ESFieldPath)
@@ -650,7 +666,7 @@ func ShredDocumentWithNow(
 				if b.NestedPath != "" {
 					rootParts = strings.Split(b.NestedPath, ".")
 				}
-				rawElems := extractNestedElementMapsWithIDs(parsedDoc, rootParts, "")
+				rawElems := extractNestedElementMapsWithSchemaAndIDs(s, parsedDoc, rootParts, "", "")
 				curB := s.Fields[b.ESFieldPath]
 				docLockedDims := curB.VectorDims
 				for _, elem := range rawElems {
@@ -685,7 +701,7 @@ func ShredDocumentWithNow(
 			if b.IsVirtualSAYTSubfield {
 				var rawStrs []string
 				if b.Kind == StorageNestedSubfield && b.NestedPath != "" {
-					rawElems := extractNestedElementMapsWithIDs(parsedDoc, strings.Split(b.NestedPath, "."), "")
+					rawElems := extractNestedElementMapsWithSchemaAndIDs(s, parsedDoc, strings.Split(b.NestedPath, "."), "", "")
 					for _, elem := range rawElems {
 						rawStrs = append(rawStrs, extractStringSliceValuesWithNull(elem.m, b.RelativeJSONPath, false, nil)...)
 					}
@@ -718,6 +734,9 @@ func ShredDocumentWithNow(
 					if strings.EqualFold(strings.TrimSpace(b.TimeSeriesMetric), "position") && len(rawLeafs) > 1 {
 						return nil, fmt.Errorf("mapper_parsing_exception: failed to parse: field type for [%s] does not accept more than single value", b.ESFieldPath)
 					}
+					if b.NullValue != nil && b.Kind != StorageNestedSubfield && isPrimaryFieldBinding(b) && hasExplicitNullAtPath(parsedDoc, b.SourceJSONPath) {
+						deferReplaceGeoNulls(b.SourceJSONPath, b.NullValue)
+					}
 				} else {
 					rawLeafs = extractRawLeafValuesWithNull(parsedDoc, b.SourceJSONPath, b.NullValue)
 				}
@@ -735,7 +754,7 @@ func ShredDocumentWithNow(
 							continue
 						}
 					}
-					coerced := coerceScalarBindingForDoris(rv, b, getNow())
+					coerced := coerceScalarBindingForDorisWithSchema(s, rv, b, getNow())
 					if coerced == nil {
 						if b.IgnoreMalformed != nil && *b.IgnoreMalformed {
 							recordIgnored(b.ESFieldPath)
@@ -785,7 +804,7 @@ func ShredDocumentWithNow(
 					return nil, compErr
 				}
 			} else {
-				vals = extractStringSliceValuesWithNull(parsedDoc, b.SourceJSONPath, b.LowercaseNormalizer, b.NullValue)
+				vals = extractStringSliceValuesWithNullForBinding(parsedDoc, b.SourceJSONPath, b, s)
 			}
 			if b.IgnoreAbove > 0 && len(vals) > 0 {
 				filtered := vals[:0]
@@ -934,6 +953,9 @@ func ShredDocumentWithNow(
 				continue
 			}
 			for _, targetField := range b.CopyTo {
+				if targetField == b.ESFieldPath {
+					continue
+				}
 				edgeKey := b.ESFieldPath + "\x00" + targetField
 				already := forwardedCount[edgeKey]
 				if already >= len(allSrc) {
@@ -995,7 +1017,7 @@ func ShredDocumentWithNow(
 							if strVal, isStr := rv.(string); isStr && strings.TrimSpace(strVal) == "" && tb.ESType != "version" && (tb.Coerce == nil || *tb.Coerce) {
 								continue
 							}
-							coerced := coerceScalarBindingForDoris(rv, tb, getNow())
+							coerced := coerceScalarBindingForDorisWithSchema(s, rv, tb, getNow())
 							if coerced == nil {
 								if tb.IgnoreMalformed != nil && *tb.IgnoreMalformed {
 									recordIgnored(targetField)
@@ -1019,7 +1041,7 @@ func ShredDocumentWithNow(
 						}
 						if len(filteredSrc) > 0 {
 							joined := strings.Join(filteredSrc, " ")
-							coerced := coerceScalarBindingForDoris(joined, tb, getNow())
+							coerced := coerceScalarBindingForDorisWithSchema(s, joined, tb, getNow())
 							if coerced != nil {
 								if existing, exists := row[tb.ColumnName]; exists && existing != nil {
 									if tb.DorisType == DorisString || tb.DorisType == DorisVarchar {
@@ -1033,17 +1055,22 @@ func ShredDocumentWithNow(
 					}
 					if tb.KeywordCompanion != "" {
 						kwB, hasKw := s.Fields[targetField+".keyword"]
+						if hasKw {
+							kwB = s.withEffectiveDefaults(kwB)
+						}
 						if hasKw && kwB.Kind == StoragePromotedArray {
 							var curKw []string
 							if existing, ok := row[tb.KeywordCompanion].([]string); ok {
 								curKw = append(curKw, existing...)
 							}
 							for _, sv := range srcStrs {
+								if kwB.NormalizerName != "" || kwB.LowercaseNormalizer {
+									sv = normalizeValueForBinding(sv, kwB, s)
+								} else if tb.KeywordNormalizer {
+									sv = strings.ToLower(sv)
+								}
 								if kwB.IgnoreAbove > 0 && len([]rune(sv)) > kwB.IgnoreAbove {
 									continue
-								}
-								if tb.KeywordNormalizer || kwB.LowercaseNormalizer {
-									sv = strings.ToLower(sv)
 								}
 								curKw = append(curKw, sv)
 							}
@@ -1053,11 +1080,13 @@ func ShredDocumentWithNow(
 						} else {
 							var filteredKw []string
 							for _, sv := range srcStrs {
+								if hasKw && (kwB.NormalizerName != "" || kwB.LowercaseNormalizer) {
+									sv = normalizeValueForBinding(sv, kwB, s)
+								} else if tb.KeywordNormalizer {
+									sv = strings.ToLower(sv)
+								}
 								if hasKw && kwB.IgnoreAbove > 0 && len([]rune(sv)) > kwB.IgnoreAbove {
 									continue
-								}
-								if tb.KeywordNormalizer || (hasKw && kwB.LowercaseNormalizer) {
-									sv = strings.ToLower(sv)
 								}
 								filteredKw = append(filteredKw, sv)
 							}
@@ -1088,7 +1117,7 @@ func ShredDocumentWithNow(
 							if strVal, isStr := rv.(string); isStr && strings.TrimSpace(strVal) == "" && tb.ESType != "version" && (tb.Coerce == nil || *tb.Coerce) {
 								continue
 							}
-							coerced := coerceScalarBindingForDoris(rv, tb, getNow())
+							coerced := coerceScalarBindingForDorisWithSchema(s, rv, tb, getNow())
 							if coerced == nil {
 								if tb.IgnoreMalformed != nil && *tb.IgnoreMalformed {
 									recordIgnored(targetField)
@@ -1103,8 +1132,8 @@ func ShredDocumentWithNow(
 								}
 							}
 							sv = formatCoercedArrayElement(coerced)
-						} else if tb.LowercaseNormalizer {
-							sv = strings.ToLower(sv)
+						} else if tb.NormalizerName != "" || tb.LowercaseNormalizer {
+							sv = normalizeValueForBinding(sv, tb, s)
 						}
 						cur = append(cur, sv)
 					}
@@ -1112,17 +1141,22 @@ func ShredDocumentWithNow(
 						row[tb.ColumnName] = cur
 					}
 					if tb.KeywordCompanion != "" {
-						kwB := s.Fields[targetField+".keyword"]
+						kwB, hasKw := s.Fields[targetField+".keyword"]
+						if hasKw {
+							kwB = s.withEffectiveDefaults(kwB)
+						}
 						var curKw []string
 						if existing, ok := row[tb.KeywordCompanion].([]string); ok {
 							curKw = append(curKw, existing...)
 						}
 						for _, sv := range srcStrs {
+							if hasKw && (kwB.NormalizerName != "" || kwB.LowercaseNormalizer) {
+								sv = normalizeValueForBinding(sv, kwB, s)
+							} else if tb.KeywordNormalizer {
+								sv = strings.ToLower(sv)
+							}
 							if kwB.IgnoreAbove > 0 && len([]rune(sv)) > kwB.IgnoreAbove {
 								continue
-							}
-							if tb.KeywordNormalizer || kwB.LowercaseNormalizer {
-								sv = strings.ToLower(sv)
 							}
 							curKw = append(curKw, sv)
 						}
@@ -1144,7 +1178,7 @@ func ShredDocumentWithNow(
 	// Populate correlated nested JSON element arrays (`n__<nested_path>`)
 	if len(s.NestedRootSpecs) > 0 {
 		for _, nr := range s.NestedRootSpecs {
-			rawElements := extractNestedElementMapsWithIDs(parsedDoc, nr.PathParts, "")
+			rawElements := extractNestedElementMapsWithSchemaAndIDs(s, parsedDoc, nr.PathParts, "", "")
 			if len(rawElements) > 0 {
 				serializedElems := make([]string, 0, len(rawElements))
 				for _, elem := range rawElements {
@@ -1166,7 +1200,7 @@ func ShredDocumentWithNow(
 	} else {
 		for nestedPath, corrCol := range s.NestedRoots {
 			pathParts := strings.Split(nestedPath, ".")
-			rawElements := extractNestedElementMapsWithIDs(parsedDoc, pathParts, "")
+			rawElements := extractNestedElementMapsWithSchemaAndIDs(s, parsedDoc, pathParts, "", "")
 			if len(rawElements) > 0 {
 				serializedElems := make([]string, 0, len(rawElements))
 				for _, elem := range rawElements {
@@ -1216,6 +1250,11 @@ func ShredDocumentWithNow(
 	if len(ignoredSrcMap) > 0 {
 		parsedDoc["__ignored_source"] = ignoredSrcMap
 		prunedDynamic = true
+	}
+	for _, gn := range deferredGeoNulls {
+		if replaceNullsAtPathInMap(parsedDoc, gn.path, gn.nullVal) {
+			prunedDynamic = true
+		}
 	}
 	row["_doc"] = buildVariantDocPayload(trimmed, parsedDoc, prunedDynamic, s)
 	if (s.SyntheticSource || isImplicitSynthMode) && !s.SourceDisabled() && !strings.EqualFold(s.SourceMode, "stored") {
@@ -1646,7 +1685,7 @@ func dateFormatAllowsNumericWithNoCoerce(format string) bool {
 	}
 	for _, part := range strings.Split(format, "||") {
 		switch strings.TrimSpace(part) {
-		case "epoch_millis", "epoch_second":
+		case "epoch_millis", "epoch_second", "epoch_nanos":
 			return true
 		}
 	}
@@ -1711,7 +1750,28 @@ func parseExactUint64(val any) (uint64, bool) {
 	return 0, false
 }
 
+func normalizeValueForBinding(val string, b FieldBinding, idx *IndexSchema) string {
+	normName := strings.TrimSpace(b.NormalizerName)
+	var cfg *analysis.IndexAnalysisConfig
+	if idx != nil {
+		cfg = idx.AnalysisConfig
+	}
+	if normName != "" {
+		if normalized, err := analysis.NormalizeTerm(val, normName, cfg, analysis.Options{}); err == nil {
+			return normalized
+		}
+	}
+	if b.LowercaseNormalizer {
+		return strings.ToLower(val)
+	}
+	return val
+}
+
 func coerceScalarBindingForDoris(val any, b FieldBinding, now time.Time) any {
+	return coerceScalarBindingForDorisWithSchema(nil, val, b, now)
+}
+
+func coerceScalarBindingForDorisWithSchema(idx *IndexSchema, val any, b FieldBinding, now time.Time) any {
 	if val == nil {
 		return nil
 	}
@@ -2012,31 +2072,31 @@ func coerceScalarBindingForDoris(val any, b FieldBinding, now time.Time) any {
 		}
 		switch v := val.(type) {
 		case string:
-			if ns, ok := ParseESDateWithFormatToEpochNanos(v, b.Format, now); ok {
+			if ns, ok := ParseESDateWithFormatAndLocaleToEpochNanos(v, b.Format, b.Locale, now); ok {
 				return ns
 			}
 		case int64:
-			if ns, ok := ParseESDateWithFormatToEpochNanos(strconv.FormatInt(v, 10), b.Format, now); ok {
+			if ns, ok := ParseESDateWithFormatAndLocaleToEpochNanos(strconv.FormatInt(v, 10), b.Format, b.Locale, now); ok {
 				return ns
 			}
 		case int:
-			if ns, ok := ParseESDateWithFormatToEpochNanos(strconv.Itoa(v), b.Format, now); ok {
+			if ns, ok := ParseESDateWithFormatAndLocaleToEpochNanos(strconv.Itoa(v), b.Format, b.Locale, now); ok {
 				return ns
 			}
 		case float64:
 			if !math.IsNaN(v) && !math.IsInf(v, 0) {
-				if ns, ok := ParseESDateWithFormatToEpochNanos(strconv.FormatFloat(v, 'f', -1, 64), b.Format, now); ok {
+				if ns, ok := ParseESDateWithFormatAndLocaleToEpochNanos(strconv.FormatFloat(v, 'f', -1, 64), b.Format, b.Locale, now); ok {
 					return ns
 				}
 			}
 		case json.Number:
-			if ns, ok := ParseESDateWithFormatToEpochNanos(v.String(), b.Format, now); ok {
+			if ns, ok := ParseESDateWithFormatAndLocaleToEpochNanos(v.String(), b.Format, b.Locale, now); ok {
 				return ns
 			}
 		}
 		return nil
 	}
-	if b.ESType == "date" && b.Format != "" {
+	if b.ESType == "date" && (b.Format != "" || b.Locale != "") {
 		if b.Coerce != nil && !*b.Coerce && !dateFormatAllowsNumericWithNoCoerce(b.Format) {
 			switch val.(type) {
 			case int, int64, float64, json.Number:
@@ -2045,26 +2105,26 @@ func coerceScalarBindingForDoris(val any, b FieldBinding, now time.Time) any {
 		}
 		switch v := val.(type) {
 		case string:
-			if ms, ok := ParseESDateWithFormatToEpochMillis(v, b.Format, now); ok {
+			if ms, ok := ParseESDateWithFormatAndLocaleToEpochMillis(v, b.Format, b.Locale, now); ok {
 				return ms
 			}
 		case int64:
 			if b.FromScript || b.FromRuntime {
 				return v
 			}
-			if ms, ok := ParseESDateWithFormatToEpochMillis(strconv.FormatInt(v, 10), b.Format, now); ok {
+			if ms, ok := ParseESDateWithFormatAndLocaleToEpochMillis(strconv.FormatInt(v, 10), b.Format, b.Locale, now); ok {
 				return ms
 			}
 		case int:
 			if b.FromScript || b.FromRuntime {
 				return int64(v)
 			}
-			if ms, ok := ParseESDateWithFormatToEpochMillis(strconv.Itoa(v), b.Format, now); ok {
+			if ms, ok := ParseESDateWithFormatAndLocaleToEpochMillis(strconv.Itoa(v), b.Format, b.Locale, now); ok {
 				return ms
 			}
 		case float64:
 			if !math.IsNaN(v) && !math.IsInf(v, 0) {
-				if ms, ok := ParseESDateWithFormatToEpochMillis(strconv.FormatFloat(v, 'f', -1, 64), b.Format, now); ok {
+				if ms, ok := ParseESDateWithFormatAndLocaleToEpochMillis(strconv.FormatFloat(v, 'f', -1, 64), b.Format, b.Locale, now); ok {
 					return ms
 				}
 			}
@@ -2074,13 +2134,18 @@ func coerceScalarBindingForDoris(val any, b FieldBinding, now time.Time) any {
 					return iv
 				}
 			}
-			if ms, ok := ParseESDateWithFormatToEpochMillis(v.String(), b.Format, now); ok {
+			if ms, ok := ParseESDateWithFormatAndLocaleToEpochMillis(v.String(), b.Format, b.Locale, now); ok {
 				return ms
 			}
 		}
 		return nil
 	}
-	coerced := coerceScalarForDoris(val, effDorisType, b.LowercaseNormalizer, now)
+	coerced := coerceScalarForDoris(val, effDorisType, b.LowercaseNormalizer && b.NormalizerName == "", now)
+	if b.NormalizerName != "" {
+		if sv, ok := coerced.(string); ok && b.ESType != "ip" && b.ESType != "geo_point" && b.ESType != "version" && b.ESType != "binary" {
+			coerced = normalizeValueForBinding(sv, b, idx)
+		}
+	}
 	switch b.ESType {
 	case "short":
 		if iv, ok := coerced.(int); ok && (iv < math.MinInt16 || iv > math.MaxInt16) {
@@ -2672,7 +2737,7 @@ func ESDateFormatToGoLayout(pattern string) string {
 			b.WriteString("02")
 		case "d":
 			b.WriteString("2")
-		case "HH":
+		case "HH", "H":
 			b.WriteString("15")
 		case "hh":
 			b.WriteString("03")
@@ -2688,6 +2753,16 @@ func ESDateFormatToGoLayout(pattern string) string {
 			b.WriteString("5")
 		case "SSS":
 			b.WriteString("000")
+		case "EEEE":
+			b.WriteString("Monday")
+		case "E", "EE", "EEE":
+			b.WriteString("Mon")
+		case "MMMM":
+			b.WriteString("January")
+		case "MMM":
+			b.WriteString("Jan")
+		case "a":
+			b.WriteString("PM")
 		case "Z", "ZZ", "ZZZ":
 			b.WriteString("-0700")
 		case "ZZZZ", "ZZZZZ", "X", "XX", "XXX", "XXXX", "XXXXX":
@@ -2708,16 +2783,166 @@ func ESDateFormatToGoLayout(pattern string) string {
 	return b.String()
 }
 
+func translateLocalizedDateInput(input, locale string) string {
+	return translateLocalizedDateInputForPattern(input, locale, "")
+}
+
+func translateLocalizedDateInputForPattern(input, locale, pattern string) string {
+	loc := strings.TrimSpace(locale)
+	if loc == "" {
+		return input
+	}
+	lang := strings.ToLower(strings.Split(strings.Split(loc, "-")[0], "_")[0])
+	if lang != "fr" {
+		return input
+	}
+	fullWeekday := strings.Contains(pattern, "EEEE")
+	fullMonth := strings.Contains(pattern, "MMMM")
+	pickWeekday := func(short, full string) string {
+		if fullWeekday {
+			return full
+		}
+		return short
+	}
+	pickMonth := func(short, full string) string {
+		if fullMonth {
+			return full
+		}
+		return short
+	}
+	lookupToken := func(tok string) (string, bool) {
+		switch strings.ToLower(tok) {
+		case "lun.", "lun", "lundi":
+			return pickWeekday("Mon", "Monday"), true
+		case "mar.", "mar", "mardi":
+			return pickWeekday("Tue", "Tuesday"), true
+		case "mer.", "mer", "mercredi":
+			return pickWeekday("Wed", "Wednesday"), true
+		case "jeu.", "jeu", "jeudi":
+			return pickWeekday("Thu", "Thursday"), true
+		case "ven.", "ven", "vendredi":
+			return pickWeekday("Fri", "Friday"), true
+		case "sam.", "sam", "samedi":
+			return pickWeekday("Sat", "Saturday"), true
+		case "dim.", "dim", "dimanche":
+			return pickWeekday("Sun", "Sunday"), true
+		case "janv.", "janv", "jan.", "jan", "janvier":
+			return pickMonth("Jan", "January"), true
+		case "févr.", "févr", "fevr.", "fevr", "fév.", "fév", "fev.", "fev", "février", "fevrier":
+			return pickMonth("Feb", "February"), true
+		case "mars":
+			return pickMonth("Mar", "March"), true
+		case "avr.", "avr", "avril":
+			return pickMonth("Apr", "April"), true
+		case "mai":
+			return pickMonth("May", "May"), true
+		case "juin":
+			return pickMonth("Jun", "June"), true
+		case "juil.", "juil", "juill.", "juill", "juillet":
+			return pickMonth("Jul", "July"), true
+		case "août", "aout", "aoû.", "aou.":
+			return pickMonth("Aug", "August"), true
+		case "sept.", "sept", "sep.", "sep", "septembre":
+			return pickMonth("Sep", "September"), true
+		case "oct.", "oct", "octobre":
+			return pickMonth("Oct", "October"), true
+		case "nov.", "nov", "novembre":
+			return pickMonth("Nov", "November"), true
+		case "déc.", "déc", "dec.", "dec", "décembre", "decembre":
+			return pickMonth("Dec", "December"), true
+		default:
+			return "", false
+		}
+	}
+	var out strings.Builder
+	out.Grow(len(input))
+	for i := 0; i < len(input); {
+		r, sz := utf8.DecodeRuneInString(input[i:])
+		if !unicode.IsLetter(r) {
+			out.WriteRune(r)
+			i += sz
+			continue
+		}
+		start := i
+		i += sz
+		for i < len(input) {
+			nr, nsz := utf8.DecodeRuneInString(input[i:])
+			if !unicode.IsLetter(nr) {
+				break
+			}
+			i += nsz
+		}
+		word := input[start:i]
+		if i < len(input) && input[i] == '.' {
+			if rep, ok := lookupToken(word + "."); ok {
+				out.WriteString(rep)
+				i++
+				continue
+			}
+		}
+		if rep, ok := lookupToken(word); ok {
+			out.WriteString(rep)
+			continue
+		}
+		out.WriteString(word)
+	}
+	return out.String()
+}
+
+func parseESStrictDateTimeString(s string, allowFrac bool) (time.Time, bool) {
+	if !strings.Contains(s, "T") {
+		return time.Time{}, false
+	}
+	if !allowFrac && strings.Contains(s, ".") {
+		return time.Time{}, false
+	}
+	var layouts []string
+	if allowFrac {
+		layouts = []string{
+			time.RFC3339Nano,
+			time.RFC3339,
+			"2006-01-02T15:04:05.999999999Z0700",
+			"2006-01-02T15:04:05.000Z0700",
+			"2006-01-02T15:04:05Z0700",
+			"2006-01-02T15:04:05.999999999Z07:00",
+			"2006-01-02T15:04:05Z07:00",
+		}
+	} else {
+		layouts = []string{
+			"2006-01-02T15:04:05Z07:00",
+			"2006-01-02T15:04:05Z0700",
+		}
+	}
+	for _, l := range layouts {
+		if t, err := time.Parse(l, s); err == nil {
+			return t.UTC(), true
+		}
+	}
+	return time.Time{}, false
+}
+
 // ParseESDateWithFormatToEpochMillis parses a date string or date math expression using an
 // optional ES date format specification (e.g., "dd/MM/yyyy||epoch_millis") before falling back
 // to standard ISO-8601 / epoch millis parsing.
 func ParseESDateWithFormatToEpochMillis(input, format string, now time.Time) (int64, bool) {
-	return ParseESDateBoundWithFormatToEpochMillis(input, format, now, false)
+	return ParseESDateBoundWithFormatAndLocaleToEpochMillis(input, format, "", now, false)
+}
+
+// ParseESDateWithFormatAndLocaleToEpochMillis parses a date string using an optional ES date
+// format specification and locale into Unix epoch milliseconds.
+func ParseESDateWithFormatAndLocaleToEpochMillis(input, format, locale string, now time.Time) (int64, bool) {
+	return ParseESDateBoundWithFormatAndLocaleToEpochMillis(input, format, locale, now, false)
 }
 
 // ParseESDateBoundWithFormatToEpochMillis parses a date string or date math expression using an
 // optional ES date format specification, rounding date-only or `/unit` expressions up when `roundUp` is true.
 func ParseESDateBoundWithFormatToEpochMillis(input, format string, now time.Time, roundUp bool) (int64, bool) {
+	return ParseESDateBoundWithFormatAndLocaleToEpochMillis(input, format, "", now, roundUp)
+}
+
+// ParseESDateBoundWithFormatAndLocaleToEpochMillis parses a date bound using an optional ES date
+// format specification and locale, rounding date-only or `/unit` expressions up when `roundUp` is true.
+func ParseESDateBoundWithFormatAndLocaleToEpochMillis(input, format, locale string, now time.Time, roundUp bool) (int64, bool) {
 	s := strings.TrimSpace(input)
 	if s == "" {
 		return 0, false
@@ -2790,7 +3015,26 @@ func ParseESDateBoundWithFormatToEpochMillis(input, format string, now time.Time
 						return finalizeFormatMatch(t, false)
 					}
 				}
-			case "strict_date_optional_time", "date_optional_time", "strict_date_optional_time_nanos", "date_optional_time_nanos", "strict_date", "date", "strict_date_hour_minute_second", "date_hour_minute_second":
+			case "strict_date_time", "date_time":
+				if t, ok := parseESStrictDateTimeString(prefix, true); ok {
+					return finalizeFormatMatch(t, false)
+				}
+			case "strict_date_time_no_millis", "date_time_no_millis":
+				if t, ok := parseESStrictDateTimeString(prefix, false); ok {
+					return finalizeFormatMatch(t, false)
+				}
+			case "strict_date", "strict_year_month_day":
+				if t, err := time.Parse("2006-01-02", prefix); err == nil {
+					return finalizeFormatMatch(t, true)
+				}
+			case "date", "year_month_day":
+				for _, l := range []string{"2006-01-02", "2006/01/02"} {
+					if t, err := time.Parse(l, prefix); err == nil {
+						return finalizeFormatMatch(t, true)
+					}
+				}
+			case "strict_date_optional_time", "date_optional_time", "strict_date_optional_time_nanos", "date_optional_time_nanos", "iso8601", "ISO8601",
+				"strict_date_hour_minute_second", "date_hour_minute_second", "strict_date_hour_minute_second_millis", "date_hour_minute_second_millis", "strict_date_hour_minute_second_fraction", "date_hour_minute_second_fraction":
 				if t, ok := parseISODateString(prefix); ok {
 					if roundUp && (!hasMath || mathExpr == "") {
 						if rt, rounded := roundUpPartialISODate(t, prefix, time.Millisecond); rounded {
@@ -2805,7 +3049,11 @@ func ParseESDateBoundWithFormatToEpochMillis(input, format string, now time.Time
 				}
 				layout := ESDateFormatToGoLayout(fmtPart)
 				if layout != "" {
-					if t, err := time.Parse(layout, prefix); err == nil {
+					cand := prefix
+					if locale != "" {
+						cand = translateLocalizedDateInputForPattern(prefix, locale, fmtPart)
+					}
+					if t, err := time.Parse(layout, cand); err == nil {
 						dateOnly := !strings.ContainsAny(fmtPart, "HhmsS")
 						return finalizeFormatMatch(t, dateOnly)
 					}
@@ -2820,12 +3068,24 @@ func ParseESDateBoundWithFormatToEpochMillis(input, format string, now time.Time
 // ParseESDateWithFormatToEpochNanos parses a date string, integer epoch value, or date math expression
 // into signed Unix epoch nanoseconds (`int64`) for `date_nanos` fields.
 func ParseESDateWithFormatToEpochNanos(input, format string, now time.Time) (int64, bool) {
-	return ParseESDateBoundWithFormatToEpochNanos(input, format, now, false)
+	return ParseESDateBoundWithFormatAndLocaleToEpochNanos(input, format, "", now, false)
+}
+
+// ParseESDateWithFormatAndLocaleToEpochNanos parses a `date_nanos` string using an optional ES
+// date format specification and locale into signed Unix epoch nanoseconds (`int64`).
+func ParseESDateWithFormatAndLocaleToEpochNanos(input, format, locale string, now time.Time) (int64, bool) {
+	return ParseESDateBoundWithFormatAndLocaleToEpochNanos(input, format, locale, now, false)
 }
 
 // ParseESDateBoundWithFormatToEpochNanos parses a `date_nanos` bound using an optional ES date format,
 // rounding date-only or `/unit` expressions up to `.999999999` when `roundUp` is true.
 func ParseESDateBoundWithFormatToEpochNanos(input, format string, now time.Time, roundUp bool) (int64, bool) {
+	return ParseESDateBoundWithFormatAndLocaleToEpochNanos(input, format, "", now, roundUp)
+}
+
+// ParseESDateBoundWithFormatAndLocaleToEpochNanos parses a `date_nanos` bound using an optional ES
+// date format specification and locale, rounding date-only or `/unit` expressions up when `roundUp` is true.
+func ParseESDateBoundWithFormatAndLocaleToEpochNanos(input, format, locale string, now time.Time, roundUp bool) (int64, bool) {
 	s := strings.TrimSpace(input)
 	if s == "" {
 		return 0, false
@@ -2913,7 +3173,26 @@ func ParseESDateBoundWithFormatToEpochNanos(input, format string, now time.Time,
 						return finalizeFormatMatchNanos(t, false)
 					}
 				}
-			case "strict_date_optional_time", "date_optional_time", "strict_date_optional_time_nanos", "date_optional_time_nanos", "strict_date", "date", "strict_date_hour_minute_second", "date_hour_minute_second":
+			case "strict_date_time", "date_time":
+				if t, ok := parseESStrictDateTimeString(prefix, true); ok {
+					return finalizeFormatMatchNanos(t, false)
+				}
+			case "strict_date_time_no_millis", "date_time_no_millis":
+				if t, ok := parseESStrictDateTimeString(prefix, false); ok {
+					return finalizeFormatMatchNanos(t, false)
+				}
+			case "strict_date", "strict_year_month_day":
+				if t, err := time.Parse("2006-01-02", prefix); err == nil {
+					return finalizeFormatMatchNanos(t, true)
+				}
+			case "date", "year_month_day":
+				for _, l := range []string{"2006-01-02", "2006/01/02"} {
+					if t, err := time.Parse(l, prefix); err == nil {
+						return finalizeFormatMatchNanos(t, true)
+					}
+				}
+			case "strict_date_optional_time", "date_optional_time", "strict_date_optional_time_nanos", "date_optional_time_nanos", "iso8601", "ISO8601",
+				"strict_date_hour_minute_second", "date_hour_minute_second", "strict_date_hour_minute_second_millis", "date_hour_minute_second_millis", "strict_date_hour_minute_second_fraction", "date_hour_minute_second_fraction":
 				if t, ok := parseISODateString(prefix); ok {
 					if roundUp && (!hasMath || mathExpr == "") {
 						if rt, rounded := roundUpPartialISODate(t, prefix, time.Nanosecond); rounded {
@@ -2928,7 +3207,11 @@ func ParseESDateBoundWithFormatToEpochNanos(input, format string, now time.Time,
 				}
 				layout := ESDateFormatToGoLayout(fmtPart)
 				if layout != "" {
-					if t, err := time.Parse(layout, prefix); err == nil {
+					cand := prefix
+					if locale != "" {
+						cand = translateLocalizedDateInputForPattern(prefix, locale, fmtPart)
+					}
+					if t, err := time.Parse(layout, cand); err == nil {
 						dateOnly := !strings.ContainsAny(fmtPart, "HhmsS")
 						return finalizeFormatMatchNanos(t, dateOnly)
 					}
@@ -3183,13 +3466,17 @@ func ParseESDateBoundToEpochNanos(input string, now time.Time, roundUp bool) (in
 	} else if idx := strings.Index(s, "||"); idx >= 0 {
 		prefix := strings.TrimSpace(s[:idx])
 		mathExpr = strings.TrimSpace(s[idx+2:])
-		if iv, err := strconv.ParseInt(prefix, 10, 64); err == nil {
-			if iv <= math.MaxInt64/1_000_000 && iv >= math.MinInt64/1_000_000 {
-				baseTime = time.Unix(0, iv*1_000_000).UTC()
-			} else {
-				baseTime = time.Unix(0, iv).UTC()
+		if !isASCIIDigits4(prefix) {
+			if iv, err := strconv.ParseInt(prefix, 10, 64); err == nil {
+				if iv <= math.MaxInt64/1_000_000 && iv >= math.MinInt64/1_000_000 {
+					baseTime = time.Unix(0, iv*1_000_000).UTC()
+				} else {
+					baseTime = time.Unix(0, iv).UTC()
+				}
+				goto applyNanosMath
 			}
-		} else if t, ok := parseISODateString(prefix); ok {
+		}
+		if t, ok := parseISODateString(prefix); ok {
 			dateOnlyPrefix = isDateOnlyString(prefix)
 			if roundUp && mathExpr == "" {
 				if rt, rounded := roundUpPartialISODate(t, prefix, time.Nanosecond); rounded {
@@ -3212,6 +3499,8 @@ func ParseESDateBoundToEpochNanos(input string, now time.Time, roundUp bool) (in
 		}
 		return safeTimeToEpochNanos(t)
 	}
+
+applyNanosMath:
 
 	t, ok := applyESDateMathWithRoundNanos(baseTime, mathExpr, roundUp)
 	if !ok {
@@ -3406,7 +3695,19 @@ func ParseESDateBoundToEpochMillis(input string, now time.Time, roundUp bool) (i
 	} else if idx := strings.Index(s, "||"); idx >= 0 {
 		prefix := strings.TrimSpace(s[:idx])
 		mathExpr = strings.TrimSpace(s[idx+2:])
-		if ms, err := strconv.ParseInt(prefix, 10, 64); err == nil {
+		if isASCIIDigits4(prefix) {
+			if t, ok := parseISODateString(prefix); ok {
+				dateOnlyPrefix = isDateOnlyString(prefix)
+				if roundUp && mathExpr == "" {
+					if rt, rounded := roundUpPartialISODate(t, prefix, time.Millisecond); rounded {
+						t = rt
+					}
+				}
+				baseTime = t
+			} else {
+				return 0, false
+			}
+		} else if ms, err := strconv.ParseInt(prefix, 10, 64); err == nil {
 			if ms > 1_000_000_000_000_000 || ms < -1_000_000_000_000_000 {
 				ms /= 1_000_000
 			}
@@ -3477,7 +3778,16 @@ func roundUpPartialISODate(t time.Time, s string, unitDelta time.Duration) (time
 	return t, false
 }
 
+func isASCIIDigits4(s string) bool {
+	return len(s) == 4 && s[0] >= '0' && s[0] <= '9' && s[1] >= '0' && s[1] <= '9' && s[2] >= '0' && s[2] <= '9' && s[3] >= '0' && s[3] <= '9'
+}
+
 func parseISODateString(s string) (time.Time, bool) {
+	if isASCIIDigits4(s) {
+		if t, err := time.Parse("2006", s); err == nil {
+			return t.UTC(), true
+		}
+	}
 	layouts := []string{
 		time.RFC3339Nano,
 		time.RFC3339,
@@ -3486,6 +3796,9 @@ func parseISODateString(s string) (time.Time, bool) {
 		"2006-01-02T15:04:05Z0700",
 		"2006-01-02T15:04:05.999999999",
 		"2006-01-02T15:04:05",
+		"2006-01-02T15:04Z07:00",
+		"2006-01-02T15:04Z0700",
+		"2006-01-02T15:04",
 		"2006-01-02 15:04:05.999999999Z0700",
 		"2006-01-02 15:04:05.999999999Z07:00",
 		"2006-01-02 15:04:05.999999999",
@@ -3676,40 +3989,39 @@ func normalizeScalar(v any) any {
 }
 
 func extractStringSliceValuesWithNull(node any, path []string, lowercase bool, nullVal any) []string {
+	return extractStringSliceValuesWithNullForBinding(node, path, FieldBinding{
+		LowercaseNormalizer: lowercase,
+		NullValue:           nullVal,
+	}, nil)
+}
+
+func extractStringSliceValuesWithNullForBinding(node any, path []string, b FieldBinding, idx *IndexSchema) []string {
 	var out []string
-	collectStringsAtPathWithNull(node, path, lowercase, nullVal, &out)
+	collectStringsAtPathWithBinding(node, path, b, idx, &out)
 	return out
 }
 
-func collectStringsAtPathWithNull(node any, path []string, lowercase bool, nullVal any, out *[]string) {
+func collectStringsAtPathWithBinding(node any, path []string, b FieldBinding, idx *IndexSchema, out *[]string) {
 	if len(path) == 0 {
 		if node == nil {
-			if nullVal != nil {
-				s := fmt.Sprintf("%v", nullVal)
-				if lowercase {
-					s = strings.ToLower(s)
-				}
+			if b.NullValue != nil {
+				s := normalizeValueForBinding(fmt.Sprintf("%v", b.NullValue), b, idx)
 				*out = append(*out, s)
 			}
 			return
 		}
 		switch v := node.(type) {
 		case string:
-			if lowercase {
-				v = strings.ToLower(v)
-			}
+			v = normalizeValueForBinding(v, b, idx)
 			*out = append(*out, v)
 		case []any:
 			for _, item := range v {
-				collectStringsAtPathWithNull(item, nil, lowercase, nullVal, out)
+				collectStringsAtPathWithBinding(item, nil, b, idx, out)
 			}
 		case map[string]any:
 			return
 		default:
-			s := fmt.Sprintf("%v", v)
-			if lowercase {
-				s = strings.ToLower(s)
-			}
+			s := normalizeValueForBinding(fmt.Sprintf("%v", v), b, idx)
 			*out = append(*out, s)
 		}
 		return
@@ -3721,16 +4033,16 @@ func collectStringsAtPathWithNull(node any, path []string, lowercase bool, nullV
 	switch curr := node.(type) {
 	case map[string]any:
 		if next, ok := curr[path[0]]; ok {
-			collectStringsAtPathWithNull(next, path[1:], lowercase, nullVal, out)
+			collectStringsAtPathWithBinding(next, path[1:], b, idx, out)
 		}
 		for i := 2; i <= len(path); i++ {
 			if next, ok := curr[strings.Join(path[:i], ".")]; ok {
-				collectStringsAtPathWithNull(next, path[i:], lowercase, nullVal, out)
+				collectStringsAtPathWithBinding(next, path[i:], b, idx, out)
 			}
 		}
 	case []any:
 		for _, elem := range curr {
-			collectStringsAtPathWithNull(elem, path, lowercase, nullVal, out)
+			collectStringsAtPathWithBinding(elem, path, b, idx, out)
 		}
 	}
 }
@@ -3757,6 +4069,25 @@ func splitNestedParentID(nestedID string) string {
 }
 
 func extractNestedElementMapsWithIDs(node any, path []string, curPrefix string) []nestedExtractedElem {
+	return extractNestedElementMapsWithSchemaAndIDs(nil, node, path, "", curPrefix)
+}
+
+func schemaHasNestedRootPath(s *IndexSchema, path string) bool {
+	if s == nil || path == "" {
+		return false
+	}
+	if _, ok := s.NestedRoots[path]; ok {
+		return true
+	}
+	for _, nr := range s.NestedRootSpecs {
+		if nr.Path == path {
+			return true
+		}
+	}
+	return false
+}
+
+func extractNestedElementMapsWithSchemaAndIDs(s *IndexSchema, node any, path []string, walkedPath string, curPrefix string) []nestedExtractedElem {
 	if node == nil {
 		return nil
 	}
@@ -3787,13 +4118,24 @@ func extractNestedElementMapsWithIDs(node any, path []string, curPrefix string) 
 	}
 	switch curr := node.(type) {
 	case map[string]any:
-		if next, exists := curr[path[0]]; exists {
-			return extractNestedElementMapsWithIDs(next, path[1:], curPrefix)
+		seg := path[0]
+		nextWalked := seg
+		if walkedPath != "" {
+			nextWalked = walkedPath + "." + seg
+		}
+		if next, exists := curr[seg]; exists {
+			nextPrefix := curPrefix
+			if len(path) > 1 {
+				if _, isSingleObj := next.(map[string]any); isSingleObj && schemaHasNestedRootPath(s, nextWalked) {
+					nextPrefix = joinNestedElemID(curPrefix, 0)
+				}
+			}
+			return extractNestedElementMapsWithSchemaAndIDs(s, next, path[1:], nextWalked, nextPrefix)
 		}
 		if len(path) > 1 {
 			dotted := strings.Join(path, ".")
 			if next, exists := curr[dotted]; exists {
-				return extractNestedElementMapsWithIDs(next, nil, curPrefix)
+				return extractNestedElementMapsWithSchemaAndIDs(s, next, nil, nextWalked, curPrefix)
 			}
 		}
 		return nil
@@ -3801,7 +4143,7 @@ func extractNestedElementMapsWithIDs(node any, path []string, curPrefix string) 
 		var res []nestedExtractedElem
 		for idx, elem := range curr {
 			nextPrefix := joinNestedElemID(curPrefix, idx)
-			res = append(res, extractNestedElementMapsWithIDs(elem, path, nextPrefix)...)
+			res = append(res, extractNestedElementMapsWithSchemaAndIDs(s, elem, path, walkedPath, nextPrefix)...)
 		}
 		return res
 	default:
@@ -3840,7 +4182,7 @@ func propagateCopyToCustomMultiFields(s *IndexSchema, row map[string]any, target
 					if strVal, isStr := rv.(string); isStr && strings.TrimSpace(strVal) == "" && subB.ESType != "version" && (subB.Coerce == nil || *subB.Coerce) {
 						continue
 					}
-					coerced := coerceScalarBindingForDoris(rv, subB, getNow())
+					coerced := coerceScalarBindingForDorisWithSchema(s, rv, subB, getNow())
 					if coerced == nil {
 						if subB.IgnoreMalformed != nil && *subB.IgnoreMalformed {
 							if recordIgnored != nil {
@@ -3857,8 +4199,8 @@ func propagateCopyToCustomMultiFields(s *IndexSchema, row map[string]any, target
 						}
 					}
 					sv = formatCoercedArrayElement(coerced)
-				} else if subB.LowercaseNormalizer {
-					sv = strings.ToLower(sv)
+				} else if subB.NormalizerName != "" || subB.LowercaseNormalizer {
+					sv = normalizeValueForBinding(sv, subB, s)
 				}
 				cur = append(cur, sv)
 			}
@@ -3877,7 +4219,7 @@ func propagateCopyToCustomMultiFields(s *IndexSchema, row map[string]any, target
 					if strVal, isStr := rv.(string); isStr && strings.TrimSpace(strVal) == "" && subB.ESType != "version" && (subB.Coerce == nil || *subB.Coerce) {
 						continue
 					}
-					coerced := coerceScalarBindingForDoris(rv, subB, getNow())
+					coerced := coerceScalarBindingForDorisWithSchema(s, rv, subB, getNow())
 					if coerced == nil {
 						if subB.IgnoreMalformed != nil && *subB.IgnoreMalformed {
 							if recordIgnored != nil {
@@ -3898,11 +4240,11 @@ func propagateCopyToCustomMultiFields(s *IndexSchema, row map[string]any, target
 						continue
 					}
 					sv := fmt.Sprintf("%v", rv)
+					if subB.NormalizerName != "" || subB.LowercaseNormalizer {
+						sv = normalizeValueForBinding(sv, subB, s)
+					}
 					if subB.IgnoreAbove > 0 && len([]rune(sv)) > subB.IgnoreAbove {
 						continue
-					}
-					if subB.LowercaseNormalizer {
-						sv = strings.ToLower(sv)
 					}
 					filtered = append(filtered, sv)
 				}
@@ -4867,6 +5209,9 @@ func normalizeNestedElementForStorage(s *IndexSchema, nestedPath string, rootPar
 					continue
 				}
 				for _, targetField := range b.CopyTo {
+					if targetField == b.ESFieldPath {
+						continue
+					}
 					edgeKey := b.ESFieldPath + "\x00" + targetField
 					already := forwardedNested[edgeKey]
 					if already >= len(allSrc) {
@@ -4890,13 +5235,16 @@ func normalizeNestedElementForStorage(s *IndexSchema, nestedPath string, rootPar
 							tb = rtb
 						}
 					}
+					if ok {
+						tb = s.withEffectiveDefaults(tb)
+					}
 					var filteredSrc []string
 					for _, sv := range srcVals {
+						if ok && (tb.NormalizerName != "" || tb.LowercaseNormalizer) {
+							sv = normalizeValueForBinding(sv, tb, s)
+						}
 						if ok && tb.IgnoreAbove > 0 && len([]rune(sv)) > tb.IgnoreAbove {
 							continue
-						}
-						if ok && tb.LowercaseNormalizer {
-							sv = strings.ToLower(sv)
 						}
 						filteredSrc = append(filteredSrc, sv)
 					}
@@ -4939,10 +5287,10 @@ func normalizeNestedElementForStorage(s *IndexSchema, nestedPath string, rootPar
 			continue
 		}
 		relPath := b.SourceJSONPath[len(rootParts):]
-		if b.IgnoreAbove > 0 || b.LowercaseNormalizer || b.IsMultiValued || b.NullValue != nil ||
-			baseB.IgnoreAbove > 0 || baseB.LowercaseNormalizer || baseB.NullValue != nil ||
+		if b.IgnoreAbove > 0 || b.LowercaseNormalizer || b.NormalizerName != "" || b.IsMultiValued || b.NullValue != nil ||
+			baseB.IgnoreAbove > 0 || baseB.LowercaseNormalizer || baseB.NormalizerName != "" || baseB.NullValue != nil ||
 			b.ESType != baseB.ESType || b.Format != baseB.Format || b.ScalingFactor != baseB.ScalingFactor {
-			applyNestedCompanionNormalizationAtPath(cloned, relPath, "__"+subKey, b, getNow)
+			applyNestedCompanionNormalizationAtPath(s, cloned, relPath, "__"+subKey, b, getNow)
 		}
 	}
 	for _, b := range fields {
@@ -4961,7 +5309,7 @@ func normalizeNestedElementForStorage(s *IndexSchema, nestedPath string, rootPar
 			continue
 		}
 		relPath := b.SourceJSONPath[len(rootParts):]
-		applyNestedBindingNormalizationAtPath(cloned, relPath, b, getNow)
+		applyNestedBindingNormalizationAtPath(s, cloned, relPath, b, getNow)
 	}
 	return cloned
 }
@@ -5059,7 +5407,7 @@ func appendNestedCopyToAtPath(s *IndexSchema, curr map[string]any, relPath []str
 	}
 }
 
-func applyNestedCompanionNormalizationAtPath(curr map[string]any, relPath []string, suffix string, b FieldBinding, getNow func() time.Time) {
+func applyNestedCompanionNormalizationAtPath(idx *IndexSchema, curr map[string]any, relPath []string, suffix string, b FieldBinding, getNow func() time.Time) {
 	if len(relPath) == 0 || curr == nil {
 		return
 	}
@@ -5072,11 +5420,11 @@ func applyNestedCompanionNormalizationAtPath(curr map[string]any, relPath []stri
 	if len(relPath) > 1 {
 		switch tv := val.(type) {
 		case map[string]any:
-			applyNestedCompanionNormalizationAtPath(tv, relPath[1:], suffix, b, getNow)
+			applyNestedCompanionNormalizationAtPath(idx, tv, relPath[1:], suffix, b, getNow)
 		case []any:
 			for _, item := range tv {
 				if subM, ok := item.(map[string]any); ok {
-					applyNestedCompanionNormalizationAtPath(subM, relPath[1:], suffix, b, getNow)
+					applyNestedCompanionNormalizationAtPath(idx, subM, relPath[1:], suffix, b, getNow)
 				}
 			}
 		}
@@ -5085,9 +5433,9 @@ func applyNestedCompanionNormalizationAtPath(curr map[string]any, relPath []stri
 	compKey := key + suffix
 	var norm any
 	if compVal, hasComp := curr[compKey]; hasComp {
-		norm = normalizeNestedLeafValue(compVal, b, getNow)
+		norm = normalizeNestedLeafValueWithSchema(idx, compVal, b, getNow)
 	} else {
-		norm = normalizeNestedLeafValue(val, b, getNow)
+		norm = normalizeNestedLeafValueWithSchema(idx, val, b, getNow)
 	}
 	if norm == nil {
 		delete(curr, compKey)
@@ -5096,7 +5444,7 @@ func applyNestedCompanionNormalizationAtPath(curr map[string]any, relPath []stri
 	}
 }
 
-func applyNestedBindingNormalizationAtPath(curr map[string]any, relPath []string, b FieldBinding, getNow func() time.Time) {
+func applyNestedBindingNormalizationAtPath(idx *IndexSchema, curr map[string]any, relPath []string, b FieldBinding, getNow func() time.Time) {
 	if len(relPath) == 0 || curr == nil {
 		return
 	}
@@ -5106,15 +5454,12 @@ func applyNestedBindingNormalizationAtPath(curr map[string]any, relPath []string
 	if !exists {
 		if b.ESType == "constant_keyword" && b.ConstantValue != nil {
 			if len(relPath) == 1 {
-				expectedStr := fmt.Sprintf("%v", b.ConstantValue)
-				if b.LowercaseNormalizer {
-					expectedStr = strings.ToLower(expectedStr)
-				}
+				expectedStr := normalizeValueForBinding(fmt.Sprintf("%v", b.ConstantValue), b, idx)
 				curr[key] = expectedStr
 			} else {
 				nextMap := make(map[string]any)
 				curr[key] = nextMap
-				applyNestedBindingNormalizationAtPath(nextMap, relPath[1:], b, getNow)
+				applyNestedBindingNormalizationAtPath(idx, nextMap, relPath[1:], b, getNow)
 			}
 		}
 		return
@@ -5122,17 +5467,17 @@ func applyNestedBindingNormalizationAtPath(curr map[string]any, relPath []string
 	if len(relPath) > 1 {
 		switch tv := val.(type) {
 		case map[string]any:
-			applyNestedBindingNormalizationAtPath(tv, relPath[1:], b, getNow)
+			applyNestedBindingNormalizationAtPath(idx, tv, relPath[1:], b, getNow)
 		case []any:
 			for _, item := range tv {
 				if subM, ok := item.(map[string]any); ok {
-					applyNestedBindingNormalizationAtPath(subM, relPath[1:], b, getNow)
+					applyNestedBindingNormalizationAtPath(idx, subM, relPath[1:], b, getNow)
 				}
 			}
 		}
 		return
 	}
-	norm := normalizeNestedLeafValue(val, b, getNow)
+	norm := normalizeNestedLeafValueWithSchema(idx, val, b, getNow)
 	if norm == nil && val != nil {
 		delete(curr, key)
 	} else {
@@ -5141,16 +5486,17 @@ func applyNestedBindingNormalizationAtPath(curr map[string]any, relPath []string
 }
 
 func normalizeNestedLeafValue(val any, b FieldBinding, getNow func() time.Time) any {
+	return normalizeNestedLeafValueWithSchema(nil, val, b, getNow)
+}
+
+func normalizeNestedLeafValueWithSchema(idx *IndexSchema, val any, b FieldBinding, getNow func() time.Time) any {
 	if b.ESType == "constant_keyword" && b.ConstantValue != nil {
-		expectedStr := fmt.Sprintf("%v", b.ConstantValue)
-		if b.LowercaseNormalizer {
-			expectedStr = strings.ToLower(expectedStr)
-		}
+		expectedStr := normalizeValueForBinding(fmt.Sprintf("%v", b.ConstantValue), b, idx)
 		if val != nil {
 			if arr, ok := val.([]any); ok {
 				var out []any
 				for _, item := range arr {
-					if norm := normalizeNestedLeafValue(item, b, getNow); norm != nil {
+					if norm := normalizeNestedLeafValueWithSchema(idx, item, b, getNow); norm != nil {
 						out = append(out, norm)
 					}
 				}
@@ -5159,10 +5505,7 @@ func normalizeNestedLeafValue(val any, b FieldBinding, getNow func() time.Time) 
 				}
 				return out
 			}
-			sv := fmt.Sprintf("%v", val)
-			if b.LowercaseNormalizer {
-				sv = strings.ToLower(sv)
-			}
+			sv := normalizeValueForBinding(fmt.Sprintf("%v", val), b, idx)
 			if sv != expectedStr {
 				return nil
 			}
@@ -5171,7 +5514,7 @@ func normalizeNestedLeafValue(val any, b FieldBinding, getNow func() time.Time) 
 	}
 	if val == nil {
 		if b.NullValue != nil {
-			return normalizeNestedLeafValue(b.NullValue, b, getNow)
+			return normalizeNestedLeafValueWithSchema(idx, b.NullValue, b, getNow)
 		}
 		return nil
 	}
@@ -5182,7 +5525,7 @@ func normalizeNestedLeafValue(val any, b FieldBinding, getNow func() time.Time) 
 		return val
 	}
 	if b.ESType == "flattened" {
-		norm, _, err := validateAndNormalizeFlattenedValue(val, b, nil)
+		norm, _, err := validateAndNormalizeFlattenedValueWithSchema(val, b, nil, idx)
 		if err != nil {
 			if b.IgnoreMalformed != nil && *b.IgnoreMalformed {
 				return nil
@@ -5203,7 +5546,7 @@ func normalizeNestedLeafValue(val any, b FieldBinding, getNow func() time.Time) 
 		}
 		var out []any
 		for _, item := range arr {
-			norm := normalizeNestedLeafValue(item, b, getNow)
+			norm := normalizeNestedLeafValueWithSchema(idx, item, b, getNow)
 			if norm != nil {
 				out = append(out, norm)
 			}
@@ -5259,7 +5602,7 @@ func normalizeNestedLeafValue(val any, b FieldBinding, getNow func() time.Time) 
 			}
 		}
 		str := strings.TrimSpace(fmt.Sprintf("%v", val))
-		if ns, ok := ParseESDateWithFormatToEpochNanos(str, b.Format, getNow()); ok {
+		if ns, ok := ParseESDateWithFormatAndLocaleToEpochNanos(str, b.Format, b.Locale, getNow()); ok {
 			return ns
 		}
 		if b.IgnoreMalformed != nil && *b.IgnoreMalformed {
@@ -5273,8 +5616,8 @@ func normalizeNestedLeafValue(val any, b FieldBinding, getNow func() time.Time) 
 			}
 		}
 		str := strings.TrimSpace(fmt.Sprintf("%v", val))
-		if b.Format != "" {
-			if ms, ok := ParseESDateWithFormatToEpochMillis(str, b.Format, getNow()); ok {
+		if b.Format != "" || b.Locale != "" {
+			if ms, ok := ParseESDateWithFormatAndLocaleToEpochMillis(str, b.Format, b.Locale, getNow()); ok {
 				return ms
 			}
 			if b.IgnoreMalformed != nil && *b.IgnoreMalformed {
@@ -5311,7 +5654,7 @@ func normalizeNestedLeafValue(val any, b FieldBinding, getNow func() time.Time) 
 			return nil
 		}
 	} else if b.ESType == "scaled_float" && b.ScalingFactor > 0 {
-		coerced := coerceScalarBindingForDoris(val, b, getNow())
+		coerced := coerceScalarBindingForDorisWithSchema(idx, val, b, getNow())
 		if coerced != nil {
 			return coerced
 		}
@@ -5322,7 +5665,7 @@ func normalizeNestedLeafValue(val any, b FieldBinding, getNow func() time.Time) 
 			return nil
 		}
 	} else if isTypedNonStringBinding(b) {
-		coerced := coerceScalarBindingForDoris(val, b, getNow())
+		coerced := coerceScalarBindingForDorisWithSchema(idx, val, b, getNow())
 		if coerced != nil {
 			if b.ESType == "unsigned_long" {
 				if u, okU := parseExactUint64(val); okU && u > uint64(math.MaxInt64) {
@@ -5337,11 +5680,11 @@ func normalizeNestedLeafValue(val any, b FieldBinding, getNow func() time.Time) 
 		if (b.Coerce != nil && !*b.Coerce) || b.ESType == "float" || b.ESType == "half_float" || b.ESType == "rank_feature" || b.ESType == "version" || b.ESType == "ip" {
 			return nil
 		}
-	} else if b.LowercaseNormalizer {
+	} else if b.NormalizerName != "" || b.LowercaseNormalizer {
 		if str, ok := val.(string); ok {
-			return strings.ToLower(str)
+			return normalizeValueForBinding(str, b, idx)
 		} else if b.ESType == "keyword" || b.ESType == "constant_keyword" || b.ESType == "wildcard" || b.DorisType == DorisVarchar {
-			return strings.ToLower(fmt.Sprintf("%v", val))
+			return normalizeValueForBinding(fmt.Sprintf("%v", val), b, idx)
 		}
 	} else if b.ESType == "keyword" || b.ESType == "constant_keyword" || b.ESType == "wildcard" || IsTextLikeESType(b.ESType) || b.DorisType == DorisVarchar {
 		if _, isStr := val.(string); !isStr {
@@ -5349,6 +5692,90 @@ func normalizeNestedLeafValue(val any, b FieldBinding, getNow func() time.Time) 
 		}
 	}
 	return val
+}
+
+func replaceNullsInLeafValue(v any, nullVal any) (any, bool) {
+	if v == nil {
+		return nullVal, true
+	}
+	if arr, ok := v.([]any); ok {
+		modified := false
+		out := make([]any, len(arr))
+		for i, elem := range arr {
+			nv, mod := replaceNullsInLeafValue(elem, nullVal)
+			out[i] = nv
+			if mod {
+				modified = true
+			}
+		}
+		if modified {
+			return out, true
+		}
+		return v, false
+	}
+	return v, false
+}
+
+func replaceNullsAtPathInMap(curr map[string]any, path []string, nullVal any) bool {
+	if len(path) == 0 || curr == nil || nullVal == nil {
+		return false
+	}
+	dotFull := strings.Join(path, ".")
+	if v, ok := curr[dotFull]; ok {
+		if nv, mod := replaceNullsInLeafValue(v, nullVal); mod {
+			curr[dotFull] = nv
+			return true
+		}
+		return false
+	}
+	if len(path) == 1 {
+		if v, ok := curr[path[0]]; ok {
+			if nv, mod := replaceNullsInLeafValue(v, nullVal); mod {
+				curr[path[0]] = nv
+				return true
+			}
+		}
+		return false
+	}
+	modified := false
+	for i := 2; i < len(path); i++ {
+		prefix := strings.Join(path[:i], ".")
+		if next, ok := curr[prefix]; ok {
+			switch tv := next.(type) {
+			case map[string]any:
+				if replaceNullsAtPathInMap(tv, path[i:], nullVal) {
+					modified = true
+				}
+			case []any:
+				for _, elem := range tv {
+					if em, ok := elem.(map[string]any); ok {
+						if replaceNullsAtPathInMap(em, path[i:], nullVal) {
+							modified = true
+						}
+					}
+				}
+			}
+		}
+	}
+	next, exists := curr[path[0]]
+	if !exists {
+		return modified
+	}
+	switch tv := next.(type) {
+	case map[string]any:
+		if replaceNullsAtPathInMap(tv, path[1:], nullVal) {
+			modified = true
+		}
+	case []any:
+		for _, elem := range tv {
+			if em, ok := elem.(map[string]any); ok {
+				if replaceNullsAtPathInMap(em, path[1:], nullVal) {
+					modified = true
+				}
+			}
+		}
+	}
+	return modified
 }
 
 // CanonicalIPToUpperHex16 converts an IPv4 or IPv6 address string into its canonical 32-char
@@ -5555,7 +5982,7 @@ func validateAndNormalizeSparseVectorFieldInDoc(curr map[string]any, path []stri
 	})
 }
 
-func validateAndNormalizeFlattenedFieldInDoc(curr map[string]any, path []string, b FieldBinding, recordIgnored func(string)) (bool, error) {
+func validateAndNormalizeFlattenedFieldInDocWithSchema(curr map[string]any, path []string, b FieldBinding, recordIgnored func(string), idx *IndexSchema) (bool, error) {
 	return traverseFieldInDocMap(curr, path, func(m map[string]any, key string) (bool, error) {
 		raw, exists := m[key]
 		if !exists || raw == nil {
@@ -5565,7 +5992,7 @@ func validateAndNormalizeFlattenedFieldInDoc(curr map[string]any, path []string,
 			}
 			return false, nil
 		}
-		norm, modified, err := validateAndNormalizeFlattenedValue(raw, b, recordIgnored)
+		norm, modified, err := validateAndNormalizeFlattenedValueWithSchema(raw, b, recordIgnored, idx)
 		if err != nil {
 			return false, err
 		}
@@ -5715,12 +6142,16 @@ func parseStrictHistogramCount(v any) (int64, bool) {
 }
 
 func validateAndNormalizeFlattenedValue(raw any, b FieldBinding, recordIgnored func(string)) (any, bool, error) {
+	return validateAndNormalizeFlattenedValueWithSchema(raw, b, recordIgnored, nil)
+}
+
+func validateAndNormalizeFlattenedValueWithSchema(raw any, b FieldBinding, recordIgnored func(string), idx *IndexSchema) (any, bool, error) {
 	if raw == nil {
 		return nil, true, nil
 	}
 	switch v := raw.(type) {
 	case map[string]any:
-		normMap, mod, err := normalizeFlattenedObjectMap(v, b, recordIgnored, 1)
+		normMap, mod, err := normalizeFlattenedObjectMap(v, b, recordIgnored, 1, idx)
 		if err != nil {
 			return nil, false, err
 		}
@@ -5738,7 +6169,7 @@ func validateAndNormalizeFlattenedValue(raw any, b FieldBinding, recordIgnored f
 			if !ok {
 				return nil, false, fmt.Errorf("mapper_parsing_exception: object mapping for [%s] tried to parse field [%s] as object, but found a concrete value", b.ESFieldPath, b.ESFieldPath)
 			}
-			normMap, _, err := normalizeFlattenedObjectMap(em, b, recordIgnored, 1)
+			normMap, _, err := normalizeFlattenedObjectMap(em, b, recordIgnored, 1, idx)
 			if err != nil {
 				return nil, false, err
 			}
@@ -5759,7 +6190,7 @@ func validateAndNormalizeFlattenedValue(raw any, b FieldBinding, recordIgnored f
 	}
 }
 
-func normalizeFlattenedObjectMap(m map[string]any, b FieldBinding, recordIgnored func(string), depth int) (map[string]any, bool, error) {
+func normalizeFlattenedObjectMap(m map[string]any, b FieldBinding, recordIgnored func(string), depth int, idx *IndexSchema) (map[string]any, bool, error) {
 	limit := b.EffectiveDepthLimit()
 	if depth > limit {
 		return nil, false, fmt.Errorf("mapper_parsing_exception: Field [%s] has exceeded max depth limit of [%d]", b.ESFieldPath, limit)
@@ -5767,7 +6198,7 @@ func normalizeFlattenedObjectMap(m map[string]any, b FieldBinding, recordIgnored
 	out := make(map[string]any, len(m))
 	modified := false
 	for k, v := range m {
-		normV, mod, err := normalizeFlattenedInnerValue(v, b, recordIgnored, depth)
+		normV, mod, err := normalizeFlattenedInnerValue(v, b, recordIgnored, depth, idx)
 		if err != nil {
 			return nil, false, err
 		}
@@ -5783,13 +6214,10 @@ func normalizeFlattenedObjectMap(m map[string]any, b FieldBinding, recordIgnored
 	return out, modified, nil
 }
 
-func normalizeFlattenedInnerValue(v any, b FieldBinding, recordIgnored func(string), depth int) (any, bool, error) {
+func normalizeFlattenedInnerValue(v any, b FieldBinding, recordIgnored func(string), depth int, idx *IndexSchema) (any, bool, error) {
 	if v == nil {
 		if b.NullValue != nil {
-			nv := fmt.Sprintf("%v", b.NullValue)
-			if b.LowercaseNormalizer {
-				nv = strings.ToLower(nv)
-			}
+			nv := normalizeValueForBinding(fmt.Sprintf("%v", b.NullValue), b, idx)
 			if b.IgnoreAbove > 0 && len([]rune(nv)) > b.IgnoreAbove {
 				if recordIgnored != nil {
 					recordIgnored(b.ESFieldPath)
@@ -5802,7 +6230,7 @@ func normalizeFlattenedInnerValue(v any, b FieldBinding, recordIgnored func(stri
 	}
 	switch tv := v.(type) {
 	case map[string]any:
-		normMap, mod, err := normalizeFlattenedObjectMap(tv, b, recordIgnored, depth+1)
+		normMap, mod, err := normalizeFlattenedObjectMap(tv, b, recordIgnored, depth+1, idx)
 		if err != nil {
 			return nil, false, err
 		}
@@ -5815,7 +6243,7 @@ func normalizeFlattenedInnerValue(v any, b FieldBinding, recordIgnored func(stri
 		var mergedObj map[string]any
 		modified := false
 		for _, elem := range tv {
-			normElem, mod, err := normalizeFlattenedInnerValue(elem, b, recordIgnored, depth)
+			normElem, mod, err := normalizeFlattenedInnerValue(elem, b, recordIgnored, depth, idx)
 			if err != nil {
 				return nil, false, err
 			}
@@ -5846,9 +6274,9 @@ func normalizeFlattenedInnerValue(v any, b FieldBinding, recordIgnored func(stri
 	case string:
 		sv := tv
 		mod := false
-		if b.LowercaseNormalizer {
-			if lower := strings.ToLower(sv); lower != sv {
-				sv = lower
+		if b.NormalizerName != "" || b.LowercaseNormalizer {
+			if norm := normalizeValueForBinding(sv, b, idx); norm != sv {
+				sv = norm
 				mod = true
 			}
 		}
@@ -6061,8 +6489,8 @@ func parseRangeBoundValue(raw any, b FieldBinding, getNow func() time.Time, roun
 	case "date_range":
 		switch tv := raw.(type) {
 		case string:
-			if b.Format != "" {
-				if ms, ok := ParseESDateBoundWithFormatToEpochMillis(tv, b.Format, getNow(), roundUp); ok {
+			if b.Format != "" || b.Locale != "" {
+				if ms, ok := ParseESDateBoundWithFormatAndLocaleToEpochMillis(tv, b.Format, b.Locale, getNow(), roundUp); ok {
 					return float64(ms), ms, true
 				}
 				return 0, 0, false

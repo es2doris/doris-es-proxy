@@ -19,6 +19,7 @@ package proxy
 
 import (
 	"bytes"
+	"container/heap"
 	"context"
 	"encoding/base64"
 	"encoding/binary"
@@ -70,6 +71,7 @@ type activeSearchScope struct {
 	searchReq         *esast.SearchRequest
 	strictConformance bool
 	reqLookupSpecs    map[string]lookupRuntimeSpecR63Search
+	schemasByIndex    map[string]*schema.IndexSchema
 }
 
 func newActiveSearchScopeR63(ctx context.Context, srv *Server, rawBody []byte, req *esast.SearchRequest) *activeSearchScope {
@@ -524,7 +526,7 @@ func evalSingleIndexTimeOrRuntimePropWithOptsR63Search(
 	}
 
 	var rawVals []any
-	if emitCtx, okCtx := runtimeFieldTypeToEmitContextRound60(esType); okCtx && strings.Contains(scriptSrc, "emit(") {
+	if emitCtx, okCtx := runtimeFieldTypeToEmitContextR64(esType); okCtx && strings.Contains(scriptSrc, "emit(") {
 		emitted, errEmit := painless.EvalEmitContext(scriptSrc, emitCtx, evalDoc, sourceDoc, p, ftMap)
 		if errEmit != nil {
 			return nil, errEmit
@@ -806,6 +808,31 @@ func formatTermsBucketKeyAndStringWithScopeR63(
 			}
 			if lower == "false" || lower == "0" {
 				return int64(0), "false", true
+			}
+		}
+	}
+	if scope != nil && len(scope.schemasByIndex) > 1 && termsSpec != nil && strings.TrimSpace(termsSpec.Field) != "" && strings.TrimSpace(termsSpec.ValueType) == "" {
+		var hasUL, hasSignedInt, hasFloat bool
+		for _, sc := range scope.schemasByIndex {
+			if sc == nil {
+				continue
+			}
+			b := sc.ResolveField(termsSpec.Field)
+			switch strings.ToLower(strings.TrimSpace(b.ESType)) {
+			case "unsigned_long":
+				hasUL = true
+			case "long", "integer", "short", "byte":
+				hasSignedInt = true
+			case "double", "float", "half_float", "scaled_float":
+				hasFloat = true
+			}
+		}
+		if (hasUL && (hasSignedInt || hasFloat)) || (hasFloat && hasSignedInt) {
+			if fv, err := strconv.ParseFloat(strings.TrimSpace(rawKey), 64); err == nil && !math.IsNaN(fv) && !math.IsInf(fv, 0) {
+				if strings.TrimSpace(termsSpec.Format) != "" {
+					return fv, formatTermsNumericPattern(fv, termsSpec.Format), true
+				}
+				return fv, "", false
 			}
 		}
 	}
@@ -1372,8 +1399,18 @@ func validateTSDBReadDocParamsR63(idxSchema *schema.IndexSchema, indexName, _ st
 	return 0, "", ""
 }
 
+const (
+	maxTSDBTombstonesPerServerR63 = 100000
+	tsdbTombstoneTTLR63           = 24 * time.Hour
+)
+
+type tsdbTombstoneEntryR63 struct {
+	version   int64
+	updatedAt int64
+}
+
 var tsdbTombstoneMuR63 sync.RWMutex
-var tsdbTombstonesBySrvR63 = make(map[*Server]map[string]map[string]int64)
+var tsdbTombstonesBySrvR63 = make(map[*Server]map[string]map[string]tsdbTombstoneEntryR63)
 
 func (s *Server) isTimeSeriesIndexR63(indexName string) bool {
 	if s == nil || indexName == "" {
@@ -1389,15 +1426,60 @@ func (s *Server) recordTSDBTombstoneVersionR63(indexName, docID string, ver int6
 	if s == nil || indexName == "" || docID == "" || ver <= 0 || !s.isTimeSeriesIndexR63(indexName) {
 		return
 	}
+	nowUnix := time.Now().UnixNano()
+	cutoff := nowUnix - tsdbTombstoneTTLR63.Nanoseconds()
 	tsdbTombstoneMuR63.Lock()
 	defer tsdbTombstoneMuR63.Unlock()
 	if tsdbTombstonesBySrvR63[s] == nil {
-		tsdbTombstonesBySrvR63[s] = make(map[string]map[string]int64)
+		tsdbTombstonesBySrvR63[s] = make(map[string]map[string]tsdbTombstoneEntryR63)
 	}
-	if tsdbTombstonesBySrvR63[s][indexName] == nil {
-		tsdbTombstonesBySrvR63[s][indexName] = make(map[string]int64)
+	srvMap := tsdbTombstonesBySrvR63[s]
+	if srvMap[indexName] == nil {
+		srvMap[indexName] = make(map[string]tsdbTombstoneEntryR63)
 	}
-	tsdbTombstonesBySrvR63[s][indexName][docID] = ver
+	srvMap[indexName][docID] = tsdbTombstoneEntryR63{
+		version:   ver,
+		updatedAt: nowUnix,
+	}
+	totalEntries := 0
+	for idxK, docsMap := range srvMap {
+		for dk, ent := range docsMap {
+			if ent.updatedAt < cutoff {
+				delete(docsMap, dk)
+			}
+		}
+		if len(docsMap) == 0 {
+			delete(srvMap, idxK)
+		} else {
+			totalEntries += len(docsMap)
+		}
+	}
+	if totalEntries > maxTSDBTombstonesPerServerR63 {
+		type keyRef struct {
+			idx       string
+			docID     string
+			updatedAt int64
+		}
+		allRefs := make([]keyRef, 0, totalEntries)
+		for idxK, docsMap := range srvMap {
+			for dk, ent := range docsMap {
+				allRefs = append(allRefs, keyRef{idx: idxK, docID: dk, updatedAt: ent.updatedAt})
+			}
+		}
+		sort.Slice(allRefs, func(i, j int) bool {
+			return allRefs[i].updatedAt < allRefs[j].updatedAt
+		})
+		toEvict := totalEntries - maxTSDBTombstonesPerServerR63
+		for i := 0; i < toEvict && i < len(allRefs); i++ {
+			ref := allRefs[i]
+			if docsMap := srvMap[ref.idx]; docsMap != nil {
+				delete(docsMap, ref.docID)
+				if len(docsMap) == 0 {
+					delete(srvMap, ref.idx)
+				}
+			}
+		}
+	}
 }
 
 func (s *Server) clearTSDBTombstoneVersionR63(indexName, docID string) {
@@ -1408,6 +1490,9 @@ func (s *Server) clearTSDBTombstoneVersionR63(indexName, docID string) {
 	defer tsdbTombstoneMuR63.Unlock()
 	if m := tsdbTombstonesBySrvR63[s]; m != nil && m[indexName] != nil {
 		delete(m[indexName], docID)
+		if len(m[indexName]) == 0 {
+			delete(m, indexName)
+		}
 	}
 }
 
@@ -1415,6 +1500,7 @@ func (s *Server) clearTSDBIndexTombstonesR63(indexName string) {
 	if s == nil || indexName == "" {
 		return
 	}
+	s.clearWave3PolishIndexStateR63(indexName)
 	tsdbTombstoneMuR63.Lock()
 	defer tsdbTombstoneMuR63.Unlock()
 	if indexName == "*" {
@@ -1432,9 +1518,11 @@ func (s *Server) getDocTombstoneVersionR63(indexName, docID string) int64 {
 	}
 	tsdbTombstoneMuR63.RLock()
 	if m := tsdbTombstonesBySrvR63[s]; m != nil && m[indexName] != nil {
-		if v := m[indexName][docID]; v > 0 {
-			tsdbTombstoneMuR63.RUnlock()
-			return v
+		if ent, ok := m[indexName][docID]; ok && ent.version > 0 {
+			if time.Now().UnixNano()-ent.updatedAt <= tsdbTombstoneTTLR63.Nanoseconds() {
+				tsdbTombstoneMuR63.RUnlock()
+				return ent.version
+			}
 		}
 	}
 	tsdbTombstoneMuR63.RUnlock()
@@ -1977,6 +2065,10 @@ func (s *Server) validateTermsLookupsExistR63(req *esast.SearchRequest) (int, st
 		}
 		idx = strings.TrimSpace(idx)
 		if idx == "" {
+			return
+		}
+		if m := s.findMissingConcreteSearchIndexRound60(context.Background(), nil, idx, nil); m != "" {
+			missingIdx = m
 			return
 		}
 		if _, _, err := s.resolveReadDocIndexWithFilter(idx); err != nil {
@@ -2541,27 +2633,73 @@ func clusterVariableWidthHistogramR63(
 			docs:  []runtimeMatchedDoc{p.md},
 		})
 	}
-	for len(clusters) > targetBuckets {
-		bestIdx := 0
-		bestDist := math.Inf(1)
-		for i := 0; i < len(clusters)-1; i++ {
-			cA := clusters[i].sumV / float64(clusters[i].count)
-			cB := clusters[i+1].sumV / float64(clusters[i+1].count)
-			d := cB - cA
-			if d < bestDist {
-				bestDist = d
-				bestIdx = i
+	if len(clusters) > targetBuckets {
+		nodes := make([]vwhNodeR64, len(clusters))
+		for i := range clusters {
+			nodes[i] = vwhNodeR64{
+				cluster: clusters[i],
+				prev:    i - 1,
+				next:    i + 1,
+				alive:   true,
+				pos:     i,
 			}
 		}
-		merged := vwhClusterR63{
-			minV:  clusters[bestIdx].minV,
-			maxV:  clusters[bestIdx+1].maxV,
-			sumV:  clusters[bestIdx].sumV + clusters[bestIdx+1].sumV,
-			count: clusters[bestIdx].count + clusters[bestIdx+1].count,
-			docs:  append(clusters[bestIdx].docs, clusters[bestIdx+1].docs...),
+		nodes[len(nodes)-1].next = -1
+
+		pq := make(vwhMergeHeapR64, 0, len(nodes))
+		pushPair := func(left, right int) {
+			cA := nodes[left].cluster.sumV / float64(nodes[left].cluster.count)
+			cB := nodes[right].cluster.sumV / float64(nodes[right].cluster.count)
+			heap.Push(&pq, vwhMergeCandidateR64{
+				left:     left,
+				right:    right,
+				leftVer:  nodes[left].version,
+				rightVer: nodes[right].version,
+				dist:     cB - cA,
+				leftPos:  nodes[left].pos,
+			})
 		}
-		clusters[bestIdx] = merged
-		clusters = append(clusters[:bestIdx+1], clusters[bestIdx+2:]...)
+		for i := 0; i < len(nodes)-1; i++ {
+			pushPair(i, i+1)
+		}
+
+		aliveCount := len(nodes)
+		for aliveCount > targetBuckets && pq.Len() > 0 {
+			item := heap.Pop(&pq).(vwhMergeCandidateR64)
+			l, r := item.left, item.right
+			if !nodes[l].alive || !nodes[r].alive || nodes[l].next != r ||
+				nodes[l].version != item.leftVer || nodes[r].version != item.rightVer {
+				continue
+			}
+			nodes[l].cluster.maxV = nodes[r].cluster.maxV
+			nodes[l].cluster.sumV += nodes[r].cluster.sumV
+			nodes[l].cluster.count += nodes[r].cluster.count
+			nodes[l].cluster.docs = append(nodes[l].cluster.docs, nodes[r].cluster.docs...)
+			nodes[l].version++
+
+			nextR := nodes[r].next
+			nodes[r].alive = false
+			nodes[l].next = nextR
+			if nextR != -1 {
+				nodes[nextR].prev = l
+			}
+			aliveCount--
+
+			if nodes[l].prev != -1 {
+				pushPair(nodes[l].prev, l)
+			}
+			if nodes[l].next != -1 {
+				pushPair(l, nodes[l].next)
+			}
+		}
+
+		mergedClusters := make([]vwhClusterR63, 0, aliveCount)
+		for cur := 0; cur != -1; cur = nodes[cur].next {
+			if nodes[cur].alive {
+				mergedClusters = append(mergedClusters, nodes[cur].cluster)
+			}
+		}
+		clusters = mergedClusters
 	}
 	// Deduplicate docs per surviving cluster for `doc_count` & sub-aggs
 	for i := range clusters {
@@ -2735,7 +2873,8 @@ func formatSortValueWithEntryFormatR63(v any, sSpec esast.SortSpec, idxSchema *s
 	if v == nil {
 		return nil
 	}
-	if nt := strings.ToLower(strings.TrimSpace(sSpec.Entry.NumericType)); nt != "" {
+	nt := strings.ToLower(strings.TrimSpace(sSpec.Entry.NumericType))
+	if nt != "" {
 		switch nt {
 		case "long":
 			switch tv := v.(type) {
@@ -2757,12 +2896,32 @@ func formatSortValueWithEntryFormatR63(v any, sSpec esast.SortSpec, idxSchema *s
 			}
 		case "double":
 			switch tv := v.(type) {
+			case uint64:
+				v = float64(tv)
 			case int64:
 				if tv != math.MaxInt64 && tv != math.MinInt64 {
 					v = float64(tv)
 				}
 			case int:
 				v = float64(tv)
+			}
+		case "date":
+			if idxSchema != nil {
+				resolved := resolveSortEntryField(sSpec, idxSchema)
+				if strings.EqualFold(strings.TrimSpace(idxSchema.ResolveField(resolved).ESType), "date_nanos") {
+					if iv, ok := toInt64(v); ok && iv != math.MaxInt64 && iv != math.MinInt64 {
+						v = iv / 1_000_000
+					}
+				}
+			}
+		case "date_nanos":
+			if idxSchema != nil {
+				resolved := resolveSortEntryField(sSpec, idxSchema)
+				if strings.EqualFold(strings.TrimSpace(idxSchema.ResolveField(resolved).ESType), "date") {
+					if iv, ok := toInt64(v); ok && iv != math.MaxInt64 && iv != math.MinInt64 {
+						v = iv * 1_000_000
+					}
+				}
 			}
 		}
 	}
@@ -2773,12 +2932,12 @@ func formatSortValueWithEntryFormatR63(v any, sSpec esast.SortSpec, idxSchema *s
 	resolved := resolveSortEntryField(sSpec, idxSchema)
 	b := idxSchema.ResolveField(resolved)
 	esType := strings.ToLower(strings.TrimSpace(b.ESType))
-	if esType == "date_nanos" {
+	if (esType == "date_nanos" && nt != "date") || nt == "date_nanos" {
 		if iv, ok := toInt64(v); ok {
 			return formatDateNanosExactR61Search(iv, fmtStr)
 		}
 	}
-	if esType == "date" || b.DorisType == schema.DorisBigInt {
+	if esType == "date" || nt == "date" || b.DorisType == schema.DorisBigInt {
 		if iv, ok := toInt64(v); ok {
 			return formatDateMillisExactR61Search(iv, fmtStr)
 		}
@@ -2961,37 +3120,60 @@ func emitRawBodyDeprecationWarningsR63(w http.ResponseWriter, s *Server, r *http
 	}
 	hasDateHistoCand := bytes.Contains(bodyBytes, []byte("date_histogram")) && bytes.Contains(bodyBytes, []byte(`"interval"`))
 	hasCommonCand := bytes.Contains(bodyBytes, []byte(`"common"`))
-	if !hasDateHistoCand && !hasCommonCand {
+	hasCutoffCand := bytes.Contains(bodyBytes, []byte(`"cutoff_frequency"`))
+	if !hasDateHistoCand && !hasCommonCand && !hasCutoffCand {
 		return
 	}
 	var root map[string]any
 	if json.Unmarshal(bodyBytes, &root) != nil || root == nil {
 		return
 	}
-	if hasCommonCand {
-		var hasDeprecatedCommonQuery func(node any) bool
-		hasDeprecatedCommonQuery = func(node any) bool {
+	if hasCommonCand || hasCutoffCand {
+		var foundCommon, foundMatchCutoff, foundMultiMatchCutoff bool
+		hasCutoff := func(m map[string]any) bool {
+			_, ok := m["cutoff_frequency"]
+			return ok
+		}
+		var scanDeprecatedQueries func(node any)
+		scanDeprecatedQueries = func(node any) {
 			switch tv := node.(type) {
 			case map[string]any:
 				if _, ok := tv["common"].(map[string]any); ok {
-					return true
+					foundCommon = true
+				}
+				if m, ok := tv["match"].(map[string]any); ok {
+					if hasCutoff(m) {
+						foundMatchCutoff = true
+					} else {
+						for _, mv := range m {
+							if fm, ok := mv.(map[string]any); ok && hasCutoff(fm) {
+								foundMatchCutoff = true
+								break
+							}
+						}
+					}
+				}
+				if mm, ok := tv["multi_match"].(map[string]any); ok && hasCutoff(mm) && !strings.EqualFold(fmt.Sprint(mm["type"]), "bool_prefix") {
+					foundMultiMatchCutoff = true
 				}
 				for _, v := range tv {
-					if hasDeprecatedCommonQuery(v) {
-						return true
-					}
+					scanDeprecatedQueries(v)
 				}
 			case []any:
 				for _, el := range tv {
-					if hasDeprecatedCommonQuery(el) {
-						return true
-					}
+					scanDeprecatedQueries(el)
 				}
 			}
-			return false
 		}
-		if hasDeprecatedCommonQuery(root["query"]) {
+		scanDeprecatedQueries(root["query"])
+		if foundCommon {
 			emitESDeprecationWarningRound61(w, s, r, "Deprecated field [common] used, replaced by [[match] query which can efficiently skip blocks of documents if the total number of hits is not tracked]")
+		}
+		if foundMatchCutoff {
+			emitESDeprecationWarningRound61(w, s, r, "Deprecated field [cutoff_frequency] used, replaced by [you can omit this option, the [match] query can skip block of documents efficiently if the total number of hits is not tracked]")
+		}
+		if foundMultiMatchCutoff {
+			emitESDeprecationWarningRound61(w, s, r, "Deprecated field [cutoff_frequency] used, replaced by [you can omit this option, the [multi_match] query can skip block of documents efficiently if the total number of hits is not tracked]")
 		}
 	}
 	if !hasDateHistoCand {

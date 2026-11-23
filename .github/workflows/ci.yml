@@ -54,6 +54,9 @@ jobs:
       - name: Test with race detector
         run: go test -race -count=1 ./... -v
 
+      - name: Fuzz seed regression
+        run: go test -run='^Fuzz' ./...
+
       - name: Merged coverage gate (>= 80.0%)
         run: |
           rm -rf /tmp/covdata
@@ -148,7 +151,7 @@ jobs:
         run: |
           jq empty deploy/grafana/doris-es-proxy-dashboard.json
           docker build -t es2doris/doris-es-proxy:ci .
-          docker run --rm es2doris/doris-es-proxy:ci version | grep -q "v0.19.0"
+          docker run --rm es2doris/doris-es-proxy:ci version | grep -q "v0.20.0"
 
   elastic-conformance:
     name: Upstream Elastic Conformance & Go SDK v8
@@ -173,8 +176,8 @@ jobs:
       - name: Run upstream Elastic rest-api-spec & wire-schema conformance
         run: |
           CONFORMANCE_REQUIRE_UPSTREAM=1 \
-          CONFORMANCE_MIN_V7_PASSED=1940 \
-          CONFORMANCE_MIN_V8_PASSED=3680 \
+          CONFORMANCE_MIN_V7_PASSED=1975 \
+          CONFORMANCE_MIN_V8_PASSED=4150 \
           CONFORMANCE_SUMMARY_MD="$GITHUB_STEP_SUMMARY" \
           CONFORMANCE_OUT_JSON="/tmp/conformance-scorecard.json" \
             go test -race -count=1 -v ./pkg/compliance -run 'TestUpstream|TestSpecSchemaValidatorLiveUpstreamSchema'

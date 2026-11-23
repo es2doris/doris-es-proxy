@@ -1364,6 +1364,55 @@ func mustacheErrTypeAndReason(err error) (string, string) {
 	return "parsing_exception", err.Error()
 }
 
+const (
+	maxMustacheDepth       = 32
+	maxMustacheOutputBytes = 4 << 20
+)
+
+func isExplicitES7RequestForMustacheR64(s *Server, r *http.Request) bool {
+	if s != nil && s.isES8Mode(r) {
+		return false
+	}
+	if s != nil && s.hasExplicitTargetESVersion() && strings.HasPrefix(s.getTargetESVersion(), "7.") {
+		return true
+	}
+	if r != nil {
+		accept := r.Header.Get("Accept")
+		ct := r.Header.Get("Content-Type")
+		cm := r.Header.Get("X-Elastic-Client-Meta")
+		if strings.Contains(accept, "compatible-with=7") || strings.Contains(ct, "compatible-with=7") ||
+			strings.HasPrefix(cm, "es=7.") || strings.Contains(cm, ",es=7.") {
+			return true
+		}
+	}
+	return false
+}
+
+func formatMustacheEOFErrorForServerR64(s *Server, r *http.Request, et, er string) (string, string) {
+	isES7 := isExplicitES7RequestForMustacheR64(s, r)
+	et = mustacheErrTypeForServerRound63(s, r, et)
+	if !isES7 {
+		if et == "json_e_o_f_exception" {
+			et = "x_content_e_o_f_exception"
+		}
+		if et == "x_content_e_o_f_exception" && strings.Contains(er, "Unexpected end-of-input") {
+			if idx := strings.Index(er, "Unexpected end-of-input"); idx >= 0 {
+				er = er[:idx] + "Unexpected end of file"
+			}
+		}
+	} else {
+		if et == "x_content_e_o_f_exception" {
+			et = "json_e_o_f_exception"
+		}
+		if et == "json_e_o_f_exception" && strings.Contains(er, "Unexpected end of file") {
+			if idx := strings.Index(er, "Unexpected end of file"); idx >= 0 {
+				er = er[:idx] + "Unexpected end-of-input: expected close marker for Object"
+			}
+		}
+	}
+	return et, er
+}
+
 func renderMustacheSearchTemplate(tplSource any, params map[string]any) (json.RawMessage, error) {
 	if params == nil {
 		params = map[string]any{}
@@ -1391,7 +1440,11 @@ func renderMustacheSearchTemplate(tplSource any, params map[string]any) (json.Ra
 	if synErr := validateMustacheTemplateSyntax(tplStr); synErr != nil {
 		return nil, synErr
 	}
-	rendered := evalMustacheBlock(tplStr, params, nil)
+	budget := maxMustacheOutputBytes
+	rendered, err := evalMustacheBlockBounded(tplStr, params, nil, 0, &budget)
+	if err != nil {
+		return nil, err
+	}
 	trimmed := strings.TrimSpace(rendered)
 	if trimmed == "" {
 		return json.RawMessage(`{}`), nil
@@ -1525,33 +1578,84 @@ func escapeMustacheJSONString(s string) string {
 }
 
 func evalMustacheBlock(tpl string, ctx map[string]any, dotVal any) string {
+	budget := maxMustacheOutputBytes
+	res, err := evalMustacheBlockBounded(tpl, ctx, dotVal, 0, &budget)
+	if err != nil {
+		return ""
+	}
+	return res
+}
+
+func evalMustacheBlockBounded(tpl string, ctx map[string]any, dotVal any, depth int, budget *int) (string, error) {
+	if depth > maxMustacheDepth {
+		return "", &mustacheTemplateError{
+			errType: "script_exception",
+			reason:  fmt.Sprintf("mustache template recursion depth exceeded maximum [%d]", maxMustacheDepth),
+		}
+	}
 	var out strings.Builder
+	writeStr := func(s string) error {
+		if budget != nil {
+			if len(s) > *budget {
+				return &mustacheTemplateError{
+					errType: "script_exception",
+					reason:  fmt.Sprintf("rendered mustache template exceeds maximum size of [%d] bytes", maxMustacheOutputBytes),
+				}
+			}
+			*budget -= len(s)
+		}
+		out.WriteString(s)
+		return nil
+	}
+	writeBytes := func(b []byte) error {
+		if budget != nil {
+			if len(b) > *budget {
+				return &mustacheTemplateError{
+					errType: "script_exception",
+					reason:  fmt.Sprintf("rendered mustache template exceeds maximum size of [%d] bytes", maxMustacheOutputBytes),
+				}
+			}
+			*budget -= len(b)
+		}
+		out.Write(b)
+		return nil
+	}
 	i := 0
 	n := len(tpl)
 	for i < n {
 		openIdx := strings.Index(tpl[i:], "{{")
 		if openIdx < 0 {
-			out.WriteString(tpl[i:])
+			if err := writeStr(tpl[i:]); err != nil {
+				return "", err
+			}
 			break
 		}
-		out.WriteString(tpl[i : i+openIdx])
+		if err := writeStr(tpl[i : i+openIdx]); err != nil {
+			return "", err
+		}
 		tagStart := i + openIdx
 		if tagStart+3 <= n && tpl[tagStart:tagStart+3] == "{{{" {
 			closeIdx := strings.Index(tpl[tagStart+3:], "}}}")
 			if closeIdx < 0 {
-				out.WriteString(tpl[tagStart:])
+				if err := writeStr(tpl[tagStart:]); err != nil {
+					return "", err
+				}
 				break
 			}
 			varName := strings.TrimSpace(tpl[tagStart+3 : tagStart+3+closeIdx])
 			if val, ok := lookupMustacheVar(varName, ctx, dotVal); ok {
-				out.WriteString(formatMustacheScalar(val))
+				if err := writeStr(formatMustacheScalar(val)); err != nil {
+					return "", err
+				}
 			}
 			i = tagStart + 3 + closeIdx + 3
 			continue
 		}
 		closeIdx := strings.Index(tpl[tagStart+2:], "}}")
 		if closeIdx < 0 {
-			out.WriteString(tpl[tagStart:])
+			if err := writeStr(tpl[tagStart:]); err != nil {
+				return "", err
+			}
 			break
 		}
 		rawTag := strings.TrimSpace(tpl[tagStart+2 : tagStart+2+closeIdx])
@@ -1583,14 +1687,23 @@ func evalMustacheBlock(tpl string, ctx map[string]any, dotVal any) string {
 								trimmedOut := strOut[:len(strOut)-1]
 								out.Reset()
 								out.WriteString(trimmedOut)
-								out.Write(b)
+								if budget != nil {
+									*budget++
+								}
+								if err := writeBytes(b); err != nil {
+									return "", err
+								}
 								i = nextPos + 1
 								continue
 							}
-							out.Write(b)
+							if err := writeBytes(b); err != nil {
+								return "", err
+							}
 						}
 					} else {
-						out.WriteString("null")
+						if err := writeStr("null"); err != nil {
+							return "", err
+						}
 					}
 					i = afterOpenTag + endIdx + len(endMarker)
 					continue
@@ -1624,7 +1737,9 @@ func evalMustacheBlock(tpl string, ctx map[string]any, dotVal any) string {
 						default:
 							items = []string{escapeMustacheJSONString(formatMustacheScalar(val))}
 						}
-						out.WriteString(strings.Join(items, delim))
+						if err := writeStr(strings.Join(items, delim)); err != nil {
+							return "", err
+						}
 					}
 					i = afterOpenTag + endIdx + len(endMarker)
 					continue
@@ -1635,8 +1750,17 @@ func evalMustacheBlock(tpl string, ctx map[string]any, dotVal any) string {
 				endIdx := strings.Index(tpl[afterOpenTag:], endMarker)
 				if endIdx >= 0 {
 					innerTpl := tpl[afterOpenTag : afterOpenTag+endIdx]
-					innerRendered := evalMustacheBlock(innerTpl, ctx, dotVal)
-					out.WriteString(strings.ReplaceAll(url.QueryEscape(innerRendered), "+", "%20"))
+					urlBudget := maxMustacheOutputBytes
+					if budget != nil {
+						urlBudget = *budget
+					}
+					innerRendered, err := evalMustacheBlockBounded(innerTpl, ctx, dotVal, depth+1, &urlBudget)
+					if err != nil {
+						return "", err
+					}
+					if err := writeStr(strings.ReplaceAll(url.QueryEscape(innerRendered), "+", "%20")); err != nil {
+						return "", err
+					}
 					i = afterOpenTag + endIdx + len(endMarker)
 					continue
 				}
@@ -1654,17 +1778,29 @@ func evalMustacheBlock(tpl string, ctx map[string]any, dotVal any) string {
 			truthy := exists && isMustacheTruthy(val)
 			if prefix == '^' {
 				if !truthy {
-					out.WriteString(evalMustacheBlock(innerTpl, ctx, dotVal))
+					sub, err := evalMustacheBlockBounded(innerTpl, ctx, dotVal, depth+1, budget)
+					if err != nil {
+						return "", err
+					}
+					out.WriteString(sub)
 				}
 			} else if truthy {
 				switch tv := val.(type) {
 				case []any:
 					for _, elem := range tv {
-						out.WriteString(evalMustacheBlock(innerTpl, ctx, elem))
+						sub, err := evalMustacheBlockBounded(innerTpl, ctx, elem, depth+1, budget)
+						if err != nil {
+							return "", err
+						}
+						out.WriteString(sub)
 					}
 				case []string:
 					for _, elem := range tv {
-						out.WriteString(evalMustacheBlock(innerTpl, ctx, elem))
+						sub, err := evalMustacheBlockBounded(innerTpl, ctx, elem, depth+1, budget)
+						if err != nil {
+							return "", err
+						}
+						out.WriteString(sub)
 					}
 				case map[string]any:
 					mergedCtx := make(map[string]any, len(ctx)+len(tv))
@@ -1674,26 +1810,38 @@ func evalMustacheBlock(tpl string, ctx map[string]any, dotVal any) string {
 					for k, v := range tv {
 						mergedCtx[k] = v
 					}
-					out.WriteString(evalMustacheBlock(innerTpl, mergedCtx, tv))
+					sub, err := evalMustacheBlockBounded(innerTpl, mergedCtx, tv, depth+1, budget)
+					if err != nil {
+						return "", err
+					}
+					out.WriteString(sub)
 				default:
-					out.WriteString(evalMustacheBlock(innerTpl, ctx, dotVal))
+					sub, err := evalMustacheBlockBounded(innerTpl, ctx, dotVal, depth+1, budget)
+					if err != nil {
+						return "", err
+					}
+					out.WriteString(sub)
 				}
 			}
 			i = afterOpenTag + endIdx + len(endMarker)
 		case '&':
 			varName := strings.TrimSpace(rawTag[1:])
 			if val, ok := lookupMustacheVar(varName, ctx, dotVal); ok {
-				out.WriteString(formatMustacheScalar(val))
+				if err := writeStr(formatMustacheScalar(val)); err != nil {
+					return "", err
+				}
 			}
 			i = afterOpenTag
 		default:
 			if val, ok := lookupMustacheVar(rawTag, ctx, dotVal); ok {
-				out.WriteString(escapeMustacheJSONString(formatMustacheScalar(val)))
+				if err := writeStr(escapeMustacheJSONString(formatMustacheScalar(val))); err != nil {
+					return "", err
+				}
 			}
 			i = afterOpenTag
 		}
 	}
-	return out.String()
+	return out.String(), nil
 }
 
 func findMatchingMustacheSectionEnd(s, secName string) int {
@@ -1812,7 +1960,7 @@ func (s *Server) handleRenderSearchTemplate(w http.ResponseWriter, r *http.Reque
 	renderedJSON, err := renderMustacheSearchTemplate(tplSource, params)
 	if err != nil {
 		et, er := mustacheErrTypeAndReason(err)
-		et = mustacheErrTypeForServerRound63(s, r, et)
+		et, er = formatMustacheEOFErrorForServerR64(s, r, et, er)
 		writeESError(w, http.StatusBadRequest, et, er)
 		return
 	}
@@ -1822,6 +1970,7 @@ func (s *Server) handleRenderSearchTemplate(w http.ResponseWriter, r *http.Reque
 	dec.UseNumber()
 	if err := dec.Decode(&parsed); err != nil {
 		et, er := classifyInvalidRenderedTemplateJSONRound61(renderedJSON)
+		et, er = formatMustacheEOFErrorForServerR64(s, r, et, er)
 		writeESError(w, http.StatusBadRequest, et, er)
 		return
 	}
@@ -2063,6 +2212,7 @@ func (s *Server) handleSearchTemplate(w http.ResponseWriter, r *http.Request) {
 		dec.UseNumber()
 		if err := dec.Decode(&body); err != nil {
 			et, er := classifyInvalidRenderedTemplateJSONRound61(bodyBytes)
+			et, er = formatMustacheEOFErrorForServerR64(s, r, et, er)
 			writeESError(w, http.StatusBadRequest, et, er)
 			return
 		}
@@ -2079,7 +2229,7 @@ func (s *Server) handleSearchTemplate(w http.ResponseWriter, r *http.Request) {
 	renderedJSON, err := renderMustacheSearchTemplate(tplSource, params)
 	if err != nil {
 		et, er := mustacheErrTypeAndReason(err)
-		et = mustacheErrTypeForServerRound63(s, r, et)
+		et, er = formatMustacheEOFErrorForServerR64(s, r, et, er)
 		writeESError(w, http.StatusBadRequest, et, er)
 		return
 	}
@@ -2088,6 +2238,7 @@ func (s *Server) handleSearchTemplate(w http.ResponseWriter, r *http.Request) {
 	checkDec.UseNumber()
 	if err := checkDec.Decode(&syntaxCheck); err != nil {
 		et, er := classifyInvalidRenderedTemplateJSONRound61(renderedJSON)
+		et, er = formatMustacheEOFErrorForServerR64(s, r, et, er)
 		writeESError(w, http.StatusBadRequest, et, er)
 		return
 	}
@@ -2165,10 +2316,7 @@ func (s *Server) handleMSearchTemplate(w http.ResponseWriter, r *http.Request) {
 	if len(lines)%2 != 0 {
 		lastLine := strings.TrimSpace(lines[len(lines)-1])
 		et, er := classifyInvalidRenderedTemplateJSONRound61([]byte(lastLine))
-		if et != "x_content_e_o_f_exception" {
-			et = "x_content_e_o_f_exception"
-			er = "Unexpected end-of-input: expected close marker for Object"
-		}
+		et, er = formatMustacheEOFErrorForServerR64(s, r, et, er)
 		writeESError(w, http.StatusBadRequest, et, er)
 		return
 	}
@@ -2185,6 +2333,7 @@ func (s *Server) handleMSearchTemplate(w http.ResponseWriter, r *http.Request) {
 		hdrDec.UseNumber()
 		if err := hdrDec.Decode(&hdrCheck); err != nil {
 			et, er := classifyInvalidRenderedTemplateJSONRound61([]byte(hdrLine))
+			et, er = formatMustacheEOFErrorForServerR64(s, r, et, er)
 			writeESError(w, http.StatusBadRequest, et, er)
 			return
 		}
@@ -2194,7 +2343,8 @@ func (s *Server) handleMSearchTemplate(w http.ResponseWriter, r *http.Request) {
 		dec.UseNumber()
 		if err := dec.Decode(&body); err != nil {
 			et, er := classifyInvalidRenderedTemplateJSONRound61([]byte(tplLine))
-			if et == "x_content_e_o_f_exception" {
+			et, er = formatMustacheEOFErrorForServerR64(s, r, et, er)
+			if et == "x_content_e_o_f_exception" || et == "json_e_o_f_exception" {
 				writeESError(w, http.StatusBadRequest, et, er)
 				return
 			}
@@ -2227,7 +2377,7 @@ func (s *Server) handleMSearchTemplate(w http.ResponseWriter, r *http.Request) {
 		renderedJSON, err := renderMustacheSearchTemplate(tplSource, params)
 		if err != nil {
 			et, er := mustacheErrTypeAndReason(err)
-			et = mustacheErrTypeForServerRound63(s, r, et)
+			et, er = formatMustacheEOFErrorForServerR64(s, r, et, er)
 			perItemErrors[idx] = map[string]any{
 				"status": http.StatusBadRequest,
 				"error": map[string]any{
@@ -2244,6 +2394,7 @@ func (s *Server) handleMSearchTemplate(w http.ResponseWriter, r *http.Request) {
 		var compact bytes.Buffer
 		if errC := json.Compact(&compact, renderedJSON); errC != nil {
 			et, er := classifyInvalidRenderedTemplateJSONRound61(renderedJSON)
+			et, er = formatMustacheEOFErrorForServerR64(s, r, et, er)
 			perItemErrors[idx] = map[string]any{
 				"status": http.StatusBadRequest,
 				"error": map[string]any{

@@ -20,6 +20,7 @@ package painless
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"math/big"
 	"reflect"
 	"regexp"
@@ -350,24 +351,61 @@ func coerceToBigIntegerRound63(v any, fieldName string) (*painlessBigInteger, er
 		return newPainlessBigInteger(big.NewInt(int64(tv))), nil
 	case json.Number:
 		s := strings.TrimSpace(tv.String())
+		if len(strings.TrimLeft(strings.TrimPrefix(strings.TrimPrefix(s, "-"), "+"), "0")) > 20000 {
+			return nil, &painlessExceptionError{
+				exType:  "IllegalArgumentException",
+				message: fmt.Sprintf("cannot parse field [%s] as BigInteger", fieldName),
+			}
+		}
 		if bi, ok := new(big.Int).SetString(s, 10); ok {
+			if err := checkBigIntBitsPainless(bi); err != nil {
+				return nil, err
+			}
 			return newPainlessBigInteger(bi), nil
 		}
 	case string:
 		s := strings.TrimSpace(tv)
+		if len(strings.TrimLeft(strings.TrimPrefix(strings.TrimPrefix(s, "-"), "+"), "0")) > 20000 {
+			return nil, &painlessExceptionError{
+				exType:  "IllegalArgumentException",
+				message: fmt.Sprintf("cannot parse field [%s] as BigInteger", fieldName),
+			}
+		}
 		if bi, ok := new(big.Int).SetString(s, 10); ok {
+			if err := checkBigIntBitsPainless(bi); err != nil {
+				return nil, err
+			}
 			return newPainlessBigInteger(bi), nil
 		}
 	case float64:
+		if math.IsNaN(tv) || math.IsInf(tv, 0) {
+			return nil, &painlessExceptionError{
+				exType:  "IllegalArgumentException",
+				message: fmt.Sprintf("cannot parse field [%s] as BigInteger", fieldName),
+			}
+		}
 		bf := new(big.Float).SetFloat64(tv)
 		bi, _ := bf.Int(nil)
 		if bi != nil {
+			if err := checkBigIntBitsPainless(bi); err != nil {
+				return nil, err
+			}
 			return newPainlessBigInteger(bi), nil
 		}
 	case float32:
-		bf := new(big.Float).SetFloat64(float64(tv))
+		f64 := float64(tv)
+		if math.IsNaN(f64) || math.IsInf(f64, 0) {
+			return nil, &painlessExceptionError{
+				exType:  "IllegalArgumentException",
+				message: fmt.Sprintf("cannot parse field [%s] as BigInteger", fieldName),
+			}
+		}
+		bf := new(big.Float).SetFloat64(f64)
 		bi, _ := bf.Int(nil)
 		if bi != nil {
+			if err := checkBigIntBitsPainless(bi); err != nil {
+				return nil, err
+			}
 			return newPainlessBigInteger(bi), nil
 		}
 	}

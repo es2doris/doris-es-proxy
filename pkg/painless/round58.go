@@ -1083,7 +1083,7 @@ func evalInstanceReceiverOnceRound58(recExpr, mName, mBare, argExpr string, isNu
 		if strings.HasPrefix(cleanRec, "doc[") {
 			expDocRec = strings.TrimSpace(expandDynamicBrackets(cleanRec, sourceMap, params, depth+1))
 		}
-		if (mBare == "forEach" || mBare == "containsAll" || mBare == "contains" || mBare == "indexOf" || mBare == "lastIndexOf" || mBare == "get" || mBare == "subList" || mBare == "join" || mBare == "length" || mBare == "size" || mBare == "isEmpty" || mBare == "arcDistance" || mBare == "planeDistance" || mBare == "geohashDistance" || mBare == "getCentroid" || mBare == "getBoundingBox" || mBare == "getLabelPosition" || mBare == "getDimensionalType" || mBare == "getMercatorWidth" || mBare == "getMercatorHeight") &&
+		if (mBare == "forEach" || mBare == "containsAll" || mBare == "contains" || mBare == "indexOf" || mBare == "lastIndexOf" || mBare == "get" || mBare == "subList" || mBare == "join" || mBare == "length" || mBare == "size" || mBare == "isEmpty" || mBare == "arcDistance" || mBare == "planeDistance" || mBare == "geohashDistance" || mBare == "getCentroid" || mBare == "getBoundingBox" || mBare == "getLabelPosition" || mBare == "getDimensionalType" || mBare == "getShapeType" || mBare == "getMercatorWidth" || mBare == "getMercatorHeight" || mBare == "topLeft" || mBare == "bottomRight") &&
 			(strings.HasPrefix(expDocRec, "doc.") || strings.HasPrefix(expDocRec, "doc?.")) &&
 			!strings.HasSuffix(expDocRec, ".value") && !strings.Contains(expDocRec, ".value.") && !strings.Contains(expDocRec, ".values.") && !strings.Contains(expDocRec, "(") {
 			docPath := strings.TrimSuffix(strings.TrimPrefix(strings.TrimPrefix(expDocRec, "doc?."), "doc."), ".values")
@@ -1091,7 +1091,7 @@ func evalInstanceReceiverOnceRound58(recExpr, mName, mBare, argExpr string, isNu
 			if dvErr != nil {
 				return nil, nil, true, dvErr
 			}
-			if mBare == "arcDistance" || mBare == "planeDistance" || mBare == "geohashDistance" || mBare == "getCentroid" || mBare == "getBoundingBox" || mBare == "getLabelPosition" || mBare == "getDimensionalType" || mBare == "getMercatorWidth" || mBare == "getMercatorHeight" {
+			if mBare == "arcDistance" || mBare == "planeDistance" || mBare == "geohashDistance" || mBare == "getCentroid" || mBare == "getBoundingBox" || mBare == "getLabelPosition" || mBare == "getDimensionalType" || mBare == "getShapeType" || mBare == "getMercatorWidth" || mBare == "getMercatorHeight" || mBare == "topLeft" || mBare == "bottomRight" {
 				if r60Res, r60Handled, r60Err := evalRound60ReceiverMethod(dv, mBare, argExpr, sourceMap, params, depth+1); r60Handled {
 					return r60Res, nil, true, r60Err
 				}
@@ -2147,11 +2147,14 @@ func evalStringRepeatRound58(s string, argVal any) (any, error) {
 			message: fmt.Sprintf("count is negative: %d", iv),
 		}
 	}
-	n := int(iv)
-	if n == 0 || s == "" {
+	if iv == 0 || s == "" {
 		return "", nil
 	}
-	if len(s)*n > MaxPainlessSliceItems*64 {
+	if iv > int64(math.MaxInt) {
+		iv = int64(math.MaxInt)
+	}
+	n := int(iv)
+	if len(s) > 0 && n > (MaxPainlessSliceItems*64)/len(s) {
 		n = (MaxPainlessSliceItems * 64) / len(s)
 	}
 	return strings.Repeat(s, n), nil

@@ -26,6 +26,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -101,6 +102,9 @@ func parseMediaQualityWeightR63(params []string) float64 {
 		kv := strings.SplitN(strings.TrimSpace(rawParam), "=", 2)
 		if len(kv) == 2 && strings.EqualFold(strings.TrimSpace(kv[0]), "q") {
 			if parsed, err := strconv.ParseFloat(strings.TrimSpace(kv[1]), 64); err == nil {
+				if math.IsNaN(parsed) || math.IsInf(parsed, 0) {
+					return 0
+				}
 				if parsed < 0 {
 					return 0
 				}
@@ -156,7 +160,8 @@ func readInitialHeaderBytesR63(r io.Reader, n int) ([]byte, error) {
 // decompressRequestBodyR63Wire transparently decompresses `gzip`, `x-gzip`, and `deflate` request bodies,
 // treating 0-byte bodies as valid empty bodies and bounding decompressed output with `http.MaxBytesReader`.
 func decompressRequestBodyR63Wire(w http.ResponseWriter, r *http.Request, maxBytes int64) (cleanup func(), ok bool) {
-	rawCE := strings.TrimSpace(r.Header.Get("Content-Encoding"))
+	ceVals := r.Header.Values("Content-Encoding")
+	rawCE := strings.TrimSpace(strings.Join(ceVals, ", "))
 	if rawCE == "" {
 		return nil, true
 	}
@@ -187,6 +192,7 @@ func decompressRequestBodyR63Wire(w http.ResponseWriter, r *http.Request, maxByt
 
 	if r.Body == nil || r.Body == http.NoBody {
 		r.Body = http.NoBody
+		r.ContentLength = 0
 		r.Header.Del("Content-Encoding")
 		r.Header.Del("Content-Length")
 		return nil, true
@@ -197,6 +203,7 @@ func decompressRequestBodyR63Wire(w http.ResponseWriter, r *http.Request, maxByt
 	if len(hdr) == 0 && errors.Is(hdrErr, io.EOF) {
 		_ = origBody.Close()
 		r.Body = http.NoBody
+		r.ContentLength = 0
 		r.Header.Del("Content-Encoding")
 		r.Header.Del("Content-Length")
 		return nil, true
@@ -241,6 +248,7 @@ func decompressRequestBodyR63Wire(w http.ResponseWriter, r *http.Request, maxByt
 			_ = origBody.Close()
 		}
 		r.Body = http.MaxBytesReader(w, gz, maxBytes)
+		r.ContentLength = -1
 		r.Header.Del("Content-Encoding")
 		r.Header.Del("Content-Length")
 		return cleanupFn, true
@@ -248,19 +256,41 @@ func decompressRequestBodyR63Wire(w http.ResponseWriter, r *http.Request, maxByt
 	case "deflate":
 		isZlibHeader := len(hdr) == 2 && (hdr[0]&0x0f) == 8 && ((int(hdr[0])<<8|int(hdr[1]))%31 == 0)
 		var decomp io.ReadCloser
+		var peek []byte
+		var peekErr error
 		if isZlibHeader {
-			zr, zErr := zlib.NewReader(combined)
-			if zErr != nil {
-				_ = origBody.Close()
-				writeESError(w, http.StatusBadRequest, "not_x_content_exception", "invalid deflate stream: "+zErr.Error())
-				return nil, false
+			// Capture compressed bytes consumed during initial zlib header/block probe so raw RFC 1951 fallback can replay.
+			var replayBuf bytes.Buffer
+			tee := io.TeeReader(combined, &replayBuf)
+			zr, zErr := zlib.NewReader(tee)
+			if zErr == nil {
+				decomp = zr
+				peek, peekErr = readInitialHeaderBytesR63(decomp, 64)
 			}
-			decomp = zr
+			if zErr != nil || (peekErr != nil && !errors.Is(peekErr, io.EOF)) {
+				var maxErr *http.MaxBytesError
+				if errors.As(peekErr, &maxErr) {
+					if decomp != nil {
+						_ = decomp.Close()
+					}
+					_ = origBody.Close()
+					writeESError(w, http.StatusRequestEntityTooLarge, "circuit_breaking_exception",
+						fmt.Sprintf("[request] Data too large, data for [<http_request>] would be larger than limit of [%d]", maxBytes))
+					return nil, false
+				}
+				if decomp != nil {
+					_ = decomp.Close()
+				}
+				// Fallback to raw RFC 1951 deflate in case 2-byte prefix matched CMF/FLG modulo 31 by coincidence.
+				fallbackCombined := io.MultiReader(bytes.NewReader(replayBuf.Bytes()), origBody)
+				decomp = flate.NewReader(fallbackCombined)
+				peek, peekErr = readInitialHeaderBytesR63(decomp, 64)
+			}
 		} else {
 			decomp = flate.NewReader(combined)
+			peek, peekErr = readInitialHeaderBytesR63(decomp, 64)
 		}
 
-		peek, peekErr := readInitialHeaderBytesR63(decomp, 64)
 		if peekErr != nil && !errors.Is(peekErr, io.EOF) {
 			_ = decomp.Close()
 			_ = origBody.Close()
@@ -280,6 +310,7 @@ func decompressRequestBodyR63Wire(w http.ResponseWriter, r *http.Request, maxByt
 			body:   origBody,
 		}
 		r.Body = http.MaxBytesReader(w, wrapped, maxBytes)
+		r.ContentLength = -1
 		r.Header.Del("Content-Encoding")
 		r.Header.Del("Content-Length")
 		return func() { _ = wrapped.Close() }, true
@@ -1038,6 +1069,17 @@ func (tw *translogWarningFilterWriterR63) filterWarnings() {
 			continue
 		}
 		tw.ResponseWriter.Header().Add("Warning", wv)
+	}
+}
+
+func (tw *translogWarningFilterWriterR63) Unwrap() http.ResponseWriter {
+	return tw.ResponseWriter
+}
+
+func (tw *translogWarningFilterWriterR63) Flush() {
+	tw.filterWarnings()
+	if fl, ok := tw.ResponseWriter.(http.Flusher); ok {
+		fl.Flush()
 	}
 }
 

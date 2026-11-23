@@ -160,10 +160,9 @@ func NormalizeTerm(text string, normalizerName string, cfg *IndexAnalysisConfig,
 	return resp.Tokens[0].Token, nil
 }
 
-// AnalyzeForQuery runs text through the specified analyzer and builds a positioned QueryTokenGraph
-// (including stacked tokens at the same position, multi-word synonym_graph / shingle spans,
-// articulation-point segments, and phrase path enumeration).
-func AnalyzeForQuery(text string, analyzerName string, cfg *IndexAnalysisConfig, opts Options) (QueryTokenGraph, error) {
+// AnalyzeTokens runs text through the specified analyzer and returns the raw positioned token slice
+// (with PositionLength normalized to >= 1), suitable for downstream query graph or term inspection.
+func AnalyzeTokens(text string, analyzerName string, cfg *IndexAnalysisConfig, opts Options) ([]Token, error) {
 	maxTokenCount := effectiveMaxTokenCount(cfg)
 	effAnalyzer := strings.TrimSpace(analyzerName)
 	if effAnalyzer == "" {
@@ -171,10 +170,32 @@ func AnalyzeForQuery(text string, analyzerName string, cfg *IndexAnalysisConfig,
 	}
 	ca, err := resolveNamedAnalyzer(effAnalyzer, cfg, opts)
 	if err != nil {
-		return QueryTokenGraph{}, err
+		return nil, err
 	}
 
 	toks, err := runCompiledAnalyzerSingleText(ca, text, maxTokenCount)
+	if err != nil {
+		return nil, err
+	}
+	for i := range toks {
+		if toks[i].PositionLength < 1 {
+			toks[i].PositionLength = 1
+		}
+	}
+	return toks, nil
+}
+
+// BuildQueryTokenGraph converts a positioned token slice into a QueryTokenGraph with
+// articulation-point segments and enumerated phrase branches.
+func BuildQueryTokenGraph(tokens []Token) QueryTokenGraph {
+	return buildQueryTokenGraph(tokens)
+}
+
+// AnalyzeForQuery runs text through the specified analyzer and builds a positioned QueryTokenGraph
+// (including stacked tokens at the same position, multi-word synonym_graph / shingle spans,
+// articulation-point segments, and phrase path enumeration).
+func AnalyzeForQuery(text string, analyzerName string, cfg *IndexAnalysisConfig, opts Options) (QueryTokenGraph, error) {
+	toks, err := AnalyzeTokens(text, analyzerName, cfg, opts)
 	if err != nil {
 		return QueryTokenGraph{}, err
 	}

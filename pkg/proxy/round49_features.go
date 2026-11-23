@@ -2,14 +2,19 @@ package proxy
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/es2doris/doris-es-proxy/pkg/esast"
@@ -348,6 +353,217 @@ func formatSnapshotResponseItemRound61(rawSnap map[string]any, repoName string, 
 	return cp
 }
 
+const proxySnapshotCatalogFileR64 = "_proxy_snapshots.json"
+
+func persistFSSnapshotsDiskR64(repoObj map[string]any, bySnap map[string]map[string]any) {
+	if repoObj == nil {
+		return
+	}
+	repoType, _ := repoObj["type"].(string)
+	if strings.TrimSpace(repoType) != "fs" {
+		return
+	}
+	settings, _ := repoObj["settings"].(map[string]any)
+	loc, _ := settings["location"].(string)
+	loc = strings.TrimSpace(loc)
+	if loc == "" {
+		return
+	}
+	info, err := os.Stat(loc)
+	if err != nil || !info.IsDir() {
+		return
+	}
+	out := make(map[string]map[string]any, len(bySnap))
+	for sName, rawSnap := range bySnap {
+		if rawSnap == nil {
+			continue
+		}
+		// Copy top-level fields without JSON-marshaling *schema.IndexSchema pointers directly.
+		entry := make(map[string]any, len(rawSnap)+1)
+		for k, v := range rawSnap {
+			if k == "__schemas" {
+				if schemas, okS := v.(map[string]*schema.IndexSchema); okS && len(schemas) > 0 {
+					rawSchemas := make(map[string]any, len(schemas))
+					for idxName, sc := range schemas {
+						if sc != nil && sc.RawMapping != nil {
+							rawSchemas[idxName] = sc.RawMapping
+						} else {
+							rawSchemas[idxName] = map[string]any{}
+						}
+					}
+					entry["__schemas_raw"] = rawSchemas
+				}
+				continue
+			}
+			entry[k] = deepCloneIngestValue(v)
+		}
+		out[sName] = entry
+	}
+	payload, err := json.Marshal(out)
+	if err != nil {
+		return
+	}
+	tmpPath := filepath.Join(loc, proxySnapshotCatalogFileR64+".tmp")
+	finalPath := filepath.Join(loc, proxySnapshotCatalogFileR64)
+	if err := os.WriteFile(tmpPath, payload, 0o600); err != nil {
+		return
+	}
+	if err := os.Rename(tmpPath, finalPath); err != nil {
+		_ = os.WriteFile(finalPath, payload, 0o600)
+		_ = os.Remove(tmpPath)
+	}
+}
+
+func fetchURLSnapshotCatalogBytesR64(rawURL string) ([]byte, bool) {
+	trimmed := strings.TrimSpace(rawURL)
+	if trimmed == "" {
+		return nil, false
+	}
+	parsed, err := url.Parse(trimmed)
+	if err != nil {
+		return nil, false
+	}
+	switch strings.ToLower(parsed.Scheme) {
+	case "file":
+		dirPath := parsed.Path
+		if parsed.Host != "" && parsed.Host != "localhost" {
+			dirPath = filepath.Join(string(filepath.Separator)+parsed.Host, parsed.Path)
+		}
+		if dirPath == "" {
+			return nil, false
+		}
+		b, readErr := os.ReadFile(filepath.Join(filepath.FromSlash(dirPath), proxySnapshotCatalogFileR64))
+		if readErr != nil {
+			return nil, false
+		}
+		return b, true
+	case "http", "https":
+		target := strings.TrimRight(trimmed, "/") + "/" + proxySnapshotCatalogFileR64
+		client := &http.Client{
+			Timeout: 5 * time.Second,
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		}
+		resp, getErr := client.Get(target)
+		if getErr != nil {
+			return nil, false
+		}
+		defer func() { _ = resp.Body.Close() }()
+		if resp.StatusCode != http.StatusOK {
+			return nil, false
+		}
+		b, readErr := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
+		if readErr != nil {
+			return nil, false
+		}
+		return b, true
+	default:
+		return nil, false
+	}
+}
+
+func (s *Server) syncURLRepoSnapshotsByExprR64(repoExpr string) {
+	type repoTarget struct {
+		name string
+		url  string
+	}
+	var targets []repoTarget
+	s.mu.RLock()
+	for rName, rObj := range s.snapshotRepos {
+		if rObj == nil {
+			continue
+		}
+		rType, _ := rObj["type"].(string)
+		if strings.TrimSpace(rType) != "url" {
+			continue
+		}
+		if repoExpr != "" && repoExpr != "_all" && repoExpr != "*" && !matchMultiWildcardWithExclusions(repoExpr, rName) {
+			continue
+		}
+		settings, _ := rObj["settings"].(map[string]any)
+		u, _ := settings["url"].(string)
+		if strings.TrimSpace(u) != "" {
+			targets = append(targets, repoTarget{name: rName, url: u})
+		}
+	}
+	s.mu.RUnlock()
+
+	for _, tgt := range targets {
+		raw, ok := fetchURLSnapshotCatalogBytesR64(tgt.url)
+		if !ok {
+			continue
+		}
+		var diskSnaps map[string]map[string]any
+		dec := json.NewDecoder(bytes.NewReader(raw))
+		dec.UseNumber()
+		if err := dec.Decode(&diskSnaps); err != nil || diskSnaps == nil {
+			continue
+		}
+		loaded := make(map[string]map[string]any, len(diskSnaps))
+		for sName, snapData := range diskSnaps {
+			if snapData == nil {
+				continue
+			}
+			snapData["repository"] = tgt.name
+			if rawSchemas, okRS := snapData["__schemas_raw"].(map[string]any); okRS {
+				compiled := make(map[string]*schema.IndexSchema, len(rawSchemas))
+				for idxName, rawMapAny := range rawSchemas {
+					var mappingSpec *esast.MappingSpec
+					if rawMapAny != nil {
+						if b, mErr := json.Marshal(rawMapAny); mErr == nil {
+							var parsed esast.MappingSpec
+							if uErr := json.Unmarshal(b, &parsed); uErr == nil {
+								mappingSpec = &parsed
+							}
+						}
+					}
+					if sc := schema.CompileIndexSchema(s.dorisDB, idxName, mappingSpec); sc != nil {
+						compiled[idxName] = sc
+					}
+				}
+				snapData["__schemas"] = compiled
+				delete(snapData, "__schemas_raw")
+			}
+			loaded[sName] = snapData
+		}
+		s.mu.Lock()
+		if curRepo := s.snapshotRepos[tgt.name]; curRepo != nil {
+			if curType, _ := curRepo["type"].(string); strings.TrimSpace(curType) == "url" {
+				if s.snapshots == nil {
+					s.snapshots = make(map[string]map[string]map[string]any)
+				}
+				s.snapshots[tgt.name] = loaded
+			}
+		}
+		s.mu.Unlock()
+	}
+}
+
+func (s *Server) syncAllFSRepositoriesDiskR64() {
+	type fsPair struct {
+		repoObj map[string]any
+		bySnap  map[string]map[string]any
+	}
+	var pairs []fsPair
+	s.mu.RLock()
+	for rName, rObj := range s.snapshotRepos {
+		if rObj == nil {
+			continue
+		}
+		if rt, _ := rObj["type"].(string); strings.TrimSpace(rt) == "fs" {
+			pairs = append(pairs, fsPair{
+				repoObj: deepCloneDocMap(rObj),
+				bySnap:  s.snapshots[rName],
+			})
+		}
+	}
+	s.mu.RUnlock()
+	for _, p := range pairs {
+		persistFSSnapshotsDiskR64(p.repoObj, p.bySnap)
+	}
+}
+
 // handleSnapshotRepo implements `/_snapshot/{repository}` (including `/_snapshot/_all` and `/_snapshot/_status`) (F1).
 func (s *Server) handleSnapshotRepo(w http.ResponseWriter, r *http.Request) {
 	repo := strings.TrimSpace(r.PathValue("repository"))
@@ -461,7 +677,20 @@ func (s *Server) handleSnapshotRepo(w http.ResponseWriter, r *http.Request) {
 			s.mu.RLock()
 			allowedURLs := ""
 			if s.clusterPersistentSettings != nil {
-				allowedURLs, _ = s.clusterPersistentSettings["repositories.url.allowed_urls"].(string)
+				switch av := s.clusterPersistentSettings["repositories.url.allowed_urls"].(type) {
+				case string:
+					allowedURLs = av
+				case []any:
+					parts := make([]string, 0, len(av))
+					for _, it := range av {
+						if ps := strings.TrimSpace(fmt.Sprintf("%v", it)); ps != "" {
+							parts = append(parts, ps)
+						}
+					}
+					allowedURLs = strings.Join(parts, ",")
+				case []string:
+					allowedURLs = strings.Join(av, ",")
+				}
 			}
 			s.mu.RUnlock()
 			effectiveAllowed := strings.TrimSpace(allowedURLs)
@@ -542,6 +771,7 @@ func (s *Server) handleSnapshotActionOrItem(w http.ResponseWriter, r *http.Reque
 	}
 
 	if snap == "_status" && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
+		s.syncURLRepoSnapshotsByExprR64(repo)
 		ignoreUnavailable := isTruthyBoolQueryParam(r, "ignore_unavailable")
 		s.mu.RLock()
 		var targetRepos []string
@@ -595,6 +825,7 @@ func (s *Server) handleSnapshotActionOrItem(w http.ResponseWriter, r *http.Reque
 
 	if r.Method == http.MethodGet || r.Method == http.MethodHead {
 		if snap != "_verify" {
+			s.syncURLRepoSnapshotsByExprR64(repo)
 			ignoreUnavailable := isTruthyBoolQueryParam(r, "ignore_unavailable")
 			verbose := true
 			if pv, hasV, err := parseStrictQueryBoolParamRound59(r, "verbose"); err != nil {
@@ -728,7 +959,8 @@ func (s *Server) handleSnapshotActionOrItem(w http.ResponseWriter, r *http.Reque
 	}
 
 	s.mu.RLock()
-	_, repoExists := s.snapshotRepos[repo]
+	repoObj, repoExists := s.snapshotRepos[repo]
+	repoType, _ := repoObj["type"].(string)
 	s.mu.RUnlock()
 	if !repoExists {
 		writeESError(w, http.StatusNotFound, "repository_missing_exception", fmt.Sprintf("[%s] missing", repo))
@@ -746,6 +978,14 @@ func (s *Server) handleSnapshotActionOrItem(w http.ResponseWriter, r *http.Reque
 
 	switch r.Method {
 	case http.MethodPut, http.MethodPost:
+		if strings.TrimSpace(repoType) == "url" {
+			msg := fmt.Sprintf("[%s] cannot create snapshot in a readonly repository", repo)
+			if s.isES8Mode(r) {
+				msg = fmt.Sprintf("[%s] repository is readonly", repo)
+			}
+			writeESError(w, http.StatusBadRequest, "repository_exception", msg)
+			return
+		}
 		waitForCompletion := false
 		if wfc, hasWFC, err := parseStrictQueryBoolParamRound59(r, "wait_for_completion"); err != nil {
 			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", err.Error())
@@ -960,6 +1200,7 @@ func (s *Server) handleSnapshotActionOrItem(w http.ResponseWriter, r *http.Reque
 		s.snapshots[repo][snap] = snapObj
 		respSnap := cloneSnapshotWithoutInternal(snapObj)
 		s.mu.Unlock()
+		s.syncAllFSRepositoriesDiskR64()
 		if waitForCompletion {
 			writeJSONWithRequest(w, r, http.StatusOK, map[string]any{
 				"snapshot": respSnap,
@@ -974,6 +1215,7 @@ func (s *Server) handleSnapshotActionOrItem(w http.ResponseWriter, r *http.Reque
 			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", err.Error())
 			return
 		}
+		s.syncURLRepoSnapshotsByExprR64(repo)
 		ignoreUnavailable := isTruthyBoolQueryParam(r, "ignore_unavailable")
 		s.mu.Lock()
 		bySnap := s.snapshots[repo]
@@ -1007,10 +1249,20 @@ func (s *Server) handleSnapshotActionOrItem(w http.ResponseWriter, r *http.Reque
 			writeESError(w, http.StatusNotFound, "snapshot_missing_exception", fmt.Sprintf("[%s:%s] is missing", repo, snap))
 			return
 		}
+		if strings.TrimSpace(repoType) == "url" {
+			s.mu.Unlock()
+			msg := fmt.Sprintf("[%s] cannot delete snapshot from a readonly repository", repo)
+			if s.isES8Mode(r) {
+				msg = fmt.Sprintf("[%s] repository is readonly", repo)
+			}
+			writeESError(w, http.StatusBadRequest, "repository_exception", msg)
+			return
+		}
 		for _, sName := range toDelete {
 			delete(bySnap, sName)
 		}
 		s.mu.Unlock()
+		s.syncAllFSRepositoriesDiskR64()
 		writeJSONWithRequest(w, r, http.StatusOK, map[string]any{"acknowledged": true})
 	default:
 		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method")
@@ -1028,6 +1280,7 @@ func (s *Server) handleSnapshotItemAction(w http.ResponseWriter, r *http.Request
 			writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method")
 			return
 		}
+		s.syncURLRepoSnapshotsByExprR64(repo)
 		ignoreUnavailable := isTruthyBoolQueryParam(r, "ignore_unavailable") || isTruthyBoolQueryParam(r, "ignoreUnavailable")
 		s.mu.RLock()
 		var targetRepos []string
@@ -1101,6 +1354,7 @@ func (s *Server) handleSnapshotItemAction(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	s.syncURLRepoSnapshotsByExprR64(repo)
 	s.mu.RLock()
 	_, repoExists := s.snapshotRepos[repo]
 	var snapObj map[string]any
@@ -1120,6 +1374,10 @@ func (s *Server) handleSnapshotItemAction(w http.ResponseWriter, r *http.Request
 		return
 	}
 	if snapObj == nil {
+		if action == "_restore" {
+			writeESError(w, http.StatusNotFound, "snapshot_restore_exception", fmt.Sprintf("[%s:%s] snapshot does not exist", repo, snap))
+			return
+		}
 		writeESError(w, http.StatusNotFound, "snapshot_missing_exception", fmt.Sprintf("[%s:%s] is missing", repo, snap))
 		return
 	}
@@ -1212,6 +1470,7 @@ func (s *Server) handleSnapshotItemAction(w http.ResponseWriter, r *http.Request
 			s.persistIndex(r.Context(), targetIdx, restoredSchema)
 		}
 		s.restoreSnapshotIndexArtifacts(r.Context(), rawSnapRef, srcIdx, targetIdx, restoredSchema, reqMap, true)
+		recordIndexRecoverySourceR62Admin(s, targetIdx, "SNAPSHOT")
 		writeJSON(w, http.StatusOK, map[string]any{
 			"accepted": true,
 			"snapshot": map[string]any{
@@ -1994,8 +2253,8 @@ func (s *Server) handleAddIndexBlock(w http.ResponseWriter, r *http.Request) {
 		}
 		s.indexCustomSettings[idx]["blocks."+block] = "true"
 		indicesRes = append(indicesRes, map[string]any{
-			"name":             idx,
-			"add_block_result": true,
+			"name":    idx,
+			"blocked": true,
 		})
 	}
 	s.mu.Unlock()
@@ -2146,6 +2405,56 @@ func (s *Server) handleModifyDataStream(w http.ResponseWriter, r *http.Request) 
 					fmt.Sprintf("data_stream [%s] is missing", dsName))
 				return
 			}
+			isFSReq, hasFSFlag := parseOptionalBoolAny(remSpec["failure_store"])
+			removeFromFailureStore := func(fsObj map[string]any) (handled bool, errored bool) {
+				if fsObj == nil {
+					return false, false
+				}
+				fsIndices, _ := fsObj["indices"].([]any)
+				foundIdx := -1
+				for i, item := range fsIndices {
+					if m, okM := item.(map[string]any); okM {
+						if existingIdx, _ := m["index_name"].(string); existingIdx == idxName {
+							foundIdx = i
+							break
+						}
+					}
+				}
+				if foundIdx < 0 {
+					return false, false
+				}
+				fsEnabled := true
+				if en, okB := parseOptionalBoolAny(fsObj["enabled"]); okB && !en {
+					fsEnabled = false
+				}
+				if foundIdx == len(fsIndices)-1 && fsEnabled {
+					s.mu.Unlock()
+					writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
+						fmt.Sprintf("cannot remove write index [%s] from data_stream [%s]", idxName, dsName))
+					return true, true
+				}
+				updated := make([]any, 0, len(fsIndices)-1)
+				updated = append(updated, fsIndices[:foundIdx]...)
+				updated = append(updated, fsIndices[foundIdx+1:]...)
+				fsObj["indices"] = updated
+				s.removeAliasTargetLocked(dsName, idxName)
+				modifiedDS[dsName] = deepCloneDocMap(ds)
+				modifiedAliases[dsName] = append([]string(nil), s.aliases[dsName]...)
+				return true, false
+			}
+			if hasFSFlag && isFSReq {
+				fsObj, _ := ds["failure_store"].(map[string]any)
+				if handled, errored := removeFromFailureStore(fsObj); handled {
+					if errored {
+						return
+					}
+					continue
+				}
+				s.mu.Unlock()
+				writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
+					fmt.Sprintf("index [%s] is not part of data_stream [%s]", idxName, dsName))
+				return
+			}
 			rawList, _ := ds["indices"].([]any)
 			foundIdx := -1
 			for i, item := range rawList {
@@ -2157,6 +2466,16 @@ func (s *Server) handleModifyDataStream(w http.ResponseWriter, r *http.Request) 
 				}
 			}
 			if foundIdx < 0 {
+				if !hasFSFlag && strings.HasPrefix(idxName, ".fs-") {
+					if fsObj, okFS := ds["failure_store"].(map[string]any); okFS {
+						if handled, errored := removeFromFailureStore(fsObj); handled {
+							if errored {
+								return
+							}
+							continue
+						}
+					}
+				}
 				s.mu.Unlock()
 				writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
 					fmt.Sprintf("index [%s] is not part of data_stream [%s]", idxName, dsName))
@@ -4262,9 +4581,23 @@ func (s *Server) handleQueryRules(w http.ResponseWriter, r *http.Request, segs [
 		results := make([]any, 0)
 		for i := from; i < total && len(results) < size; i++ {
 			id := ids[i]
+			rules := s.queryRulesets[id]
+			criteriaCounts := make(map[string]int)
+			for _, rm := range rules {
+				if crits, ok := rm["criteria"].([]any); ok {
+					for _, ci := range crits {
+						if cm, ok := ci.(map[string]any); ok {
+							if ct, _ := cm["type"].(string); ct != "" {
+								criteriaCounts[ct]++
+							}
+						}
+					}
+				}
+			}
 			results = append(results, map[string]any{
-				"ruleset_id": id,
-				"count":      len(s.queryRulesets[id]),
+				"ruleset_id":                 id,
+				"rule_total_count":           len(rules),
+				"rule_criteria_types_counts": criteriaCounts,
 			})
 		}
 		s.mu.RUnlock()
@@ -4874,13 +5207,15 @@ func (s *Server) handleVotingConfigExclusions(w http.ResponseWriter, r *http.Req
 			}
 		}
 		s.mu.Unlock()
-		writeJSONWithRequest(w, r, http.StatusOK, map[string]any{"acknowledged": true})
+		ensureESCompatHeaders(w, r)
+		w.WriteHeader(http.StatusOK)
 
 	case http.MethodDelete:
 		s.mu.Lock()
 		s.votingExclusions = nil
 		s.mu.Unlock()
-		writeJSONWithRequest(w, r, http.StatusOK, map[string]any{"acknowledged": true})
+		ensureESCompatHeaders(w, r)
+		w.WriteHeader(http.StatusOK)
 
 	default:
 		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
@@ -5043,6 +5378,17 @@ func (s *Server) handleRollup(w http.ResponseWriter, r *http.Request, segs []str
 		if len(out) == 0 && target != "" && target != "_all" && target != "*" {
 			if _, idxExists := s.indices[target]; idxExists {
 				out[target] = map[string]any{"rollup_jobs": []any{}}
+			} else if ds, isDS := s.dataStreams[target]; isDS && ds != nil {
+				for _, bi := range extractDataStreamBackingIndexNames(ds) {
+					out[bi] = map[string]any{"rollup_jobs": []any{}}
+				}
+				if len(out) == 0 {
+					out[target] = map[string]any{"rollup_jobs": []any{}}
+				}
+			} else if aliasTargets := s.aliases[target]; len(aliasTargets) > 0 {
+				for _, at := range aliasTargets {
+					out[at] = map[string]any{"rollup_jobs": []any{}}
+				}
 			} else {
 				s.mu.RUnlock()
 				writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("rollup data [%s] not found", target))
@@ -6115,9 +6461,21 @@ func (s *Server) handleSecurityAPI(w http.ResponseWriter, r *http.Request, segs 
 				writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "api_key [name] is required")
 				return
 			}
+			ownerUsername := "elastic"
+			if basicUser, _, okBasic := r.BasicAuth(); okBasic && strings.TrimSpace(basicUser) != "" {
+				ownerUsername = strings.TrimSpace(basicUser)
+			}
 			s.mu.Lock()
 			if s.securityAPIKeys == nil {
 				s.securityAPIKeys = make(map[string]map[string]any)
+			}
+			if ownerUsername == "elastic" {
+				if authHdr := strings.TrimSpace(r.Header.Get("Authorization")); strings.HasPrefix(strings.ToLower(authHdr), "apikey ") {
+					// Resolve owning user from calling ApiKey when creating nested keys.
+					if decOwner := resolveAPIKeyUsernameFromHeaderR64(authHdr[7:], s.securityAPIKeys); decOwner != "" {
+						ownerUsername = decOwner
+					}
+				}
 			}
 			keyID := fmt.Sprintf("key-%d", len(s.securityAPIKeys)+1)
 			secret := "secret-" + keyID
@@ -6125,7 +6483,7 @@ func (s *Server) handleSecurityAPI(w http.ResponseWriter, r *http.Request, segs 
 			s.securityAPIKeys[keyID] = map[string]any{
 				"id":               keyID,
 				"name":             name,
-				"username":         "elastic",
+				"username":         ownerUsername,
 				"realm":            "default_native",
 				"invalidated":      false,
 				"creation":         time.Now().UTC().UnixMilli(),
@@ -7979,6 +8337,17 @@ func (s *Server) handleAsyncSearch(w http.ResponseWriter, r *http.Request, segs 
 			return
 		}
 		if isStatus {
+			shardsStatus := map[string]any{
+				"total":      1,
+				"successful": 1,
+				"skipped":    0,
+				"failed":     0,
+			}
+			if respMap, okR := entryCopy["response"].(map[string]any); okR {
+				if sh, okS := respMap["_shards"].(map[string]any); okS {
+					shardsStatus = deepCloneDocMap(sh)
+				}
+			}
 			statusObj := map[string]any{
 				"id":                        entryCopy["id"],
 				"is_running":                false,
@@ -7987,12 +8356,7 @@ func (s *Server) handleAsyncSearch(w http.ResponseWriter, r *http.Request, segs 
 				"expiration_time_in_millis": entryCopy["expiration_time_in_millis"],
 				"completion_time_in_millis": entryCopy["completion_time_in_millis"],
 				"completion_status":         200,
-				"_shards": map[string]any{
-					"total":      1,
-					"successful": 1,
-					"skipped":    0,
-					"failed":     0,
-				},
+				"_shards":                   shardsStatus,
 			}
 			writeJSONWithRequest(w, r, http.StatusOK, statusObj)
 			return
@@ -8042,6 +8406,7 @@ func (s *Server) handleAsyncSearch(w http.ResponseWriter, r *http.Request, segs 
 
 	// Strip async-only body options before delegating to handleSearch
 	searchBytes := rawBodyBytes
+	hasDeprecatedQuery := false
 	if peekBody != nil {
 		cleaned := false
 		for _, ak := range []string{"keep_on_completion", "wait_for_completion_timeout", "keep_alive"} {
@@ -8049,6 +8414,10 @@ func (s *Server) handleAsyncSearch(w http.ResponseWriter, r *http.Request, segs 
 				delete(peekBody, ak)
 				cleaned = true
 			}
+		}
+		if qVal, hasQ := peekBody["query"]; hasQ && rewriteDeprecatedQueryClauseR64(qVal) {
+			hasDeprecatedQuery = true
+			cleaned = true
 		}
 		if cleaned {
 			if b, mErr := json.Marshal(peekBody); mErr == nil {
@@ -8066,6 +8435,9 @@ func (s *Server) handleAsyncSearch(w http.ResponseWriter, r *http.Request, segs 
 	subReq.ContentLength = int64(len(searchBytes))
 
 	rec := &asyncCaptureResponseWriter{}
+	if hasDeprecatedQuery {
+		emitESDeprecationWarningRound61(rec, s, r, "[deprecated] query")
+	}
 	s.handleSearch(rec, subReq)
 	var warnings []string
 	for k, vals := range rec.Header() {
@@ -8090,6 +8462,19 @@ func (s *Server) handleAsyncSearch(w http.ResponseWriter, r *http.Request, segs 
 	dec.UseNumber()
 	if err := dec.Decode(&searchResp); err != nil {
 		searchResp = map[string]any{}
+	}
+	asyncIdxPat := ""
+	if len(segs) >= 2 && segs[1] == "_async_search" {
+		asyncIdxPat = segs[0]
+	}
+	if asyncShards := s.computeTargetsTotalShardsR64(asyncIdxPat); asyncShards > 0 {
+		shMap, _ := searchResp["_shards"].(map[string]any)
+		if shMap == nil {
+			shMap = map[string]any{"skipped": 0, "failed": 0}
+			searchResp["_shards"] = shMap
+		}
+		shMap["total"] = asyncShards
+		shMap["successful"] = asyncShards
 	}
 	nowMS := time.Now().UnixMilli()
 	outEnvelope := map[string]any{
@@ -8216,21 +8601,28 @@ func (s *Server) handleESQLQuery(w http.ResponseWriter, r *http.Request, segs []
 		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
 		return
 	}
-	body, ok := parseJSONBody(w, r)
+	esqlStart := time.Now()
+	statusRec := &esqlStatusRecorderR64{ResponseWriter: w, code: http.StatusOK}
+	queryStrForStats := ""
+	defer func() {
+		s.recordESQLTelemetryR64(r, queryStrForStats, statusRec.code < 400, time.Since(esqlStart).Milliseconds())
+	}()
+	body, ok := parseJSONBody(statusRec, r)
 	if !ok {
 		return
 	}
 	if badMsg, okFields := validateESQLBodyFieldsRound63(body); !okFields {
-		writeESError(w, http.StatusBadRequest, "parsing_exception", badMsg)
+		writeESError(statusRec, http.StatusBadRequest, "parsing_exception", badMsg)
 		return
 	}
 	queryStr, _ := body["query"].(string)
 	if strings.TrimSpace(queryStr) == "" {
-		writeESError(w, http.StatusBadRequest, "verification_exception", "Found 1 problem\nline 1:1: [query] is required")
+		writeESError(statusRec, http.StatusBadRequest, "verification_exception", "Found 1 problem\nline 1:1: [query] is required")
 		return
 	}
+	queryStrForStats = queryStr
 
-	s.executeESQLQueryEngine(w, r, body, queryStr)
+	s.executeESQLQueryEngine(statusRec, r, body, queryStr)
 }
 
 // handleWatcherQueryWatches implements `POST/GET /_watcher/_query/watches` (Round 54 F8).
@@ -8350,18 +8742,24 @@ func (s *Server) handleCatTransforms(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) ensureLicenseStateLocked() map[string]any {
+	defaults := map[string]any{
+		"status":               "active",
+		"uid":                  "doris-es-license-0001",
+		"type":                 "basic",
+		"mode":                 "basic",
+		"issue_date":           "2026-01-01T00:00:00.000Z",
+		"issue_date_in_millis": int64(1767225600000),
+		"max_nodes":            1000,
+		"issued_to":            "doris-es-cluster",
+		"issuer":               "elasticsearch",
+		"start_date_in_millis": int64(-1),
+	}
 	if s.licenseState == nil {
-		s.licenseState = map[string]any{
-			"status":               "active",
-			"uid":                  "doris-es-license-0001",
-			"type":                 "basic",
-			"mode":                 "basic",
-			"issue_date":           "2026-01-01T00:00:00.000Z",
-			"issue_date_in_millis": int64(1767225600000),
-			"max_nodes":            1000,
-			"issued_to":            "doris-es-cluster",
-			"issuer":               "elasticsearch",
-			"start_date_in_millis": int64(-1),
+		s.licenseState = make(map[string]any, len(defaults))
+	}
+	for k, v := range defaults {
+		if _, ok := s.licenseState[k]; !ok {
+			s.licenseState[k] = v
 		}
 	}
 	cp := make(map[string]any, len(s.licenseState))
@@ -8468,6 +8866,20 @@ func (s *Server) handleLicenseAPI(w http.ResponseWriter, r *http.Request, segs [
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"eligible_to_start_trial": true})
 
+	case "feature_usage", "_feature_usage":
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+			return
+		}
+		if r.Method == http.MethodHead {
+			ensureESCompatHeaders(w, r)
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		writeJSONWithRequest(w, r, http.StatusOK, map[string]any{
+			"features": map[string]any{},
+		})
+
 	default:
 		writeESError(w, http.StatusNotFound, "invalid_index_name_exception", "unknown license endpoint: "+r.URL.Path)
 	}
@@ -8514,16 +8926,12 @@ func (s *Server) handleXPackAPI(w http.ResponseWriter, r *http.Request, segs []s
 		usage["rollup"] = map[string]any{"available": true, "enabled": true, "count": rollupCount}
 		usage["enrich"] = map[string]any{"available": true, "enabled": true, "count": enrichCount}
 		usage["inference"] = map[string]any{"available": true, "enabled": true, "count": inferenceCount}
+		esqlFeaturesMap, esqlQueriesMap := s.snapshotESQLTelemetryR64()
 		usage["esql"] = map[string]any{
 			"available": true,
 			"enabled":   true,
-			"features": map[string]any{
-				"from": 1, "row": 1, "show": 1, "eval": 1,
-				"where": 1, "stats": 1, "sort": 1, "limit": 1,
-				"keep": 1, "drop": 1, "rename": 1, "dissect": 1,
-				"grok": 1, "enrich": 1, "mv_expand": 1, "lookup": 1, "meta": 1,
-			},
-			"queries": map[string]any{"_all": map[string]any{"total": 0, "failed": 0, "time_millis": 0}},
+			"features":  esqlFeaturesMap,
+			"queries":   esqlQueriesMap,
 		}
 		writeJSONWithRequest(w, r, http.StatusOK, usage)
 		return
@@ -8759,10 +9167,27 @@ func (s *Server) resolveMaintenanceTargetIndices(w http.ResponseWriter, rawIndex
 					matched = append(matched, idx)
 				}
 			}
+			for dsName, ds := range s.dataStreams {
+				if matchSimpleWildcard(pat, dsName) && ds != nil {
+					for _, bi := range extractDataStreamBackingIndexNames(ds) {
+						if !seen[bi] {
+							seen[bi] = true
+							matched = append(matched, bi)
+						}
+					}
+				}
+			}
 		} else if _, exists := s.indices[pat]; exists {
 			if !seen[pat] {
 				seen[pat] = true
 				matched = append(matched, pat)
+			}
+		} else if ds, isDS := s.dataStreams[pat]; isDS && ds != nil {
+			for _, bi := range extractDataStreamBackingIndexNames(ds) {
+				if !seen[bi] {
+					seen[bi] = true
+					matched = append(matched, bi)
+				}
 			}
 		} else if targets, isAlias := s.aliases[pat]; isAlias && len(targets) > 0 {
 			for _, t := range targets {
@@ -10424,6 +10849,7 @@ func (s *Server) handleClusterInfo(w http.ResponseWriter, r *http.Request, segs 
 				{"type": "fail"},
 				{"type": "fingerprint"},
 				{"type": "foreach"},
+				{"type": "geo_grid"},
 				{"type": "geoip"},
 				{"type": "grok"},
 				{"type": "gsub"},
@@ -10558,4 +10984,177 @@ func (s *Server) handleNodesRepositoriesMetering(w http.ResponseWriter, r *http.
 			},
 		},
 	})
+}
+
+func resolveAPIKeyUsernameFromHeaderR64(token string, apiKeys map[string]map[string]any) string {
+	decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(token))
+	if err != nil {
+		return ""
+	}
+	cred := string(decoded)
+	colon := strings.IndexByte(cred, ':')
+	if colon <= 0 {
+		return ""
+	}
+	keyID := cred[:colon]
+	if kObj := apiKeys[keyID]; kObj != nil {
+		if u, ok := kObj["username"].(string); ok && strings.TrimSpace(u) != "" {
+			return strings.TrimSpace(u)
+		}
+	}
+	return ""
+}
+
+func rewriteDeprecatedQueryClauseR64(v any) bool {
+	found := false
+	switch q := v.(type) {
+	case map[string]any:
+		if _, hasDep := q["deprecated"]; hasDep {
+			delete(q, "deprecated")
+			if len(q) == 0 {
+				q["match_all"] = map[string]any{}
+			}
+			found = true
+		}
+		for _, child := range q {
+			if rewriteDeprecatedQueryClauseR64(child) {
+				found = true
+			}
+		}
+	case []any:
+		for _, item := range q {
+			if rewriteDeprecatedQueryClauseR64(item) {
+				found = true
+			}
+		}
+	}
+	return found
+}
+
+func (s *Server) computeTargetsTotalShardsR64(rawIndex string) int {
+	pat := strings.TrimSpace(rawIndex)
+	if pat == "" {
+		pat = "_all"
+	}
+	targets := s.resolveTargetIndices(pat)
+	if len(targets) == 0 {
+		return 0
+	}
+	total := 0
+	for _, t := range targets {
+		if s.isIndexClosed(t) {
+			continue
+		}
+		numShards, _, _ := s.getIndexShardAndReplicaCounts(t)
+		if numShards <= 0 {
+			numShards = 1
+		}
+		total += numShards
+	}
+	return total
+}
+
+type esqlStatusRecorderR64 struct {
+	http.ResponseWriter
+	code int
+}
+
+func (rw *esqlStatusRecorderR64) Unwrap() http.ResponseWriter {
+	return rw.ResponseWriter
+}
+
+func (rw *esqlStatusRecorderR64) WriteHeader(status int) {
+	rw.code = status
+	rw.ResponseWriter.WriteHeader(status)
+}
+
+func (rw *esqlStatusRecorderR64) Write(b []byte) (int, error) {
+	if rw.code == 0 {
+		rw.code = http.StatusOK
+	}
+	return rw.ResponseWriter.Write(b)
+}
+
+type esqlTelemetryBucketR64 struct {
+	total      int64
+	failed     int64
+	timeMillis int64
+}
+
+type esqlServerTelemetryR64 struct {
+	mu       sync.Mutex
+	features map[string]int64
+	rest     esqlTelemetryBucketR64
+	kibana   esqlTelemetryBucketR64
+}
+
+var (
+	esqlTelemetryRegistryMuR64 sync.Mutex
+	esqlTelemetryRegistryR64   = make(map[*Server]*esqlServerTelemetryR64)
+)
+
+func getOrCreateESQLTelemetryR64(s *Server) *esqlServerTelemetryR64 {
+	esqlTelemetryRegistryMuR64.Lock()
+	defer esqlTelemetryRegistryMuR64.Unlock()
+	st := esqlTelemetryRegistryR64[s]
+	if st == nil {
+		st = &esqlServerTelemetryR64{
+			features: ESQLSupportedFeaturesMapR64(),
+		}
+		esqlTelemetryRegistryR64[s] = st
+	}
+	return st
+}
+
+func (s *Server) recordESQLTelemetryR64(r *http.Request, queryStr string, ok bool, elapsedMs int64) {
+	if s == nil {
+		return
+	}
+	if elapsedMs < 0 {
+		elapsedMs = 0
+	}
+	st := getOrCreateESQLTelemetryR64(s)
+	isKibana := r != nil && (strings.EqualFold(strings.TrimSpace(r.Header.Get("x-elastic-product-origin")), "kibana") ||
+		strings.TrimSpace(r.Header.Get("kbn-xsrf")) != "")
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	b := &st.rest
+	if isKibana {
+		b = &st.kibana
+	}
+	b.total++
+	b.timeMillis += elapsedMs
+	if !ok {
+		b.failed++
+	} else if strings.TrimSpace(queryStr) != "" {
+		RecordESQLFeatureUsageR64(st.features, queryStr)
+	}
+}
+
+func (s *Server) snapshotESQLTelemetryR64() (map[string]any, map[string]any) {
+	st := getOrCreateESQLTelemetryR64(s)
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	featuresOut := make(map[string]any, len(st.features))
+	for k, v := range st.features {
+		featuresOut[k] = v
+	}
+	queriesOut := map[string]any{
+		"rest": map[string]any{
+			"total":       st.rest.total,
+			"failed":      st.rest.failed,
+			"time_millis": st.rest.timeMillis,
+		},
+		"kibana": map[string]any{
+			"total":       st.kibana.total,
+			"failed":      st.kibana.failed,
+			"time_millis": st.kibana.timeMillis,
+		},
+		"_all": map[string]any{
+			"total":       st.rest.total + st.kibana.total,
+			"failed":      st.rest.failed + st.kibana.failed,
+			"time_millis": st.rest.timeMillis + st.kibana.timeMillis,
+		},
+	}
+	return featuresOut, queriesOut
 }

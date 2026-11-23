@@ -68,7 +68,7 @@ type sdkOrderDoc struct {
 
 // --- elastic/elasticsearch-specification schema.json Wire Validator (via compliance.SpecSchemaValidator) ---
 
-const minValidatedEndpointsTarget = 125
+const minValidatedEndpointsTarget = 190
 
 var targetValidatedEndpoints = []string{
 	"info",
@@ -215,6 +215,75 @@ var targetValidatedEndpoints = []string{
 	"cat.pending_tasks",
 	"cat.nodeattrs",
 	"cat.component_templates",
+	"create",
+	"exists_source",
+	"knn_search",
+	"terms_enum",
+	"capabilities",
+	"health_report",
+	"get_script_context",
+	"get_script_languages",
+	"features.get_features",
+	"migration.deprecations",
+	"dangling_indices.list_dangling_indices",
+	"reindex_rethrottle",
+	"update_by_query_rethrottle",
+	"delete_by_query_rethrottle",
+	"indices.disk_usage",
+	"indices.field_usage_stats",
+	"indices.shard_stores",
+	"indices.reload_search_analyzers",
+	"indices.resolve_cluster",
+	"indices.add_block",
+	"indices.migrate_to_data_stream",
+	"indices.put_data_lifecycle",
+	"indices.get_data_lifecycle",
+	"indices.explain_data_lifecycle",
+	"indices.delete_data_lifecycle",
+	"indices.modify_data_stream",
+	"cluster.info",
+	"cluster.remote_info",
+	"cluster.post_voting_config_exclusions",
+	"cluster.delete_voting_config_exclusions",
+	"license.get",
+	"license.get_basic_status",
+	"cat.help",
+	"cat.allocation",
+	"cat.snapshots",
+	"cat.transforms",
+	"cat.ml_jobs",
+	"ilm.stop",
+	"ilm.start",
+	"ilm.remove_policy",
+	"slm.put_lifecycle",
+	"slm.get_lifecycle",
+	"slm.execute_lifecycle",
+	"slm.execute_retention",
+	"slm.get_status",
+	"slm.get_stats",
+	"slm.stop",
+	"slm.start",
+	"slm.delete_lifecycle",
+	"enrich.put_policy",
+	"enrich.get_policy",
+	"enrich.execute_policy",
+	"enrich.stats",
+	"enrich.delete_policy",
+	"sql.translate",
+	"sql.clear_cursor",
+	"async_search.status",
+	"eql.get_status",
+	"eql.get",
+	"eql.delete",
+	"synonyms.get_synonym_rule",
+	"synonyms.delete_synonym_rule",
+	"query_rules.put_ruleset",
+	"query_rules.get_ruleset",
+	"query_rules.list_rulesets",
+	"query_rules.put_rule",
+	"query_rules.get_rule",
+	"query_rules.delete_rule",
+	"query_rules.delete_ruleset",
 }
 
 // --- Wire-Conformance Recording Transport ---
@@ -2047,6 +2116,7 @@ func TestOfficialElasticGoSDKv8_Conformance(t *testing.T) {
 	})
 
 	runRound63SDKConformanceSubtests(t, ctx, targetURL, idx, aliasName, esClient, wireTransport)
+	runRound64SDKConformanceSubtests(t, ctx, idx, aliasName, esClient, wireTransport)
 
 	ubqBody := `{"query":{"term":{"category":"storage"}},"script":{"source":"ctx._source.quantity = ctx._source.quantity + params.bump","lang":"painless","params":{"bump":6}}}`
 	ubqRes, err := esClient.UpdateByQuery(

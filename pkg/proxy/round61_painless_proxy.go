@@ -270,11 +270,11 @@ func PrepareDocForRuntimeScriptRound61(idxSchema *schema.IndexSchema, doc map[st
 		}
 	}
 
-	// Preserve structured source objects (`flattened`, `geo_point`, `dense_vector`) on `cp`
+	// Preserve structured source objects (`flattened`, `geo_point`, `geo_shape`, `shape`, `dense_vector`) on `cp`
 	// when `doc` carries an unflattened map or coordinate slice at that path.
 	if doc != nil {
 		for fPath, ft := range ftMap {
-			if ft != "flattened" && ft != "geo_point" && ft != "dense_vector" {
+			if ft != "flattened" && ft != "geo_point" && ft != "geo_shape" && ft != "shape" && ft != "dense_vector" {
 				continue
 			}
 			segs := strings.Split(fPath, ".")
@@ -648,6 +648,10 @@ func coerceRuntimeValuesWithScriptFlagR62Search(esType, format string, rawVals [
 			continue
 		}
 		switch esType {
+		case "geo_shape", "shape":
+			if norm, ok := normalizeGeoShapeValueToGeoJSONR64(rv, false); ok && norm != nil {
+				coerced = append(coerced, norm)
+			}
 		case "geo_point":
 			if gp, ok := rv.(*painless.GeoPointVal); ok && gp != nil {
 				if fromScript {

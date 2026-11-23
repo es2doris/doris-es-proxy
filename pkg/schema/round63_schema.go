@@ -352,7 +352,7 @@ func parseSingleAggregateMetricObject(
 			s := v.String()
 			if strings.ContainsAny(s, ".eE") {
 				f, err := v.Float64()
-				if err != nil || f != math.Trunc(f) || f <= 0 || f > float64(math.MaxInt64) {
+				if err != nil || f != math.Trunc(f) || f <= 0 || f >= math.Exp2(63) {
 					return 0, fmt.Errorf("mapper_parsing_exception: [value_count] must be a positive integer on [%s], got [%s]", b.ESFieldPath, s)
 				}
 				return int64(f), nil
@@ -363,7 +363,7 @@ func parseSingleAggregateMetricObject(
 			}
 			return iv, nil
 		case float64:
-			if math.IsNaN(v) || math.IsInf(v, 0) || v != math.Trunc(v) || v <= 0 || v > float64(math.MaxInt64) {
+			if math.IsNaN(v) || math.IsInf(v, 0) || v != math.Trunc(v) || v <= 0 || v >= math.Exp2(63) {
 				return 0, fmt.Errorf("mapper_parsing_exception: [value_count] must be a positive integer on [%s], got [%v]", b.ESFieldPath, v)
 			}
 			return int64(v), nil
@@ -912,14 +912,33 @@ func extractExcessDynamicFieldsToIgnoredSource(s *IndexSchema, parsedDoc map[str
 				continue
 			}
 			if isMappedParent {
-				if subMap, ok := v.(map[string]any); ok {
+				switch sub := v.(type) {
+				case map[string]any:
 					subDst := make(map[string]any)
-					walk(subMap, full, subDst)
+					walk(sub, full, subDst)
 					if len(subDst) > 0 {
 						dst[k] = subDst
 					}
-					if len(subMap) == 0 {
+					if len(sub) == 0 {
 						delete(curr, k)
+					}
+				case []any:
+					var elemIgnored []any
+					hasAny := false
+					for _, elem := range sub {
+						if em, ok := elem.(map[string]any); ok {
+							subDst := make(map[string]any)
+							walk(em, full, subDst)
+							if len(subDst) > 0 {
+								hasAny = true
+							}
+							elemIgnored = append(elemIgnored, subDst)
+						} else {
+							elemIgnored = append(elemIgnored, map[string]any{})
+						}
+					}
+					if hasAny {
+						dst[k] = elemIgnored
 					}
 				}
 				continue
@@ -1004,6 +1023,18 @@ func mergeMissingSyntheticKeys(dst, src map[string]any) {
 			if srcMap, okSrc := sv.(map[string]any); okSrc {
 				mergeMissingSyntheticKeys(exMap, srcMap)
 			}
+			continue
+		}
+		if exSlice, okExS := existing.([]any); okExS {
+			if srcSlice, okSrcS := sv.([]any); okSrcS && len(exSlice) == len(srcSlice) {
+				for i := range exSlice {
+					exEl, ok1 := exSlice[i].(map[string]any)
+					srcEl, ok2 := srcSlice[i].(map[string]any)
+					if ok1 && ok2 {
+						mergeMissingSyntheticKeys(exEl, srcEl)
+					}
+				}
+			}
 		}
 	}
 }
@@ -1039,8 +1070,8 @@ func reconstructSyntheticFlattenedValue(idxSchema *IndexSchema, rawVal any, b Fi
 		if b.IgnoreAbove > 0 && len([]rune(s)) > b.IgnoreAbove {
 			return s, true, true
 		}
-		if b.LowercaseNormalizer {
-			s = strings.ToLower(s)
+		if b.NormalizerName != "" || b.LowercaseNormalizer {
+			s = normalizeValueForBinding(s, b, idxSchema)
 		}
 		return s, false, true
 	}
@@ -1184,7 +1215,7 @@ func reconstructSyntheticSparseVectorValue(idxSchema *IndexSchema, rawVal any) (
 	switch tv := rawVal.(type) {
 	case map[string]any:
 		if len(tv) == 0 {
-			return nil, false
+			return map[string]any{}, true
 		}
 		out := make(map[string]any, len(tv))
 		for tk, wRaw := range tv {
@@ -1204,7 +1235,7 @@ func reconstructSyntheticSparseVectorValue(idxSchema *IndexSchema, rawVal any) (
 		return out, true
 	case []any:
 		if len(tv) == 0 {
-			return nil, false
+			return []any{}, true
 		}
 		merged := make(map[string]any)
 		for _, elem := range tv {
@@ -1318,7 +1349,7 @@ func reconstructSyntheticAnnotatedTextValue(
 	}
 }
 
-func reconstructSyntheticCountedKeywordValue(rawVal any, b FieldBinding) (any, bool) {
+func reconstructSyntheticCountedKeywordValue(idxSchema *IndexSchema, rawVal any, b FieldBinding) (any, bool) {
 	if rawVal == nil {
 		return nil, false
 	}
@@ -1327,8 +1358,8 @@ func reconstructSyntheticCountedKeywordValue(rawVal any, b FieldBinding) (any, b
 		if b.IgnoreAbove > 0 && len([]rune(s)) > b.IgnoreAbove {
 			return s, true
 		}
-		if b.LowercaseNormalizer {
-			s = strings.ToLower(s)
+		if b.NormalizerName != "" || b.LowercaseNormalizer {
+			s = normalizeValueForBinding(s, b, idxSchema)
 		}
 		return s, false
 	}
@@ -1379,7 +1410,7 @@ func formatSyntheticDateValue(val any, b FieldBinding, ignoredSet map[string]boo
 		return nil, false
 	}
 	nowUTC := time.Now().UTC()
-	ms, ok := parseSyntheticEpochMillis(val, b.Format, nowUTC)
+	ms, ok := parseSyntheticEpochMillis(val, b.Format, b.Locale, nowUTC)
 	if !ok {
 		if ignoredSet[fullPath] {
 			return nil, false
@@ -1397,6 +1428,10 @@ func formatSyntheticDateValue(val any, b FieldBinding, ignoredSet map[string]boo
 		return ms / 1000, true
 	case "", "strict_date_optional_time", "date_optional_time", "strict_date_time", "date_time":
 		return time.UnixMilli(ms).UTC().Format("2006-01-02T15:04:05.000Z"), true
+	case "strict_date_optional_time_nanos", "date_optional_time_nanos":
+		return time.UnixMilli(ms).UTC().Format("2006-01-02T15:04:05.000000000Z"), true
+	case "strict_date_time_no_millis", "date_time_no_millis":
+		return time.UnixMilli(ms).UTC().Format("2006-01-02T15:04:05Z"), true
 	default:
 		if goLayout := ESDateFormatToGoLayout(firstFmt); goLayout != "" {
 			return time.UnixMilli(ms).UTC().Format(goLayout), true
@@ -1405,24 +1440,24 @@ func formatSyntheticDateValue(val any, b FieldBinding, ignoredSet map[string]boo
 	}
 }
 
-func parseSyntheticEpochMillis(val any, format string, now time.Time) (int64, bool) {
+func parseSyntheticEpochMillis(val any, format, locale string, now time.Time) (int64, bool) {
 	switch v := val.(type) {
 	case int:
-		return ParseESDateWithFormatToEpochMillis(strconv.Itoa(v), format, now)
+		return ParseESDateBoundWithFormatAndLocaleToEpochMillis(strconv.Itoa(v), format, locale, now, false)
 	case int64:
-		return ParseESDateWithFormatToEpochMillis(strconv.FormatInt(v, 10), format, now)
+		return ParseESDateBoundWithFormatAndLocaleToEpochMillis(strconv.FormatInt(v, 10), format, locale, now, false)
 	case json.Number:
-		return ParseESDateWithFormatToEpochMillis(v.String(), format, now)
+		return ParseESDateBoundWithFormatAndLocaleToEpochMillis(v.String(), format, locale, now, false)
 	case float64:
 		if math.IsNaN(v) || math.IsInf(v, 0) {
 			return 0, false
 		}
-		return ParseESDateWithFormatToEpochMillis(strconv.FormatFloat(v, 'f', -1, 64), format, now)
+		return ParseESDateBoundWithFormatAndLocaleToEpochMillis(strconv.FormatFloat(v, 'f', -1, 64), format, locale, now, false)
 	case string:
 		if strings.TrimSpace(v) == "" {
 			return 0, false
 		}
-		return ParseESDateWithFormatToEpochMillis(v, format, now)
+		return ParseESDateBoundWithFormatAndLocaleToEpochMillis(v, format, locale, now, false)
 	default:
 		return 0, false
 	}
@@ -1545,7 +1580,7 @@ func flattenAndParseTSDBDimensionValues(
 				return nil
 			}
 		}
-		td, err := parseTSDBTypedDimensionScalar(fieldName, effB, v)
+		td, err := parseTSDBTypedDimensionScalarWithSchema(idx, fieldName, effB, v)
 		if err != nil {
 			if ignoreMal {
 				return nil

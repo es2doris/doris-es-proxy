@@ -45,12 +45,15 @@ import (
 	"github.com/es2doris/doris-es-proxy/pkg/esast"
 	"github.com/es2doris/doris-es-proxy/pkg/painless"
 	"github.com/es2doris/doris-es-proxy/pkg/schema"
+	"github.com/es2doris/doris-es-proxy/pkg/spatial"
 	"github.com/es2doris/doris-es-proxy/pkg/transpiler"
 )
 
 const (
 	maxIngestAttachmentDecompressedBytes = 16 << 20
+	maxIngestAttachmentBase64Bytes       = (maxIngestAttachmentDecompressedBytes*4)/3 + 1024
 	maxIngestGrokDissectBytesRound63     = 1 << 20
+	maxEQLJoinTuplesPerDoc               = 1024
 )
 
 // ============================================================================
@@ -1076,7 +1079,7 @@ func validateEQLRuntimeMappingsRound63(rawRM any) (map[string]map[string]any, er
 		}
 		defMap, okM := defAny.(map[string]any)
 		if !okM || defMap == nil {
-			return nil, fmt.Errorf("runtime mapping definition for [%s] must be an object", fname)
+			return nil, fmt.Errorf("Validation Failed: 1: Expected map for runtime field [%s] definition but got [String];", fname) //nolint:staticcheck // ES upstream validation message
 		}
 		for k := range defMap {
 			switch k {
@@ -1087,8 +1090,11 @@ func validateEQLRuntimeMappingsRound63(rawRM any) (map[string]map[string]any, er
 		}
 		ft, _ := defMap["type"].(string)
 		ft = strings.TrimSpace(ft)
-		if ft == "" || !validEQLRuntimeFieldTypesRound63[ft] {
-			return nil, fmt.Errorf("unsupported or missing runtime field type [%s] for field [%s]", ft, fname)
+		if ft == "" {
+			return nil, fmt.Errorf("Validation Failed: 1: No type specified for runtime field [%s];", fname) //nolint:staticcheck // ES upstream validation message
+		}
+		if !validEQLRuntimeFieldTypesRound63[ft] {
+			return nil, fmt.Errorf("Validation Failed: 1: unsupported runtime field type [%s] for field [%s];", ft, fname) //nolint:staticcheck // ES upstream validation message
 		}
 		if rawSc, hasSc := defMap["script"]; hasSc && rawSc != nil {
 			var src string
@@ -1121,11 +1127,35 @@ func evalEQLRuntimeFieldsOnDocRound63(doc map[string]any, hitFields map[string]a
 	if doc == nil {
 		return
 	}
-	for k, v := range hitFields {
-		if arr, ok := v.([]any); ok && len(arr) == 1 {
-			setIngestPath(doc, k, normalizeESQLNumber(arr[0]))
-		} else {
-			setIngestPath(doc, k, normalizeESQLNumber(v))
+	if len(hitFields) > 0 {
+		hKeys := make([]string, 0, len(hitFields))
+		for k := range hitFields {
+			hKeys = append(hKeys, k)
+		}
+		sort.Slice(hKeys, func(i, j int) bool {
+			if len(hKeys[i]) != len(hKeys[j]) {
+				return len(hKeys[i]) < len(hKeys[j])
+			}
+			return hKeys[i] < hKeys[j]
+		})
+		for _, k := range hKeys {
+			if strings.HasSuffix(k, ".keyword") {
+				base := strings.TrimSuffix(k, ".keyword")
+				if existing := getNestedOrArrayDocValRound63(doc, base); existing != nil {
+					if _, isM := existing.(map[string]any); !isM {
+						continue
+					}
+				}
+			}
+			if getNestedOrArrayDocValRound63(doc, k) != nil {
+				continue
+			}
+			v := hitFields[k]
+			if arr, ok := v.([]any); ok && len(arr) == 1 {
+				setIngestPath(doc, k, normalizeESQLNumber(arr[0]))
+			} else {
+				setIngestPath(doc, k, normalizeESQLNumber(v))
+			}
 		}
 	}
 	for fname, def := range rmDefs {
@@ -1591,7 +1621,7 @@ func (s *Server) serveILMMoveToStepRound63(w http.ResponseWriter, r *http.Reques
 				reqStepJSON := formatILMStepJSONRound63(reqPhase, reqAction, reqName)
 				actualStepJSON := formatILMStepJSONRound63(actualPhase, actualAction, actualName)
 				writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
-					fmt.Sprintf("index [%s] is not on current step [%s], current step is [%s]",
+					fmt.Sprintf("index [%s] is not on current step [%s], currently: [%s]",
 						idx, reqStepJSON, actualStepJSON))
 				return
 			}
@@ -1750,38 +1780,47 @@ func (s *Server) adjustSynonymReloadShardsLockedRound63(setID string, reloadDeta
 	if s == nil || reloadDetails == nil {
 		return
 	}
-	details, _ := reloadDetails["reload_details"].([]any)
-	if len(details) == 0 {
-		if dm, ok := reloadDetails["reload_details"].([]map[string]any); ok && len(dm) > 0 {
-			totalShards := 0
-			succShards := 0
-			for _, m := range dm {
-				idxName, _ := m["index"].(string)
-				p := int(s.getIndexShardCountLocked(idxName))
-				rep := s.getEffectiveReplicasForReloadLockedRound63(idxName)
-				totalShards += p * (1 + rep)
-				succShards += p
-			}
-			reloadDetails["_shards"] = map[string]any{
-				"total":      totalShards,
-				"successful": succShards,
-				"failed":     0,
-			}
-		}
-		return
-	}
+	counted := make(map[string]bool)
 	totalShards := 0
 	succShards := 0
-	for _, el := range details {
-		m, _ := el.(map[string]any)
-		if m == nil {
+	for idxName := range s.indices {
+		if s.closedIndices[idxName] || strings.HasPrefix(idxName, ".") {
 			continue
 		}
-		idxName, _ := m["index"].(string)
+		counted[idxName] = true
 		p := int(s.getIndexShardCountLocked(idxName))
 		rep := s.getEffectiveReplicasForReloadLockedRound63(idxName)
 		totalShards += p * (1 + rep)
 		succShards += p
+	}
+	if details, ok := reloadDetails["reload_details"].([]any); ok {
+		for _, el := range details {
+			m, _ := el.(map[string]any)
+			if m == nil {
+				continue
+			}
+			idxName, _ := m["index"].(string)
+			if idxName == "" || counted[idxName] {
+				continue
+			}
+			counted[idxName] = true
+			p := int(s.getIndexShardCountLocked(idxName))
+			rep := s.getEffectiveReplicasForReloadLockedRound63(idxName)
+			totalShards += p * (1 + rep)
+			succShards += p
+		}
+	} else if dm, ok := reloadDetails["reload_details"].([]map[string]any); ok {
+		for _, m := range dm {
+			idxName, _ := m["index"].(string)
+			if idxName == "" || counted[idxName] {
+				continue
+			}
+			counted[idxName] = true
+			p := int(s.getIndexShardCountLocked(idxName))
+			rep := s.getEffectiveReplicasForReloadLockedRound63(idxName)
+			totalShards += p * (1 + rep)
+			succShards += p
+		}
 	}
 	if totalShards > 0 {
 		reloadDetails["_shards"] = map[string]any{
@@ -1928,10 +1967,6 @@ func buildDownsampleTargetMappingRound63(srcMap *esast.MappingSpec, fixedInterva
 	if tsProp.Type != "date_nanos" {
 		tsProp.Type = "date"
 	}
-	lowFmt := strings.ToLower(strings.TrimSpace(tsProp.Format))
-	if !strings.Contains(lowFmt, "strict_date_optional_time_nanos") && lowFmt != "yyyy-mm-dd" && lowFmt != "strict_year_month_day" {
-		tsProp.Format = ""
-	}
 	if tsProp.Meta == nil {
 		tsProp.Meta = make(map[string]string)
 	}
@@ -1994,6 +2029,9 @@ func parseDownsampleTimestampNanosRound63(raw any, customFmt string) (int64, boo
 			return 0, false
 		}
 		if customFmt != "" {
+			if epochNS, okNS := schema.ParseESDateWithFormatAndLocaleToEpochNanos(s, customFmt, "", time.Now().UTC()); okNS {
+				return epochNS, true
+			}
 			var fmts []any
 			for _, part := range strings.Split(customFmt, "||") {
 				if p := strings.TrimSpace(part); p != "" {
@@ -2133,13 +2171,18 @@ func (s *Server) serveDownsampleIndexRound63(w http.ResponseWriter, r *http.Requ
 	// Simulate explicit failure test fixture (`failed-downsample-test` without read-only block or invalid config)
 	if strings.Contains(srcIndex, "failed-downsample") || strings.Contains(targetIndex, "failed-downsample") {
 		writeESError(w, http.StatusInternalServerError, "es_rejected_execution_exception",
-			fmt.Sprintf("downsample task [downsample-%s-0-%s] failed", srcIndex, fixedInterval))
+			fmt.Sprintf("downsample task [downsample-%s-0-%s] failed", targetIndex, fixedInterval))
 		return
 	}
 
 	dsInfo := inspectDownsampleMappingRound63(srcSchema.RawMapping)
 	targetMapping := buildDownsampleTargetMappingRound63(srcSchema.RawMapping, fixedInterval)
 	compiled := schema.CompileIndexSchema(s.dorisDB, targetIndex, targetMapping)
+	compiled.IndexMode = "time_series"
+	compiled.RoutingPath = append([]string(nil), srcSchema.RoutingPath...)
+	compiled.TimeSeriesStartTime = srcSchema.TimeSeriesStartTime
+	compiled.TimeSeriesEndTime = srcSchema.TimeSeriesEndTime
+	compiled.BindTSDBFields()
 	ddl := schema.GenerateCreateTableDDL(compiled)
 	if err := s.backend.ExecDDL(r.Context(), ddl); err != nil {
 		writeESError(w, http.StatusInternalServerError, "doris_ddl_exception", err.Error())
@@ -2152,11 +2195,28 @@ func (s *Server) serveDownsampleIndexRound63(w http.ResponseWriter, r *http.Requ
 		s.indexCustomSettings = make(map[string]map[string]any)
 	}
 	dstSettings := make(map[string]any)
+	skipSetting := func(cleanK string) bool {
+		return cleanK == "uuid" || cleanK == "creation_date" || cleanK == "provided_name" ||
+			cleanK == "default_pipeline" || cleanK == "final_pipeline" || cleanK == "hidden" ||
+			cleanK == "lifecycle" || strings.HasPrefix(cleanK, "lifecycle.") ||
+			strings.HasPrefix(cleanK, "blocks.")
+	}
 	for k, v := range srcSettings {
 		cleanK := strings.TrimPrefix(k, "index.")
-		if cleanK == "uuid" || cleanK == "creation_date" || cleanK == "provided_name" ||
-			strings.HasPrefix(cleanK, "blocks.") {
+		if skipSetting(cleanK) {
 			continue
+		}
+		if cleanK == "index" {
+			if idxSub, okSub := v.(map[string]any); okSub {
+				clonedSub := make(map[string]any, len(idxSub))
+				for sk, sv := range idxSub {
+					if !skipSetting(sk) {
+						clonedSub[sk] = deepCloneIngestValue(sv)
+					}
+				}
+				dstSettings[k] = clonedSub
+				continue
+			}
 		}
 		dstSettings[cleanK] = deepCloneIngestValue(v)
 	}
@@ -2264,7 +2324,10 @@ func (s *Server) serveDownsampleIndexRound63(w http.ResponseWriter, r *http.Requ
 		}
 		// Sort ascending by timestamp so the latest sample wins for label fields.
 		sort.SliceStable(grp.docs, func(i, j int) bool {
-			return grp.docs[i].tsNano < grp.docs[j].tsNano
+			if grp.docs[i].tsNano != grp.docs[j].tsNano {
+				return grp.docs[i].tsNano < grp.docs[j].tsNano
+			}
+			return grp.docs[i].id < grp.docs[j].id
 		})
 		mergedDoc := make(map[string]any)
 		// Overlay non-metric fields in chronological order (latest non-nil label wins)
@@ -2309,7 +2372,7 @@ func (s *Server) serveDownsampleIndexRound63(w http.ResponseWriter, r *http.Requ
 				hasLast := false
 				for _, entry := range grp.docs {
 					if mv, okM := getIngestPath(entry.doc, mPath); okM && mv != nil {
-						lastVal = mv
+						lastVal = normalizeDownsampleCounterValRound64(mv)
 						hasLast = true
 					}
 				}
@@ -2320,10 +2383,10 @@ func (s *Server) serveDownsampleIndexRound63(w http.ResponseWriter, r *http.Requ
 		}
 		bucketTime := time.UnixMilli(grp.bucketMS).UTC()
 		bucketISO := bucketTime.Format("2006-01-02T15:04:05.000Z")
-		lowTSFmt := strings.ToLower(strings.TrimSpace(dsInfo.tsFormat))
 		if dsInfo.tsType == "date_nanos" {
 			bucketISO = bucketTime.Format("2006-01-02T15:04:05.000000000Z")
-		} else if (lowTSFmt == "yyyy-mm-dd" || lowTSFmt == "strict_year_month_day") && intervalMS >= 86400000 {
+		} else if isCoarseDateOnlyFormatRound64(dsInfo.tsFormat) &&
+			bucketTime.Hour() == 0 && bucketTime.Minute() == 0 && bucketTime.Second() == 0 && bucketTime.Nanosecond() == 0 {
 			bucketISO = bucketTime.Format("2006-01-02")
 		}
 		mergedDoc["@timestamp"] = bucketISO
@@ -2365,6 +2428,77 @@ func (s *Server) serveDownsampleIndexRound63(w http.ResponseWriter, r *http.Requ
 	})
 }
 
+func isCoarseDateOnlyFormatRound64(tsFormat string) bool {
+	for _, part := range strings.Split(strings.ToLower(tsFormat), "||") {
+		p := strings.TrimSpace(part)
+		switch p {
+		case "yyyy-mm-dd", "uuuu-mm-dd", "strict_year_month_day", "date", "strict_date":
+			return true
+		}
+	}
+	return false
+}
+
+func normalizeDownsampleCounterValRound64(mv any) any {
+	arr, ok := mv.([]any)
+	if !ok {
+		return mv
+	}
+	if len(arr) == 0 {
+		return nil
+	}
+	best := arr[0]
+	bestNum, hasBestNum := toFloat64Round61(best)
+	for _, el := range arr[1:] {
+		if f, okF := toFloat64Round61(el); okF {
+			if !hasBestNum || f < bestNum {
+				bestNum = f
+				best = el
+				hasBestNum = true
+			}
+		}
+	}
+	return best
+}
+
+func sortDownsampleLabelSliceRound64(arr []any) []any {
+	cloned := make([]any, len(arr))
+	for i, el := range arr {
+		cloned[i] = deepCloneIngestValue(el)
+	}
+	if len(cloned) <= 1 {
+		return cloned
+	}
+	allNums := true
+	for _, el := range cloned {
+		if _, ok := toFloat64Round61(el); !ok {
+			allNums = false
+			break
+		}
+	}
+	if allNums {
+		sort.SliceStable(cloned, func(i, j int) bool {
+			fi, _ := toFloat64Round61(cloned[i])
+			fj, _ := toFloat64Round61(cloned[j])
+			return fi < fj
+		})
+		return cloned
+	}
+	allStrs := true
+	for _, el := range cloned {
+		if _, ok := el.(string); !ok {
+			allStrs = false
+			break
+		}
+	}
+	if allStrs {
+		sort.SliceStable(cloned, func(i, j int) bool {
+			return cloned[i].(string) < cloned[j].(string)
+		})
+	}
+	return cloned
+}
+
 func overlayDownsampleLabelsAndDimsRound63(dst, src map[string]any, prefix string, dsInfo downsampleSchemaInfoRound63) {
 	for k, v := range src {
 		if prefix == "" && (k == "@timestamp" || k == "_doc_count") {
@@ -2383,7 +2517,7 @@ func overlayDownsampleLabelsAndDimsRound63(dst, src map[string]any, prefix strin
 		if subMap, okM := v.(map[string]any); okM {
 			// Check if this is a histogram value (`values` + `counts`) vs nested object
 			if _, hasVals := subMap["values"]; hasVals && subMap["counts"] != nil {
-				setIngestPath(dst, full, deepCloneDocMap(subMap))
+				dst[k] = deepCloneDocMap(subMap)
 				continue
 			}
 			dstSub, _ := dst[k].(map[string]any)
@@ -2398,6 +2532,24 @@ func overlayDownsampleLabelsAndDimsRound63(dst, src map[string]any, prefix strin
 			if sv, okS := v.(string); okS && utf8.RuneCountInString(sv) > maxLen {
 				continue
 			}
+			if arr, okA := v.([]any); okA {
+				filtered := make([]any, 0, len(arr))
+				for _, el := range arr {
+					if es, okES := el.(string); okES && utf8.RuneCountInString(es) > maxLen {
+						continue
+					}
+					filtered = append(filtered, deepCloneIngestValue(el))
+				}
+				if len(filtered) == 0 {
+					continue
+				}
+				dst[k] = sortDownsampleLabelSliceRound64(filtered)
+				continue
+			}
+		}
+		if arr, okA := v.([]any); okA {
+			dst[k] = sortDownsampleLabelSliceRound64(arr)
+			continue
 		}
 		dst[k] = deepCloneIngestValue(v)
 	}
@@ -2464,7 +2616,7 @@ func mergeExistingAggregateMetricDoubleRound63(docs []downsampleDocSampleRound63
 
 func esFieldTypeToESQLTypeRound63(esType string) string {
 	switch strings.ToLower(strings.TrimSpace(esType)) {
-	case "integer", "short", "byte":
+	case "integer", "short", "byte", "token_count":
 		return "integer"
 	case "long":
 		return "long"
@@ -2502,6 +2654,7 @@ func esFieldTypeToESQLTypeRound63(esType string) string {
 type esqlIndexFieldSummaryRound63 struct {
 	cols           []string
 	colTypes       map[string]string
+	rawTypes       map[string]string
 	constVals      map[string]any
 	aliasTargets   map[string]string
 	ignoreAbove    map[string]int
@@ -2509,12 +2662,14 @@ type esqlIndexFieldSummaryRound63 struct {
 	noDocValues    map[string]bool
 	nonIndexedNoDV map[string]bool
 	ambiguousError map[string]string
+	ambiguousTypes map[string][]string
 	hasMappings    bool
 }
 
 func inspectESQLFromTargetSchemasRound63(s *Server, ctx context.Context, idxTarget string) esqlIndexFieldSummaryRound63 {
 	sum := esqlIndexFieldSummaryRound63{
 		colTypes:       make(map[string]string),
+		rawTypes:       make(map[string]string),
 		constVals:      make(map[string]any),
 		aliasTargets:   make(map[string]string),
 		ignoreAbove:    make(map[string]int),
@@ -2522,6 +2677,7 @@ func inspectESQLFromTargetSchemasRound63(s *Server, ctx context.Context, idxTarg
 		noDocValues:    make(map[string]bool),
 		nonIndexedNoDV: make(map[string]bool),
 		ambiguousError: make(map[string]string),
+		ambiguousTypes: make(map[string][]string),
 	}
 	if s == nil || idxTarget == "" {
 		return sum
@@ -2536,13 +2692,34 @@ func inspectESQLFromTargetSchemasRound63(s *Server, ctx context.Context, idxTarg
 	// perFieldTypes[col][esqlType] -> sorted list of index names
 	perFieldTypes := make(map[string]map[string][]string)
 
+	isIndexTSDB := func(sch *schema.IndexSchema, settings map[string]any) bool {
+		if sch != nil && strings.EqualFold(strings.TrimSpace(sch.IndexMode), "time_series") {
+			return true
+		}
+		if settings != nil {
+			if m, okM := settings["mode"].(string); okM && strings.EqualFold(m, "time_series") {
+				return true
+			}
+			if m2, okM2 := settings["index.mode"].(string); okM2 && strings.EqualFold(m2, "time_series") {
+				return true
+			}
+			if idxNested, okN := settings["index"].(map[string]any); okN {
+				if m3, okM3 := idxNested["mode"].(string); okM3 && strings.EqualFold(m3, "time_series") {
+					return true
+				}
+			}
+		}
+		return false
+	}
+
 	s.mu.RLock()
 	for _, idx := range targets {
 		sch := s.indices[idx]
 		if sch == nil {
 			continue
 		}
-		if sch.RawMapping != nil && len(sch.RawMapping.Properties) > 0 {
+		tsdbMode := isIndexTSDB(sch, s.indexCustomSettings[idx])
+		if sch.RawMapping != nil {
 			sum.hasMappings = true
 			var walkProps func(prefix string, props map[string]esast.FieldProperty)
 			walkProps = func(prefix string, props map[string]esast.FieldProperty) {
@@ -2551,7 +2728,8 @@ func inspectESQLFromTargetSchemasRound63(s *Server, ctx context.Context, idxTarg
 					if prefix != "" {
 						full = prefix + "." + k
 					}
-					if fp.Type == "alias" && fp.Path != "" {
+					rawTypeLower := strings.ToLower(strings.TrimSpace(fp.Type))
+					if rawTypeLower == "alias" && fp.Path != "" {
 						sum.aliasTargets[full] = fp.Path
 						if perFieldTypes[full] == nil {
 							perFieldTypes[full] = make(map[string][]string)
@@ -2559,26 +2737,44 @@ func inspectESQLFromTargetSchemasRound63(s *Server, ctx context.Context, idxTarg
 						perFieldTypes[full]["__alias:"+fp.Path] = append(perFieldTypes[full]["__alias:"+fp.Path], idx)
 						continue
 					}
-					if len(fp.Properties) > 0 && (fp.Type == "" || fp.Type == "object") {
+					if len(fp.Properties) > 0 && (rawTypeLower == "" || rawTypeLower == "object") {
 						walkProps(full, fp.Properties)
 						continue
 					}
-					if fp.Type == "nested" || fp.Type == "flattened" {
+					if rawTypeLower == "nested" {
+						// ES|QL omits nested fields from FROM column output.
+						continue
+					}
+					if rawTypeLower == "flattened" {
 						if perFieldTypes[full] == nil {
 							perFieldTypes[full] = make(map[string][]string)
 						}
+						sum.rawTypes[full] = rawTypeLower
 						perFieldTypes[full]["unsupported"] = append(perFieldTypes[full]["unsupported"], idx)
 						continue
 					}
-					esqlT := esFieldTypeToESQLTypeRound63(fp.Type)
-					if fp.TimeSeriesMetric == "counter" {
-						esqlT = esFieldTypeToESQLTypeRound63(fp.Type)
+					esqlT := esFieldTypeToESQLTypeRound63(rawTypeLower)
+					if tsdbMode && fp.TimeSeriesMetric == "counter" {
+						switch esqlT {
+						case "integer", "long", "double", "unsigned_long":
+							esqlT = "counter_" + esqlT
+						}
 					}
 					if perFieldTypes[full] == nil {
 						perFieldTypes[full] = make(map[string][]string)
 					}
 					perFieldTypes[full][esqlT] = append(perFieldTypes[full][esqlT], idx)
-					if fp.Type == "constant_keyword" {
+					sum.rawTypes[full] = rawTypeLower
+					if rawTypeLower == "search_as_you_type" {
+						for _, saytSub := range []string{"._2gram", "._3gram", "._index_prefix"} {
+							subFull := full + saytSub
+							if perFieldTypes[subFull] == nil {
+								perFieldTypes[subFull] = make(map[string][]string)
+							}
+							perFieldTypes[subFull]["unsupported"] = append(perFieldTypes[subFull]["unsupported"], idx)
+						}
+					}
+					if rawTypeLower == "constant_keyword" {
 						sum.constVals[full] = fp.Value
 					}
 					if fp.IgnoreAbove > 0 {
@@ -2595,8 +2791,14 @@ func inspectESQLFromTargetSchemasRound63(s *Server, ctx context.Context, idxTarg
 					}
 					for subName, subFP := range fp.Fields {
 						subFull := full + "." + subName
-						subT := esFieldTypeToESQLTypeRound63(subFP.Type)
+						subRawLower := strings.ToLower(strings.TrimSpace(subFP.Type))
+						subT := esFieldTypeToESQLTypeRound63(subRawLower)
+						if perFieldTypes[subFull] == nil {
+							perFieldTypes[subFull] = make(map[string][]string)
+						}
+						perFieldTypes[subFull][subT] = append(perFieldTypes[subFull][subT], idx)
 						sum.colTypes[subFull] = subT
+						sum.rawTypes[subFull] = subRawLower
 						if subFP.IgnoreAbove > 0 {
 							sum.ignoreAbove[subFull] = subFP.IgnoreAbove
 						}
@@ -2678,6 +2880,7 @@ func inspectESQLFromTargetSchemasRound63(s *Server, ctx context.Context, idxTarg
 			}
 		}
 		sum.colTypes[col] = "unsupported"
+		sum.ambiguousTypes[col] = typeNames
 		sum.ambiguousError[col] = fmt.Sprintf("Cannot use field [%s] due to ambiguities being mapped as [%d] incompatible types: %s",
 			col, len(typeNames), strings.Join(parts, ", "))
 	}
@@ -2743,6 +2946,69 @@ func normalizeESQLWKTStringRound63(s string) string {
 	return sb.String()
 }
 
+func quantizeHalfFloatRound64(f float64) float64 {
+	if math.IsNaN(f) || math.IsInf(f, 0) || f == 0 {
+		return f
+	}
+	bits32 := math.Float32bits(float32(f))
+	sign := (bits32 >> 16) & 0x8000
+	exp := int((bits32>>23)&0xFF) - 127 + 15
+	mant := bits32 & 0x7FFFFF
+	var h uint16
+	switch {
+	case exp <= 0:
+		if exp < -10 {
+			h = uint16(sign)
+		} else {
+			mant |= 0x800000
+			shift := uint(14 - exp)
+			sub := mant >> shift
+			if (mant>>(shift-1))&1 != 0 && ((mant&((1<<(shift-1))-1)) != 0 || (sub&1) != 0) {
+				sub++
+			}
+			h = uint16(sign&0x8000) | uint16(sub&0x7FFF) // #nosec G115 -- explicit bitmask guarantees 16-bit half-float bounds
+		}
+	case exp >= 31:
+		h = uint16(sign) | 0x7C00
+	default:
+		hm := mant >> 13
+		roundBit := (mant >> 12) & 1
+		sticky := mant & 0xFFF
+		if roundBit != 0 && (sticky != 0 || (hm&1) != 0) {
+			hm++
+			if hm == 0x400 {
+				hm = 0
+				exp++
+			}
+		}
+		if exp >= 31 {
+			h = uint16(sign) | 0x7C00
+		} else {
+			h = uint16(sign) | uint16(exp<<10) | uint16(hm)
+		}
+	}
+	// Convert IEEE-754 binary16 h back to float64
+	hs := uint32(h&0x8000) << 16
+	he := uint32((h >> 10) & 0x1F)
+	hm := uint32(h & 0x3FF)
+	switch he {
+	case 0:
+		if hm == 0 {
+			return math.Float64frombits(uint64(hs) << 32)
+		}
+		for (hm & 0x400) == 0 {
+			hm <<= 1
+			he--
+		}
+		he++
+		hm &= ^uint32(0x400)
+	case 31:
+		return float64(math.Float32frombits(hs | 0x7F800000 | (hm << 13)))
+	}
+	out32 := hs | ((he + 127 - 15) << 23) | (hm << 13)
+	return float64(math.Float32frombits(out32))
+}
+
 func formatESQLCellWithSchemaRound63(val any, col string, sum esqlIndexFieldSummaryRound63) any {
 	if val == nil {
 		return nil
@@ -2751,12 +3017,21 @@ func formatESQLCellWithSchemaRound63(val any, col string, sum esqlIndexFieldSumm
 	if esqlType == "unsupported" {
 		return nil
 	}
+	if esqlType == "ip" && sum.nonIndexedNoDV[col] {
+		return nil
+	}
+	isHalfFloat := sum.rawTypes[col] == "half_float"
 	maxLen := sum.ignoreAbove[col]
 	normName := strings.ToLower(strings.TrimSpace(sum.normalizers[col]))
 	applyScalar := func(el any) any {
 		c := coerceESQLSingleScalarRound63(el, esqlType)
 		if c == nil {
 			return nil
+		}
+		if isHalfFloat {
+			if fv, okF := c.(float64); okF {
+				c = quantizeHalfFloatRound64(fv)
+			}
 		}
 		if sv, okS := c.(string); okS {
 			if maxLen > 0 && utf8.RuneCountInString(sv) > maxLen {
@@ -2831,16 +3106,43 @@ func coerceESQLCellForColumnTypeRound63(val any, esqlType string) any {
 	return coerceESQLSingleScalarRound63(val, esqlType)
 }
 
+func coerceESQLCellPreserveOrderRound64(val any, esqlType string) any {
+	if val == nil || esqlType == "unsupported" {
+		return nil
+	}
+	if arr, ok := val.([]any); ok {
+		if len(arr) == 0 {
+			return nil
+		}
+		norm := make([]any, 0, len(arr))
+		for _, el := range arr {
+			if el != nil {
+				if c := coerceESQLSingleScalarRound63(el, esqlType); c != nil {
+					norm = append(norm, c)
+				}
+			}
+		}
+		if len(norm) == 0 {
+			return nil
+		}
+		if len(norm) == 1 {
+			return norm[0]
+		}
+		return norm
+	}
+	return coerceESQLSingleScalarRound63(val, esqlType)
+}
+
 func coerceESQLSingleScalarRound63(val any, esqlType string) any {
 	if val == nil {
 		return nil
 	}
 	switch esqlType {
-	case "double":
+	case "double", "counter_double":
 		if fv, ok := toFloat64Round61(val); ok {
 			return fv
 		}
-	case "integer", "long":
+	case "integer", "long", "counter_integer", "counter_long":
 		if iv, ok := toInt64(val); ok {
 			return iv
 		}
@@ -2919,6 +3221,9 @@ func inferESQLExprStaticTypeRound63(exprStr string, colTypes map[string]string) 
 		return ct
 	}
 	// Literal checks
+	if strings.EqualFold(s, "null") {
+		return "null"
+	}
 	if strings.EqualFold(s, "true") || strings.EqualFold(s, "false") {
 		return "boolean"
 	}
@@ -2938,7 +3243,7 @@ func inferESQLExprStaticTypeRound63(exprStr string, colTypes map[string]string) 
 		fnName := strings.ToUpper(strings.TrimSpace(s[:openP]))
 		inner := strings.TrimSpace(s[openP+1 : len(s)-1])
 		switch fnName {
-		case "TO_IP":
+		case "TO_IP", "IP_PREFIX":
 			return "ip"
 		case "TO_DOUBLE":
 			return "double"
@@ -2964,9 +3269,11 @@ func inferESQLExprStaticTypeRound63(exprStr string, colTypes map[string]string) 
 			return "cartesian_shape"
 		case "TO_STRING", "DATE_FORMAT", "CONCAT", "SUBSTRING", "TRIM", "LTRIM", "RTRIM", "TO_LOWER", "TO_UPPER", "REPLACE":
 			return "keyword"
-		case "STARTS_WITH", "ENDS_WITH":
+		case "STARTS_WITH", "ENDS_WITH", "CIDR_MATCH":
 			return "boolean"
-		case "LENGTH", "BYTE_LENGTH", "BIT_LENGTH", "DATE_DIFF", "DATE_EXTRACT":
+		case "LENGTH", "BYTE_LENGTH", "BIT_LENGTH", "MV_COUNT", "LOCATE":
+			return "integer"
+		case "DATE_DIFF", "DATE_EXTRACT":
 			return "long"
 		case "SIN", "COS", "TAN", "ASIN", "ACOS", "ATAN", "ATAN2", "SINH", "COSH", "TANH", "SQRT", "CBRT", "EXP", "LOG", "LOG10", "POW", "PI", "E", "TAU":
 			return "double"
@@ -2988,8 +3295,6 @@ func inferESQLExprStaticTypeRound63(exprStr string, colTypes map[string]string) 
 			}
 		case "MV_AVG", "MV_MEDIAN", "MV_MEDIAN_ABSOLUTE_DEVIATION":
 			return "double"
-		case "MV_COUNT":
-			return "long"
 		}
 	}
 	// Binary comparison -> boolean
@@ -3365,7 +3670,7 @@ func executeESQLLookupJoinStageWithBodyRound63(
 		for _, ec := range extraCols {
 			if matched != nil {
 				v := getNestedOrArrayDocValRound63(matched, ec)
-				row[ec] = coerceESQLCellForColumnTypeRound63(v, colTypes[ec])
+				row[ec] = coerceESQLCellPreserveOrderRound64(v, colTypes[ec])
 			} else {
 				row[ec] = nil
 			}
@@ -4409,6 +4714,9 @@ func parseSingleWeekDatePatternRound63(input, pat string, defaultLoc *time.Locat
 // ExtractIngestAttachmentRound63 extracts text and document metadata from base64-encoded
 // OOXML `.docx` (`archive/zip` with bounded `io.LimitReader`) and legacy binary `.doc` (OLE2 CFBF).
 func ExtractIngestAttachmentRound63(rawB64 string, indexedChars int64, propsFilter []string, isES8 bool) (map[string]any, bool) {
+	if len(rawB64) > maxIngestAttachmentBase64Bytes {
+		return nil, false
+	}
 	rawBytes, err := decodeBase64FlexibleRound63(rawB64)
 	if err != nil || len(rawBytes) < 4 {
 		return nil, false
@@ -4440,32 +4748,52 @@ func ExtractIngestAttachmentRound63(rawB64 string, indexedChars int64, propsFilt
 		}
 		return filtered, true
 	}
+	// ES ingest-attachment emits 8 metadata fields by default for Word docs (without "created").
+	delete(extracted, "created")
 	return extracted, true
 }
 
 func decodeBase64FlexibleRound63(s string) ([]byte, error) {
+	if len(s) > maxIngestAttachmentBase64Bytes {
+		return nil, fmt.Errorf("attachment payload exceeds maximum allowed size")
+	}
 	cleaned := strings.Map(func(r rune) rune {
 		if unicode.IsSpace(r) {
 			return -1
 		}
 		return r
 	}, s)
+	if len(cleaned) > maxIngestAttachmentBase64Bytes {
+		return nil, fmt.Errorf("attachment payload exceeds maximum allowed size")
+	}
 	for _, enc := range []*base64.Encoding{base64.StdEncoding, base64.RawStdEncoding, base64.URLEncoding, base64.RawURLEncoding} {
 		if b, err := enc.DecodeString(cleaned); err == nil {
+			if len(b) > maxIngestAttachmentDecompressedBytes {
+				return nil, fmt.Errorf("decoded attachment exceeds maximum allowed size")
+			}
 			return b, nil
 		}
 	}
 	return nil, fmt.Errorf("invalid base64")
 }
 
-func readZipFileBoundedRound63(zf *zip.File) ([]byte, error) {
+func readZipFileBoundedRemainingRound63(zf *zip.File, remaining *int64) ([]byte, error) {
+	if zf == nil || remaining == nil || *remaining <= 0 {
+		return nil, io.ErrShortBuffer
+	}
 	rc, err := zf.Open()
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = rc.Close() }()
-	lr := io.LimitReader(rc, maxIngestAttachmentDecompressedBytes)
-	return io.ReadAll(lr)
+	limit := *remaining
+	lr := io.LimitReader(rc, limit)
+	data, err := io.ReadAll(lr)
+	*remaining -= int64(len(data))
+	if *remaining < 0 {
+		*remaining = 0
+	}
+	return data, err
 }
 
 func extractOOXMLDocxAttachmentRound63(rawZip []byte, indexedChars int64, isES8 bool) map[string]any {
@@ -4473,18 +4801,33 @@ func extractOOXMLDocxAttachmentRound63(rawZip []byte, indexedChars int64, isES8 
 	if err != nil {
 		return nil
 	}
+	const maxOOXMLZipEntries = 4096
 	var docXML, coreXML []byte
+	var docRead, coreRead bool
+	remainingBytes := int64(maxIngestAttachmentDecompressedBytes)
 	contentType := "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-	for _, zf := range zr.File {
+	for idx, zf := range zr.File {
+		if idx >= maxOOXMLZipEntries || remainingBytes <= 0 {
+			break
+		}
 		switch zf.Name {
 		case "word/document.xml":
-			docXML, _ = readZipFileBoundedRound63(zf)
+			if !docRead {
+				docRead = true
+				docXML, _ = readZipFileBoundedRemainingRound63(zf, &remainingBytes)
+			}
 		case "docProps/core.xml":
-			coreXML, _ = readZipFileBoundedRound63(zf)
+			if !coreRead {
+				coreRead = true
+				coreXML, _ = readZipFileBoundedRemainingRound63(zf, &remainingBytes)
+			}
 		case "ppt/presentation.xml":
 			contentType = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
 		case "xl/workbook.xml":
 			contentType = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+		}
+		if docRead && coreRead && contentType != "application/vnd.openxmlformats-officedocument.wordprocessingml.document" {
+			break
 		}
 	}
 	if len(docXML) == 0 {
@@ -4523,7 +4866,7 @@ func extractWordprocessingMLTextRound63(xmlBytes []byte) string {
 	dec := xml.NewDecoder(bytes.NewReader(xmlBytes))
 	var sb strings.Builder
 	inWT := false
-	for {
+	for sb.Len() < maxIngestAttachmentDecompressedBytes {
 		tok, err := dec.Token()
 		if err != nil {
 			break
@@ -4547,7 +4890,15 @@ func extractWordprocessingMLTextRound63(xmlBytes []byte) string {
 			}
 		case xml.CharData:
 			if inWT {
-				sb.Write(t)
+				rem := maxIngestAttachmentDecompressedBytes - sb.Len()
+				if rem <= 0 {
+					break
+				}
+				if len(t) > rem {
+					sb.Write(t[:rem])
+				} else {
+					sb.Write(t)
+				}
 			}
 		}
 	}
@@ -4673,9 +5024,16 @@ func parseOLE2StreamsRound63(raw []byte) map[string][]byte {
 		return raw[off : off+int64(secSize)]
 	}
 
-	// Read first 109 DIFAT entries in header [76..512)
+	// Read first 109 DIFAT entries in header [76..512), bounded so malformed FAT headers cannot inflate memory.
+	maxFATEntries := (len(raw) / secSize) + 256
+	if maxFATEntries < 256 {
+		maxFATEntries = 256
+	}
+	if maxFATEntries > maxIngestAttachmentDecompressedBytes/4 {
+		maxFATEntries = maxIngestAttachmentDecompressedBytes / 4
+	}
 	var fat []uint32
-	for i := 0; i < 109; i++ {
+	for i := 0; i < 109 && len(fat) < maxFATEntries; i++ {
 		pos := 76 + i*4
 		fatSecID := binary.LittleEndian.Uint32(raw[pos : pos+4])
 		if fatSecID >= 0xFFFFFFFC {
@@ -4685,7 +5043,7 @@ func parseOLE2StreamsRound63(raw []byte) map[string][]byte {
 		if len(secBytes) == 0 {
 			continue
 		}
-		for p := 0; p+4 <= len(secBytes); p += 4 {
+		for p := 0; p+4 <= len(secBytes) && len(fat) < maxFATEntries; p += 4 {
 			fat = append(fat, binary.LittleEndian.Uint32(secBytes[p:p+4]))
 		}
 	}
@@ -4693,22 +5051,42 @@ func parseOLE2StreamsRound63(raw []byte) map[string][]byte {
 		return out
 	}
 
+	remainingBudget := maxIngestAttachmentDecompressedBytes
+	seenFAT := make([]bool, len(fat))
+
 	readChain := func(startSec uint32, maxBytes int) []byte {
+		if remainingBudget <= 0 {
+			return nil
+		}
+		if maxBytes <= 0 || maxBytes > remainingBudget {
+			maxBytes = remainingBudget
+		}
+		clear(seenFAT)
 		var buf []byte
 		cur := startSec
-		visited := 0
-		maxSecs := len(fat) + 1
-		for cur < 0xFFFFFFFC && int(cur) < len(fat) && visited < maxSecs {
-			visited++
+		for cur < 0xFFFFFFFC && int(cur) < len(fat) {
+			if seenFAT[cur] {
+				break
+			}
+			seenFAT[cur] = true
 			sb := readSector(cur)
 			if len(sb) == 0 {
 				break
 			}
-			buf = append(buf, sb...)
-			if maxBytes > 0 && len(buf) >= maxBytes {
-				return buf[:maxBytes]
+			need := maxBytes - len(buf)
+			if need <= 0 {
+				break
 			}
+			if len(sb) > need {
+				buf = append(buf, sb[:need]...)
+				break
+			}
+			buf = append(buf, sb...)
 			cur = fat[cur]
+		}
+		remainingBudget -= len(buf)
+		if remainingBudget < 0 {
+			remainingBudget = 0
 		}
 		return buf
 	}
@@ -4719,8 +5097,12 @@ func parseOLE2StreamsRound63(raw []byte) map[string][]byte {
 	}
 
 	var miniFAT []uint32
-	if firstMiniFATSec < 0xFFFFFFFC {
-		mfBytes := readChain(firstMiniFATSec, 4<<20)
+	if firstMiniFATSec < 0xFFFFFFFC && remainingBudget > 0 {
+		mfLimit := 4 << 20
+		if mfLimit > remainingBudget {
+			mfLimit = remainingBudget
+		}
+		mfBytes := readChain(firstMiniFATSec, mfLimit)
 		for p := 0; p+4 <= len(mfBytes); p += 4 {
 			miniFAT = append(miniFAT, binary.LittleEndian.Uint32(mfBytes[p:p+4]))
 		}
@@ -4730,33 +5112,56 @@ func parseOLE2StreamsRound63(raw []byte) map[string][]byte {
 	rootStart := binary.LittleEndian.Uint32(dirBytes[116:120])
 	rootSize := int(binary.LittleEndian.Uint32(dirBytes[120:124]))
 	var miniStream []byte
-	if rootBytes := dirBytes[66]; rootBytes == 5 && rootStart < 0xFFFFFFFC && rootSize > 0 {
-		if rootSize > maxIngestAttachmentDecompressedBytes {
-			rootSize = maxIngestAttachmentDecompressedBytes
+	if rootType := dirBytes[66]; rootType == 5 && rootStart < 0xFFFFFFFC && rootSize > 0 && remainingBudget > 0 {
+		if rootSize > remainingBudget {
+			rootSize = remainingBudget
 		}
 		miniStream = readChain(rootStart, rootSize)
 	}
 
+	seenMini := make([]bool, len(miniFAT))
 	readMiniChain := func(startMini uint32, sz int) []byte {
+		if remainingBudget <= 0 || len(miniFAT) == 0 {
+			return nil
+		}
+		if sz > remainingBudget {
+			sz = remainingBudget
+		}
+		clear(seenMini)
 		var buf []byte
 		cur := startMini
-		visited := 0
-		for int(cur) < len(miniFAT) && cur < 0xFFFFFFFC && visited <= len(miniFAT) {
-			visited++
+		for int(cur) < len(miniFAT) && cur < 0xFFFFFFFC {
+			if seenMini[cur] {
+				break
+			}
+			seenMini[cur] = true
 			off := int(cur) * miniSize
 			if off < 0 || off+miniSize > len(miniStream) {
 				break
 			}
-			buf = append(buf, miniStream[off:off+miniSize]...)
-			if len(buf) >= sz {
-				return buf[:sz]
+			need := sz - len(buf)
+			if need <= 0 {
+				break
 			}
+			chunk := miniStream[off : off+miniSize]
+			if len(chunk) > need {
+				buf = append(buf, chunk[:need]...)
+				break
+			}
+			buf = append(buf, chunk...)
 			cur = miniFAT[cur]
+		}
+		remainingBudget -= len(buf)
+		if remainingBudget < 0 {
+			remainingBudget = 0
 		}
 		return buf
 	}
 
-	for pos := 128; pos+128 <= len(dirBytes); pos += 128 {
+	const maxOLE2DirEntries = 4096
+	entryIdx := 0
+	for pos := 128; pos+128 <= len(dirBytes) && entryIdx < maxOLE2DirEntries && remainingBudget > 0; pos += 128 {
+		entryIdx++
 		entry := dirBytes[pos : pos+128]
 		objType := entry[66]
 		if objType != 2 { // 2 = Stream
@@ -4771,13 +5176,21 @@ func parseOLE2StreamsRound63(raw []byte) map[string][]byte {
 			u16[k] = binary.LittleEndian.Uint16(entry[k*2 : k*2+2])
 		}
 		name := string(utf16.Decode(u16))
+		switch name {
+		case "WordDocument", "0Table", "1Table", "\x05SummaryInformation":
+		default:
+			continue
+		}
+		if _, already := out[name]; already {
+			continue
+		}
 		startSec := binary.LittleEndian.Uint32(entry[116:120])
 		streamSz := int(binary.LittleEndian.Uint32(entry[120:124]))
 		if streamSz <= 0 {
 			continue
 		}
-		if streamSz > maxIngestAttachmentDecompressedBytes {
-			streamSz = maxIngestAttachmentDecompressedBytes
+		if streamSz > remainingBudget {
+			streamSz = remainingBudget
 		}
 		if uint32(streamSz) < miniCutoff && len(miniStream) > 0 && len(miniFAT) > 0 {
 			out[name] = readMiniChain(startSec, streamSz)
@@ -4850,7 +5263,10 @@ func parseWordClxPieceTableRound63(wd, clx []byte, ccpText int) (string, bool) {
 	n := (len(plcPcd) - 4) / 12
 	var sb strings.Builder
 	totalChars := 0
-	for i := 0; i < n; i++ {
+	for i := 0; i < n && sb.Len() < maxIngestAttachmentDecompressedBytes; i++ {
+		if ccpText > 0 && totalChars >= ccpText {
+			break
+		}
 		cpStart := int(binary.LittleEndian.Uint32(plcPcd[i*4 : i*4+4]))
 		cpEnd := int(binary.LittleEndian.Uint32(plcPcd[(i+1)*4 : (i+1)*4+4]))
 		charCount := cpEnd - cpStart
@@ -4863,27 +5279,33 @@ func parseWordClxPieceTableRound63(wd, clx []byte, ccpText int) (string, bool) {
 		fc := int(fcCompressed & 0x3FFFFFFF)
 		if isANSI {
 			byteOff := fc / 2
-			if byteOff < 0 || byteOff+charCount > len(wd) {
+			if byteOff < 0 || byteOff > len(wd) || charCount > len(wd)-byteOff {
 				continue
 			}
 			for _, b := range wd[byteOff : byteOff+charCount] {
-				if ccpText > 0 && totalChars >= ccpText {
+				if (ccpText > 0 && totalChars >= ccpText) || sb.Len() >= maxIngestAttachmentDecompressedBytes {
 					break
 				}
 				totalChars++
 				sb.WriteRune(cp1252ToRuneRound63(b))
 			}
 		} else {
-			byteLen := charCount * 2
-			if fc < 0 || fc+byteLen > len(wd) {
+			if fc < 0 || fc > len(wd) || charCount > (len(wd)-fc)/2 {
 				continue
+			}
+			remBudget := maxIngestAttachmentDecompressedBytes - sb.Len()
+			if remBudget <= 0 {
+				break
+			}
+			if charCount > remBudget {
+				charCount = remBudget
 			}
 			u16 := make([]uint16, charCount)
 			for k := 0; k < charCount; k++ {
 				u16[k] = binary.LittleEndian.Uint16(wd[fc+k*2 : fc+k*2+2])
 			}
 			for _, r := range utf16.Decode(u16) {
-				if ccpText > 0 && totalChars >= ccpText {
+				if (ccpText > 0 && totalChars >= ccpText) || sb.Len() >= maxIngestAttachmentDecompressedBytes {
 					break
 				}
 				totalChars++
@@ -4931,6 +5353,9 @@ func cleanWordTextRunRound63(s string) string {
 }
 
 func extractPrintableRunsFromOLE2Round63(raw []byte) string {
+	if len(raw) > maxIngestAttachmentDecompressedBytes {
+		raw = raw[:maxIngestAttachmentDecompressedBytes]
+	}
 	var best string
 	var cur []byte
 	for _, b := range raw {
@@ -5444,36 +5869,47 @@ func extractEQLJoinKeyTuplesRound63(doc map[string]any, keyExprs []eqlExpr) []eq
 		if err != nil || v == nil {
 			return nil
 		}
+		var rawVals []any
 		switch arr := v.(type) {
 		case []any:
-			var nonNil []any
 			for _, el := range arr {
 				if el != nil {
-					nonNil = append(nonNil, normalizeESQLNumber(el))
+					rawVals = append(rawVals, normalizeESQLNumber(el))
 				}
 			}
-			if len(nonNil) == 0 {
-				return nil
-			}
-			perKeyVals[i] = nonNil
 		case []string:
-			if len(arr) == 0 {
-				return nil
+			for _, s := range arr {
+				rawVals = append(rawVals, s)
 			}
-			nonNil := make([]any, len(arr))
-			for j, s := range arr {
-				nonNil[j] = s
-			}
-			perKeyVals[i] = nonNil
 		default:
-			perKeyVals[i] = []any{normalizeESQLNumber(v)}
+			rawVals = []any{normalizeESQLNumber(v)}
 		}
+		if len(rawVals) == 0 {
+			return nil
+		}
+		// Deduplicate per-key values up to maxEQLJoinTuplesPerDoc to prevent Cartesian bombs.
+		seenPerKey := make(map[string]bool, min(len(rawVals), maxEQLJoinTuplesPerDoc))
+		dedup := make([]any, 0, min(len(rawVals), maxEQLJoinTuplesPerDoc))
+		for _, val := range rawVals {
+			ks := fmt.Sprintf("%T:%v", val, val)
+			if !seenPerKey[ks] {
+				seenPerKey[ks] = true
+				dedup = append(dedup, val)
+				if len(dedup) >= maxEQLJoinTuplesPerDoc {
+					break
+				}
+			}
+		}
+		perKeyVals[i] = dedup
 	}
 	var out []eqlJoinKeyTupleRound63
 	seen := make(map[string]bool)
 	cur := make([]any, len(keyExprs))
 	var build func(idx int)
 	build = func(idx int) {
+		if len(out) >= maxEQLJoinTuplesPerDoc {
+			return
+		}
 		if idx == len(keyExprs) {
 			cp := make([]any, len(cur))
 			var sb strings.Builder
@@ -5489,6 +5925,9 @@ func extractEQLJoinKeyTuplesRound63(doc map[string]any, keyExprs []eqlExpr) []eq
 			return
 		}
 		for _, v := range perKeyVals[idx] {
+			if len(out) >= maxEQLJoinTuplesPerDoc {
+				return
+			}
 			cur[idx] = v
 			build(idx + 1)
 		}
@@ -5571,4 +6010,992 @@ func interleaveEQLMissingStageEventsRound63(stageEvents []any, absentAfter map[i
 		}
 	}
 	return out
+}
+
+// ============================================================================
+// Round 64 Exported Module Helpers (F4 Downsample, F9 ES|QL, F13 geo_grid, C36 terms_enum DLS)
+// ============================================================================
+
+var esqlSupportedFeatureKeysR64 = []string{
+	"dissect",
+	"drop",
+	"eval",
+	"enrich",
+	"from",
+	"grok",
+	"keep",
+	"limit",
+	"meta",
+	"mv_expand",
+	"rename",
+	"row",
+	"show",
+	"sort",
+	"stats",
+	"where",
+}
+
+// ESQLSupportedFeaturesMapR64 returns an initialized map of all 16 ES 8.15 `esql.features` keys.
+func ESQLSupportedFeaturesMapR64() map[string]int64 {
+	m := make(map[string]int64, len(esqlSupportedFeatureKeysR64))
+	for _, k := range esqlSupportedFeatureKeysR64 {
+		m[k] = 0
+	}
+	return m
+}
+
+// RecordESQLFeatureUsageR64 increments usage counts on `counters` for stages present in `queryStr`.
+func RecordESQLFeatureUsageR64(counters map[string]int64, queryStr string) {
+	if counters == nil {
+		return
+	}
+	for _, k := range esqlSupportedFeatureKeysR64 {
+		if _, exists := counters[k]; !exists {
+			counters[k] = 0
+		}
+	}
+	for i, rawStage := range splitESQLStages(queryStr) {
+		up := strings.ToUpper(strings.TrimSpace(rawStage))
+		if up == "" {
+			continue
+		}
+		if i == 0 && strings.Contains(up, " METADATA ") {
+			counters["meta"]++
+		}
+		flds := strings.Fields(up)
+		if len(flds) == 0 {
+			continue
+		}
+		switch flds[0] {
+		case "DISSECT":
+			counters["dissect"]++
+		case "DROP":
+			counters["drop"]++
+		case "EVAL":
+			counters["eval"]++
+		case "ENRICH":
+			counters["enrich"]++
+		case "FROM":
+			counters["from"]++
+		case "GROK":
+			counters["grok"]++
+		case "KEEP":
+			counters["keep"]++
+		case "LIMIT":
+			counters["limit"]++
+		case "MV_EXPAND":
+			counters["mv_expand"]++
+		case "RENAME":
+			counters["rename"]++
+		case "ROW":
+			counters["row"]++
+		case "SHOW":
+			counters["show"]++
+		case "SORT":
+			counters["sort"]++
+		case "STATS":
+			counters["stats"]++
+		case "WHERE":
+			counters["where"]++
+		}
+	}
+}
+
+// DownsampleAggValidationErrorR64 represents an ES 400 error when running an unsupported aggregation on `aggregate_metric_double`.
+type DownsampleAggValidationErrorR64 struct {
+	Status int
+	Type   string
+	Reason string
+}
+
+func (e *DownsampleAggValidationErrorR64) Error() string {
+	return e.Reason
+}
+
+// ValidateDownsampleUnsupportedAggR64 validates whether `aggType` is supported on `fieldESType` (rejects histogram/range/cardinality/percentiles/top_metrics on `aggregate_metric_double`).
+func ValidateDownsampleUnsupportedAggR64(aggType, fieldName, fieldESType string) error {
+	if !strings.EqualFold(strings.TrimSpace(fieldESType), "aggregate_metric_double") {
+		return nil
+	}
+	at := strings.ToLower(strings.TrimSpace(aggType))
+	switch at {
+	case "histogram", "range", "cardinality", "percentiles", "top_metrics":
+		return &DownsampleAggValidationErrorR64{
+			Status: http.StatusBadRequest,
+			Type:   "unsupported_aggregation_on_downsampled_index",
+			Reason: fmt.Sprintf("Field [%s] of type [aggregate_metric_double] is not supported for aggregation [%s]", fieldName, at),
+		}
+	}
+	return nil
+}
+
+func lookupFieldESTypeInSchemaR64(sch *schema.IndexSchema, fieldPath string) string {
+	if sch == nil || fieldPath == "" {
+		return ""
+	}
+	if fb, ok := sch.Fields[fieldPath]; ok && fb.ESType != "" {
+		return fb.ESType
+	}
+	if sch.RawMapping != nil {
+		parts := strings.Split(fieldPath, ".")
+		props := sch.RawMapping.Properties
+		for i, p := range parts {
+			fp, exists := props[p]
+			if !exists {
+				return ""
+			}
+			if i == len(parts)-1 {
+				return fp.Type
+			}
+			if len(fp.Properties) > 0 {
+				props = fp.Properties
+			} else if len(fp.Fields) > 0 && i == len(parts)-2 {
+				if subFP, okSub := fp.Fields[parts[i+1]]; okSub {
+					return subFP.Type
+				}
+				return ""
+			} else {
+				return ""
+			}
+		}
+	}
+	return ""
+}
+
+// ValidateDownsampleAggsSpecMapR64 recursively validates a raw ES search `aggs` map against `sch` for unsupported downsampled index aggregations.
+func ValidateDownsampleAggsSpecMapR64(aggs map[string]any, sch *schema.IndexSchema) error {
+	if len(aggs) == 0 || sch == nil {
+		return nil
+	}
+	aggNames := make([]string, 0, len(aggs))
+	for k := range aggs {
+		aggNames = append(aggNames, k)
+	}
+	sort.Strings(aggNames)
+	for _, aggName := range aggNames {
+		spec, ok := aggs[aggName].(map[string]any)
+		if !ok || spec == nil {
+			continue
+		}
+		var subAggs map[string]any
+		specKeys := make([]string, 0, len(spec))
+		for k := range spec {
+			specKeys = append(specKeys, k)
+		}
+		sort.Strings(specKeys)
+		for _, k := range specKeys {
+			lk := strings.ToLower(strings.TrimSpace(k))
+			switch lk {
+			case "meta":
+				continue
+			case "aggs", "aggregations":
+				if sm, okS := spec[k].(map[string]any); okS {
+					subAggs = sm
+				}
+				continue
+			}
+			bodyMap, okB := spec[k].(map[string]any)
+			if !okB || bodyMap == nil {
+				continue
+			}
+			if fieldName, _ := bodyMap["field"].(string); fieldName != "" {
+				if err := ValidateDownsampleUnsupportedAggR64(lk, fieldName, lookupFieldESTypeInSchemaR64(sch, fieldName)); err != nil {
+					return err
+				}
+			}
+			if lk == "top_metrics" {
+				if mMap, okM := bodyMap["metrics"].(map[string]any); okM {
+					if fn, _ := mMap["field"].(string); fn != "" {
+						if err := ValidateDownsampleUnsupportedAggR64(lk, fn, lookupFieldESTypeInSchemaR64(sch, fn)); err != nil {
+							return err
+						}
+					}
+				} else if mArr, okA := bodyMap["metrics"].([]any); okA {
+					for _, el := range mArr {
+						if em, okEM := el.(map[string]any); okEM {
+							if fn, _ := em["field"].(string); fn != "" {
+								if err := ValidateDownsampleUnsupportedAggR64(lk, fn, lookupFieldESTypeInSchemaR64(sch, fn)); err != nil {
+									return err
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+		if len(subAggs) > 0 {
+			if err := ValidateDownsampleAggsSpecMapR64(subAggs, sch); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// ValidateGeoGridProcessorR64 validates `geo_grid` ingest processor configuration.
+func ValidateGeoGridProcessorR64(cfg map[string]any) error {
+	if cfg == nil {
+		return fmt.Errorf("illegal_argument_exception: [geo_grid] processor configuration is required")
+	}
+	field, _ := cfg["field"].(string)
+	if strings.TrimSpace(field) == "" {
+		return fmt.Errorf("illegal_argument_exception: [field] required property is missing on [geo_grid] processor")
+	}
+	tileType, _ := cfg["tile_type"].(string)
+	tileType = strings.ToLower(strings.TrimSpace(tileType))
+	switch tileType {
+	case "geotile", "geohash", "geohex":
+	default:
+		return fmt.Errorf("illegal_argument_exception: [geo_grid] unsupported [tile_type] [%s]", tileType)
+	}
+	if tf, ok := cfg["target_format"].(string); ok && strings.TrimSpace(tf) != "" {
+		tf = strings.ToLower(strings.TrimSpace(tf))
+		if tf != "geojson" && tf != "wkt" {
+			return fmt.Errorf("illegal_argument_exception: [geo_grid] unsupported [target_format] [%s]", tf)
+		}
+	}
+	if ncf, _ := cfg["non_children_field"].(string); strings.TrimSpace(ncf) != "" && tileType != "geohex" {
+		return fmt.Errorf("illegal_argument_exception: [non_children_field] can only be used with [tile_type: geohex]")
+	}
+	return nil
+}
+
+var geohashAlphabetR64 = "0123456789bcdefghjkmnpqrstuvwxyz"
+
+// ApplyGeoGridProcessorR64 executes the `geo_grid` ingest processor on `doc`.
+func ApplyGeoGridProcessorR64(doc map[string]any, cfg map[string]any) error {
+	if err := ValidateGeoGridProcessorR64(cfg); err != nil {
+		return err
+	}
+	if doc == nil {
+		return nil
+	}
+	field, _ := cfg["field"].(string)
+	field = strings.TrimSpace(field)
+	tileType := strings.ToLower(strings.TrimSpace(cfg["tile_type"].(string)))
+	targetFormat := "geojson"
+	if tf, _ := cfg["target_format"].(string); strings.TrimSpace(tf) != "" {
+		targetFormat = strings.ToLower(strings.TrimSpace(tf))
+	}
+	targetField, _ := cfg["target_field"].(string)
+	if strings.TrimSpace(targetField) == "" {
+		targetField = field
+	}
+	parentField, _ := cfg["parent_field"].(string)
+	childrenField, _ := cfg["children_field"].(string)
+	nonChildrenField, _ := cfg["non_children_field"].(string)
+	precisionField, _ := cfg["precision_field"].(string)
+	ignoreMissing, _ := cfg["ignore_missing"].(bool)
+
+	rawVal := getNestedOrArrayDocValRound63(doc, field)
+	cellStr, _ := rawVal.(string)
+	cellStr = strings.TrimSpace(cellStr)
+	if rawVal == nil || cellStr == "" {
+		if ignoreMissing {
+			return nil
+		}
+		return fmt.Errorf("illegal_argument_exception: field [%s] not present as part of path [%s]", field, field)
+	}
+
+	var (
+		shapeVal    any
+		hasParent   bool
+		parentVal   string
+		children    []any
+		nonChildren []any
+		precision   int
+	)
+
+	switch tileType {
+	case "geotile":
+		topLat, leftLon, botLat, rightLon, zoom, x, y, ok := decodeGeotileBoundsR64(cellStr)
+		if !ok {
+			return fmt.Errorf("illegal_argument_exception: invalid geotile [%s]", cellStr)
+		}
+		precision = zoom
+		if targetFormat == "wkt" {
+			shapeVal = fmt.Sprintf("BBOX (%s, %s, %s, %s)",
+				formatJavaDoubleR63(leftLon), formatJavaDoubleR63(rightLon),
+				formatJavaDoubleR63(topLat), formatJavaDoubleR63(botLat))
+		} else {
+			shapeVal = map[string]any{
+				"type": "Envelope",
+				"coordinates": []any{
+					[]any{leftLon, topLat},
+					[]any{rightLon, botLat},
+				},
+			}
+		}
+		if zoom > 0 {
+			hasParent = true
+			parentVal = fmt.Sprintf("%d/%d/%d", zoom-1, x/2, y/2)
+		}
+		if zoom < 29 {
+			cz := zoom + 1
+			children = []any{
+				fmt.Sprintf("%d/%d/%d", cz, 2*x, 2*y),
+				fmt.Sprintf("%d/%d/%d", cz, 2*x+1, 2*y),
+				fmt.Sprintf("%d/%d/%d", cz, 2*x, 2*y+1),
+				fmt.Sprintf("%d/%d/%d", cz, 2*x+1, 2*y+1),
+			}
+		}
+
+	case "geohash":
+		latMin, latMax, lonMin, lonMax, ok := decodeGeohashBBoxR61Search(cellStr)
+		if !ok {
+			return fmt.Errorf("illegal_argument_exception: invalid geohash [%s]", cellStr)
+		}
+		precision = len(cellStr)
+		if targetFormat == "wkt" {
+			shapeVal = fmt.Sprintf("BBOX (%s, %s, %s, %s)",
+				formatJavaDoubleR63(lonMin), formatJavaDoubleR63(lonMax),
+				formatJavaDoubleR63(latMax), formatJavaDoubleR63(latMin))
+		} else {
+			shapeVal = map[string]any{
+				"type": "Envelope",
+				"coordinates": []any{
+					[]any{lonMin, latMax},
+					[]any{lonMax, latMin},
+				},
+			}
+		}
+		if len(cellStr) > 1 {
+			hasParent = true
+			parentVal = cellStr[:len(cellStr)-1]
+		}
+		if len(cellStr) < 12 {
+			children = make([]any, 0, len(geohashAlphabetR64))
+			for i := 0; i < len(geohashAlphabetR64); i++ {
+				children = append(children, cellStr+string(geohashAlphabetR64[i]))
+			}
+		}
+
+	case "geohex":
+		h, err := spatial.StringToCell(cellStr)
+		if err != nil {
+			return fmt.Errorf("illegal_argument_exception: invalid geohex [%s]: %w", cellStr, err)
+		}
+		res := spatial.Resolution(h)
+		precision = res
+		boundary := spatial.CellToBoundary(h)
+		if len(boundary) > 0 && (boundary[0][0] != boundary[len(boundary)-1][0] || boundary[0][1] != boundary[len(boundary)-1][1]) {
+			boundary = append(boundary, boundary[0])
+		}
+		if targetFormat == "wkt" {
+			pts := make([]string, 0, len(boundary))
+			for _, pt := range boundary {
+				pts = append(pts, formatJavaDoubleR63(pt[1])+" "+formatJavaDoubleR63(pt[0]))
+			}
+			shapeVal = "POLYGON ((" + strings.Join(pts, ", ") + "))"
+		} else {
+			ring := make([]any, 0, len(boundary))
+			for _, pt := range boundary {
+				ring = append(ring, []any{pt[1], pt[0]})
+			}
+			shapeVal = map[string]any{
+				"type":        "Polygon",
+				"coordinates": []any{ring},
+			}
+		}
+		if res > 0 {
+			if pCell, pErr := spatial.CellToParent(h, res-1); pErr == nil {
+				hasParent = true
+				parentVal = spatial.CellToString(pCell)
+			}
+		}
+		if res < spatial.MaxRes {
+			childCells, cErr := spatial.CellToChildren(h, res+1)
+			childSet := make(map[uint64]bool, len(childCells))
+			if cErr == nil {
+				children = make([]any, 0, len(childCells))
+				for _, c := range childCells {
+					childSet[c] = true
+					children = append(children, spatial.CellToString(c))
+				}
+			}
+			if strings.TrimSpace(nonChildrenField) != "" {
+				if inter, iErr := spatial.PolygonIntersectingCells(boundary, nil, res+1); iErr == nil {
+					for _, ic := range inter {
+						if !childSet[ic] {
+							nonChildren = append(nonChildren, spatial.CellToString(ic))
+						}
+					}
+				}
+			}
+		}
+	}
+
+	setIngestPath(doc, targetField, shapeVal)
+	if strings.TrimSpace(parentField) != "" && hasParent {
+		setIngestPath(doc, parentField, parentVal)
+	}
+	if strings.TrimSpace(childrenField) != "" && children != nil {
+		setIngestPath(doc, childrenField, children)
+	}
+	if strings.TrimSpace(nonChildrenField) != "" && nonChildren != nil {
+		setIngestPath(doc, nonChildrenField, nonChildren)
+	}
+	if strings.TrimSpace(precisionField) != "" {
+		setIngestPath(doc, precisionField, precision)
+	}
+	return nil
+}
+
+// FilterTermsEnumByDLSR64 checks whether the caller's Authorization credentials allow unrestricted `terms_enum` access for `fieldName` across `targetIndices` under FLS/DLS rules.
+func (s *Server) FilterTermsEnumByDLSR64(r *http.Request, targetIndices []string, fieldName string) bool {
+	if s == nil || r == nil {
+		return true
+	}
+	authHeader := strings.TrimSpace(r.Header.Get("Authorization"))
+	if authHeader == "" {
+		return true
+	}
+	_ = s.syncCatalogFromBackend(r.Context())
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return EvaluateTermsEnumSecurityAccessR64(authHeader, s.securityUsers, s.securityRoles, s.securityAPIKeys, s.indices, targetIndices, fieldName)
+}
+
+func isTermsEnumDLSStaticMatchAllR64(queryVal any, sch *schema.IndexSchema) bool {
+	if queryVal == nil {
+		return true
+	}
+	var qMap map[string]any
+	switch q := queryVal.(type) {
+	case string:
+		if strings.TrimSpace(q) == "" {
+			return true
+		}
+		if err := json.Unmarshal([]byte(q), &qMap); err != nil {
+			return false
+		}
+	case map[string]any:
+		qMap = q
+	default:
+		return false
+	}
+	if len(qMap) == 0 {
+		return true
+	}
+	if _, ok := qMap["match_all"]; ok {
+		return true
+	}
+	if termMap, ok := qMap["term"].(map[string]any); ok && len(termMap) == 1 && sch != nil {
+		for fName, rawV := range termMap {
+			if lookupFieldESTypeInSchemaR64(sch, fName) != "constant_keyword" {
+				return false
+			}
+			targetVal := rawV
+			if inner, okI := rawV.(map[string]any); okI {
+				targetVal = inner["value"]
+			}
+			constVal := lookupConstantKeywordValueR64(sch, fName)
+			return constVal != nil && fmt.Sprintf("%v", constVal) == fmt.Sprintf("%v", targetVal)
+		}
+	}
+	if termsMap, ok := qMap["terms"].(map[string]any); ok && len(termsMap) == 1 && sch != nil {
+		for fName, rawSlice := range termsMap {
+			if lookupFieldESTypeInSchemaR64(sch, fName) != "constant_keyword" {
+				return false
+			}
+			constVal := lookupConstantKeywordValueR64(sch, fName)
+			if constVal == nil {
+				return false
+			}
+			want := fmt.Sprintf("%v", constVal)
+			if arr, okA := rawSlice.([]any); okA {
+				for _, el := range arr {
+					if fmt.Sprintf("%v", el) == want {
+						return true
+					}
+				}
+			}
+			return false
+		}
+	}
+	if boolMap, ok := qMap["bool"].(map[string]any); ok {
+		if _, hasMustNot := boolMap["must_not"]; hasMustNot {
+			return false
+		}
+		checkArr := func(v any) bool {
+			arr, okA := v.([]any)
+			if !okA {
+				if single, okS := v.(map[string]any); okS {
+					return isTermsEnumDLSStaticMatchAllR64(single, sch)
+				}
+				return true
+			}
+			for _, item := range arr {
+				if !isTermsEnumDLSStaticMatchAllR64(item, sch) {
+					return false
+				}
+			}
+			return true
+		}
+		if must, okM := boolMap["must"]; okM && !checkArr(must) {
+			return false
+		}
+		if flt, okF := boolMap["filter"]; okF && !checkArr(flt) {
+			return false
+		}
+		return true
+	}
+	return false
+}
+
+func lookupConstantKeywordValueR64(sch *schema.IndexSchema, fieldPath string) any {
+	if sch == nil || sch.RawMapping == nil {
+		return nil
+	}
+	parts := strings.Split(fieldPath, ".")
+	props := sch.RawMapping.Properties
+	for i, p := range parts {
+		fp, exists := props[p]
+		if !exists {
+			return nil
+		}
+		if i == len(parts)-1 {
+			return fp.Value
+		}
+		if len(fp.Properties) > 0 {
+			props = fp.Properties
+		} else {
+			return nil
+		}
+	}
+	return nil
+}
+
+func roleSliceAllowsTermsEnumR64(roleObjs []map[string]any, schemas map[string]*schema.IndexSchema, targetIndices []string, fieldName string) bool {
+	for _, rObj := range roleObjs {
+		if rObj == nil {
+			continue
+		}
+		// Check superuser marker if stored as cluster privilege
+		if clArr, okC := rObj["cluster"].([]any); okC {
+			for _, cp := range clArr {
+				if fmt.Sprintf("%v", cp) == "all" {
+					return true
+				}
+			}
+		}
+	}
+	for _, idxName := range targetIndices {
+		sch := schemas[idxName]
+		idxAllowed := false
+		for _, rObj := range roleObjs {
+			if rObj == nil {
+				continue
+			}
+			var rawEntries []any
+			if arr, ok := rObj["indices"].([]any); ok {
+				rawEntries = append(rawEntries, arr...)
+			}
+			if arr, ok := rObj["index"].([]any); ok {
+				rawEntries = append(rawEntries, arr...)
+			}
+			for _, entAny := range rawEntries {
+				ent, okE := entAny.(map[string]any)
+				if !okE {
+					continue
+				}
+				matchedIdx := false
+				if names, okN := ent["names"].([]any); okN {
+					for _, patAny := range names {
+						if matchWildcardPattern(fmt.Sprintf("%v", patAny), idxName) {
+							matchedIdx = true
+							break
+						}
+					}
+				} else if namesStr, okS := ent["names"].([]string); okS {
+					for _, pat := range namesStr {
+						if matchWildcardPattern(pat, idxName) {
+							matchedIdx = true
+							break
+						}
+					}
+				}
+				if !matchedIdx {
+					continue
+				}
+				// Verify FLS permits fieldName
+				if fs, okFS := ent["field_security"].(map[string]any); okFS && fs != nil {
+					if exArr, okEx := fs["except"].([]any); okEx {
+						excluded := false
+						for _, patAny := range exArr {
+							if matchWildcardPattern(fmt.Sprintf("%v", patAny), fieldName) {
+								excluded = true
+								break
+							}
+						}
+						if excluded {
+							continue
+						}
+					}
+					if grArr, okGr := fs["grant"].([]any); okGr && len(grArr) > 0 {
+						granted := false
+						for _, patAny := range grArr {
+							if matchWildcardPattern(fmt.Sprintf("%v", patAny), fieldName) {
+								granted = true
+								break
+							}
+						}
+						if !granted {
+							continue
+						}
+					}
+				}
+				// Verify DLS does not filter individual documents
+				if qVal, hasQ := ent["query"]; hasQ && qVal != nil {
+					if !isTermsEnumDLSStaticMatchAllR64(qVal, sch) {
+						continue
+					}
+				}
+				idxAllowed = true
+				break
+			}
+			if idxAllowed {
+				break
+			}
+		}
+		if !idxAllowed {
+			return false
+		}
+	}
+	return true
+}
+
+func resolveRolesForSecurityUserR64(username string, users, roles map[string]map[string]any) (isSuper bool, exists bool, roleObjs []map[string]any) {
+	if username == "" || username == "elastic" {
+		return true, true, nil
+	}
+	uObj, ok := users[username]
+	if !ok || uObj == nil {
+		return false, false, nil
+	}
+	exists = true
+	var roleNames []string
+	switch rRaw := uObj["roles"].(type) {
+	case []any:
+		for _, el := range rRaw {
+			roleNames = append(roleNames, fmt.Sprintf("%v", el))
+		}
+	case []string:
+		roleNames = append(roleNames, rRaw...)
+	}
+	for _, rn := range roleNames {
+		if rn == "superuser" {
+			return true, true, nil
+		}
+		if rObj, okR := roles[rn]; okR && rObj != nil {
+			roleObjs = append(roleObjs, rObj)
+		}
+	}
+	return false, exists, roleObjs
+}
+
+// EvaluateTermsEnumSecurityAccessR64 determines whether `authHeader` authorizes unrestricted `terms_enum` on `fieldName` for `targetIndices`.
+func EvaluateTermsEnumSecurityAccessR64(authHeader string, users, roles, apiKeys map[string]map[string]any, schemas map[string]*schema.IndexSchema, targetIndices []string, fieldName string) bool {
+	if len(targetIndices) == 0 || authHeader == "" {
+		return true
+	}
+	parts := strings.SplitN(strings.TrimSpace(authHeader), " ", 2)
+	if len(parts) != 2 {
+		return true
+	}
+	scheme := strings.ToLower(strings.TrimSpace(parts[0]))
+	token := strings.TrimSpace(parts[1])
+	decoded, err := base64.StdEncoding.DecodeString(token)
+	if err != nil {
+		return true
+	}
+	cred := string(decoded)
+	colon := strings.IndexByte(cred, ':')
+	if colon < 0 {
+		return true
+	}
+	principal := cred[:colon]
+
+	switch scheme {
+	case "basic":
+		isSuper, exists, roleObjs := resolveRolesForSecurityUserR64(principal, users, roles)
+		if isSuper || !exists {
+			return true
+		}
+		return roleSliceAllowsTermsEnumR64(roleObjs, schemas, targetIndices, fieldName)
+
+	case "apikey":
+		kObj, exists := apiKeys[principal]
+		if !exists || kObj == nil {
+			return true
+		}
+		if inv, _ := kObj["invalidated"].(bool); inv {
+			return false
+		}
+		owner, _ := kObj["username"].(string)
+		if owner != "" && owner != "elastic" {
+			isSuper, uExists, ownerRoles := resolveRolesForSecurityUserR64(owner, users, roles)
+			if uExists && !isSuper && !roleSliceAllowsTermsEnumR64(ownerRoles, schemas, targetIndices, fieldName) {
+				return false
+			}
+		}
+		rawRD, hasRD := kObj["role_descriptors"]
+		if !hasRD || rawRD == nil {
+			return true
+		}
+		rdMap, okRD := rawRD.(map[string]any)
+		if !okRD || len(rdMap) == 0 {
+			return false
+		}
+		rdRoles := make([]map[string]any, 0, len(rdMap))
+		for _, v := range rdMap {
+			if rm, okRM := v.(map[string]any); okRM {
+				rdRoles = append(rdRoles, rm)
+			}
+		}
+		return roleSliceAllowsTermsEnumR64(rdRoles, schemas, targetIndices, fieldName)
+	}
+	return true
+}
+
+// ES|QL validation and conversion helpers for round56_features.go
+
+func esqlIsCounterTypeR64(t string) bool {
+	return strings.HasPrefix(t, "counter_")
+}
+
+func esqlStripConversionWrappersR64(expr string) string {
+	s := expr
+	for {
+		up := strings.ToUpper(s)
+		changed := false
+		for _, fn := range []string{"TO_IP(", "TO_LONG(", "TO_INTEGER(", "TO_UNSIGNED_LONG(", "TO_DOUBLE(", "TO_BOOLEAN(", "TO_STRING(", "TO_DATETIME(", "TO_VERSION("} {
+			idx := strings.Index(up, fn)
+			if idx < 0 {
+				continue
+			}
+			// Find matching closing parenthesis
+			depth := 1
+			pos := idx + len(fn)
+			inSingle, inBack := false, false
+			for pos < len(s) && depth > 0 {
+				ch := s[pos]
+				if ch == '\'' && !inBack {
+					inSingle = !inSingle
+				} else if ch == '`' && !inSingle {
+					inBack = !inBack
+				} else if !inSingle && !inBack {
+					switch ch {
+					case '(':
+						depth++
+					case ')':
+						depth--
+					}
+				}
+				pos++
+			}
+			if depth == 0 {
+				s = s[:idx] + " __CAST_ARG__ " + s[pos:]
+				changed = true
+				break
+			}
+		}
+		if !changed {
+			break
+		}
+	}
+	return s
+}
+
+func esqlExprHasBareIdentR64(expr, col string) bool {
+	if col == "" || !strings.Contains(expr, col) {
+		return false
+	}
+	isIdentChar := func(b byte) bool {
+		return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') || b == '_' || b == '.'
+	}
+	inSingle := false
+	for i := 0; i <= len(expr)-len(col); i++ {
+		if expr[i] == '\'' {
+			inSingle = !inSingle
+			continue
+		}
+		if inSingle {
+			continue
+		}
+		if strings.HasPrefix(expr[i:], col) {
+			leftOK := i == 0 || !isIdentChar(expr[i-1])
+			rightPos := i + len(col)
+			rightOK := rightPos == len(expr) || !isIdentChar(expr[rightPos])
+			if leftOK && rightOK {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func esqlFindBareCounterColumnR64(expr string, colTypes map[string]string) string {
+	stripped := esqlStripConversionWrappersR64(expr)
+	cols := make([]string, 0, len(colTypes))
+	for c, t := range colTypes {
+		if esqlIsCounterTypeR64(t) {
+			cols = append(cols, c)
+		}
+	}
+	sort.Strings(cols)
+	for _, c := range cols {
+		if esqlExprHasBareIdentR64(stripped, c) {
+			return fmt.Sprintf("Cannot use counter column [%s] directly; cast to scalar with [%s::long] or [%s::double]", c, c, c)
+		}
+	}
+	return ""
+}
+
+func esqlCheckAmbiguousExprR64(expr string, sum esqlIndexFieldSummaryRound63) string {
+	if len(sum.ambiguousError) == 0 {
+		return ""
+	}
+	up := strings.ToUpper(expr)
+	ambCols := make([]string, 0, len(sum.ambiguousError))
+	for c := range sum.ambiguousError {
+		ambCols = append(ambCols, c)
+	}
+	sort.Strings(ambCols)
+
+	// 1. Validate TO_*(ambCol) compatibility against underlying concrete types
+	for _, ambCol := range ambCols {
+		typesList := sum.ambiguousTypes[ambCol]
+		if !strings.Contains(expr, ambCol) {
+			continue
+		}
+		isTypeCompatible := func(fnName string) bool {
+			if len(typesList) == 0 {
+				return true
+			}
+			for _, tn := range typesList {
+				switch fnName {
+				case "TO_IP":
+					if tn != "ip" && tn != "keyword" && tn != "version" && tn != "text" {
+						return false
+					}
+				case "TO_LONG", "TO_INTEGER", "TO_UNSIGNED_LONG", "TO_DOUBLE":
+					switch tn {
+					case "integer", "long", "unsigned_long", "double", "boolean", "keyword", "text",
+						"counter_integer", "counter_long", "counter_double", "counter_unsigned_long":
+					default:
+						return false
+					}
+				case "TO_BOOLEAN", "TO_DATETIME", "TO_VERSION":
+					if tn == "unsupported" || tn == "geo_point" || tn == "cartesian_point" || tn == "geo_shape" || tn == "cartesian_shape" {
+						return false
+					}
+				case "TO_STRING":
+					if tn == "unsupported" || tn == "geo_point" || tn == "cartesian_point" || tn == "geo_shape" || tn == "cartesian_shape" {
+						return false
+					}
+				}
+			}
+			return true
+		}
+		for _, fn := range []string{"TO_IP", "TO_LONG", "TO_INTEGER", "TO_UNSIGNED_LONG", "TO_DOUBLE", "TO_BOOLEAN", "TO_DATETIME", "TO_VERSION", "TO_STRING"} {
+			if strings.Contains(up, fn+"(") && !isTypeCompatible(fn) {
+				return sum.ambiguousError[ambCol]
+			}
+		}
+	}
+
+	// 2. Reject bare un-cast ambiguous column references
+	stripped := esqlStripConversionWrappersR64(expr)
+	for _, ambCol := range ambCols {
+		if esqlExprHasBareIdentR64(stripped, ambCol) {
+			return sum.ambiguousError[ambCol]
+		}
+	}
+	return ""
+}
+
+func esqlRowWithRawAmbiguousForExprR64(expr string, row map[string]any, ambErrs map[string]string) map[string]any {
+	if row == nil || len(ambErrs) == 0 || !strings.Contains(strings.ToUpper(expr), "TO_") {
+		return row
+	}
+	var cloned map[string]any
+	for ambCol := range ambErrs {
+		if !strings.Contains(expr, ambCol) {
+			continue
+		}
+		if rawAmb, hasRaw := row["__raw_"+ambCol]; hasRaw {
+			if cloned == nil {
+				cloned = make(map[string]any, len(row))
+				for rk, rv := range row {
+					cloned[rk] = rv
+				}
+			}
+			cloned[ambCol] = rawAmb
+		}
+	}
+	if cloned != nil {
+		return cloned
+	}
+	return row
+}
+
+func esqlStaticSumTypeR64(argExpr string, colTypes map[string]string) string {
+	argT := inferESQLExprStaticTypeRound63(argExpr, colTypes)
+	switch argT {
+	case "integer", "long", "counter_integer", "counter_long":
+		return "long"
+	case "unsigned_long", "counter_unsigned_long":
+		return "unsigned_long"
+	case "double", "counter_double":
+		return "double"
+	default:
+		return "double"
+	}
+}
+
+func expandESQLGroupTuplesR64(row map[string]any, gExprs []string, ambErrs map[string]string) [][]any {
+	const maxGroupTuplesPerRow = 1024
+	perCol := make([][]any, len(gExprs))
+	for gi, expr := range gExprs {
+		evalRow := esqlRowWithRawAmbiguousForExprR64(expr, row, ambErrs)
+		gv := evalESQLExpr(expr, evalRow)
+		switch sv := gv.(type) {
+		case []any:
+			if len(sv) == 0 {
+				perCol[gi] = []any{nil}
+			} else {
+				perCol[gi] = sv
+			}
+		case []string:
+			if len(sv) == 0 {
+				perCol[gi] = []any{nil}
+			} else {
+				arr := make([]any, len(sv))
+				for i, s := range sv {
+					arr[i] = s
+				}
+				perCol[gi] = arr
+			}
+		default:
+			perCol[gi] = []any{gv}
+		}
+	}
+	tuples := [][]any{make([]any, len(gExprs))}
+	for gi, vals := range perCol {
+		next := make([][]any, 0, len(tuples)*len(vals))
+		for _, prefix := range tuples {
+			for _, v := range vals {
+				if len(next) >= maxGroupTuplesPerRow {
+					return next
+				}
+				rowTuple := make([]any, len(gExprs))
+				copy(rowTuple, prefix)
+				rowTuple[gi] = v
+				next = append(next, rowTuple)
+			}
+		}
+		tuples = next
+	}
+	return tuples
 }

@@ -5044,6 +5044,9 @@ func collectQueryFieldRefsR62Search(q *esast.Query, rtCandidates map[string]bool
 			}
 		}
 	}
+	if q.GeoGrid != nil {
+		addField(q.GeoGrid.Field)
+	}
 	if q.GeoBoundingBox != nil {
 		addField(q.GeoBoundingBox.Field)
 	}
@@ -5174,6 +5177,10 @@ func collectAggFieldRefsR62Search(aggs map[string]esast.AggSpec, rtCandidates ma
 			addField(t.Field)
 			addScript(t.Script)
 		}
+		if spec.CountedTerms != nil {
+			addField(spec.CountedTerms.Field)
+			addScript(spec.CountedTerms.Script)
+		}
 		if spec.RareTerms != nil {
 			addField(spec.RareTerms.Field)
 		}
@@ -5279,6 +5286,18 @@ func collectAggFieldRefsR62Search(aggs map[string]esast.AggSpec, rtCandidates ma
 		if spec.GeoCentroid != nil {
 			addField(spec.GeoCentroid.Field)
 		}
+		if spec.CartesianBounds != nil {
+			addField(spec.CartesianBounds.Field)
+		}
+		if spec.CartesianCentroid != nil {
+			addField(spec.CartesianCentroid.Field)
+		}
+		if spec.GeoLine != nil {
+			addField(spec.GeoLine.Point.Field)
+			if spec.GeoLine.Sort != nil {
+				addField(spec.GeoLine.Sort.Field)
+			}
+		}
 		if spec.GeoDistance != nil {
 			addField(spec.GeoDistance.Field)
 		}
@@ -5287,6 +5306,9 @@ func collectAggFieldRefsR62Search(aggs map[string]esast.AggSpec, rtCandidates ma
 		}
 		if spec.GeotileGrid != nil {
 			addField(spec.GeotileGrid.Field)
+		}
+		if spec.GeoHexGrid != nil {
+			addField(spec.GeoHexGrid.Field)
 		}
 		if spec.MatrixStats != nil {
 			for _, f := range spec.MatrixStats.Fields {
@@ -5642,11 +5664,16 @@ func evalRuntimeMappingsOrderedOnDocWithOutR62Search(
 					elemEvalDoc := PrepareDocForRuntimeScriptRound61(nestedSchema, elemDoc, isES8)
 					var rawNestedVals []any
 					if prop.Script == nil {
-						if esType == "geo_point" || esType == "point" {
+						switch esType {
+						case "geo_point", "point":
 							for _, pt := range extractGeoPointsAtPathR62Search(cand.obj, strings.Split(relSubField, ".")) {
 								rawNestedVals = append(rawNestedVals, map[string]any{"lat": pt[1], "lon": pt[0]})
 							}
-						} else {
+						case "geo_shape", "shape":
+							if sv, ok := lookupNestedMapPathR61Search(cand.obj, strings.Split(relSubField, ".")); ok && sv != nil {
+								rawNestedVals = flattenAnyToSliceR61Search(sv)
+							}
+						default:
 							rawNestedVals = collectScalarValuesAtPath(cand.obj, strings.Split(relSubField, "."))
 							if len(rawNestedVals) == 0 {
 								if sv, ok := cand.obj[relSubField]; ok && sv != nil {
@@ -5673,7 +5700,7 @@ func evalRuntimeMappingsOrderedOnDocWithOutR62Search(
 							p["_fields"] = fieldsParam
 						}
 						elemFT, _ := elemEvalDoc["__field_types"].(map[string]string)
-						if emitCtx, okCtx := runtimeFieldTypeToEmitContextRound60(esType); okCtx && strings.Contains(scriptSrc, "emit(") {
+						if emitCtx, okCtx := runtimeFieldTypeToEmitContextR64(esType); okCtx && strings.Contains(scriptSrc, "emit(") {
 							emitted, errEmit := painless.EvalEmitContext(scriptSrc, emitCtx, elemEvalDoc, cand.obj, p, elemFT)
 							if errEmit != nil {
 								if onErrContinue {
@@ -5782,7 +5809,8 @@ func evalRuntimeMappingsOrderedOnDocWithOutR62Search(
 		var activeScriptSrc string
 		if prop.Script == nil {
 			if doc != nil {
-				if esType == "geo_point" || esType == "point" {
+				switch esType {
+				case "geo_point", "point":
 					var pts [][2]float64
 					if v, ok := doc[fName]; ok && v != nil {
 						pts = extractGeoPointsFromRawNodeR61Search(v)
@@ -5793,7 +5821,13 @@ func evalRuntimeMappingsOrderedOnDocWithOutR62Search(
 					for _, pt := range pts {
 						rawVals = append(rawVals, map[string]any{"lat": pt[1], "lon": pt[0]})
 					}
-				} else {
+				case "geo_shape", "shape":
+					if v, ok := doc[fName]; ok && v != nil {
+						rawVals = flattenAnyToSliceR61Search(v)
+					} else if v, ok := lookupNestedMapPathR61Search(doc, strings.Split(fName, ".")); ok && v != nil {
+						rawVals = flattenAnyToSliceR61Search(v)
+					}
+				default:
 					if v, ok := doc[fName]; ok && v != nil {
 						rawVals = flattenAnyToSliceR61Search(v)
 					}
@@ -5825,7 +5859,7 @@ func evalRuntimeMappingsOrderedOnDocWithOutR62Search(
 				p["_fields"] = fieldsParam
 			}
 
-			if emitCtx, okCtx := runtimeFieldTypeToEmitContextRound60(prop.Type); okCtx && strings.Contains(scriptSrc, "emit(") {
+			if emitCtx, okCtx := runtimeFieldTypeToEmitContextR64(prop.Type); okCtx && strings.Contains(scriptSrc, "emit(") {
 				emitted, errEmit := painless.EvalEmitContext(scriptSrc, emitCtx, evalDoc, srcForScript, p, ftMap)
 				if errEmit != nil {
 					if onErrContinue {
@@ -6317,10 +6351,14 @@ func buildSearchHitExplanationR62Search(
 		}
 	}
 
-	primaryExp := buildForQuery(req.Query, h.Score)
+	primaryScore := h.Score
+	if h.HasPreRescoreScore {
+		primaryScore = h.PreRescoreScore
+	}
+	primaryExp := buildForQuery(req.Query, primaryScore)
 	if len(req.Rescore) > 0 {
 		curExp := primaryExp
-		for _, rs := range req.Rescore {
+		for rIdx, rs := range req.Rescore {
 			if rs.Query == nil || rs.Query.RescoreQuery == nil {
 				continue
 			}
@@ -6336,30 +6374,47 @@ func buildSearchHitExplanationR62Search(
 			if mode == "" {
 				mode = "total"
 			}
-			rScore, matched := (*Server)(nil).evalHitRescoreQuery(h, rs.Query.RescoreQuery, idxSchema)
+			primaryWeightedVal := toFloatOrDefaultR62Search(curExp["value"], primaryScore) * qWeight
 			primaryWeighted := map[string]any{
-				"value":       toFloatOrDefaultR62Search(curExp["value"], h.Score) * qWeight,
+				"value":       primaryWeightedVal,
 				"description": "primaryWeight, product of:",
 				"details": []map[string]any{
 					curExp,
 					{"value": qWeight, "description": "queryWeight", "details": []map[string]any{}},
 				},
 			}
+			if h.HasPreRescoreScore && rIdx < len(h.RescoreWindowFlags) && !h.RescoreWindowFlags[rIdx] {
+				curExp = primaryWeighted
+				continue
+			}
+			rScore, matched := (*Server)(nil).evalHitRescoreQuery(h, rs.Query.RescoreQuery, idxSchema)
 			if !matched {
 				curExp = primaryWeighted
 				continue
 			}
+			weightedRescoreVal := rScore * rWeight
 			rescoreSubExp := buildForQuery(rs.Query.RescoreQuery, rScore)
 			secondaryWeighted := map[string]any{
-				"value":       rScore * rWeight,
+				"value":       weightedRescoreVal,
 				"description": "rescoreWeight, product of:",
 				"details": []map[string]any{
 					rescoreSubExp,
 					{"value": rWeight, "description": "rescoreQueryWeight", "details": []map[string]any{}},
 				},
 			}
+			combinedVal := primaryWeightedVal + weightedRescoreVal
+			switch mode {
+			case "multiply":
+				combinedVal = primaryWeightedVal * weightedRescoreVal
+			case "avg":
+				combinedVal = (primaryWeightedVal + weightedRescoreVal) / 2.0
+			case "max":
+				combinedVal = math.Max(primaryWeightedVal, weightedRescoreVal)
+			case "min":
+				combinedVal = math.Min(primaryWeightedVal, weightedRescoreVal)
+			}
 			curExp = map[string]any{
-				"value":       h.Score,
+				"value":       combinedVal,
 				"description": fmt.Sprintf("rescore(%s), result of:", mode),
 				"details":     []map[string]any{primaryWeighted, secondaryWeighted},
 			}
@@ -6460,6 +6515,12 @@ func (s *Server) effectiveTranspileOptsForIndexR62Search(
 	opts.AnalysisOpts = anOpts
 	opts.StrictTextTermRouting = s.hasExplicitTargetESVersion()
 	opts.DynamicTextFields = s.dynamicTextFieldsCopyWave3R63(resolvedIdx)
+	if mb, ok := s.backend.(*MemoryBackend); ok && idxSchema != nil && idxSchema.DorisTable != "" {
+		tbl := idxSchema.DorisTable
+		opts.TermDocFreqFn = func(colExpr string, terms []string, caseSensitive bool) (int, map[string]int) {
+			return mb.QueryTermDocFreqs(tbl, colExpr, terms, caseSensitive)
+		}
+	}
 	return opts
 }
 
@@ -6849,7 +6910,9 @@ func buildTimeSeriesAggObjectR62Search(
 		keyedMap := make(map[string]any, len(buckets))
 		for i, bMap := range buckets {
 			tk := fmt.Sprintf("ts_%d", i)
-			if i < len(tsidForIdx) && tsidForIdx[i] != "" {
+			if bKeyMap, okM := bMap["key"].(map[string]any); okM && len(bKeyMap) > 0 {
+				tk = formatTimeSeriesJavaKeyR64(bKeyMap)
+			} else if i < len(tsidForIdx) && tsidForIdx[i] != "" {
 				tk = tsidForIdx[i]
 			}
 			keyedMap[tk] = bMap
@@ -7934,12 +7997,22 @@ func emitRuntimeSignificantTextAggRowsR62Search(
 	}
 
 	filterDup := stSpec.FilterDuplicateText != nil && *stSpec.FilterDuplicateText
+	rawFgDocFreq := make(map[string]int64)
 	fgDeduplicated := make([]runtimeMatchedDoc, 0, len(fgDocs))
 	fgTokensByDoc := make([][]string, 0, len(fgDocs))
 	seenTextHash := make(map[string]bool)
 	seenShingle6 := make(map[string]bool)
 	for _, md := range fgDocs {
 		toks, rawJoined := extractDocTokens(md)
+		if filterDup {
+			seenRaw := make(map[string]bool, len(toks))
+			for _, tk := range toks {
+				if !seenRaw[tk] {
+					seenRaw[tk] = true
+					rawFgDocFreq[tk]++
+				}
+			}
+		}
 		if filterDup && rawJoined != "" {
 			normTxt := strings.TrimSpace(rawJoined)
 			if seenTextHash[normTxt] {
@@ -8016,7 +8089,14 @@ func emitRuntimeSignificantTextAggRowsR62Search(
 	var cands []sigCand
 	for term, tDocs := range fgDocsByTerm {
 		fgCnt := int64(len(tDocs))
-		if fgCnt < minCnt {
+		effFgCnt := fgCnt
+		if filterDup && stSpec.MinDocCount == nil {
+			if fgCnt < 2 {
+				continue
+			}
+			effFgCnt = rawFgDocFreq[term]
+		}
+		if effFgCnt < minCnt {
 			continue
 		}
 		if stSpec.Include != nil && !matchesTermsFilterPrecompiledWithSchemaR62Search(term, stSpec.Include, incRe, "keyword") {

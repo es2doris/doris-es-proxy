@@ -126,12 +126,21 @@ func formatJavaFloatingPainless(f float64, bits int) string {
 	if bits == 32 {
 		return FormatJavaFloat32(float32(f))
 	}
-	return strconv.FormatFloat(f, 'f', -1, 64)
+	return FormatJavaFloat64(f)
 }
 
 // formatValueForStringPainless formats any Painless value for String.valueOf,
-// Objects.toString, .toString(), and string '+' concatenation.
+// Objects.toString, and .toString().
 func formatValueForStringPainless(v any) string {
+	return FormatValueSafe(v)
+}
+
+// formatValueForStringConcatPainless formats values for Painless '+' string concatenation
+// while preserving legacy finite Go '%v' float64 formatting compatibility.
+func formatValueForStringConcatPainless(v any) string {
+	if f, ok := v.(float64); ok && !math.IsNaN(f) && !math.IsInf(f, 0) {
+		return fmt.Sprintf("%v", f)
+	}
 	return FormatValueSafe(v)
 }
 

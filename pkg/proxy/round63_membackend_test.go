@@ -63,12 +63,24 @@ func TestRound63_F10_MemBackendStrictCastJSONTypeAndConv(t *testing.T) {
 		t.Fatalf("expected CAST(CONV(...) AS BIGINT) & mask = 0xFE800000, got ok=%v val=%v", ok, masked)
 	}
 
-	// 2. `JSON_TYPE(json_extract(_source, ...))` distinguishes `'STRING'` (`"[WARN] retry [1]"`) from `'ARRAY'` (`["x","y"]`).
-	if jtMsg := resolveColumnValue(row, `JSON_TYPE(json_extract(`+"`_source`"+`, '$."msg"'))`); jtMsg != "STRING" {
-		t.Fatalf("expected JSON_TYPE msg = STRING, got %v", jtMsg)
+	// 2. `JSON_TYPE(doc, path)` enforces strict Doris 4.1.3 2-arg signature and distinguishes `'STRING'` from `'ARRAY'`.
+	if err := checkStrictNereidsSQLTypesR63Mem(`SELECT ` + "`_id`" + ` FROM ` + "`doris_es`.`idx_r63`" + ` WHERE JSON_TYPE(json_extract(` + "`_source`" + `, '$."msg"')) = 'STRING'`); err == nil {
+		t.Fatalf("expected checkStrictNereidsSQLTypesR63Mem to reject 1-argument JSON_TYPE")
 	}
-	if jtTags := resolveColumnValue(row, `JSON_TYPE(json_extract(`+"`_source`"+`, '$."tags"'))`); jtTags != "ARRAY" {
-		t.Fatalf("expected JSON_TYPE tags = ARRAY, got %v", jtTags)
+	if jtOne := resolveColumnValue(row, `JSON_TYPE(json_extract(`+"`_source`"+`, '$."msg"'))`); jtOne != nil {
+		t.Fatalf("expected 1-argument JSON_TYPE to return nil, got %v", jtOne)
+	}
+	if jtMsg := resolveColumnValue(row, `JSON_TYPE(TRY_CAST(`+"`_source`"+` AS JSON), '$."msg"')`); jtMsg != "STRING" {
+		t.Fatalf("expected 2-arg JSON_TYPE msg = STRING, got %v", jtMsg)
+	}
+	if jtTags := resolveColumnValue(row, `JSON_TYPE(TRY_CAST(`+"`_source`"+` AS JSON), '$."tags"')`); jtTags != "ARRAY" {
+		t.Fatalf("expected 2-arg JSON_TYPE tags = ARRAY, got %v", jtTags)
+	}
+	if jtRawArr := resolveColumnValue(row, `JSON_TYPE(TRY_CAST('[1.5, 2.5]' AS JSON), '$')`); jtRawArr != "ARRAY" {
+		t.Fatalf("expected 2-arg JSON_TYPE root ARRAY literal = ARRAY, got %v", jtRawArr)
+	}
+	if jtBadJSON := resolveColumnValue(row, `JSON_TYPE(TRY_CAST('37.7,-122.4' AS JSON), '$')`); jtBadJSON != nil {
+		t.Fatalf("expected 2-arg JSON_TYPE on non-JSON string via TRY_CAST AS JSON to return nil, got %v", jtBadJSON)
 	}
 
 	// 3. `TRY_CAST` + `DATETIMEV2(6)` + `MICROSECOND` preserves fractional ms (`1700000000123`).

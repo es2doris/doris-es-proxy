@@ -157,6 +157,7 @@ func (t *Transpiler) compileQueryStringWithMode(qsq *esast.QueryStringQuery, sco
 	flags.quoteAnalyzer = strings.TrimSpace(qsq.QuoteAnalyzer)
 	flags.zeroTermsQuery = strings.TrimSpace(qsq.ZeroTermsQuery)
 	flags.lenient = qsq.Lenient
+	flags.autoGenerateSynonymsPhraseQuery = qsq.AutoGenerateSynonymsPhraseQuery
 	flags.checkRegexLen = func(pat string) {
 		t.checkRegexLengthLimit(pat)
 	}
@@ -229,12 +230,17 @@ func (t *Transpiler) compileQueryStringWithMode(qsq *esast.QueryStringQuery, sco
 	if qsq.Lenient != nil && *qsq.Lenient {
 		t.inLenientQuery = true
 	}
+	prevAutoGenSyn := t.autoGenSynPhraseQuery
+	if qsq.AutoGenerateSynonymsPhraseQuery != nil {
+		t.autoGenSynPhraseQuery = qsq.AutoGenerateSynonymsPhraseQuery
+	}
 	compiled := t.CompileQuery(&parsedAST, scoring, nctx)
+	t.autoGenSynPhraseQuery = prevAutoGenSyn
 	t.inLenientQuery = prevLenient
 	if scoring && qsq.Boost != nil && *qsq.Boost != 1.0 && compiled.ScoreSQL != "" && compiled.ScoreSQL != "0.0" {
 		compiled.ScoreSQL = fmt.Sprintf("((%s) * %.4f)", compiled.ScoreSQL, *qsq.Boost)
 	}
-	if !isSimple && flags.whitespace && (flags.queryType == "" || flags.queryType == "best_fields" || flags.queryType == "most_fields") && flags.quoteFieldSuffix == "" && flags.timeZone == "" && flags.phraseSlop == 0 && flags.fuzziness == nil && flags.fuzzyPrefixLength == 0 && flags.fuzzyMaxExpansions == 0 && flags.analyzer == "" && flags.quoteAnalyzer == "" && flags.zeroTermsQuery == "" && flags.escape && (flags.lenient == nil || !*flags.lenient) && compiled.WhereSQL != "FALSE" {
+	if !isSimple && flags.whitespace && (flags.queryType == "" || flags.queryType == "best_fields" || flags.queryType == "most_fields") && flags.quoteFieldSuffix == "" && flags.timeZone == "" && flags.phraseSlop == 0 && flags.fuzziness == nil && flags.fuzzyPrefixLength == 0 && flags.fuzzyMaxExpansions == 0 && flags.analyzer == "" && flags.quoteAnalyzer == "" && flags.zeroTermsQuery == "" && flags.escape && (flags.lenient == nil || !*flags.lenient) && flags.autoGenerateSynonymsPhraseQuery == nil && compiled.WhereSQL != "FALSE" {
 		if rewrittenRaw, ok := t.rewriteDoris4SearchQuery(raw); ok && t.Opts.UseDoris4SearchFunc && nctx == nil && qsq.MinimumShouldMatch == nil && defaultField != "__unmatched_wildcard__" && !strings.ContainsAny(raw, "[{><~/^\\") && !strings.Contains(compiled.WhereSQL, "`_doc`[") && !strings.Contains(compiled.WhereSQL, "array_exists(") && !strings.Contains(compiled.EffectiveSafeWhere(), "array_exists(") && !strings.Contains(compiled.WhereSQL, "array_contains(") && !strings.Contains(compiled.WhereSQL, " LIKE ") && !strings.Contains(compiled.WhereSQL, " REGEXP ") && !strings.Contains(compiled.WhereSQL, "`n__") && !strings.Contains(compiled.WhereSQL, " IS NOT NULL") && !strings.Contains(compiled.WhereSQL, "array_size(") {
 			if len(expandedFields) > 1 {
 				if canEmitMultiFieldDoris4SearchDisjunction(rewrittenRaw, defaultOp) {
@@ -489,34 +495,35 @@ func (t *Transpiler) isDoris4SearchableField(fname string) bool {
 const maxLuceneDepth = esast.MaxQueryStringDepth
 
 type simpleQueryFlags struct {
-	and                  bool
-	or                   bool
-	not                  bool
-	phrase               bool
-	prefix               bool
-	precedence           bool
-	fuzzy                bool
-	slop                 bool
-	escape               bool
-	whitespace           bool
-	quoteFieldSuffix     string
-	timeZone             string
-	queryType            string
-	tieBreaker           *float64
-	phraseSlop           int
-	fuzziness            any
-	fuzzyPrefixLength    int
-	fuzzyMaxExpansions   int
-	fuzzyTranspositions  *bool
-	allowLeadingWildcard *bool
-	analyzer             string
-	quoteAnalyzer        string
-	zeroTermsQuery       string
-	lenient              *bool
-	expandFields         func(string) []string
-	isTextField          func(string) bool
-	isWhitespaceField    func(string) bool
-	checkRegexLen        func(string)
+	and                             bool
+	or                              bool
+	not                             bool
+	phrase                          bool
+	prefix                          bool
+	precedence                      bool
+	fuzzy                           bool
+	slop                            bool
+	escape                          bool
+	whitespace                      bool
+	quoteFieldSuffix                string
+	timeZone                        string
+	queryType                       string
+	tieBreaker                      *float64
+	phraseSlop                      int
+	fuzziness                       any
+	fuzzyPrefixLength               int
+	fuzzyMaxExpansions              int
+	fuzzyTranspositions             *bool
+	allowLeadingWildcard            *bool
+	analyzer                        string
+	quoteAnalyzer                   string
+	zeroTermsQuery                  string
+	lenient                         *bool
+	autoGenerateSynonymsPhraseQuery *bool
+	expandFields                    func(string) []string
+	isTextField                     func(string) bool
+	isWhitespaceField               func(string) bool
+	checkRegexLen                   func(string)
 }
 
 func allSimpleQueryFlags() simpleQueryFlags {

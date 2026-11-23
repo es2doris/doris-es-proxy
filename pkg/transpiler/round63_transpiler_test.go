@@ -96,11 +96,12 @@ func TestRound63_F10_QuoteDorisJSONPathAndTSIDOrder(t *testing.T) {
 	}
 
 	arrPlain := sqlRuntimeSourceJSONTypeIsArrayExpr("tags")
-	if !strings.Contains(arrPlain, "JSON_TYPE(json_extract(`_source`") {
+	if !strings.Contains(arrPlain, "JSON_TYPE(TRY_CAST(`_source` AS JSON),") {
 		t.Fatalf("unexpected arrPlain: %s", arrPlain)
 	}
 	arrDot := sqlRuntimeSourceJSONTypeIsArrayExpr("meta.tags")
-	if !strings.Contains(arrDot, "COALESCE(json_extract") {
+	if !strings.Contains(arrDot, `JSON_TYPE(TRY_CAST(`+"`_source`"+` AS JSON), '$."meta"."tags"')`) ||
+		!strings.Contains(arrDot, `JSON_TYPE(TRY_CAST(`+"`_source`"+` AS JSON), '$."meta.tags"')`) {
 		t.Fatalf("unexpected arrDot: %s", arrDot)
 	}
 	msExpr := sqlRuntimeSourceDateMillisExpr("`s`")
@@ -528,7 +529,7 @@ func TestRound63_F13_VectorSearchNestedQuantizedAndSparse(t *testing.T) {
 
 	// Dynamic fallback when `ES8Compat: false`.
 	dynPlan := mustSearchPlanR63(t, trDyn, `{"knn":{"field":"dyn_vec","query_vector":[1,2,3],"k":2,"num_candidates":4}}`)
-	if !strings.Contains(dynPlan.HitsSQL, "COALESCE(CAST(`_doc`['dyn_vec'] AS ARRAY<FLOAT>)") {
+	if !strings.Contains(dynPlan.HitsSQL, "COALESCE(TRY_CAST(`_doc`['dyn_vec'] AS ARRAY<FLOAT>)") {
 		t.Fatalf("expected dynamic vector _doc + _source fallback, got:\n%s", dynPlan.HitsSQL)
 	}
 

@@ -468,7 +468,7 @@ func TestRound62_F7_SyntheticSourceSubobjectsFalseAndLogsDB(t *testing.T) {
 	}
 	traceMap, _ := spansMap["trace"].(map[string]any)
 	spanMap, _ := spansMap["span"].(map[string]any)
-	if !reflect.DeepEqual(traceMap["id"], []any{"a", "b"}) || !reflect.DeepEqual(spanMap["id"], []any{"1", "1"}) {
+	if !reflect.DeepEqual(traceMap["id"], []any{"a", "b"}) || spanMap["id"] != "1" {
 		t.Fatalf("unexpected flattened spans: %#v", spansMap)
 	}
 	presSlice, ok := gotSynth["preserved_objs"].([]any)

@@ -659,9 +659,9 @@ var (
 	reAggMetric                 = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, '(_metric|_stats_[a-z_]+)' AS `_bucket_key`, CAST\\(COALESCE\\((AVG|SUM|MIN|MAX|COUNT|STDDEV_POP)\\((.+?)\\), 0\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched`(?: WHERE (.+))?$")
 	reAggPercentile             = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, '([^']+)' AS `_bucket_key`, CAST\\(COALESCE\\(PERCENTILE_APPROX\\((.+?), ([0-9.]+)\\), 0\\) AS DOUBLE\\) AS `_doc_count` FROM (`base_matched`(?: LATERAL VIEW EXPLODE\\(.+?\\) `_(?:nt|t)` AS `_(?:nel|elem)`)?)(?: WHERE (.+))?$")
 	reAggPercentileRank         = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, '([^']+)' AS `_bucket_key`, CAST\\(COALESCE\\(AVG\\(CASE WHEN (.+?) <= ([0-9.eE+-]+) THEN 100\\.0 ELSE 0\\.0 END\\), 0\\) AS DOUBLE\\) AS `_doc_count` FROM (`base_matched`(?: LATERAL VIEW EXPLODE\\(.+?\\) `_(?:nt|t)` AS `_(?:nel|elem)`)?)(?: WHERE (.+))?$")
-	reAggDateHist               = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, CAST\\(CAST\\(FLOOR\\((?:\\((.+?) \\+ (-?\\d+)\\)|(.+?)) / (\\d+)\\) \\* \\d+(?: - -?\\d+)? AS BIGINT\\) AS STRING\\) AS `_bucket_key`, CAST\\((?:COUNT\\(\\*\\)|COUNT\\(DISTINCT `_id`\\)) AS DOUBLE\\) AS `_doc_count` FROM (`base_matched`(?: LATERAL VIEW EXPLODE\\((?:CASE WHEN .+ END|`[^`]+`)\\) `_(?:t|ht|rng_t)` AS `_(?:elem|helem|bidx|off)`)?) WHERE (?:(?:\\((.+)\\) AND )?(?:`[^`]+`|CAST\\([^)]+\\)|`_doc`\\[[^\\]]+\\]) IS NOT NULL|(.+?)) GROUP BY `_bucket_key` ORDER BY CAST\\(`_bucket_key` AS BIGINT\\) ASC")
+	reAggDateHist               = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, CAST\\(CAST\\(FLOOR\\((?:\\((.+?) \\+ (-?\\d+)\\)|(.+?)) / (\\d+)\\) \\* \\d+(?: - -?\\d+)? AS BIGINT\\) AS STRING\\) AS `_bucket_key`, CAST\\((?:COUNT\\(\\*\\)|COUNT\\(DISTINCT `_id`\\)) AS DOUBLE\\) AS `_doc_count` FROM (`base_matched`(?: LATERAL VIEW EXPLODE\\((?:CASE WHEN .+ END|`[^`]+`)\\) `_(?:t|ht|rng_t)` AS `_(?:elem|helem|bidx|off)`)?) WHERE (?:(?:\\((.+)\\) AND )?(?:`[^`]+`|(?:TRY_CAST|CAST)\\([^)]+\\)|`_doc`\\[[^\\]]+\\]) IS NOT NULL|(.+?)) GROUP BY `_bucket_key` ORDER BY CAST\\(`_bucket_key` AS BIGINT\\) ASC")
 	reAggDateHistGeneric        = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, (.+?) AS `_bucket_key`, CAST\\((?:COUNT\\(\\*\\)|COUNT\\(DISTINCT `_id`\\)) AS DOUBLE\\) AS `_doc_count` FROM (.+?) WHERE (.+?) GROUP BY `_bucket_key` ORDER BY CAST\\(`_bucket_key` AS BIGINT\\) ASC")
-	reAggHist                   = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, CAST\\(FLOOR\\(\\((.+?) - ([^)]+)\\) / ([^)]+)\\) \\* [^)]+ \\+ [^)]+ AS STRING\\) AS `_bucket_key`, CAST\\((?:COUNT\\(\\*\\)|COUNT\\(DISTINCT `_id`\\)|COALESCE\\(SUM\\((.+?)\\), 0\\)) AS DOUBLE\\) AS `_doc_count` FROM (`base_matched`(?: LATERAL VIEW EXPLODE\\(.+?\\) `_(?:t|ht|rng_t)` AS `_(?:elem|helem|bidx|off)`)?) WHERE (?:(?:\\((.+)\\) AND )?(?:`[^`]+`|CAST\\([^)]+\\)|`_doc`\\[[^\\]]+\\]) IS NOT NULL|(.+?)) GROUP BY `_bucket_key` ORDER BY CAST\\(`_bucket_key` AS DOUBLE\\) ASC")
+	reAggHist                   = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, CAST\\(FLOOR\\(\\((.+?) - ([^)]+)\\) / ([^)]+)\\) \\* [^)]+ \\+ [^)]+ AS STRING\\) AS `_bucket_key`, CAST\\((?:COUNT\\(\\*\\)|COUNT\\(DISTINCT `_id`\\)|COALESCE\\(SUM\\((.+?)\\), 0\\)) AS DOUBLE\\) AS `_doc_count` FROM (`base_matched`(?: LATERAL VIEW EXPLODE\\(.+?\\) `_(?:t|ht|rng_t)` AS `_(?:elem|helem|bidx|off)`)?) WHERE (?:(?:\\((.+)\\) AND )?(?:`[^`]+`|(?:TRY_CAST|CAST)\\([^)]+\\)|`_doc`\\[[^\\]]+\\]) IS NOT NULL|(.+?)) GROUP BY `_bucket_key` ORDER BY CAST\\(`_bucket_key` AS DOUBLE\\) ASC")
 	reAggRawValues              = regexp.MustCompile(`^SELECT '(__raw_vals__(?:''|[^'])*)' AS ` + "`_agg_name`, CONCAT\\('_vals:', (?:IF\\(COUNT\\(.+?\\) <= 50000, )?COALESCE\\(ARRAY_JOIN\\(COLLECT_LIST\\(CAST\\((.+?) AS DOUBLE\\)\\), ','\\), ''\\)(?:, ':OVERFLOW:'\\))?\\) AS `_bucket_key`, CAST\\(COUNT\\(.+?\\) AS DOUBLE\\) AS `_doc_count` FROM (.+)$")
 	reAggSubRawValues           = regexp.MustCompile(`^SELECT '(__raw_vals__(?:''|[^'])*)' AS ` + "`_agg_name`, CONCAT\\(CAST\\((.+?) AS STRING\\), '\\\\x1f(?:', '_vals:|_vals:)', (?:IF\\(COUNT\\(.+?\\) <= 50000, )?COALESCE\\(ARRAY_JOIN\\(COLLECT_LIST\\(CAST\\((.+?) AS DOUBLE\\)\\), ','\\), ''\\)(?:, ':OVERFLOW:'\\))?\\) AS `_bucket_key`, CAST\\(COUNT\\(.+?\\) AS DOUBLE\\) AS `_doc_count` FROM (.+)$")
 	reAggRange                  = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, '([^']+)' AS `_bucket_key`, CAST\\(" + docCountAggExprPatR62Mem + " AS DOUBLE\\) AS `_doc_count` FROM (`base_matched`(?: LATERAL VIEW EXPLODE\\(`[^`]+`\\) `_t` AS `_elem`)?) WHERE (.+)$")
@@ -1763,7 +1763,11 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 				if val := resolveColumnValue(row, colExpr); val != nil {
 					if f, ok := toFloat(val); ok {
 						if wf, okW := toFloat(resolveColumnValue(row, sumExpr)); okW {
-							b := math.Round((math.Floor((f-offset)/interval+1e-9)*interval+offset)*1e12) / 1e12
+							rawB := math.Floor((f-offset)/interval+1e-9)*interval + offset
+							b := rawB
+							if math.Abs(rawB) < 1e6 {
+								b = math.Round(rawB*1e12) / 1e12
+							}
 							counts[b] += int64(math.Round(wf))
 						}
 					}
@@ -1774,7 +1778,11 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 				seenRowBucket := make(map[float64]bool)
 				for _, elem := range asSliceOrSingle(val) {
 					if f, ok := toFloat(elem); ok {
-						b := math.Round((math.Floor((f-offset)/interval+1e-9)*interval+offset)*1e12) / 1e12
+						rawB := math.Floor((f-offset)/interval+1e-9)*interval + offset
+						b := rawB
+						if math.Abs(rawB) < 1e6 {
+							b = math.Round(rawB*1e12) / 1e12
+						}
 						if seenRowBucket[b] {
 							continue
 						}
@@ -3173,24 +3181,27 @@ func evalWhereExpr(row map[string]any, expr string) bool {
 
 	for _, op := range []string{">=", "<=", "!=", "=", ">", "<"} {
 		if idx := findTopLevelOp(expr, op); idx > 0 {
-			lhs := strings.TrimSpace(expr[:idx])
-			rhs := strings.TrimSpace(expr[idx+len(op):])
+			lhs := trimOuterParens(strings.TrimSpace(expr[:idx]))
+			rhs := trimOuterParens(strings.TrimSpace(expr[idx+len(op):]))
 			ci := false
 			if strings.HasPrefix(lhs, "lower(") && strings.HasSuffix(lhs, ")") {
 				ci = true
-				lhs = lhs[6 : len(lhs)-1]
+				lhs = trimOuterParens(lhs[6 : len(lhs)-1])
 			}
 			if strings.HasPrefix(rhs, "lower(") && strings.HasSuffix(rhs, ")") {
 				ci = true
-				rhs = rhs[6 : len(rhs)-1]
+				rhs = trimOuterParens(rhs[6 : len(rhs)-1])
 			}
-			if isArithmeticSQLExpr(lhs) || strings.HasPrefix(lhs, "CAST(COALESCE(") {
-				if hasUnwrappedNullColumnRef(row, lhs) {
+			if isArithmeticSQLExpr(lhs) || strings.HasPrefix(lhs, "CAST(COALESCE(") || strings.HasPrefix(lhs, "TRY_CAST(COALESCE(") {
+				if hasUnwrappedNullColumnRef(row, lhs) || hasNullArithmeticOperandR63Mem(row, lhs) {
 					return false
 				}
 				lhsNum := evalNumericExpr(row, lhs)
 				rhsNum, err := strconv.ParseFloat(rhs, 64)
 				if err != nil {
+					if hasUnwrappedNullColumnRef(row, rhs) || hasNullArithmeticOperandR63Mem(row, rhs) {
+						return false
+					}
 					rhsNum = evalNumericExpr(row, rhs)
 				}
 				switch op {
@@ -3213,7 +3224,21 @@ func evalWhereExpr(row map[string]any, expr string) bool {
 				return false
 			}
 			var rhsVal any
-			if strings.HasPrefix(rhs, "json_extract_string(") || (strings.HasPrefix(rhs, "`") && strings.HasSuffix(rhs, "`")) || isArithmeticSQLExpr(rhs) || strings.HasPrefix(rhs, "CAST(") || strings.HasPrefix(rhs, "COALESCE(") {
+			rhsExprPrefixes := []string{
+				"json_extract_string(", "CAST(", "TRY_CAST(", "COALESCE(",
+				"GREATEST(", "LEAST(", "FLOOR(", "CEIL(", "ROUND(", "ABS(",
+				"DATE_TRUNC(", "UNIX_TIMESTAMP(", "TIMESTAMPDIFF(", "MICROSECOND(", "SECONDS_ADD(",
+			}
+			rhsIsExpr := (strings.HasPrefix(rhs, "`") && strings.HasSuffix(rhs, "`")) || isArithmeticSQLExpr(rhs)
+			if !rhsIsExpr {
+				for _, pfx := range rhsExprPrefixes {
+					if strings.HasPrefix(rhs, pfx) {
+						rhsIsExpr = true
+						break
+					}
+				}
+			}
+			if rhsIsExpr {
 				rhsVal = resolveColumnValue(row, rhs)
 				if rhsVal == nil {
 					return false
@@ -3612,6 +3637,17 @@ func evalNumericExpr(row map[string]any, expr string) float64 {
 		return 0
 	}
 
+	if strings.HasPrefix(expr, "TRY_CAST(") && !strings.HasPrefix(expr, "TRY_CAST(`_doc`") && hasMatchingOuterParens(expr, 8) {
+		for _, suffix := range []string{" AS DOUBLE)", " AS BIGINT)", " AS LARGEINT)", " AS INT)"} {
+			if strings.HasSuffix(expr, suffix) {
+				v := resolveColumnValue(row, expr)
+				if f, ok := toFloat(v); ok {
+					return f
+				}
+				return 0
+			}
+		}
+	}
 	if strings.HasPrefix(expr, "CAST(") && !strings.HasPrefix(expr, "CAST(`_doc`") {
 		for _, suffix := range []string{" AS DOUBLE)", " AS BIGINT)", " AS LARGEINT)", " AS INT)"} {
 			if strings.HasSuffix(expr, suffix) {
@@ -3641,11 +3677,20 @@ func evalNumericExpr(row map[string]any, expr string) float64 {
 		}
 	}
 
-	for _, fn := range []string{"GREATEST", "LEAST", "COALESCE", "POW", "LOG10", "LN", "EXP", "SQRT", "SIN", "COS", "TAN", "ASIN", "ACOS", "ATAN2", "ATAN", "FLOOR", "CEIL", "ROUND", "TRUNCATE", "ABS", "UNIX_TIMESTAMP", "TIMESTAMPDIFF"} {
+	for _, fn := range []string{"GREATEST", "LEAST", "COALESCE", "POW", "LOG10", "LN", "EXP", "SQRT", "SIN", "COS", "TAN", "ASIN", "ACOS", "ATAN2", "ATAN", "FLOOR", "CEIL", "ROUND", "TRUNCATE", "ABS", "UNIX_TIMESTAMP", "TIMESTAMPDIFF", "MICROSECOND"} {
 		if strings.HasPrefix(expr, fn+"(") && strings.HasSuffix(expr, ")") && hasMatchingOuterParens(expr, len(fn)) {
 			inner := expr[len(fn)+1 : len(expr)-1]
 			args := splitTopLevelArgs(inner)
 			switch fn {
+			case "MICROSECOND":
+				if len(args) == 1 {
+					if v := memEvalMicrosecond(row, args[0]); v != nil {
+						if fv, ok := toFloat(v); ok {
+							return fv
+						}
+					}
+				}
+				return 0
 			case "TIMESTAMPDIFF":
 				if len(args) == 3 {
 					if v := memEvalTimestampDiff(row, args[0], args[1], args[2]); v != nil {
@@ -3828,17 +3873,18 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 		}
 		return nil
 	}
-	if strings.HasPrefix(colExpr, "array_map(_x -> CAST(_x AS DOUBLE), ") && strings.HasSuffix(colExpr, ")") {
-		inner := strings.TrimSpace(colExpr[len("array_map(_x -> CAST(_x AS DOUBLE), ") : len(colExpr)-1])
-		return resolveColumnValue(row, inner)
-	}
-	if strings.HasPrefix(colExpr, "array_map(_x -> CAST(_x AS BIGINT), ") && strings.HasSuffix(colExpr, ")") {
-		inner := strings.TrimSpace(colExpr[len("array_map(_x -> CAST(_x AS BIGINT), ") : len(colExpr)-1])
-		return resolveColumnValue(row, inner)
-	}
-	if strings.HasPrefix(colExpr, "array_map(_x -> CAST(_x AS LARGEINT), ") && strings.HasSuffix(colExpr, ")") {
-		inner := strings.TrimSpace(colExpr[len("array_map(_x -> CAST(_x AS LARGEINT), ") : len(colExpr)-1])
-		return resolveColumnValue(row, inner)
+	for _, pfx := range []string{
+		"array_map(_x -> CAST(_x AS DOUBLE), ",
+		"array_map(_x -> TRY_CAST(_x AS DOUBLE), ",
+		"array_map(_x -> CAST(_x AS BIGINT), ",
+		"array_map(_x -> TRY_CAST(_x AS BIGINT), ",
+		"array_map(_x -> CAST(_x AS LARGEINT), ",
+		"array_map(_x -> TRY_CAST(_x AS LARGEINT), ",
+	} {
+		if strings.HasPrefix(colExpr, pfx) && strings.HasSuffix(colExpr, ")") {
+			inner := strings.TrimSpace(colExpr[len(pfx) : len(colExpr)-1])
+			return resolveColumnValue(row, inner)
+		}
 	}
 	if strings.HasPrefix(colExpr, "array_map(_el -> json_extract_string(_el, ") && strings.HasSuffix(colExpr, ")") {
 		args := splitTopLevelArgs(colExpr[len("array_map(") : len(colExpr)-1])
@@ -4043,9 +4089,10 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 			}
 			return bestF
 		}
-		isNumericMap := strings.HasPrefix(inner, "array_map(_x -> CAST(_x AS LARGEINT), ") ||
-			strings.HasPrefix(inner, "array_map(_x -> CAST(_x AS BIGINT), ") ||
-			strings.HasPrefix(inner, "array_map(_x -> CAST(_x AS DOUBLE), ")
+		isLargeIntMap := strings.HasPrefix(inner, "array_map(_x -> CAST(_x AS LARGEINT), ") || strings.HasPrefix(inner, "array_map(_x -> TRY_CAST(_x AS LARGEINT), ")
+		isBigIntMap := strings.HasPrefix(inner, "array_map(_x -> CAST(_x AS BIGINT), ") || strings.HasPrefix(inner, "array_map(_x -> TRY_CAST(_x AS BIGINT), ")
+		isDoubleMap := strings.HasPrefix(inner, "array_map(_x -> CAST(_x AS DOUBLE), ") || strings.HasPrefix(inner, "array_map(_x -> TRY_CAST(_x AS DOUBLE), ")
+		isNumericMap := isLargeIntMap || isBigIntMap || isDoubleMap
 		if aSlice, okA := rawResolved.([]any); okA && len(aSlice) > 0 && !isNumericMap {
 			var bestAny any
 			hasAny := false
@@ -4098,17 +4145,17 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 				best = e
 			}
 		}
-		if strings.HasPrefix(inner, "array_map(_x -> CAST(_x AS LARGEINT), ") {
+		if isLargeIntMap {
 			if bi, ok := memParseExactBigInt(best); ok {
 				return memNormalizeExactIntValue(bi)
 			}
 		}
-		if strings.HasPrefix(inner, "array_map(_x -> CAST(_x AS BIGINT), ") {
+		if isBigIntMap {
 			if iv, ok := toInt64(best); ok {
 				return iv
 			}
 		}
-		if strings.HasPrefix(inner, "array_map(_x -> CAST(_x AS DOUBLE), ") {
+		if isDoubleMap {
 			if fv, ok := toFloat(best); ok {
 				return fv
 			}
@@ -4302,10 +4349,16 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 			return extractJSONPathRawR62Mem(elemJSON, rawPathLit)
 		}
 	}
-	if strings.HasPrefix(colExpr, "CAST(`_doc`") && hasMatchingOuterParens(colExpr, 4) {
+	isCastDoc := strings.HasPrefix(colExpr, "CAST(`_doc`") && hasMatchingOuterParens(colExpr, 4)
+	isTryCastDoc := strings.HasPrefix(colExpr, "TRY_CAST(`_doc`") && hasMatchingOuterParens(colExpr, 8)
+	if isCastDoc || isTryCastDoc {
 		asIdx := strings.LastIndex(colExpr, " AS ")
 		if asIdx > 0 {
-			pathPart := colExpr[len("CAST(`_doc`"):asIdx]
+			prefixLen := len("CAST(`_doc`")
+			if isTryCastDoc {
+				prefixLen = len("TRY_CAST(`_doc`")
+			}
+			pathPart := colExpr[prefixLen:asIdx]
 			var segs []string
 			for _, p := range strings.Split(pathPart, "['") {
 				p = strings.TrimSuffix(p, "']")
@@ -4339,9 +4392,15 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 							return ms
 						}
 					}
+					if isTryCastDoc {
+						return nil
+					}
 				} else if strings.HasSuffix(colExpr, " AS DOUBLE)") {
 					if fv, ok := toFloat(res); ok {
 						return fv
+					}
+					if isTryCastDoc {
+						return nil
 					}
 				} else if strings.HasSuffix(colExpr, " AS ARRAY<STRING>)") {
 					return memCoerceVariantToArrayOfString(res)
@@ -4508,10 +4567,16 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 			tLat, errLat := strconv.ParseFloat(strings.TrimSpace(args[3]), 64)
 			if errLon == nil && errLat == nil {
 				lonExpr := strings.TrimSpace(args[0])
-				if docIdx := strings.Index(lonExpr, "CAST(`_doc`"); docIdx >= 0 {
+				docIdx := strings.Index(lonExpr, "CAST(`_doc`")
+				docPfxLen := len("CAST(`_doc`")
+				if tryIdx := strings.Index(lonExpr, "TRY_CAST(`_doc`"); tryIdx >= 0 && (docIdx < 0 || tryIdx < docIdx) {
+					docIdx = tryIdx
+					docPfxLen = len("TRY_CAST(`_doc`")
+				}
+				if docIdx >= 0 {
 					docSub := lonExpr[docIdx:]
 					if asIdx := strings.Index(docSub, " AS "); asIdx > 0 {
-						pathPart := docSub[len("CAST(`_doc`"):asIdx]
+						pathPart := docSub[docPfxLen:asIdx]
 						var segs []string
 						for _, p := range strings.Split(pathPart, "['") {
 							p = strings.TrimSuffix(p, "']")
@@ -4682,6 +4747,14 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 		}
 		return nil
 	}
+	if (strings.HasPrefix(colExpr, "MICROSECOND(") || strings.HasPrefix(colExpr, "microsecond(")) && strings.HasSuffix(colExpr, ")") && hasMatchingOuterParens(colExpr, len("MICROSECOND")) {
+		inner := strings.TrimSpace(colExpr[len("MICROSECOND(") : len(colExpr)-1])
+		args := splitTopLevelArgs(inner)
+		if len(args) == 1 {
+			return memEvalMicrosecond(row, args[0])
+		}
+		return nil
+	}
 	if (strings.HasPrefix(colExpr, "DATE_FORMAT(") || strings.HasPrefix(colExpr, "date_format(")) && strings.HasSuffix(colExpr, ")") {
 		inner := colExpr[len("DATE_FORMAT(") : len(colExpr)-1]
 		args := splitTopLevelArgs(inner)
@@ -4795,9 +4868,15 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 		}
 		return nil
 	}
+	jsonCastPfxLen := 0
 	if strings.HasPrefix(colExpr, "CAST(") && !strings.HasPrefix(colExpr, "CAST(`_doc`") {
-		if asJSONIdx := strings.Index(colExpr, " AS JSON)["); asJSONIdx > len("CAST(") && strings.HasSuffix(colExpr, "]") && findTopLevelOp(colExpr, " AS ") < 0 {
-			innerVar := strings.TrimSpace(colExpr[len("CAST("):asJSONIdx])
+		jsonCastPfxLen = len("CAST(")
+	} else if strings.HasPrefix(colExpr, "TRY_CAST(") && !strings.HasPrefix(colExpr, "TRY_CAST(`_doc`") {
+		jsonCastPfxLen = len("TRY_CAST(")
+	}
+	if jsonCastPfxLen > 0 {
+		if asJSONIdx := strings.Index(colExpr, " AS JSON)["); asJSONIdx > jsonCastPfxLen && strings.HasSuffix(colExpr, "]") && findTopLevelOp(colExpr, " AS ") < 0 {
+			innerVar := strings.TrimSpace(colExpr[jsonCastPfxLen:asJSONIdx])
 			pathPart := colExpr[asJSONIdx+len(" AS JSON)"):]
 			rawVal := resolveColumnValue(row, innerVar)
 			if rawVal == nil {
@@ -4824,13 +4903,26 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 			return extractJSONPathFromStr(rawStr, segs)
 		}
 	}
-	if strings.HasPrefix(colExpr, "CAST(") && !strings.HasPrefix(colExpr, "CAST(`_doc`") && hasMatchingOuterParens(colExpr, 4) {
-		if strings.HasSuffix(colExpr, " AS DATETIME)") {
-			inner := strings.TrimSpace(colExpr[len("CAST(") : len(colExpr)-len(" AS DATETIME)")])
-			return resolveColumnValue(row, inner)
+	isCastCol := strings.HasPrefix(colExpr, "CAST(") && !strings.HasPrefix(colExpr, "CAST(`_doc`") && hasMatchingOuterParens(colExpr, 4)
+	isTryCastCol := strings.HasPrefix(colExpr, "TRY_CAST(") && !strings.HasPrefix(colExpr, "TRY_CAST(`_doc`") && hasMatchingOuterParens(colExpr, 8)
+	if isCastCol || isTryCastCol {
+		castPfxLen := len("CAST(")
+		if isTryCastCol {
+			castPfxLen = len("TRY_CAST(")
+		}
+		if innerDT, isDT := trimDateTimeCastInnerR64Mem(colExpr, castPfxLen); isDT {
+			v := resolveColumnValue(row, innerDT)
+			if v == nil {
+				return nil
+			}
+			y, m, d, hh, mm, ss, ns, ok := memParseDateTimeWallClock(v)
+			if !ok {
+				return nil
+			}
+			return time.Date(y, m, d, hh, mm, ss, ns, time.UTC).Format("2006-01-02 15:04:05.000000")
 		}
 		if strings.HasSuffix(colExpr, " AS LARGEINT)") {
-			inner := strings.TrimSpace(colExpr[len("CAST(") : len(colExpr)-len(" AS LARGEINT)")])
+			inner := strings.TrimSpace(colExpr[castPfxLen : len(colExpr)-len(" AS LARGEINT)")])
 			if bi, ok := memParseExactBigInt(inner); ok {
 				return memNormalizeExactIntValue(bi)
 			}
@@ -4840,7 +4932,7 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 			return nil
 		}
 		if strings.HasSuffix(colExpr, " AS DOUBLE)") {
-			inner := strings.TrimSpace(colExpr[len("CAST(") : len(colExpr)-len(" AS DOUBLE)")])
+			inner := strings.TrimSpace(colExpr[castPfxLen : len(colExpr)-len(" AS DOUBLE)")])
 			if f, err := strconv.ParseFloat(inner, 64); err == nil {
 				return f
 			}
@@ -4864,7 +4956,7 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 				}
 			}
 			if isArithmeticSQLExpr(inner) || strings.Contains(inner, "CASE WHEN") {
-				if hasUnwrappedNullColumnRef(row, inner) {
+				if hasUnwrappedNullColumnRef(row, inner) || hasNullArithmeticOperandR63Mem(row, inner) {
 					return nil
 				}
 				return evalNumericExpr(row, inner)
@@ -4872,7 +4964,7 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 			return nil
 		}
 		if strings.HasSuffix(colExpr, " AS BIGINT)") {
-			inner := strings.TrimSpace(colExpr[len("CAST(") : len(colExpr)-len(" AS BIGINT)")])
+			inner := strings.TrimSpace(colExpr[castPfxLen : len(colExpr)-len(" AS BIGINT)")])
 			if v := resolveColumnValue(row, inner); v != nil {
 				switch v.(type) {
 				case []any, []string:
@@ -4882,9 +4974,11 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 							out = append(out, iv)
 						} else if f, ok := toFloat(elem); ok {
 							out = append(out, int64(f))
-						} else if s, ok := elem.(string); ok {
-							if ms, ok := schema.ParseESDateToEpochMillis(s, time.Now().UTC()); ok {
-								out = append(out, ms)
+						} else if !isTryCastCol {
+							if s, ok := elem.(string); ok {
+								if ms, ok := schema.ParseESDateToEpochMillis(s, time.Now().UTC()); ok {
+									out = append(out, ms)
+								}
 							}
 						}
 					}
@@ -4902,15 +4996,17 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 						}
 						return int64(f)
 					}
-					if s, ok := v.(string); ok {
-						if ms, ok := schema.ParseESDateToEpochMillis(s, time.Now().UTC()); ok {
-							return ms
+					if !isTryCastCol {
+						if s, ok := v.(string); ok {
+							if ms, ok := schema.ParseESDateToEpochMillis(s, time.Now().UTC()); ok {
+								return ms
+							}
 						}
 					}
 				}
 			}
 			if isArithmeticSQLExpr(inner) {
-				if hasUnwrappedNullColumnRef(row, inner) {
+				if hasUnwrappedNullColumnRef(row, inner) || hasNullArithmeticOperandR63Mem(row, inner) {
 					return nil
 				}
 				num := evalNumericExpr(row, inner)
@@ -4929,7 +5025,7 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 				}
 				return int64(0)
 			}
-			inner := strings.TrimSpace(colExpr[len("CAST(") : len(colExpr)-len(" AS INT)")])
+			inner := strings.TrimSpace(colExpr[castPfxLen : len(colExpr)-len(" AS INT)")])
 			if v := resolveColumnValue(row, inner); v != nil {
 				switch v.(type) {
 				case []any, []string:
@@ -4950,7 +5046,7 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 				}
 			}
 			if isArithmeticSQLExpr(inner) || strings.Contains(inner, "CASE WHEN") {
-				if hasUnwrappedNullColumnRef(row, inner) {
+				if hasUnwrappedNullColumnRef(row, inner) || hasNullArithmeticOperandR63Mem(row, inner) {
 					return nil
 				}
 				return int64(evalNumericExpr(row, inner))
@@ -4958,7 +5054,7 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 			return nil
 		}
 		if strings.HasSuffix(colExpr, " AS STRING)") {
-			inner := colExpr[len("CAST(") : len(colExpr)-len(" AS STRING)")]
+			inner := colExpr[castPfxLen : len(colExpr)-len(" AS STRING)")]
 			if v := resolveColumnValue(row, inner); v != nil {
 				switch tv := v.(type) {
 				case []any, []string:
@@ -4984,11 +5080,11 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 			return nil
 		}
 		if strings.HasSuffix(colExpr, " AS ARRAY<STRING>)") {
-			inner := strings.TrimSpace(colExpr[len("CAST(") : len(colExpr)-len(" AS ARRAY<STRING>)")])
+			inner := strings.TrimSpace(colExpr[castPfxLen : len(colExpr)-len(" AS ARRAY<STRING>)")])
 			return coerceCastArrayOfStringR62Mem(resolveColumnValue(row, inner))
 		}
 		if strings.HasSuffix(colExpr, " AS ARRAY<LARGEINT>)") {
-			inner := strings.TrimSpace(colExpr[len("CAST(") : len(colExpr)-len(" AS ARRAY<LARGEINT>)")])
+			inner := strings.TrimSpace(colExpr[castPfxLen : len(colExpr)-len(" AS ARRAY<LARGEINT>)")])
 			return toStringSlice(memCoerceSQLLargeInt(resolveColumnValue(row, inner)))
 		}
 		if strings.HasSuffix(colExpr, " AS ARRAY<FLOAT>)") || strings.HasSuffix(colExpr, " AS ARRAY<DOUBLE>)") {
@@ -4996,7 +5092,7 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 			if strings.HasSuffix(colExpr, " AS ARRAY<DOUBLE>)") {
 				suffix = " AS ARRAY<DOUBLE>)"
 			}
-			inner := strings.TrimSpace(colExpr[len("CAST(") : len(colExpr)-len(suffix)])
+			inner := strings.TrimSpace(colExpr[castPfxLen : len(colExpr)-len(suffix)])
 			if strings.HasPrefix(inner, "[") && strings.HasSuffix(inner, "]") {
 				if vec := parseVectorLiteral(inner); len(vec) > 0 {
 					return vec
@@ -5006,7 +5102,7 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 			return memCoerceArrayOfFloat(resolveColumnValue(row, inner))
 		}
 		if strings.HasSuffix(colExpr, " AS BOOLEAN)") {
-			inner := colExpr[len("CAST(") : len(colExpr)-len(" AS BOOLEAN)")]
+			inner := colExpr[castPfxLen : len(colExpr)-len(" AS BOOLEAN)")]
 			if v := resolveColumnValue(row, inner); v != nil {
 				switch v.(type) {
 				case []any, []string:
@@ -5140,7 +5236,7 @@ func hasUnwrappedNullColumnRef(row map[string]any, expr string) bool {
 	if strings.Contains(expr, "CASE ") {
 		return false
 	}
-	if strings.Contains(expr, "_el ->") || strings.Contains(expr, "_x ->") || strings.Contains(expr, "_nel ->") {
+	if !isArithmeticSQLExpr(expr) && (strings.Contains(expr, "_el ->") || strings.Contains(expr, "_x ->") || strings.Contains(expr, "_nel ->")) {
 		return resolveColumnValue(row, expr) == nil
 	}
 	stripped := stripCoalesceSubexprs(expr)
@@ -5215,7 +5311,7 @@ func isArithmeticSQLExpr(expr string) bool {
 	if strings.EqualFold(trimmed, "PI()") {
 		return true
 	}
-	for _, fn := range []string{"CASE ", "ST_Distance_Sphere(", "GREATEST(", "LEAST(", "POW(", "LOG10(", "LN(", "EXP(", "SQRT(", "SIN(", "COS(", "TAN(", "ASIN(", "ACOS(", "ATAN2(", "ATAN(", "FLOOR(", "CEIL(", "ROUND(", "TRUNCATE(", "ABS(", "UNIX_TIMESTAMP(", "TIMESTAMPDIFF(", "MURMUR_HASH3_32("} {
+	for _, fn := range []string{"CASE ", "ST_Distance_Sphere(", "GREATEST(", "LEAST(", "POW(", "LOG10(", "LN(", "EXP(", "SQRT(", "SIN(", "COS(", "TAN(", "ASIN(", "ACOS(", "ATAN2(", "ATAN(", "FLOOR(", "CEIL(", "ROUND(", "TRUNCATE(", "ABS(", "UNIX_TIMESTAMP(", "TIMESTAMPDIFF(", "MICROSECOND(", "MURMUR_HASH3_32("} {
 		if strings.HasPrefix(trimmed, fn) {
 			return true
 		}
@@ -5599,10 +5695,16 @@ func unquoteSQLLiteral(s string) string {
 
 func parseSQLLiteralValue(s string) any {
 	s = strings.TrimSpace(s)
+	litCastPfxLen := 0
 	if strings.HasPrefix(s, "CAST(") && hasMatchingOuterParens(s, 4) {
+		litCastPfxLen = len("CAST(")
+	} else if strings.HasPrefix(s, "TRY_CAST(") && hasMatchingOuterParens(s, 8) {
+		litCastPfxLen = len("TRY_CAST(")
+	}
+	if litCastPfxLen > 0 {
 		for _, suffix := range []string{" AS LARGEINT)", " AS BIGINT)", " AS DOUBLE)", " AS INT)", " AS STRING)"} {
 			if strings.HasSuffix(s, suffix) {
-				inner := strings.TrimSpace(s[len("CAST(") : len(s)-len(suffix)])
+				inner := strings.TrimSpace(s[litCastPfxLen : len(s)-len(suffix)])
 				return parseSQLLiteralValue(inner)
 			}
 		}
@@ -6300,6 +6402,48 @@ func memEvalDateTrunc(row map[string]any, arg0, arg1 string) any {
 		return nil
 	}
 	return trunc.Format("2006-01-02 15:04:05.000000")
+}
+
+func memEvalMicrosecond(row map[string]any, dtExpr string) any {
+	dtExpr = strings.TrimSpace(dtExpr)
+	if hasUnwrappedNullColumnRef(row, dtExpr) {
+		return nil
+	}
+	dtVal := resolveColumnValue(row, dtExpr)
+	if dtVal == nil {
+		return nil
+	}
+	_, _, _, _, _, _, ns, ok := memParseDateTimeWallClock(dtVal)
+	if !ok {
+		return nil
+	}
+	return int64(ns / 1000)
+}
+
+func trimDateTimeCastInnerR64Mem(colExpr string, prefixLen int) (string, bool) {
+	if strings.HasSuffix(colExpr, " AS DATETIME)") {
+		return strings.TrimSpace(colExpr[prefixLen : len(colExpr)-len(" AS DATETIME)")]), true
+	}
+	if strings.HasSuffix(colExpr, " AS DATETIMEV2)") {
+		return strings.TrimSpace(colExpr[prefixLen : len(colExpr)-len(" AS DATETIMEV2)")]), true
+	}
+	const marker = " AS DATETIMEV2("
+	if idx := strings.LastIndex(colExpr, marker); idx > prefixLen && strings.HasSuffix(colExpr, "))") {
+		scale := colExpr[idx+len(marker) : len(colExpr)-2]
+		if scale != "" {
+			allDigits := true
+			for i := 0; i < len(scale); i++ {
+				if scale[i] < '0' || scale[i] > '9' {
+					allDigits = false
+					break
+				}
+			}
+			if allDigits {
+				return strings.TrimSpace(colExpr[prefixLen:idx]), true
+			}
+		}
+	}
+	return "", false
 }
 
 func memEvalUnixTimestamp(row map[string]any, dtExpr string) any {
@@ -7297,6 +7441,10 @@ func evalColumnFuncR62Mem(row map[string]any, colExpr string) (any, bool) {
 	}
 	if strings.HasPrefix(colExpr, "CAST(`base_matched`.`_doc`") {
 		rewritten := "CAST(`_doc`" + colExpr[len("CAST(`base_matched`.`_doc`"):]
+		return resolveColumnValue(row, rewritten), true
+	}
+	if strings.HasPrefix(colExpr, "TRY_CAST(`base_matched`.`_doc`") {
+		rewritten := "TRY_CAST(`_doc`" + colExpr[len("TRY_CAST(`base_matched`.`_doc`"):]
 		return resolveColumnValue(row, rewritten), true
 	}
 	// Joined alias column lookup (`_jp_1`.`_jp_bkey_1`, `_jc_1`.`_jc_bkey_1`, `_ts_top_1`.`_ts_bkey_1`)

@@ -66,18 +66,25 @@ type StreamLoadClient struct {
 	cachedBEBase   atomic.Value // string base URL (e.g. "http://127.0.0.1:8040") discovered from FE 307 redirect
 	allowedHostsMu sync.RWMutex
 	allowedBEHosts map[string]struct{}
+	lookupNetIP    func(ctx context.Context, network, host string) ([]netip.Addr, error)
 }
 
 func NewStreamLoadClient(cfg StreamLoadConfig) *StreamLoadClient {
 	if cfg.Timeout <= 0 {
 		cfg.Timeout = 30 * time.Second
 	}
+	c := &StreamLoadClient{
+		cfg:            cfg,
+		allowedBEHosts: make(map[string]struct{}),
+	}
+	c.seedConfiguredHosts()
+
 	baseDialer := &net.Dialer{
 		Timeout:   5 * time.Second,
 		KeepAlive: 30 * time.Second,
 	}
 	transport := &http.Transport{
-		Proxy: http.ProxyFromEnvironment,
+		Proxy: nil, // Explicitly ignore ambient HTTP_PROXY/HTTPS_PROXY so metadata/internal targets cannot be reached via proxy bypass.
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			host, port, err := net.SplitHostPort(addr)
 			if err != nil {
@@ -86,19 +93,27 @@ func NewStreamLoadClient(cfg StreamLoadConfig) *StreamLoadClient {
 			if isBlockedStreamLoadHost(host) {
 				return nil, fmt.Errorf("stream load dial blocked: metadata or link-local address %q", host)
 			}
+			feLoopback := c.isConfiguredFELoopback()
 			if parsedIP, ok := parseNormalizedStreamLoadIP(host); ok {
 				if isBlockedStreamLoadAddr(parsedIP) {
 					return nil, fmt.Errorf("stream load dial blocked: metadata or link-local IP %s", parsedIP)
 				}
+				if !feLoopback && parsedIP.IsLoopback() {
+					return nil, fmt.Errorf("stream load dial blocked: loopback IP %s disallowed for non-loopback FE endpoint", parsedIP)
+				}
 				return baseDialer.DialContext(ctx, network, net.JoinHostPort(parsedIP.String(), port))
 			}
-			ips, resolveErr := net.DefaultResolver.LookupNetIP(ctx, "ip", host)
+			ips, resolveErr := c.resolveNetIPs(ctx, "ip", host)
 			if resolveErr != nil {
 				return nil, resolveErr
 			}
 			for _, ip := range ips {
-				if isBlockedStreamLoadAddr(ip) {
+				cleanIP := ip.Unmap().WithZone("")
+				if isBlockedStreamLoadAddr(cleanIP) {
 					return nil, fmt.Errorf("stream load dial blocked: host %q resolved to metadata or link-local IP %s", host, ip)
+				}
+				if !feLoopback && cleanIP.IsLoopback() {
+					return nil, fmt.Errorf("stream load dial blocked: host %q resolved to loopback IP %s for non-loopback FE endpoint", host, ip)
 				}
 			}
 			if len(ips) == 0 {
@@ -106,7 +121,7 @@ func NewStreamLoadClient(cfg StreamLoadConfig) *StreamLoadClient {
 			}
 			var lastDialErr error
 			for _, ip := range ips {
-				conn, dialErr := baseDialer.DialContext(ctx, network, net.JoinHostPort(ip.Unmap().String(), port))
+				conn, dialErr := baseDialer.DialContext(ctx, network, net.JoinHostPort(ip.Unmap().WithZone("").String(), port))
 				if dialErr == nil {
 					return conn, nil
 				}
@@ -120,12 +135,6 @@ func NewStreamLoadClient(cfg StreamLoadConfig) *StreamLoadClient {
 		IdleConnTimeout:       90 * time.Second,
 		ExpectContinueTimeout: 50 * time.Millisecond,
 	}
-
-	c := &StreamLoadClient{
-		cfg:            cfg,
-		allowedBEHosts: make(map[string]struct{}),
-	}
-	c.seedConfiguredHosts()
 
 	c.httpClient = &http.Client{
 		Timeout:   cfg.Timeout,
@@ -145,6 +154,24 @@ func NewStreamLoadClient(cfg StreamLoadConfig) *StreamLoadClient {
 		},
 	}
 	return c
+}
+
+func (c *StreamLoadClient) isConfiguredFELoopback() bool {
+	if c == nil {
+		return false
+	}
+	feURL, err := c.parseConfiguredFEURL()
+	if err != nil {
+		return false
+	}
+	return isLoopbackStreamLoadHost(feURL.Hostname())
+}
+
+func (c *StreamLoadClient) resolveNetIPs(ctx context.Context, network, host string) ([]netip.Addr, error) {
+	if c != nil && c.lookupNetIP != nil {
+		return c.lookupNetIP(ctx, network, host)
+	}
+	return net.DefaultResolver.LookupNetIP(ctx, network, host)
 }
 
 func (c *StreamLoadClient) seedConfiguredHosts() {
@@ -461,16 +488,13 @@ func (c *StreamLoadClient) checkStreamLoadRedirect(req *http.Request, via []*htt
 	if len(via) > 0 && req.URL != nil && req.URL.User != nil && c.matchesConfiguredRedirectUserinfo(req.URL.User) {
 		req.URL.User = nil
 	}
-	feURL, err := c.validateStreamLoadTargetHostAndScheme(req.URL)
+	_, err := c.validateStreamLoadTargetHostAndScheme(req.URL)
 	if err != nil {
 		req.Header.Del("Authorization")
 		return err
 	}
 	if !strings.HasSuffix(req.URL.Path, "/_stream_load") {
 		req.Header.Del("Authorization")
-		if isLoopbackStreamLoadHost(feURL.Hostname()) && isLoopbackStreamLoadHost(req.URL.Hostname()) {
-			return nil
-		}
 		return fmt.Errorf("stream load rejected non-stream-load redirect path %q", req.URL.Path)
 	}
 	if len(via) > 0 {
@@ -490,6 +514,7 @@ func (c *StreamLoadClient) checkStreamLoadRedirect(req *http.Request, via []*htt
 type streamLoadResponse struct {
 	Status             string `json:"Status"`
 	Message            string `json:"Message"`
+	ExistingJobStatus  string `json:"ExistingJobStatus"`
 	NumberTotalRows    int64  `json:"NumberTotalRows"`
 	NumberLoadedRows   int64  `json:"NumberLoadedRows"`
 	NumberFilteredRows int64  `json:"NumberFilteredRows"`
@@ -642,7 +667,20 @@ func (c *StreamLoadClient) loadSingleNDJSONBatch(
 			return fmt.Errorf("unexpected stream load response (HTTP %d): %s", resp.StatusCode, string(bodyBytes))
 		}
 		if strings.EqualFold(slResp.Status, "Label Already Exists") && attempt > 1 {
-			return nil
+			if strings.EqualFold(slResp.ExistingJobStatus, "VISIBLE") || strings.EqualFold(slResp.ExistingJobStatus, "COMMITTED") {
+				return nil
+			}
+			if attempt < maxAttempts && !strings.EqualFold(slResp.ExistingJobStatus, "ABORTED") {
+				lastErr = fmt.Errorf("doris stream load label already exists with status %q: %s", slResp.ExistingJobStatus, slResp.Message)
+				continue
+			}
+			detail := c.fetchErrorURLDetail(ctx, slResp.ErrorURL)
+			msg := slResp.Message
+			if msg == "" {
+				msg = string(bodyBytes)
+			}
+			return fmt.Errorf("doris stream load failed (HTTP %d, status=%s, existing_job_status=%s): %s (error_url=%s detail=%s)",
+				resp.StatusCode, slResp.Status, slResp.ExistingJobStatus, msg, slResp.ErrorURL, detail)
 		}
 		if !strings.EqualFold(slResp.Status, "Success") && !strings.EqualFold(slResp.Status, "Publish Timeout") {
 			if isTransientStreamLoadError(slResp.Status, slResp.Message) && attempt < maxAttempts {

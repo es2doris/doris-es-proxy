@@ -873,7 +873,7 @@ func TestServer_DeepEvalProtocolAndMultiIndexFixes(t *testing.T) {
 	if code, body := doReq(http.MethodPost, "/hl_idx/_search", `{
 		"query": {"match": {"title": "system em"}},
 		"highlight": {"fields": {"*": {}}}
-	}`); code != http.StatusOK || !strings.Contains(body, `\u003cem\u003esystem\u003c/em\u003e \u003cem\u003eem\u003c/em\u003eerald g\u003cem\u003eem\u003c/em\u003e`) {
+	}`); code != http.StatusOK || !strings.Contains(body, `<em>system</em> <em>em</em>erald g<em>em</em>`) {
 		t.Fatalf("expected wildcard highlight without <em> tag corruption, got %d %s", code, body)
 	}
 

@@ -176,67 +176,141 @@ func extractCompatibleWithParam(hdrVal string) (string, bool) {
 }
 
 // validateWireAcceptAndCompatHeadersRound60 enforces ES 7/8 Content-Type & Accept media-type
-// negotiation rules, returning false after writing HTTP 406 Not Acceptable when invalid.
+// negotiation rules (and OpenSearch compatible-with=2), returning false after writing HTTP 406 Not Acceptable when invalid.
 func (s *Server) validateWireAcceptAndCompatHeadersRound60(w http.ResponseWriter, r *http.Request) bool {
 	if r == nil {
 		return true
 	}
-	accept := strings.TrimSpace(r.Header.Get("Accept"))
-	reqCT := strings.TrimSpace(r.Header.Get("Content-Type"))
+	acceptVals := r.Header.Values("Accept")
+	accept := strings.TrimSpace(strings.Join(acceptVals, ", "))
+	reqCTVals := r.Header.Values("Content-Type")
 
-	accCompat, hasAccCompat := extractCompatibleWithParam(accept)
-	ctCompat, hasCTCompat := extractCompatibleWithParam(reqCT)
+	var ctESCompat string
+	hasCTESCompat := false
+	for _, rawCT := range reqCTVals {
+		rawCT = strings.TrimSpace(rawCT)
+		if rawCT == "" {
+			continue
+		}
+		lowerCT := strings.ToLower(rawCT)
+		mtCT := strings.TrimSpace(strings.SplitN(lowerCT, ";", 2)[0])
+		ctCompat, hasCTCompat := extractCompatibleWithParam(rawCT)
+		switch {
+		case strings.HasPrefix(mtCT, "application/vnd.elasticsearch+"):
+			if !hasCTCompat {
+				w.Header().Set("Content-Type", "application/json; charset=UTF-8")
+				writeESError(w, http.StatusNotAcceptable, "not_acceptable_exception",
+					"Content-Type [application/vnd.elasticsearch+...] requires compatible-with parameter")
+				return false
+			}
+			if ctCompat != "7" && ctCompat != "8" {
+				w.Header().Set("Content-Type", "application/json; charset=UTF-8")
+				writeESError(w, http.StatusNotAcceptable, "not_acceptable_exception",
+					fmt.Sprintf("Content-Type compatible-with version [%s] is not supported; must be 7 or 8", ctCompat))
+				return false
+			}
+			if hasCTESCompat && ctESCompat != ctCompat {
+				w.Header().Set("Content-Type", "application/json; charset=UTF-8")
+				writeESError(w, http.StatusNotAcceptable, "not_acceptable_exception",
+					fmt.Sprintf("Content-Type compatible-with versions [%s] and [%s] conflict", ctESCompat, ctCompat))
+				return false
+			}
+			ctESCompat = ctCompat
+			hasCTESCompat = true
+		case strings.HasPrefix(mtCT, "application/vnd.opensearch+"):
+			if hasCTCompat && ctCompat != "2" && ctCompat != "1" && ctCompat != "3" {
+				w.Header().Set("Content-Type", "application/json; charset=UTF-8")
+				writeESError(w, http.StatusNotAcceptable, "not_acceptable_exception",
+					fmt.Sprintf("Content-Type compatible-with version [%s] is not supported; must be 2", ctCompat))
+				return false
+			}
+		case hasCTCompat && ctCompat != "7" && ctCompat != "8":
+			w.Header().Set("Content-Type", "application/json; charset=UTF-8")
+			writeESError(w, http.StatusNotAcceptable, "not_acceptable_exception",
+				fmt.Sprintf("Content-Type compatible-with version [%s] is not supported; must be 7 or 8", ctCompat))
+			return false
+		}
+	}
 
-	if hasAccCompat && accCompat != "7" && accCompat != "8" {
-		w.Header().Set("Content-Type", "application/json; charset=UTF-8")
-		writeESError(w, http.StatusNotAcceptable, "not_acceptable_exception",
-			fmt.Sprintf("Compatible-with version [%s] is not supported; must be 7 or 8", accCompat))
-		return false
-	}
-	if hasCTCompat && ctCompat != "7" && ctCompat != "8" {
-		w.Header().Set("Content-Type", "application/json; charset=UTF-8")
-		writeESError(w, http.StatusNotAcceptable, "not_acceptable_exception",
-			fmt.Sprintf("Content-Type compatible-with version [%s] is not supported; must be 7 or 8", ctCompat))
-		return false
-	}
-	if hasAccCompat && hasCTCompat && accCompat != ctCompat {
-		w.Header().Set("Content-Type", "application/json; charset=UTF-8")
-		writeESError(w, http.StatusNotAcceptable, "not_acceptable_exception",
-			fmt.Sprintf("Accept version [%s] conflicts with Content-Type version [%s]", accCompat, ctCompat))
-		return false
-	}
-	if strings.Contains(strings.ToLower(reqCT), "application/vnd.elasticsearch+") && !hasCTCompat {
-		w.Header().Set("Content-Type", "application/json; charset=UTF-8")
-		writeESError(w, http.StatusNotAcceptable, "not_acceptable_exception",
-			"Content-Type [application/vnd.elasticsearch+...] requires compatible-with parameter")
-		return false
-	}
-	if accept != "" {
-		acceptable := false
-		for _, rawMedia := range strings.Split(accept, ",") {
-			semi := strings.Split(strings.TrimSpace(rawMedia), ";")
+	var accESCompat string
+	hasAccESCompat := false
+	for _, rawAccept := range acceptVals {
+		for _, mediaPart := range strings.Split(rawAccept, ",") {
+			semi := strings.Split(strings.TrimSpace(mediaPart), ";")
 			mt := strings.ToLower(strings.TrimSpace(semi[0]))
 			if mt == "" {
 				continue
 			}
-			if parseMediaQualityWeightR63(semi[1:]) <= 0 {
-				continue
+			partCompat, hasPartCompat := extractCompatibleWithParam(mediaPart)
+			if strings.HasPrefix(mt, "application/vnd.elasticsearch+") {
+				if hasPartCompat && partCompat != "7" && partCompat != "8" {
+					w.Header().Set("Content-Type", "application/json; charset=UTF-8")
+					writeESError(w, http.StatusNotAcceptable, "not_acceptable_exception",
+						fmt.Sprintf("Compatible-with version [%s] is not supported; must be 7 or 8", partCompat))
+					return false
+				}
+				if hasPartCompat && parseMediaQualityWeightR63(semi[1:]) > 0 {
+					accESCompat = partCompat
+					hasAccESCompat = true
+				}
+			} else if strings.HasPrefix(mt, "application/vnd.opensearch+") {
+				if hasPartCompat && partCompat != "2" && partCompat != "1" && partCompat != "3" {
+					w.Header().Set("Content-Type", "application/json; charset=UTF-8")
+					writeESError(w, http.StatusNotAcceptable, "not_acceptable_exception",
+						fmt.Sprintf("Compatible-with version [%s] is not supported; must be 2", partCompat))
+					return false
+				}
+			} else if hasPartCompat && partCompat != "7" && partCompat != "8" {
+				w.Header().Set("Content-Type", "application/json; charset=UTF-8")
+				writeESError(w, http.StatusNotAcceptable, "not_acceptable_exception",
+					fmt.Sprintf("Compatible-with version [%s] is not supported; must be 7 or 8", partCompat))
+				return false
 			}
-			switch mt {
-			case "*/*", "application/*", "text/*", "image/*",
-				"application/json", "application/x-ndjson", "application/ndjson",
-				"application/vnd.mapbox-vector-tile",
-				"application/yaml", "application/x-yaml", "application/cbor", "application/smile",
-				"text/plain", "text/html", "text/yaml", "text/csv", "text/tab-separated-values":
-				acceptable = true
-			case "application/vnd.elasticsearch+json",
-				"application/vnd.elasticsearch+x-ndjson",
-				"application/vnd.elasticsearch+ndjson",
-				"application/vnd.elasticsearch+yaml",
-				"application/vnd.elasticsearch+cbor",
-				"application/vnd.elasticsearch+smile":
-				if hasAccCompat && (accCompat == "7" || accCompat == "8") {
+		}
+	}
+	if hasAccESCompat && hasCTESCompat && accESCompat != ctESCompat {
+		w.Header().Set("Content-Type", "application/vnd.elasticsearch+json; compatible-with="+accESCompat)
+		writeESError(w, http.StatusNotAcceptable, "not_acceptable_exception",
+			fmt.Sprintf("Accept version [%s] conflicts with Content-Type version [%s]", accESCompat, ctESCompat))
+		return false
+	}
+	if accept != "" {
+		acceptable := false
+		for _, rawAccept := range acceptVals {
+			for _, rawMedia := range strings.Split(rawAccept, ",") {
+				semi := strings.Split(strings.TrimSpace(rawMedia), ";")
+				mt := strings.ToLower(strings.TrimSpace(semi[0]))
+				if mt == "" {
+					continue
+				}
+				if parseMediaQualityWeightR63(semi[1:]) <= 0 {
+					continue
+				}
+				switch mt {
+				case "*/*", "application/*", "text/*", "image/*",
+					"application/json", "application/x-ndjson", "application/ndjson",
+					"application/vnd.mapbox-vector-tile",
+					"application/yaml", "application/x-yaml", "application/cbor", "application/smile",
+					"text/plain", "text/html", "text/yaml", "text/csv", "text/tab-separated-values":
 					acceptable = true
+				case "application/vnd.elasticsearch+json",
+					"application/vnd.elasticsearch+x-ndjson",
+					"application/vnd.elasticsearch+ndjson",
+					"application/vnd.elasticsearch+yaml",
+					"application/vnd.elasticsearch+cbor",
+					"application/vnd.elasticsearch+smile":
+					partCompat, hasPartCompat := extractCompatibleWithParam(rawMedia)
+					if hasPartCompat && (partCompat == "7" || partCompat == "8") {
+						acceptable = true
+					}
+				case "application/vnd.opensearch+json",
+					"application/vnd.opensearch+x-ndjson",
+					"application/vnd.opensearch+ndjson",
+					"application/vnd.opensearch+yaml":
+					partCompat, hasPartCompat := extractCompatibleWithParam(rawMedia)
+					if !hasPartCompat || partCompat == "2" || partCompat == "1" || partCompat == "3" {
+						acceptable = true
+					}
 				}
 			}
 		}
@@ -1738,11 +1812,6 @@ func (s *Server) collectIndexFielddataAndCompletionSizesRound61(indexName string
 				totalComp += sz
 				continue
 			}
-			if docCount > 0 && (fb.ESType == "keyword" || fb.ESType == "text" || fb.DorisType == schema.DorisString) {
-				sz := docCount * 64
-				fdSizes[fn] = sz
-				totalFD += sz
-			}
 		}
 	}
 	var scanRawCompletion func(prefix string, props map[string]esast.FieldProperty)
@@ -1758,7 +1827,7 @@ func (s *Server) collectIndexFielddataAndCompletionSizesRound61(indexName string
 					compSizes[full] = sz
 					totalComp += sz
 				}
-			} else if docCount > 0 && (prop.Fielddata == true) {
+			} else if docCount > 0 && (isFielddataEnabledRound61(prop.Fielddata) || (prop.EagerGlobalOrdinals != nil && *prop.EagerGlobalOrdinals)) {
 				if _, exists := fdSizes[full]; !exists {
 					sz := docCount * 64
 					fdSizes[full] = sz
@@ -1781,7 +1850,7 @@ func (s *Server) collectIndexFielddataAndCompletionSizesRound61(indexName string
 	st := getOrCreateRound61AdminState(s)
 	st.mu.RLock()
 	for fn, fc := range st.fieldAccesses[indexName] {
-		if fc == nil || strings.HasPrefix(fn, "_") {
+		if fc == nil || strings.HasPrefix(fn, "_") || !fc.globalOrdinalsLoaded {
 			continue
 		}
 		if _, isComp := compSizes[fn]; isComp {
@@ -2624,7 +2693,7 @@ func (s *Server) serveNodesInfoRound60(w http.ResponseWriter, r *http.Request, n
 				"ingest-attachment", "ingest-common", "ingest-geoip", "ingest-user-agent",
 				"lang-expression", "lang-mustache", "lang-painless",
 				"mapper-extras", "parent-join", "percolator", "rank-eval", "reindex",
-				"transport-netty4",
+				"repository-url", "transport-netty4",
 			}
 			mods := make([]any, 0, len(modNames))
 			for _, mn := range modNames {
@@ -3962,6 +4031,53 @@ func (s *Server) applyDocTypeToSearchResponseRound60(resp map[string]any, r *htt
 	}
 	if aggs, ok := resp["aggregations"].(map[string]any); ok {
 		walkAggs(aggs)
+	}
+	if !es8 {
+		if prof, ok := resp["profile"].(map[string]any); ok && prof != nil {
+			var patchProfileAggs func(aggsAny any)
+			patchProfileAggs = func(aggsAny any) {
+				var nodes []map[string]any
+				switch list := aggsAny.(type) {
+				case []map[string]any:
+					nodes = list
+				case []any:
+					for _, item := range list {
+						if m, okM := item.(map[string]any); okM {
+							nodes = append(nodes, m)
+						}
+					}
+				}
+				for _, node := range nodes {
+					if node == nil {
+						continue
+					}
+					if aggType, _ := node["type"].(string); aggType == "GlobalOrdinalsStringTermsAggregator" {
+						if dbg, okD := node["debug"].(map[string]any); okD && dbg != nil {
+							dbg["collection_strategy"] = "dense"
+						}
+					}
+					if ch, hasCh := node["children"]; hasCh {
+						patchProfileAggs(ch)
+					}
+				}
+			}
+			var shards []map[string]any
+			switch shRaw := prof["shards"].(type) {
+			case []map[string]any:
+				shards = shRaw
+			case []any:
+				for _, item := range shRaw {
+					if m, okM := item.(map[string]any); okM {
+						shards = append(shards, m)
+					}
+				}
+			}
+			for _, sh := range shards {
+				if sh != nil {
+					patchProfileAggs(sh["aggregations"])
+				}
+			}
+		}
 	}
 }
 

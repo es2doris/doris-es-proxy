@@ -365,9 +365,8 @@ func TestRound45FilterPathCoalescerStreamLoadMembackendAndIngest(t *testing.T) {
 
 	// Cross-scheme or non-API redirect on different host must not receive Authorization
 	feRedirectExt := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Redirect to a path that is NOT /_stream_load or /api/ on another host/port
-		//Wait: httptest on 127.0.0.1 has same hostname (127.0.0.1), so let's test infinite redirect loop cap (stopped after 5 redirects)
-		http.Redirect(w, r, "/loop", http.StatusTemporaryRedirect)
+		// Infinite redirect loop on a valid /_stream_load path must stop after 5 redirects
+		http.Redirect(w, r, "/api/db/tbl/_stream_load", http.StatusTemporaryRedirect)
 	}))
 	defer feRedirectExt.Close()
 

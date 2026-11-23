@@ -1295,7 +1295,7 @@ func TestRound30BoostZeroFuzzyCaseInsensitiveTermsSetAndRelativeNestedSubAggs(t 
 	if err != nil {
 		t.Fatalf("BuildSearchPlan(req2) failed: %v", err)
 	}
-	if !strings.Contains(plan2.HitsSQL, "COALESCE(CAST(`_doc`['dyn_thresh'] AS DOUBLE), 1)") {
+	if !strings.Contains(plan2.HitsSQL, "COALESCE(TRY_CAST(`_doc`['dyn_thresh'] AS DOUBLE), 1)") {
 		t.Fatalf("expected numeric column ref in COALESCE for dyn_thresh, got:\n%s", plan2.HitsSQL)
 	}
 	if !strings.Contains(plan2.HitsSQL, "(CASE WHEN `f__req_count` IS NOT NULL THEN 1 ELSE 0 END)") {
@@ -3302,7 +3302,7 @@ func TestRound48TranspilerSpecCompliance(t *testing.T) {
 	if w := tr.CompileQuery(&flatRootQ, false, nil).WhereSQL; !strings.Contains(w, `LIKE '%"prod"%'`) {
 		t.Fatalf("F15 expected root flattened term query to match JSON leaf string, got %s", w)
 	}
-	if w := tr.CompileQuery(&flatSubKeyQ, false, nil).WhereSQL; !strings.Contains(w, "array_contains(CAST(`_doc`['labels']['env'] AS ARRAY<STRING>), 'prod')") {
+	if w := tr.CompileQuery(&flatSubKeyQ, false, nil).WhereSQL; !strings.Contains(w, "array_contains(TRY_CAST(`_doc`['labels']['env'] AS ARRAY<STRING>), 'prod')") {
 		t.Fatalf("F15 expected flattened sub-key term query to check array_contains on _doc['labels']['env'], got %s", w)
 	}
 	if w := tr.CompileQuery(&flatNestedQ, false, nil).WhereSQL; !strings.Contains(w, "$.attrs.color") || !strings.Contains(w, "ARRAY<STRING>") {
