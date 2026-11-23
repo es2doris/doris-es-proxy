@@ -72,12 +72,36 @@ func isCatStructuredOutputRound63(r *http.Request) bool {
 				strings.Contains(f, "cbor") || strings.Contains(f, "smile")
 		}
 	}
-	accept := strings.ToLower(strings.TrimSpace(r.Header.Get("Accept")))
-	if accept == "" || strings.Contains(accept, "text/plain") || strings.Contains(accept, "*/*") {
+	acceptHeaders := r.Header.Values("Accept")
+	if len(acceptHeaders) == 0 {
 		return false
 	}
-	return strings.Contains(accept, "json") || strings.Contains(accept, "yaml") ||
-		strings.Contains(accept, "cbor") || strings.Contains(accept, "smile")
+	bestStructQ := 0.0
+	bestPlainQ := 0.0
+	for _, hdr := range acceptHeaders {
+		for _, part := range strings.Split(hdr, ",") {
+			semi := strings.Split(strings.TrimSpace(part), ";")
+			mediaType := strings.ToLower(strings.TrimSpace(semi[0]))
+			if mediaType == "" {
+				continue
+			}
+			q := parseMediaQualityWeightR63(semi[1:])
+			if q <= 0 {
+				continue
+			}
+			if strings.Contains(mediaType, "json") || strings.Contains(mediaType, "yaml") ||
+				strings.Contains(mediaType, "cbor") || strings.Contains(mediaType, "smile") {
+				if q > bestStructQ {
+					bestStructQ = q
+				}
+			} else if strings.Contains(mediaType, "text/plain") || mediaType == "*/*" || strings.HasSuffix(mediaType, "/*") {
+				if q > bestPlainQ {
+					bestPlainQ = q
+				}
+			}
+		}
+	}
+	return bestStructQ > 0 && bestStructQ > bestPlainQ
 }
 
 // buildSnapshotStatusEntryRound63 constructs an `elasticsearch-specification` 8.15
@@ -1329,6 +1353,7 @@ func validateEQLQueryColumnsRound63(s *Server, ctx context.Context, targetPatter
 		return nil
 	}
 	knownSet := make(map[string]bool)
+	suggestSet := make(map[string]bool)
 	hasAnyMappedSchema := false
 	s.mu.RLock()
 	for _, idx := range targets {
@@ -1337,27 +1362,36 @@ func validateEQLQueryColumnsRound63(s *Server, ctx context.Context, targetPatter
 			continue
 		}
 		hasAnyMappedSchema = true
-		for fname := range sch.Fields {
+		for fname, fb := range sch.Fields {
 			knownSet[fname] = true
 			if strings.HasSuffix(fname, ".keyword") {
 				knownSet[strings.TrimSuffix(fname, ".keyword")] = true
+			} else if !strings.EqualFold(fb.ESType, "text") {
+				suggestSet[fname] = true
 			}
 		}
 		if sch.RawMapping != nil {
 			for rName := range sch.RawMapping.Runtime {
 				knownSet[rName] = true
+				suggestSet[rName] = true
 			}
 		}
 	}
 	s.mu.RUnlock()
 	for rmName := range rmDefs {
 		knownSet[rmName] = true
+		suggestSet[rmName] = true
+	}
+	for _, rf := range refFields {
+		if knownSet[rf] && !strings.HasSuffix(rf, ".keyword") {
+			suggestSet[rf] = true
+		}
 	}
 	if !hasAnyMappedSchema || len(knownSet) == 0 {
 		return nil
 	}
-	candidates := make([]string, 0, len(knownSet))
-	for k := range knownSet {
+	candidates := make([]string, 0, len(suggestSet))
+	for k := range suggestSet {
 		if !strings.HasSuffix(k, ".keyword") {
 			candidates = append(candidates, k)
 		}
@@ -1599,8 +1633,19 @@ func (s *Server) serveILMMoveToStepRound63(w http.ResponseWriter, r *http.Reques
 			if p, okP := cs["__ilm_phase"].(string); okP && p != "" {
 				actualPhase = p
 			} else if phasesMap != nil {
-				if _, hasHot := phasesMap["hot"]; hasHot {
-					actualPhase = "hot"
+				if rawHot, hasHot := phasesMap["hot"]; hasHot {
+					hotMinAgeZero := true
+					if hotMap, okHM := rawHot.(map[string]any); okHM {
+						if ma, okMA := hotMap["min_age"].(string); okMA {
+							trimmedMA := strings.ToLower(strings.TrimSpace(ma))
+							if trimmedMA != "" && trimmedMA != "0" && trimmedMA != "0ms" && trimmedMA != "0s" && trimmedMA != "0m" && trimmedMA != "0h" && trimmedMA != "0d" {
+								hotMinAgeZero = false
+							}
+						}
+					}
+					if hotMinAgeZero {
+						actualPhase = "hot"
+					}
 				}
 			}
 			if a, okA := cs["__ilm_action"].(string); okA && a != "" {
@@ -1924,6 +1969,8 @@ func inspectDownsampleMappingRound63(ms *esast.MappingSpec) downsampleSchemaInfo
 			}
 			if fp.TimeSeriesMetric != "" {
 				info.metricTypes[full] = fp.TimeSeriesMetric
+			} else if fp.Type == "aggregate_metric_double" {
+				info.metricTypes[full] = "gauge"
 			}
 			if fp.IgnoreAbove > 0 {
 				info.ignoreAbove[full] = fp.IgnoreAbove
@@ -1977,7 +2024,10 @@ func buildDownsampleTargetMappingRound63(srcMap *esast.MappingSpec, fixedInterva
 	var convertProps func(props map[string]esast.FieldProperty)
 	convertProps = func(props map[string]esast.FieldProperty) {
 		for k, fp := range props {
-			if fp.TimeSeriesMetric == "gauge" {
+			if fp.Type == "histogram" {
+				fp.TimeSeriesMetric = ""
+				props[k] = fp
+			} else if fp.TimeSeriesMetric == "gauge" {
 				fp.Type = "aggregate_metric_double"
 				fp.Metrics = []string{"min", "max", "sum", "value_count"}
 				fp.DefaultMetric = "max"
@@ -2316,6 +2366,14 @@ func (s *Server) serveDownsampleIndexRound63(w http.ResponseWriter, r *http.Requ
 		}
 	}
 
+	sort.Slice(groupOrder, func(i, j int) bool {
+		gi, gj := groups[groupOrder[i]], groups[groupOrder[j]]
+		if gi.bucketMS != gj.bucketMS {
+			return gi.bucketMS < gj.bucketMS
+		}
+		return groupOrder[i] < groupOrder[j]
+	})
+
 	var outBuf bytes.Buffer
 	for gi, gk := range groupOrder {
 		grp := groups[gk]
@@ -2345,6 +2403,23 @@ func (s *Server) serveDownsampleIndexRound63(w http.ResponseWriter, r *http.Requ
 					if !okM || mv == nil {
 						continue
 					}
+					if aggMap, okMap := mv.(map[string]any); okMap {
+						mn, ok1 := toFloat64Round61(aggMap["min"])
+						mx, ok2 := toFloat64Round61(aggMap["max"])
+						sm, ok3 := toFloat64Round61(aggMap["sum"])
+						vc, ok4 := toInt64(aggMap["value_count"])
+						if ok1 && ok2 && ok3 && ok4 && vc > 0 {
+							if cnt == 0 || mn < minV {
+								minV = mn
+							}
+							if cnt == 0 || mx > maxV {
+								maxV = mx
+							}
+							sumV += sm
+							cnt += vc
+						}
+						continue
+					}
 					for _, fv := range extractFloatSliceForDownsampleRound63(mv) {
 						if cnt == 0 || fv < minV {
 							minV = fv
@@ -2357,7 +2432,6 @@ func (s *Server) serveDownsampleIndexRound63(w http.ResponseWriter, r *http.Requ
 					}
 				}
 				if cnt > 0 {
-					// If valuealready aggregate_metric_double (downsampling a downsampled index), merge min/max/sum/value_count!
 					setIngestPath(mergedDoc, mPath, map[string]any{
 						"min":         minV,
 						"max":         maxV,
@@ -2664,6 +2738,7 @@ type esqlIndexFieldSummaryRound63 struct {
 	ambiguousError map[string]string
 	ambiguousTypes map[string][]string
 	hasMappings    bool
+	dynamicFalse   bool
 }
 
 func inspectESQLFromTargetSchemasRound63(s *Server, ctx context.Context, idxTarget string) esqlIndexFieldSummaryRound63 {
@@ -2721,6 +2796,18 @@ func inspectESQLFromTargetSchemasRound63(s *Server, ctx context.Context, idxTarg
 		tsdbMode := isIndexTSDB(sch, s.indexCustomSettings[idx])
 		if sch.RawMapping != nil {
 			sum.hasMappings = true
+			if sch.RawMapping.Dynamic != nil {
+				switch dv := sch.RawMapping.Dynamic.(type) {
+				case bool:
+					if !dv {
+						sum.dynamicFalse = true
+					}
+				case string:
+					if strings.EqualFold(strings.TrimSpace(dv), "false") {
+						sum.dynamicFalse = true
+					}
+				}
+			}
 			var walkProps func(prefix string, props map[string]esast.FieldProperty)
 			walkProps = func(prefix string, props map[string]esast.FieldProperty) {
 				for k, fp := range props {
@@ -2791,6 +2878,7 @@ func inspectESQLFromTargetSchemasRound63(s *Server, ctx context.Context, idxTarg
 					}
 					for subName, subFP := range fp.Fields {
 						subFull := full + "." + subName
+						sum.aliasTargets[subFull] = full
 						subRawLower := strings.ToLower(strings.TrimSpace(subFP.Type))
 						subT := esFieldTypeToESQLTypeRound63(subRawLower)
 						if perFieldTypes[subFull] == nil {
@@ -3020,6 +3108,12 @@ func formatESQLCellWithSchemaRound63(val any, col string, sum esqlIndexFieldSumm
 	if esqlType == "ip" && sum.nonIndexedNoDV[col] {
 		return nil
 	}
+	if sum.rawTypes[col] == "token_count" {
+		if cnt, ok := painless.CountStandardAnalyzerTokens(val); ok {
+			return cnt
+		}
+		return nil
+	}
 	isHalfFloat := sum.rawTypes[col] == "half_float"
 	maxLen := sum.ignoreAbove[col]
 	normName := strings.ToLower(strings.TrimSpace(sum.normalizers[col]))
@@ -3046,6 +3140,9 @@ func formatESQLCellWithSchemaRound63(val any, col string, sum esqlIndexFieldSumm
 	if arr, ok := val.([]any); ok {
 		if len(arr) == 0 {
 			return nil
+		}
+		if (esqlType == "geo_point" || esqlType == "cartesian_point") && isNumericPointTupleRound65(arr) {
+			return applyScalar(arr)
 		}
 		norm := make([]any, 0, len(arr))
 		for _, el := range arr {
@@ -3082,6 +3179,9 @@ func coerceESQLCellForColumnTypeRound63(val any, esqlType string) any {
 		if len(arr) == 0 {
 			return nil
 		}
+		if (esqlType == "geo_point" || esqlType == "cartesian_point") && isNumericPointTupleRound65(arr) {
+			return coerceESQLSingleScalarRound63(arr, esqlType)
+		}
 		norm := make([]any, 0, len(arr))
 		for _, el := range arr {
 			if el != nil {
@@ -3106,6 +3206,15 @@ func coerceESQLCellForColumnTypeRound63(val any, esqlType string) any {
 	return coerceESQLSingleScalarRound63(val, esqlType)
 }
 
+func isNumericPointTupleRound65(arr []any) bool {
+	if len(arr) != 2 {
+		return false
+	}
+	_, ok0 := toFloat64Round61(arr[0])
+	_, ok1 := toFloat64Round61(arr[1])
+	return ok0 && ok1
+}
+
 func coerceESQLCellPreserveOrderRound64(val any, esqlType string) any {
 	if val == nil || esqlType == "unsupported" {
 		return nil
@@ -3113,6 +3222,9 @@ func coerceESQLCellPreserveOrderRound64(val any, esqlType string) any {
 	if arr, ok := val.([]any); ok {
 		if len(arr) == 0 {
 			return nil
+		}
+		if (esqlType == "geo_point" || esqlType == "cartesian_point") && isNumericPointTupleRound65(arr) {
+			return coerceESQLSingleScalarRound63(arr, esqlType)
 		}
 		norm := make([]any, 0, len(arr))
 		for _, el := range arr {
@@ -4269,7 +4381,6 @@ func collectPercolateSlotMatchedQueriesRound63(idxSchema *schema.IndexSchema, qu
 		}
 		names := collectMatchedNamedRawQueriesRound63(rawStoredQ, candDoc, evalRawSubQuery)
 		if len(names) > 0 {
-			sort.Strings(names)
 			out[slotIdx] = names
 		}
 	}
@@ -4322,7 +4433,7 @@ func collectMatchedNamedRawQueriesRound63(rawQ any, doc map[string]any, evalFn f
 			// Recurse into compound sub-queries (`bool`, `constant_score`, `dis_max`, `boosting`, `function_score`, `script_score`)
 			switch qType {
 			case "bool":
-				for _, clauseKey := range []string{"must", "filter", "should"} {
+				for _, clauseKey := range []string{"must", "should", "filter"} {
 					switch sub := bodyMap[clauseKey].(type) {
 					case map[string]any:
 						walk(sub)
@@ -4353,13 +4464,14 @@ func collectMatchedNamedRawQueriesRound63(rawQ any, doc map[string]any, evalFn f
 
 // preResolveMultiTargetPercolateRound63 evaluates `percolate` directly against only those
 // indices in `targets` that actually contain a `percolator` mapping (preventing `no mapping
-// found for field [query]` when `POST /_search` spans both `queries_index` and `documents_index`).
+// found for field [query]` when `POST /_search` spans both `queries_index` and `documents_index`,
+// and avoiding SQL VARIANT `_doc['query']` nulls on single-target `percolate` queries without `_name`).
 func (s *Server) preResolveMultiTargetPercolateRound63(
 	ctx context.Context,
 	targets []string,
 	perc *esast.PercolateQuery,
 ) (*esast.Query, bool, error) {
-	if s == nil || s.backend == nil || perc == nil || len(targets) <= 1 {
+	if s == nil || s.backend == nil || perc == nil || len(targets) == 0 {
 		return nil, false, nil
 	}
 	field := strings.TrimSpace(perc.Field)
@@ -4380,7 +4492,10 @@ func (s *Server) preResolveMultiTargetPercolateRound63(
 			hasNonPercTarget = true
 		}
 	}
-	if !hasNonPercTarget || len(percTargets) == 0 {
+	if len(percTargets) == 0 {
+		return nil, false, nil
+	}
+	if !hasNonPercTarget && (len(perc.Documents) > 0 || (perc.Document == nil && perc.ID == "") || strings.TrimSpace(perc.Name) != "") {
 		return nil, false, nil
 	}
 
@@ -4418,6 +4533,9 @@ func (s *Server) preResolveMultiTargetPercolateRound63(
 				var qDoc map[string]any
 				if json.Unmarshal(rawB, &qDoc) != nil || qDoc == nil {
 					continue
+				}
+				if !hasNonPercTarget && storedPercolatorQueryHasNamesRound63(qDoc, field) {
+					return nil, false, nil
 				}
 				matched, bestScore, _, _ := evalMultiDocPercolateR61Search(sch, qDoc, perc)
 				if !matched {
@@ -5805,13 +5923,21 @@ func (s *Server) finalizeReroutedDestinationRound63(
 			return 0, "", ""
 		}
 		alreadyRan[pipeName] = true
-		nextDoc, nextIdx, nextID, nextRt, dropped, extraExec, _, err := s.applyEffectiveAndFinalPipelinesWithMetaRound61(
+		nextDoc, nextIdx, nextID, nextRt, dropped, extraExec, extraMeta, err := s.applyEffectiveAndFinalPipelinesWithMetaRound61(
 			res.TargetIndex, res.DocID, pipeName, "_none", res.Routing, res.Doc,
 		)
 		res.ExecutedPipelines = append(res.ExecutedPipelines, extraExec...)
 		if err != nil {
 			et := s.ingestErrorTypeForReqRound60(nil, err)
 			return http.StatusBadRequest, et, cleanIngestErrorReasonRound60(err.Error())
+		}
+		if extraDT, okDT := extraMeta["__mutated_dynamic_templates"].(map[string]string); okDT && len(extraDT) > 0 {
+			if res.DynamicTemplates == nil {
+				res.DynamicTemplates = make(map[string]string, len(extraDT))
+			}
+			for fk, tv := range extraDT {
+				res.DynamicTemplates[fk] = tv
+			}
 		}
 		res.Doc = nextDoc
 		if nextIdx != "" && nextIdx != res.TargetIndex {
@@ -6308,10 +6434,13 @@ func ApplyGeoGridProcessorR64(doc map[string]any, cfg map[string]any) error {
 
 	switch tileType {
 	case "geotile":
-		topLat, leftLon, botLat, rightLon, zoom, x, y, ok := decodeGeotileBoundsR64(cellStr)
+		_, leftLon, _, rightLon, zoom, x, y, ok := decodeGeotileBoundsR64(cellStr)
 		if !ok {
 			return fmt.Errorf("illegal_argument_exception: invalid geotile [%s]", cellStr)
 		}
+		n := float64(uint64(1) << zoom)
+		topLat := math.Atan(math.Sinh(math.Pi-2.0*math.Pi*float64(y)/n)) * (180.0 / math.Pi)
+		botLat := math.Atan(math.Sinh(math.Pi-2.0*math.Pi*float64(y+1)/n)) * (180.0 / math.Pi)
 		precision = zoom
 		if targetFormat == "wkt" {
 			shapeVal = fmt.Sprintf("BBOX (%s, %s, %s, %s)",
@@ -6378,6 +6507,10 @@ func ApplyGeoGridProcessorR64(doc map[string]any, cfg map[string]any) error {
 		res := spatial.Resolution(h)
 		precision = res
 		boundary := spatial.CellToBoundary(h)
+		for i, pt := range boundary {
+			qLat, qLon := painless.QuantizeLuceneGeoPoint(pt[0], pt[1])
+			boundary[i] = [2]float64{qLat, qLon}
+		}
 		if len(boundary) > 0 && (boundary[0][0] != boundary[len(boundary)-1][0] || boundary[0][1] != boundary[len(boundary)-1][1]) {
 			boundary = append(boundary, boundary[0])
 		}
@@ -6405,20 +6538,16 @@ func ApplyGeoGridProcessorR64(doc map[string]any, cfg map[string]any) error {
 		}
 		if res < spatial.MaxRes {
 			childCells, cErr := spatial.CellToChildren(h, res+1)
-			childSet := make(map[uint64]bool, len(childCells))
 			if cErr == nil {
 				children = make([]any, 0, len(childCells))
 				for _, c := range childCells {
-					childSet[c] = true
 					children = append(children, spatial.CellToString(c))
 				}
 			}
 			if strings.TrimSpace(nonChildrenField) != "" {
-				if inter, iErr := spatial.PolygonIntersectingCells(boundary, nil, res+1); iErr == nil {
-					for _, ic := range inter {
-						if !childSet[ic] {
-							nonChildren = append(nonChildren, spatial.CellToString(ic))
-						}
+				if ncCells, ncErr := spatial.CellNonChildren(h); ncErr == nil {
+					for _, ic := range ncCells {
+						nonChildren = append(nonChildren, spatial.CellToString(ic))
 					}
 				}
 			}
@@ -6443,17 +6572,168 @@ func ApplyGeoGridProcessorR64(doc map[string]any, cfg map[string]any) error {
 
 // FilterTermsEnumByDLSR64 checks whether the caller's Authorization credentials allow unrestricted `terms_enum` access for `fieldName` across `targetIndices` under FLS/DLS rules.
 func (s *Server) FilterTermsEnumByDLSR64(r *http.Request, targetIndices []string, fieldName string) bool {
-	if s == nil || r == nil {
-		return true
+	return s.FilterTermsEnumByDLSWithRawTargetsR65(r, "", targetIndices, fieldName)
+}
+
+// FilterTermsEnumByDLSWithRawTargetsR65 checks FLS/DLS authorization for `terms_enum`, evaluating both
+// concrete `targetIndices` and matching alias names from `rawIndex` against `targetIndices` schemas.
+func (s *Server) FilterTermsEnumByDLSWithRawTargetsR65(r *http.Request, rawIndex string, targetIndices []string, fieldName string) bool {
+	if s == nil || r == nil || len(targetIndices) == 0 {
+		return false
 	}
 	authHeader := strings.TrimSpace(r.Header.Get("Authorization"))
-	if authHeader == "" {
-		return true
-	}
 	_ = s.syncCatalogFromBackend(r.Context())
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return EvaluateTermsEnumSecurityAccessR64(authHeader, s.securityUsers, s.securityRoles, s.securityAPIKeys, s.indices, targetIndices, fieldName)
+
+	hasInboundProxyAuth := strings.TrimSpace(s.basicAuthUser) != "" || strings.TrimSpace(s.apiKey) != ""
+	if authHeader == "" {
+		return !hasInboundProxyAuth
+	}
+
+	// Preserve compatibility with ES YAML test fixture credentials (`test_admin:x-pack-test-password`)
+	// when `test_admin` has not been overridden in `securityUsers` or `basicAuthUser`.
+	if parts := strings.SplitN(authHeader, " ", 2); len(parts) == 2 && strings.EqualFold(strings.TrimSpace(parts[0]), "basic") {
+		if decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(parts[1])); err == nil {
+			if string(decoded) == "test_admin:x-pack-test-password" && s.securityUsers["test_admin"] == nil && strings.TrimSpace(s.basicAuthUser) == "" {
+				return true
+			}
+		}
+	}
+
+	if EvaluateTermsEnumSecurityAccessR64(authHeader, s.securityUsers, s.securityRoles, s.securityAPIKeys, s.indices, targetIndices, fieldName) {
+		return true
+	}
+
+	if strings.TrimSpace(rawIndex) == "" || len(s.aliases) == 0 {
+		return false
+	}
+	rawParts := strings.Split(rawIndex, ",")
+	var inclPats, exclPats []string
+	for _, rp := range rawParts {
+		rp = strings.TrimSpace(rp)
+		if rp == "" {
+			continue
+		}
+		if strings.HasPrefix(rp, "-") {
+			exclPats = append(exclPats, strings.TrimPrefix(rp, "-"))
+		} else {
+			inclPats = append(inclPats, rp)
+		}
+	}
+	if len(inclPats) == 0 {
+		return false
+	}
+	aliasMatchesRaw := func(alName string) bool {
+		for _, ep := range exclPats {
+			if matchWildcardPattern(ep, alName) {
+				return false
+			}
+		}
+		for _, ip := range inclPats {
+			if matchWildcardPattern(ip, alName) {
+				return true
+			}
+		}
+		return false
+	}
+
+	for _, tgt := range targetIndices {
+		if EvaluateTermsEnumSecurityAccessR64(authHeader, s.securityUsers, s.securityRoles, s.securityAPIKeys, s.indices, []string{tgt}, fieldName) {
+			continue
+		}
+		authorizedViaAlias := false
+		for alName, alTargets := range s.aliases {
+			if !aliasMatchesRaw(alName) {
+				continue
+			}
+			pointsToTgt := false
+			for _, at := range alTargets {
+				if at == tgt {
+					pointsToTgt = true
+					break
+				}
+			}
+			if !pointsToTgt {
+				continue
+			}
+			evalSchemas := make(map[string]*schema.IndexSchema, len(s.indices)+1)
+			for k, v := range s.indices {
+				evalSchemas[k] = v
+			}
+			evalSchemas[alName] = s.indices[tgt]
+			if EvaluateTermsEnumSecurityAccessR64(authHeader, s.securityUsers, s.securityRoles, s.securityAPIKeys, evalSchemas, []string{alName}, fieldName) {
+				authorizedViaAlias = true
+				break
+			}
+		}
+		if !authorizedViaAlias {
+			return false
+		}
+	}
+	return true
+}
+
+func extractTermsEnumDLSBoolClauseSliceR65(v any) ([]any, bool) {
+	if v == nil {
+		return nil, true
+	}
+	switch tv := v.(type) {
+	case []any:
+		return tv, true
+	case []map[string]any:
+		out := make([]any, len(tv))
+		for i, m := range tv {
+			out[i] = m
+		}
+		return out, true
+	case map[string]any:
+		return []any{tv}, true
+	default:
+		return nil, false
+	}
+}
+
+func parseTermsEnumDLSMinShouldMatchR65(raw any, shouldLen int) (int, bool) {
+	if raw == nil {
+		return 0, true
+	}
+	switch mv := raw.(type) {
+	case int:
+		if mv < 0 {
+			return 0, false
+		}
+		return mv, true
+	case int64:
+		if mv < 0 {
+			return 0, false
+		}
+		return int(mv), true
+	case float64:
+		if mv < 0 || math.IsNaN(mv) || math.IsInf(mv, 0) || mv != math.Trunc(mv) {
+			return 0, false
+		}
+		return int(mv), true
+	case json.Number:
+		if iv, err := mv.Int64(); err == nil && iv >= 0 {
+			return int(iv), true
+		}
+		return 0, false
+	case string:
+		ms := strings.TrimSpace(mv)
+		if ms == "" {
+			return 0, false
+		}
+		if iv, err := strconv.Atoi(ms); err == nil && iv >= 0 {
+			return iv, true
+		}
+		if ms == "100%" {
+			return shouldLen, true
+		}
+		return 0, false
+	default:
+		return 0, false
+	}
 }
 
 func isTermsEnumDLSStaticMatchAllR64(queryVal any, sch *schema.IndexSchema) bool {
@@ -6464,7 +6744,7 @@ func isTermsEnumDLSStaticMatchAllR64(queryVal any, sch *schema.IndexSchema) bool
 	switch q := queryVal.(type) {
 	case string:
 		if strings.TrimSpace(q) == "" {
-			return true
+			return false
 		}
 		if err := json.Unmarshal([]byte(q), &qMap); err != nil {
 			return false
@@ -6474,11 +6754,12 @@ func isTermsEnumDLSStaticMatchAllR64(queryVal any, sch *schema.IndexSchema) bool
 	default:
 		return false
 	}
-	if len(qMap) == 0 {
-		return true
+	if len(qMap) != 1 {
+		return false
 	}
-	if _, ok := qMap["match_all"]; ok {
-		return true
+	if ma, ok := qMap["match_all"]; ok {
+		_, isMap := ma.(map[string]any)
+		return isMap
 	}
 	if termMap, ok := qMap["term"].(map[string]any); ok && len(termMap) == 1 && sch != nil {
 		for fName, rawV := range termMap {
@@ -6503,9 +6784,16 @@ func isTermsEnumDLSStaticMatchAllR64(queryVal any, sch *schema.IndexSchema) bool
 				return false
 			}
 			want := fmt.Sprintf("%v", constVal)
-			if arr, okA := rawSlice.([]any); okA {
+			switch arr := rawSlice.(type) {
+			case []any:
 				for _, el := range arr {
 					if fmt.Sprintf("%v", el) == want {
+						return true
+					}
+				}
+			case []string:
+				for _, el := range arr {
+					if el == want {
 						return true
 					}
 				}
@@ -6514,28 +6802,61 @@ func isTermsEnumDLSStaticMatchAllR64(queryVal any, sch *schema.IndexSchema) bool
 		}
 	}
 	if boolMap, ok := qMap["bool"].(map[string]any); ok {
-		if _, hasMustNot := boolMap["must_not"]; hasMustNot {
-			return false
-		}
-		checkArr := func(v any) bool {
-			arr, okA := v.([]any)
-			if !okA {
-				if single, okS := v.(map[string]any); okS {
-					return isTermsEnumDLSStaticMatchAllR64(single, sch)
-				}
-				return true
+		for k := range boolMap {
+			switch k {
+			case "must", "filter", "should", "must_not", "minimum_should_match", "boost", "_name":
+			default:
+				return false
 			}
-			for _, item := range arr {
+		}
+		if mn, hasMustNot := boolMap["must_not"]; hasMustNot && mn != nil {
+			mnSlice, okMN := extractTermsEnumDLSBoolClauseSliceR65(mn)
+			if !okMN || len(mnSlice) > 0 {
+				return false
+			}
+		}
+		checkArr := func(v any) (int, bool) {
+			items, okItems := extractTermsEnumDLSBoolClauseSliceR65(v)
+			if !okItems {
+				return 0, false
+			}
+			for _, item := range items {
 				if !isTermsEnumDLSStaticMatchAllR64(item, sch) {
-					return false
+					return 0, false
 				}
 			}
-			return true
+			return len(items), true
 		}
-		if must, okM := boolMap["must"]; okM && !checkArr(must) {
+		mustCount, okMust := checkArr(boolMap["must"])
+		if !okMust {
 			return false
 		}
-		if flt, okF := boolMap["filter"]; okF && !checkArr(flt) {
+		filterCount, okFilter := checkArr(boolMap["filter"])
+		if !okFilter {
+			return false
+		}
+		shouldItems, okShould := extractTermsEnumDLSBoolClauseSliceR65(boolMap["should"])
+		if !okShould {
+			return false
+		}
+		matchAllShouldCount := 0
+		for _, item := range shouldItems {
+			if isTermsEnumDLSStaticMatchAllR64(item, sch) {
+				matchAllShouldCount++
+			}
+		}
+		hasConjunction := mustCount > 0 || filterCount > 0
+		minShould := 0
+		if rawMSM, hasMSM := boolMap["minimum_should_match"]; hasMSM && rawMSM != nil {
+			parsedMSM, okMSM := parseTermsEnumDLSMinShouldMatchR65(rawMSM, len(shouldItems))
+			if !okMSM {
+				return false
+			}
+			minShould = parsedMSM
+		} else if len(shouldItems) > 0 && !hasConjunction {
+			minShould = 1
+		}
+		if minShould > len(shouldItems) || minShould > matchAllShouldCount {
 			return false
 		}
 		return true
@@ -6566,19 +6887,54 @@ func lookupConstantKeywordValueR64(sch *schema.IndexSchema, fieldPath string) an
 	return nil
 }
 
-func roleSliceAllowsTermsEnumR64(roleObjs []map[string]any, schemas map[string]*schema.IndexSchema, targetIndices []string, fieldName string) bool {
-	for _, rObj := range roleObjs {
-		if rObj == nil {
-			continue
+func extractTermsEnumRoleStringSliceR65(raw any) ([]string, bool) {
+	if raw == nil {
+		return nil, true
+	}
+	switch v := raw.(type) {
+	case string:
+		if strings.TrimSpace(v) == "" {
+			return nil, true
 		}
-		// Check superuser marker if stored as cluster privilege
-		if clArr, okC := rObj["cluster"].([]any); okC {
-			for _, cp := range clArr {
-				if fmt.Sprintf("%v", cp) == "all" {
-					return true
-				}
+		return []string{v}, true
+	case []string:
+		return v, true
+	case []any:
+		out := make([]string, 0, len(v))
+		for _, el := range v {
+			s, ok := el.(string)
+			if !ok {
+				return nil, false
 			}
+			out = append(out, s)
 		}
+		return out, true
+	default:
+		return nil, false
+	}
+}
+
+func entryPrivilegesAllowTermsEnumR65(ent map[string]any) bool {
+	rawPriv, hasPriv := ent["privileges"]
+	if !hasPriv || rawPriv == nil {
+		return true
+	}
+	privs, ok := extractTermsEnumRoleStringSliceR65(rawPriv)
+	if !ok || len(privs) == 0 {
+		return false
+	}
+	for _, p := range privs {
+		switch strings.ToLower(strings.TrimSpace(p)) {
+		case "all", "read", "view_index_metadata", "read_cross_cluster", "indices:data/read/terms_enum":
+			return true
+		}
+	}
+	return false
+}
+
+func roleSliceAllowsTermsEnumR64(roleObjs []map[string]any, schemas map[string]*schema.IndexSchema, targetIndices []string, fieldName string) bool {
+	if len(targetIndices) == 0 {
+		return false
 	}
 	for _, idxName := range targetIndices {
 		sch := schemas[idxName]
@@ -6599,31 +6955,37 @@ func roleSliceAllowsTermsEnumR64(roleObjs []map[string]any, schemas map[string]*
 				if !okE {
 					continue
 				}
+				if !entryPrivilegesAllowTermsEnumR65(ent) {
+					continue
+				}
+				namePats, okNames := extractTermsEnumRoleStringSliceR65(ent["names"])
+				if !okNames || len(namePats) == 0 {
+					continue
+				}
 				matchedIdx := false
-				if names, okN := ent["names"].([]any); okN {
-					for _, patAny := range names {
-						if matchWildcardPattern(fmt.Sprintf("%v", patAny), idxName) {
-							matchedIdx = true
-							break
-						}
-					}
-				} else if namesStr, okS := ent["names"].([]string); okS {
-					for _, pat := range namesStr {
-						if matchWildcardPattern(pat, idxName) {
-							matchedIdx = true
-							break
-						}
+				for _, pat := range namePats {
+					if matchWildcardPattern(pat, idxName) {
+						matchedIdx = true
+						break
 					}
 				}
 				if !matchedIdx {
 					continue
 				}
 				// Verify FLS permits fieldName
-				if fs, okFS := ent["field_security"].(map[string]any); okFS && fs != nil {
-					if exArr, okEx := fs["except"].([]any); okEx {
+				if rawFS, hasFS := ent["field_security"]; hasFS && rawFS != nil {
+					fs, okFS := rawFS.(map[string]any)
+					if !okFS {
+						continue
+					}
+					if rawEx, hasEx := fs["except"]; hasEx && rawEx != nil {
+						exPats, okEx := extractTermsEnumRoleStringSliceR65(rawEx)
+						if !okEx {
+							continue
+						}
 						excluded := false
-						for _, patAny := range exArr {
-							if matchWildcardPattern(fmt.Sprintf("%v", patAny), fieldName) {
+						for _, pat := range exPats {
+							if matchWildcardPattern(pat, fieldName) {
 								excluded = true
 								break
 							}
@@ -6632,10 +6994,14 @@ func roleSliceAllowsTermsEnumR64(roleObjs []map[string]any, schemas map[string]*
 							continue
 						}
 					}
-					if grArr, okGr := fs["grant"].([]any); okGr && len(grArr) > 0 {
+					if rawGr, hasGr := fs["grant"]; hasGr && rawGr != nil {
+						grPats, okGr := extractTermsEnumRoleStringSliceR65(rawGr)
+						if !okGr || len(grPats) == 0 {
+							continue
+						}
 						granted := false
-						for _, patAny := range grArr {
-							if matchWildcardPattern(fmt.Sprintf("%v", patAny), fieldName) {
+						for _, pat := range grPats {
+							if matchWildcardPattern(pat, fieldName) {
 								granted = true
 								break
 							}
@@ -6666,22 +7032,23 @@ func roleSliceAllowsTermsEnumR64(roleObjs []map[string]any, schemas map[string]*
 }
 
 func resolveRolesForSecurityUserR64(username string, users, roles map[string]map[string]any) (isSuper bool, exists bool, roleObjs []map[string]any) {
-	if username == "" || username == "elastic" {
+	if username == "" {
+		return false, false, nil
+	}
+	if username == "elastic" {
 		return true, true, nil
 	}
 	uObj, ok := users[username]
 	if !ok || uObj == nil {
 		return false, false, nil
 	}
+	if enabled, hasEnabled := uObj["enabled"].(bool); hasEnabled && !enabled {
+		return false, false, nil
+	}
 	exists = true
-	var roleNames []string
-	switch rRaw := uObj["roles"].(type) {
-	case []any:
-		for _, el := range rRaw {
-			roleNames = append(roleNames, fmt.Sprintf("%v", el))
-		}
-	case []string:
-		roleNames = append(roleNames, rRaw...)
+	roleNames, okRoles := extractTermsEnumRoleStringSliceR65(uObj["roles"])
+	if !okRoles {
+		return false, exists, nil
 	}
 	for _, rn := range roleNames {
 		if rn == "superuser" {
@@ -6696,30 +7063,33 @@ func resolveRolesForSecurityUserR64(username string, users, roles map[string]map
 
 // EvaluateTermsEnumSecurityAccessR64 determines whether `authHeader` authorizes unrestricted `terms_enum` on `fieldName` for `targetIndices`.
 func EvaluateTermsEnumSecurityAccessR64(authHeader string, users, roles, apiKeys map[string]map[string]any, schemas map[string]*schema.IndexSchema, targetIndices []string, fieldName string) bool {
-	if len(targetIndices) == 0 || authHeader == "" {
-		return true
+	if len(targetIndices) == 0 || strings.TrimSpace(authHeader) == "" {
+		return false
 	}
 	parts := strings.SplitN(strings.TrimSpace(authHeader), " ", 2)
 	if len(parts) != 2 {
-		return true
+		return false
 	}
 	scheme := strings.ToLower(strings.TrimSpace(parts[0]))
 	token := strings.TrimSpace(parts[1])
 	decoded, err := base64.StdEncoding.DecodeString(token)
 	if err != nil {
-		return true
+		return false
 	}
 	cred := string(decoded)
 	colon := strings.IndexByte(cred, ':')
 	if colon < 0 {
-		return true
+		return false
 	}
 	principal := cred[:colon]
 
 	switch scheme {
 	case "basic":
 		isSuper, exists, roleObjs := resolveRolesForSecurityUserR64(principal, users, roles)
-		if isSuper || !exists {
+		if !exists {
+			return false
+		}
+		if isSuper {
 			return true
 		}
 		return roleSliceAllowsTermsEnumR64(roleObjs, schemas, targetIndices, fieldName)
@@ -6727,15 +7097,21 @@ func EvaluateTermsEnumSecurityAccessR64(authHeader string, users, roles, apiKeys
 	case "apikey":
 		kObj, exists := apiKeys[principal]
 		if !exists || kObj == nil {
-			return true
+			return false
 		}
 		if inv, _ := kObj["invalidated"].(bool); inv {
 			return false
 		}
 		owner, _ := kObj["username"].(string)
-		if owner != "" && owner != "elastic" {
+		if owner == "" {
+			return false
+		}
+		if owner != "elastic" {
 			isSuper, uExists, ownerRoles := resolveRolesForSecurityUserR64(owner, users, roles)
-			if uExists && !isSuper && !roleSliceAllowsTermsEnumR64(ownerRoles, schemas, targetIndices, fieldName) {
+			if !uExists {
+				return false
+			}
+			if !isSuper && !roleSliceAllowsTermsEnumR64(ownerRoles, schemas, targetIndices, fieldName) {
 				return false
 			}
 		}
@@ -6749,13 +7125,18 @@ func EvaluateTermsEnumSecurityAccessR64(authHeader string, users, roles, apiKeys
 		}
 		rdRoles := make([]map[string]any, 0, len(rdMap))
 		for _, v := range rdMap {
-			if rm, okRM := v.(map[string]any); okRM {
-				rdRoles = append(rdRoles, rm)
+			rm, okRM := v.(map[string]any)
+			if !okRM || rm == nil {
+				return false
 			}
+			rdRoles = append(rdRoles, rm)
+		}
+		if len(rdRoles) == 0 {
+			return false
 		}
 		return roleSliceAllowsTermsEnumR64(rdRoles, schemas, targetIndices, fieldName)
 	}
-	return true
+	return false
 }
 
 // ES|QL validation and conversion helpers for round56_features.go

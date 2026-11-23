@@ -832,9 +832,22 @@ func setupCategoryFixtureIfNeeded(category string, client *http.Client) func() {
 		}
 	}
 
+	httpURL := strings.TrimRight(httpSrv.URL, "/") + "/"
+	fileURL := "file://" + filepath.ToSlash(tmpDir) + "/"
+	if !strings.HasPrefix(fileURL, "file:///") {
+		fileURL = "file:///" + strings.TrimPrefix(filepath.ToSlash(tmpDir), "/") + "/"
+	}
+	allowedURLs := strings.Join([]string{
+		"http://snapshot.test*",
+		"https://snapshot.test*",
+		httpURL + "*",
+		fileURL + "*",
+	}, ",")
+
 	sendFixtureJSON(http.MethodPut, "/_cluster/settings", map[string]any{
 		"persistent": map[string]any{
-			"repositories.url.allowed_urls": "http://snapshot.test*,https://snapshot.test*,http://127.0.0.1:*,http://[::1]:*,file://*",
+			"path.repo":                     []string{tmpDir},
+			"repositories.url.allowed_urls": allowedURLs,
 		},
 	})
 	sendFixtureJSON(http.MethodPut, "/_snapshot/repository-fs?verify=false", map[string]any{
@@ -846,13 +859,9 @@ func setupCategoryFixtureIfNeeded(category string, client *http.Client) func() {
 	sendFixtureJSON(http.MethodPut, "/_snapshot/repository-url?verify=false", map[string]any{
 		"type": "url",
 		"settings": map[string]any{
-			"url": strings.TrimRight(httpSrv.URL, "/") + "/",
+			"url": httpURL,
 		},
 	})
-	fileURL := "file://" + filepath.ToSlash(tmpDir) + "/"
-	if !strings.HasPrefix(fileURL, "file:///") {
-		fileURL = "file:///" + strings.TrimPrefix(filepath.ToSlash(tmpDir), "/") + "/"
-	}
 	sendFixtureJSON(http.MethodPut, "/_snapshot/repository-file?verify=false", map[string]any{
 		"type": "url",
 		"settings": map[string]any{
@@ -866,6 +875,7 @@ func setupCategoryFixtureIfNeeded(category string, client *http.Client) func() {
 		sendFixtureJSON(http.MethodDelete, "/_snapshot/repository-fs", nil)
 		sendFixtureJSON(http.MethodPut, "/_cluster/settings", map[string]any{
 			"persistent": map[string]any{
+				"path.repo":                     nil,
 				"repositories.url.allowed_urls": nil,
 			},
 		})

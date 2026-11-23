@@ -3645,8 +3645,8 @@ func TestRound51TranspilerF10ToF18(t *testing.T) {
 	var nanosDFQ, arrGeoDFQ, nestedGeoDFQ esast.Query
 	_ = json.Unmarshal([]byte(`{"distance_feature":{"field":"ts_nanos","origin":1700000000000000000,"pivot":"1d"}}`), &nanosDFQ)
 	cqNanos := tr.CompileQuery(&nanosDFQ, true, nil)
-	if !strings.Contains(cqNanos.ScoreSQL, "1.7e+12") || strings.Contains(cqNanos.ScoreSQL, "1.7e+18") {
-		t.Fatalf("F11 expected date_nanos numeric origin to normalize to 1.7e+12 ms, got %s", cqNanos.ScoreSQL)
+	if !strings.Contains(cqNanos.ScoreSQL, "1700000000000") || strings.Contains(cqNanos.ScoreSQL, "1700000000000000000") || strings.Contains(cqNanos.ScoreSQL, "1.7e+18") {
+		t.Fatalf("F11 expected date_nanos numeric origin to normalize to 1700000000000 ms, got %s", cqNanos.ScoreSQL)
 	}
 	_ = json.Unmarshal([]byte(`{"distance_feature":{"field":"locs","origin":[-74.0,40.7],"pivot":"1000m"}}`), &arrGeoDFQ)
 	cqArrGeo := tr.CompileQuery(&arrGeoDFQ, true, nil)

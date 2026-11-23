@@ -401,6 +401,7 @@ func TestRound64_ScopedRepositoryURLFixtureIsolation(t *testing.T) {
 		mu          sync.Mutex
 		repos       map[string]map[string]any
 		allowedURLs string
+		pathRepo    []string
 	}
 	state := &sharedRepoState{
 		repos: make(map[string]map[string]any),
@@ -422,6 +423,18 @@ func TestRound64_ScopedRepositoryURLFixtureIsolation(t *testing.T) {
 						state.allowedURLs = ""
 					} else if s, ok := val.(string); ok {
 						state.allowedURLs = s
+					}
+				}
+				if val, exists := pers["path.repo"]; exists {
+					if val == nil {
+						state.pathRepo = nil
+					} else if items, ok := val.([]any); ok {
+						state.pathRepo = state.pathRepo[:0]
+						for _, item := range items {
+							if s, ok := item.(string); ok {
+								state.pathRepo = append(state.pathRepo, s)
+							}
+						}
 					}
 				}
 				state.mu.Unlock()
@@ -546,23 +559,51 @@ func TestRound64_ScopedRepositoryURLFixtureIsolation(t *testing.T) {
 				reuse, sc.SectionsPassed, sc.SectionsFailed, sc.FailureSamples)
 		}
 		state.mu.Lock()
-		if len(state.repos) != 0 || state.allowedURLs != "" {
+		if len(state.repos) != 0 || state.allowedURLs != "" || len(state.pathRepo) != 0 {
 			state.mu.Unlock()
-			t.Fatalf("reuse=%v expected clean state after repository_url teardown, got repos=%+v allowedURLs=%q",
-				reuse, state.repos, state.allowedURLs)
+			t.Fatalf("reuse=%v expected clean state after repository_url teardown, got repos=%+v allowedURLs=%q pathRepo=%v",
+				reuse, state.repos, state.allowedURLs, state.pathRepo)
 		}
 		state.mu.Unlock()
 	}
 
-	// Verify setupCategoryFixtureIfNeeded exposes an HTTP server serving files from repository-fs's temp dir.
+	// Verify setupCategoryFixtureIfNeeded exposes an HTTP server serving files from repository-fs's temp dir,
+	// configures explicit path.repo + scoped allowed_urls without blanket wildcards, and resets settings on cleanup.
 	var capturedFSLocation string
 	var capturedHTTPURL string
 	var capturedFileURL string
+	var capturedAllowedURLs string
+	var capturedPathRepo []string
+	var clearedAllowedURLs bool
+	var clearedPathRepo bool
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		bodyBytes, _ := io.ReadAll(r.Body)
 		var m map[string]any
 		_ = json.Unmarshal(bodyBytes, &m)
 		if r.Method == http.MethodPut {
+			if r.URL.Path == "/_cluster/settings" {
+				if pers, ok := m["persistent"].(map[string]any); ok {
+					if val, exists := pers["repositories.url.allowed_urls"]; exists {
+						if val == nil {
+							clearedAllowedURLs = true
+						} else if s, ok := val.(string); ok {
+							capturedAllowedURLs = s
+						}
+					}
+					if val, exists := pers["path.repo"]; exists {
+						if val == nil {
+							clearedPathRepo = true
+						} else if items, ok := val.([]any); ok {
+							capturedPathRepo = nil
+							for _, item := range items {
+								if s, ok := item.(string); ok {
+									capturedPathRepo = append(capturedPathRepo, s)
+								}
+							}
+						}
+					}
+				}
+			}
 			if settings, ok := m["settings"].(map[string]any); ok {
 				switch r.URL.Path {
 				case "/_snapshot/repository-fs":
@@ -595,6 +636,24 @@ func TestRound64_ScopedRepositoryURLFixtureIsolation(t *testing.T) {
 		cleanup()
 		t.Fatalf("unexpected fixture settings: fs=%q url=%q file=%q", capturedFSLocation, capturedHTTPURL, capturedFileURL)
 	}
+	if len(capturedPathRepo) != 1 || capturedPathRepo[0] != capturedFSLocation {
+		cleanup()
+		t.Fatalf("expected persistent path.repo=[%q], got %v", capturedFSLocation, capturedPathRepo)
+	}
+	for _, want := range []string{"http://snapshot.test*", "https://snapshot.test*", capturedHTTPURL + "*", capturedFileURL + "*"} {
+		if !strings.Contains(capturedAllowedURLs, want) {
+			cleanup()
+			t.Fatalf("expected repositories.url.allowed_urls (%q) to contain %q", capturedAllowedURLs, want)
+		}
+	}
+	for _, banned := range []string{"file://*", "http://127.0.0.1:*", "http://[::1]:*"} {
+		for _, tok := range strings.Split(capturedAllowedURLs, ",") {
+			if strings.TrimSpace(tok) == banned {
+				cleanup()
+				t.Fatalf("repositories.url.allowed_urls (%q) must not include blanket wildcard %q", capturedAllowedURLs, banned)
+			}
+		}
+	}
 	if err := os.WriteFile(filepath.Join(capturedFSLocation, "index.latest"), []byte(`{"ok":true}`), 0o600); err != nil {
 		cleanup()
 		t.Fatalf("writing probe file in tmpDir: %v", err)
@@ -611,6 +670,9 @@ func TestRound64_ScopedRepositoryURLFixtureIsolation(t *testing.T) {
 		t.Fatalf("expected HTTP fixture to serve tmpDir file, got %q", string(got))
 	}
 	cleanup()
+	if !clearedAllowedURLs || !clearedPathRepo {
+		t.Fatalf("expected cleanup to reset cluster settings (allowedURLs=%v, pathRepo=%v)", clearedAllowedURLs, clearedPathRepo)
+	}
 	if _, err := os.Stat(capturedFSLocation); !os.IsNotExist(err) {
 		t.Fatalf("expected tmpDir %q to be removed after cleanup, err=%v", capturedFSLocation, err)
 	}

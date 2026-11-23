@@ -1379,7 +1379,7 @@ func IsValidTSDBDimensionFieldType(esType string) bool {
 	switch strings.ToLower(strings.TrimSpace(esType)) {
 	case "keyword", "constant_keyword", "wildcard", "ip", "version",
 		"byte", "short", "integer", "long", "unsigned_long",
-		"boolean", "date", "date_nanos":
+		"boolean", "date", "date_nanos", "passthrough":
 		return true
 	default:
 		return false
@@ -1388,6 +1388,10 @@ func IsValidTSDBDimensionFieldType(esType string) bool {
 
 // ValidateTSDBFieldParams validates `time_series_dimension`, `time_series_dimensions`, and `time_series_metric` on a field.
 func ValidateTSDBFieldParams(fullPath, fType string, prop esast.FieldProperty) error {
+	fType = strings.ToLower(strings.TrimSpace(fType))
+	if fType == "passthrough" && prop.Subobjects != nil && *prop.Subobjects {
+		return fmt.Errorf("mapper_parsing_exception: Mapping definition for [%s] has unsupported parameters:  [subobjects : true]", fullPath)
+	}
 	if prop.TimeSeriesDimension != nil && *prop.TimeSeriesDimension {
 		if prop.Script != nil {
 			return fmt.Errorf("mapper_parsing_exception: [time_series_dimension] cannot be set on field [%s] with [script]", fullPath)
@@ -1440,9 +1444,51 @@ func ValidateTSDBFieldParams(fullPath, fType string, prop esast.FieldProperty) e
 	return nil
 }
 
-func extractRawTSDBSettingsValues(settings map[string]any) (mode string, routingPath []string, startTime string, endTime string, err error) {
+type tsdbRawSettings struct {
+	mode        string
+	routingPath []string
+	startTime   string
+	endTime     string
+	hasMode     bool
+	hasRP       bool
+	hasStart    bool
+	hasEnd      bool
+}
+
+func formatRawTSDBSettingValue(raw any) string {
+	switch v := raw.(type) {
+	case nil:
+		return ""
+	case string:
+		return strings.TrimSpace(v)
+	case json.Number:
+		return strings.TrimSpace(v.String())
+	case int:
+		return strconv.Itoa(v)
+	case int64:
+		return strconv.FormatInt(v, 10)
+	case uint64:
+		return strconv.FormatUint(v, 10)
+	case float64:
+		if !math.IsNaN(v) && !math.IsInf(v, 0) && v == math.Trunc(v) && math.Abs(v) < 9e18 {
+			return strconv.FormatInt(int64(v), 10)
+		}
+		return strconv.FormatFloat(v, 'f', -1, 64)
+	case float32:
+		f64 := float64(v)
+		if !math.IsNaN(f64) && !math.IsInf(f64, 0) && f64 == math.Trunc(f64) && math.Abs(f64) < 9e18 {
+			return strconv.FormatInt(int64(f64), 10)
+		}
+		return strconv.FormatFloat(f64, 'f', -1, 32)
+	default:
+		return strings.TrimSpace(fmt.Sprintf("%v", raw))
+	}
+}
+
+func extractRawTSDBSettingsWithPresence(settings map[string]any) (tsdbRawSettings, error) {
+	var out tsdbRawSettings
 	if len(settings) == 0 {
-		return "", nil, "", "", nil
+		return out, nil
 	}
 	lookup := func(keys ...string) (any, bool) {
 		for _, k := range keys {
@@ -1481,63 +1527,102 @@ func extractRawTSDBSettingsValues(settings map[string]any) (mode string, routing
 	}
 
 	if rawMode, ok := lookup("index.mode", "mode"); ok {
-		mode = strings.ToLower(strings.TrimSpace(fmt.Sprintf("%v", rawMode)))
+		out.hasMode = true
+		out.mode = strings.ToLower(strings.TrimSpace(formatRawTSDBSettingValue(rawMode)))
 	}
 	if rawRP, ok := lookup("index.routing_path", "routing_path"); ok {
+		out.hasRP = true
 		switch tv := rawRP.(type) {
 		case string:
 			for _, p := range strings.Split(tv, ",") {
 				if p = strings.TrimSpace(p); p != "" {
-					routingPath = append(routingPath, p)
+					out.routingPath = append(out.routingPath, p)
 				}
 			}
 		case []string:
 			for _, p := range tv {
 				if p = strings.TrimSpace(p); p != "" {
-					routingPath = append(routingPath, p)
+					out.routingPath = append(out.routingPath, p)
 				}
 			}
 		case []any:
 			for _, item := range tv {
-				if p := strings.TrimSpace(fmt.Sprintf("%v", item)); p != "" {
-					routingPath = append(routingPath, p)
+				if p := formatRawTSDBSettingValue(item); p != "" {
+					out.routingPath = append(out.routingPath, p)
 				}
 			}
 		}
 	}
 	if rawStart, ok := lookup("index.time_series.start_time", "time_series.start_time"); ok {
-		startTime = strings.TrimSpace(fmt.Sprintf("%v", rawStart))
+		out.hasStart = true
+		out.startTime = formatRawTSDBSettingValue(rawStart)
 	}
 	if rawEnd, ok := lookup("index.time_series.end_time", "time_series.end_time"); ok {
-		endTime = strings.TrimSpace(fmt.Sprintf("%v", rawEnd))
+		out.hasEnd = true
+		out.endTime = formatRawTSDBSettingValue(rawEnd)
 	}
-	return mode, routingPath, startTime, endTime, nil
+	return out, nil
+}
+
+func parseTSDBSettingTime(input string, nowUTC time.Time) (time.Time, bool) {
+	s := strings.TrimSpace(input)
+	if s == "" {
+		return time.Time{}, false
+	}
+	if pt, ok := parseISODateString(s); ok {
+		return pt.UTC(), true
+	}
+	if ms, ok := ParseESDateToEpochMillis(s, nowUTC); ok {
+		return time.UnixMilli(ms).UTC(), true
+	}
+	return time.Time{}, false
 }
 
 // ExtractTSDBSettings extracts and validates `index.mode`, `index.routing_path`, `index.time_series.start_time`, and `index.time_series.end_time`.
 func ExtractTSDBSettings(settings map[string]any) (mode string, routingPath []string, startTime string, endTime string, err error) {
-	mode, routingPath, startTime, endTime, err = extractRawTSDBSettingsValues(settings)
+	raw, err := extractRawTSDBSettingsWithPresence(settings)
 	if err != nil {
-		return mode, routingPath, startTime, endTime, err
+		return raw.mode, raw.routingPath, raw.startTime, raw.endTime, err
 	}
+	mode = raw.mode
+	routingPath = raw.routingPath
+	startTime = raw.startTime
+	endTime = raw.endTime
 	if mode != "" {
-		if mErr := ValidateIndexModeSettings(mode, settings); mErr != nil {
+		// Allow omitted routing_path in ExtractTSDBSettings so data_stream templates/backing indices work,
+		// while still rejecting explicitly empty routing_path: [] (`ValidateIndexModeSettings` rejects both).
+		if mErr := validateIndexModeSettingsWithOpts(mode, settings, true); mErr != nil {
 			return mode, routingPath, startTime, endTime, mErr
 		}
 	}
 	if mode == "time_series" {
-		if startTime != "" && endTime != "" {
-			sMs, okS := ParseESDateToEpochMillis(startTime, time.Now().UTC())
-			eMs, okE := ParseESDateToEpochMillis(endTime, time.Now().UTC())
+		nowUTC := time.Now().UTC()
+		var sTime, eTime time.Time
+		var hasST, hasET bool
+		if raw.hasStart {
+			if startTime == "" {
+				return mode, routingPath, startTime, endTime, fmt.Errorf("illegal_argument_exception: cannot parse empty datetime for [index.time_series.start_time]")
+			}
+			var okS bool
+			sTime, okS = parseTSDBSettingTime(startTime, nowUTC)
 			if !okS {
 				return mode, routingPath, startTime, endTime, fmt.Errorf("illegal_argument_exception: failed to parse [index.time_series.start_time] [%s]", startTime)
 			}
+			hasST = true
+		}
+		if raw.hasEnd {
+			if endTime == "" {
+				return mode, routingPath, startTime, endTime, fmt.Errorf("illegal_argument_exception: cannot parse empty datetime for [index.time_series.end_time]")
+			}
+			var okE bool
+			eTime, okE = parseTSDBSettingTime(endTime, nowUTC)
 			if !okE {
 				return mode, routingPath, startTime, endTime, fmt.Errorf("illegal_argument_exception: failed to parse [index.time_series.end_time] [%s]", endTime)
 			}
-			if sMs >= eMs {
-				return mode, routingPath, startTime, endTime, fmt.Errorf("illegal_argument_exception: [index.time_series.start_time] [%s] must be before [index.time_series.end_time] [%s]", startTime, endTime)
-			}
+			hasET = true
+		}
+		if hasST && hasET && !sTime.Before(eTime) {
+			return mode, routingPath, startTime, endTime, fmt.Errorf("illegal_argument_exception: [index.time_series.start_time] [%s] must be before [index.time_series.end_time] [%s]", startTime, endTime)
 		}
 	}
 	return mode, routingPath, startTime, endTime, nil
@@ -1585,10 +1670,109 @@ func matchesAnyTSDBRoutingPath(routingPath []string, fieldPath string) bool {
 	return false
 }
 
-// ValidateTSDBMapping validates that every mapped field matching `routing_path` is a valid TSDB dimension (`140_routing_path.yml:97`).
-func ValidateTSDBMapping(m *esast.MappingSpec, routingPath []string) error {
-	if m == nil || len(routingPath) == 0 {
+func matchesExactTSDBRoutingPath(routingPath []string, fieldPath string) bool {
+	for _, rp := range routingPath {
+		rp = strings.TrimSpace(rp)
+		if rp != "" && !strings.ContainsAny(rp, "*?") && rp == fieldPath {
+			return true
+		}
+	}
+	return false
+}
+
+func findNestedTSDBDimensionPath(props map[string]esast.FieldProperty, prefix string) string {
+	keys := make([]string, 0, len(props))
+	for k := range props {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		prop := props[k]
+		full := k
+		if prefix != "" {
+			full = prefix + "." + k
+		}
+		if prop.TimeSeriesDimension != nil && *prop.TimeSeriesDimension {
+			return full
+		}
+		if len(prop.Properties) > 0 {
+			if found := findNestedTSDBDimensionPath(prop.Properties, full); found != "" {
+				return found
+			}
+		}
+	}
+	return ""
+}
+
+// ValidateTSDBRuntimeFieldsRoutingPath validates that no runtime field matches the index `routing_path`.
+func ValidateTSDBRuntimeFieldsRoutingPath(routingPath []string, runtime map[string]esast.FieldProperty) error {
+	if len(routingPath) == 0 || len(runtime) == 0 {
 		return nil
+	}
+	keys := make([]string, 0, len(runtime))
+	for k := range runtime {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, rtName := range keys {
+		if matchesAnyTSDBRoutingPath(routingPath, rtName) {
+			return esWireError(fmt.Sprintf("illegal_argument_exception: runtime fields may not match [routing_path] but [%s] matched", rtName))
+		}
+	}
+	return nil
+}
+
+// ValidateTSDBRuntimeShadowing rejects runtime fields that attempt to shadow a mapped `time_series_dimension` or `time_series_metric`.
+func ValidateTSDBRuntimeShadowing(idx *IndexSchema, runtime map[string]esast.FieldProperty) error {
+	if idx == nil || len(runtime) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(runtime))
+	for k := range runtime {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, rtName := range keys {
+		if b, ok := idx.Fields[rtName]; ok {
+			if b.TimeSeriesDimension != nil && *b.TimeSeriesDimension {
+				return esWireError(fmt.Sprintf("illegal_argument_exception: Field [%s] attempted to shadow a time_series_dimension", rtName))
+			}
+			if b.TimeSeriesMetric != "" {
+				return esWireError(fmt.Sprintf("illegal_argument_exception: Field [%s] attempted to shadow a time_series_metric", rtName))
+			}
+		}
+	}
+	return nil
+}
+
+// ValidateTSDBMapping validates TSDB mapping constraints: rejects `nested` fields, enforces runtime field and `routing_path` rules (`140_routing_path.yml:97`, `20_mapping.yml`).
+func ValidateTSDBMapping(m *esast.MappingSpec, routingPath []string) error {
+	if m == nil {
+		return nil
+	}
+	if dsTS, ok := m.DataStreamTimestamp.(map[string]any); ok {
+		if en, hasEn := dsTS["enabled"]; hasEn {
+			if eb, ok := parseTSDBBoolOptionR61(en); ok && !eb {
+				return fmt.Errorf("illegal_argument_exception: [_data_stream_timestamp] meta field has been disabled")
+			}
+		}
+	}
+	if len(m.Source) > 0 {
+		if inc, hasInc := m.Source["includes"]; hasInc && inc != nil {
+			return fmt.Errorf("illegal_argument_exception: filtering the stored _source is incompatible with synthetic source")
+		}
+		if exc, hasExc := m.Source["excludes"]; hasExc && exc != nil {
+			return fmt.Errorf("illegal_argument_exception: filtering the stored _source is incompatible with synthetic source")
+		}
+	}
+	if tsProp, ok := m.Properties["@timestamp"]; ok {
+		tsType := strings.ToLower(strings.TrimSpace(tsProp.Type))
+		if tsType != "" && tsType != "date" && tsType != "date_nanos" {
+			return fmt.Errorf("illegal_argument_exception: data stream timestamp field [@timestamp] is of type [%s], but [date,date_nanos] is expected", tsProp.Type)
+		}
+	}
+	if _, hasRT := m.Runtime["@timestamp"]; hasRT {
+		return fmt.Errorf("illegal_argument_exception: docvalues not found for index sort field:[@timestamp]")
 	}
 	var walk func(props map[string]esast.FieldProperty, prefix string) error
 	walk = func(props map[string]esast.FieldProperty, prefix string) error {
@@ -1604,8 +1788,41 @@ func ValidateTSDBMapping(m *esast.MappingSpec, routingPath []string) error {
 				full = prefix + "." + k
 			}
 			fType := strings.ToLower(strings.TrimSpace(prop.Type))
-			isObj := len(prop.Properties) > 0 || fType == "object" || fType == "nested" || fType == ""
+			if fType == "nested" {
+				if prop.TimeSeriesDimension != nil && *prop.TimeSeriesDimension {
+					return esWireError(fmt.Sprintf("mapper_parsing_exception: time_series_dimension can't be configured in nested field [%s]", full))
+				}
+				if dimPath := findNestedTSDBDimensionPath(prop.Properties, full); dimPath != "" {
+					return esWireError(fmt.Sprintf("mapper_parsing_exception: time_series_dimension can't be configured in nested field [%s]", dimPath))
+				}
+				return esWireError("illegal_argument_exception: cannot have nested fields when index is in [index.mode=time_series]")
+			}
+			if fType == "passthrough" {
+				if prop.Subobjects != nil && *prop.Subobjects {
+					return esWireError(fmt.Sprintf("mapper_parsing_exception: Mapping definition for [%s] has unsupported parameters:  [subobjects : true]", full))
+				}
+				isDim := prop.TimeSeriesDimension != nil && *prop.TimeSeriesDimension && prop.Script == nil
+				if len(routingPath) > 0 && matchesExactTSDBRoutingPath(routingPath, full) && !isDim {
+					return esWireError(fmt.Sprintf(
+						"illegal_argument_exception: All fields that match routing_path must be configured with [time_series_dimension: true] or flattened fields with a list of dimensions in [time_series_dimensions] and without the [script] parameter. [%s] was [passthrough].",
+						full,
+					))
+				}
+				if len(prop.Properties) > 0 {
+					if err := walk(prop.Properties, full); err != nil {
+						return err
+					}
+				}
+				continue
+			}
+			isObj := len(prop.Properties) > 0 || fType == "object" || fType == ""
 			if isObj {
+				if len(routingPath) > 0 && matchesExactTSDBRoutingPath(routingPath, full) {
+					return esWireError(fmt.Sprintf(
+						"illegal_argument_exception: All fields that match routing_path must be configured with [time_series_dimension: true] or flattened fields with a list of dimensions in [time_series_dimensions] and without the [script] parameter. [%s] was [object].",
+						full,
+					))
+				}
 				if err := walk(prop.Properties, full); err != nil {
 					return err
 				}
@@ -1640,7 +1857,7 @@ func ValidateTSDBMapping(m *esast.MappingSpec, routingPath []string) error {
 				}
 				continue
 			}
-			if matchesAnyTSDBRoutingPath(routingPath, full) {
+			if len(routingPath) > 0 && matchesAnyTSDBRoutingPath(routingPath, full) {
 				isDim := prop.TimeSeriesDimension != nil && *prop.TimeSeriesDimension && prop.Script == nil
 				if !isDim {
 					return esWireError(fmt.Sprintf(
@@ -1652,7 +1869,10 @@ func ValidateTSDBMapping(m *esast.MappingSpec, routingPath []string) error {
 		}
 		return nil
 	}
-	return walk(m.Properties, "")
+	if err := walk(m.Properties, ""); err != nil {
+		return err
+	}
+	return ValidateTSDBRuntimeFieldsRoutingPath(routingPath, m.Runtime)
 }
 
 type esWireError string
@@ -1673,6 +1893,24 @@ func ValidateTSDBDocID(id, indexName string) error {
 func ComputeTSDBIdentity(idx *IndexSchema, doc map[string]any, settings map[string]any) (tsid string, docID string, routingKey string, err error) {
 	tsid, docID, routingKey, _, err = ComputeTSDBIdentityWithRoutingHash(idx, doc, settings)
 	return tsid, docID, routingKey, err
+}
+
+func schemaHasAnyTSDBDimension(idx *IndexSchema) bool {
+	if idx == nil {
+		return false
+	}
+	for _, b := range idx.Fields {
+		if b.AliasTarget != "" || strings.EqualFold(b.ESType, "passthrough") {
+			continue
+		}
+		if b.TimeSeriesDimension != nil && *b.TimeSeriesDimension {
+			return true
+		}
+		if strings.EqualFold(b.ESType, "flattened") && len(b.TimeSeriesDimensions) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // ComputeTSDBIdentityWithRoutingHash returns `(_tsid, _id, routingKey, _ts_routing_hash, error)` for a TSDB document.
@@ -1706,7 +1944,7 @@ func ComputeTSDBIdentityWithRoutingHash(idx *IndexSchema, doc map[string]any, se
 	// 1. Extract and validate `@timestamp` (`[start_time, end_time)` half-open interval).
 	rawTS, hasTS := extractSingleDocPathValue(doc, []string{"@timestamp"})
 	if !hasTS || rawTS == nil {
-		return "", "", "", "", fmt.Errorf("mapper_parsing_exception: required [@timestamp] is missing in time_series mode")
+		return "", "", "", "", fmt.Errorf("mapper_parsing_exception: data stream timestamp field [@timestamp] is missing")
 	}
 	if _, isArr := rawTS.([]any); isArr {
 		return "", "", "", "", fmt.Errorf("mapper_parsing_exception: [@timestamp] cannot be multi-valued in time_series mode")
@@ -1721,26 +1959,30 @@ func ComputeTSDBIdentityWithRoutingHash(idx *IndexSchema, doc map[string]any, se
 			}
 		}
 	}
-	tsMs, okTS := parseTSDBTimestampMillis(rawTS, tsType, tsFormat)
+	tsTime, tsMs, okTS := parseTSDBTimestampTime(rawTS, tsType, tsFormat)
 	if !okTS {
 		return "", "", "", "", fmt.Errorf("mapper_parsing_exception: failed to parse field [@timestamp] of type [%s] in document", tsType)
 	}
 	nowUTC := time.Now().UTC()
 	if startStr != "" {
-		if sMs, okS := ParseESDateToEpochMillis(startStr, nowUTC); okS && tsMs < sMs {
+		if sTime, okS := parseTSDBSettingTime(startStr, nowUTC); okS && tsTime.Before(sTime) {
 			return "", "", "", "", fmt.Errorf(
-				"mapper_parsing_exception: [@timestamp] [%d] is before [index.time_series.start_time] [%s]",
-				tsMs, startStr,
+				"mapper_parsing_exception: time series index @timestamp value [%s] must be larger than %s",
+				tsTime.UTC().Format(time.RFC3339Nano), sTime.UTC().Format(time.RFC3339Nano),
 			)
 		}
 	}
 	if endStr != "" {
-		if eMs, okE := ParseESDateToEpochMillis(endStr, nowUTC); okE && tsMs >= eMs {
+		if eTime, okE := parseTSDBSettingTime(endStr, nowUTC); okE && !tsTime.Before(eTime) {
 			return "", "", "", "", fmt.Errorf(
-				"mapper_parsing_exception: [@timestamp] [%d] is on or after [index.time_series.end_time] [%s]",
-				tsMs, endStr,
+				"mapper_parsing_exception: time series index @timestamp value [%s] must be smaller than %s",
+				tsTime.UTC().Format(time.RFC3339Nano), eTime.UTC().Format(time.RFC3339Nano),
 			)
 		}
+	}
+
+	if err := validateTSDBDocDynamicRoutingPaths(idx, doc, routingPath); err != nil {
+		return "", "", "", "", err
 	}
 
 	// 2. Collect typed dimensions from schema (`FieldBinding` + `RawMapping`).
@@ -1748,7 +1990,7 @@ func ComputeTSDBIdentityWithRoutingHash(idx *IndexSchema, doc map[string]any, se
 	if dimErr != nil {
 		return "", "", "", "", dimErr
 	}
-	if len(dims) == 0 {
+	if len(dims) == 0 && !schemaHasAnyTSDBDimension(idx) {
 		return "", "", "", "", fmt.Errorf("mapper_parsing_exception: document in time_series mode must contain at least one time_series_dimension")
 	}
 	sort.Slice(dims, func(i, j int) bool {
@@ -1812,6 +2054,229 @@ func ComputeTSDBIdentityWithRoutingHash(idx *IndexSchema, doc map[string]any, se
 	binary.BigEndian.PutUint64(idBytes[12:20], uint64(tsMs)) // #nosec G115 -- signed epoch ms encoded big-endian per ES TSDB format
 	docID = base64.RawURLEncoding.EncodeToString(idBytes[:])
 	return tsid, docID, routingKey, routingHash, nil
+}
+
+func normalizeTSDBDynamicModeVal(raw any) string {
+	switch v := raw.(type) {
+	case bool:
+		if v {
+			return "true"
+		}
+		return "false"
+	case string:
+		s := strings.ToLower(strings.TrimSpace(v))
+		if s != "" {
+			return s
+		}
+	}
+	return "true"
+}
+
+func effectiveTSDBDynamicModeAtPath(idx *IndexSchema, fieldPath string) string {
+	if idx == nil {
+		return "true"
+	}
+	parts := strings.Split(fieldPath, ".")
+	for i := len(parts) - 1; i >= 1; i-- {
+		anc := strings.Join(parts[:i], ".")
+		if b, ok := idx.Fields[anc]; ok {
+			if strings.EqualFold(b.ESType, "passthrough") && b.TimeSeriesDimension != nil && *b.TimeSeriesDimension {
+				return "passthrough_dim"
+			}
+			if strings.EqualFold(b.ESType, "flattened") {
+				return "flattened"
+			}
+		}
+	}
+	if idx.RawMapping == nil {
+		return "true"
+	}
+	mode := normalizeTSDBDynamicModeVal(idx.RawMapping.Dynamic)
+	props := idx.RawMapping.Properties
+	for i := 0; i < len(parts); {
+		matched := false
+		for j := len(parts); j > i; j-- {
+			segKey := strings.Join(parts[i:j], ".")
+			if prop, ok := props[segKey]; ok {
+				if prop.Dynamic != nil {
+					mode = normalizeTSDBDynamicModeVal(prop.Dynamic)
+				}
+				if strings.EqualFold(prop.Type, "passthrough") && prop.TimeSeriesDimension != nil && *prop.TimeSeriesDimension {
+					return "passthrough_dim"
+				}
+				if strings.EqualFold(prop.Type, "flattened") {
+					return "flattened"
+				}
+				props = prop.Properties
+				i = j
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			break
+		}
+	}
+	return mode
+}
+
+func hasMappedFieldPrefix(idx *IndexSchema, prefix string) bool {
+	if idx == nil {
+		return false
+	}
+	pDot := prefix + "."
+	for k := range idx.Fields {
+		if k == prefix || strings.HasPrefix(k, pDot) {
+			return true
+		}
+	}
+	return false
+}
+
+func inferTSDBRuntimeDynamicLeafType(val any, es8Mode bool) string {
+	switch v := val.(type) {
+	case bool:
+		return "boolean"
+	case int, int64, uint64:
+		return "long"
+	case json.Number:
+		s := v.String()
+		if strings.ContainsAny(s, ".eE") {
+			if es8Mode {
+				return "float"
+			}
+			return "double"
+		}
+		return "long"
+	case float64:
+		if v == math.Trunc(v) {
+			return "long"
+		}
+		if es8Mode {
+			return "float"
+		}
+		return "double"
+	case string:
+		if _, ok := parseISODateString(strings.TrimSpace(v)); ok {
+			return "date"
+		}
+		return "keyword"
+	default:
+		return "keyword"
+	}
+}
+
+func validateTSDBDocDynamicRoutingPaths(idx *IndexSchema, doc map[string]any, routingPath []string) error {
+	if idx == nil || len(doc) == 0 || len(routingPath) == 0 {
+		return nil
+	}
+	var walk func(curr map[string]any, prefix string) error
+	walk = func(curr map[string]any, prefix string) error {
+		keys := make([]string, 0, len(curr))
+		for k := range curr {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			val := curr[k]
+			if val == nil {
+				continue
+			}
+			full := k
+			if prefix != "" {
+				full = prefix + "." + k
+			}
+			dyn := effectiveTSDBDynamicModeAtPath(idx, full)
+			if dyn == "passthrough_dim" || dyn == "flattened" {
+				continue
+			}
+			if subMap, isMap := val.(map[string]any); isMap {
+				if !hasMappedFieldPrefix(idx, full) && matchesAnyTSDBRoutingPath(routingPath, full) && dyn == "false" {
+					return esWireError(fmt.Sprintf("illegal_argument_exception: All fields matching [routing_path] must be mapped but [%s] was declared as [dynamic: false]", full))
+				}
+				if err := walk(subMap, full); err != nil {
+					return err
+				}
+				continue
+			}
+			if arr, isArr := val.([]any); isArr {
+				hasMapElem := false
+				for _, elem := range arr {
+					if em, okM := elem.(map[string]any); okM {
+						hasMapElem = true
+						expSub := expandDottedKeysForSyntheticObject(idx, em, full)
+						if err := walk(expSub, full); err != nil {
+							return err
+						}
+					}
+				}
+				if hasMapElem {
+					continue
+				}
+			}
+			if b, mapped := idx.Fields[full]; mapped {
+				if b.FromRuntime && matchesAnyTSDBRoutingPath(routingPath, full) {
+					if dyn == "runtime" {
+						return esWireError(fmt.Sprintf(
+							"illegal_argument_exception: All fields that match routing_path must be configured with [time_series_dimension: true] or flattened fields with a list of dimensions in [time_series_dimensions] and without the [script] parameter. [%s] was a runtime [%s].",
+							full, strings.ToLower(strings.TrimSpace(b.ESType)),
+						))
+					}
+					return esWireError(fmt.Sprintf("illegal_argument_exception: runtime fields may not match [routing_path] but [%s] matched", full))
+				}
+				continue
+			}
+			if matchesAnyTSDBRoutingPath(routingPath, full) {
+				if dyn == "false" {
+					return esWireError(fmt.Sprintf("illegal_argument_exception: All fields matching [routing_path] must be mapped but [%s] was declared as [dynamic: false]", full))
+				}
+				if dyn == "runtime" {
+					return esWireError(fmt.Sprintf(
+						"illegal_argument_exception: All fields that match routing_path must be configured with [time_series_dimension: true] or flattened fields with a list of dimensions in [time_series_dimensions] and without the [script] parameter. [%s] was a runtime [%s].",
+						full, inferTSDBRuntimeDynamicLeafType(val, idx.ES8Mode),
+					))
+				}
+			}
+		}
+		return nil
+	}
+	expanded := expandDottedKeysForSyntheticObject(idx, doc, "")
+	return walk(expanded, "")
+}
+
+func parseTSDBTimestampTime(raw any, tsType, format string) (time.Time, int64, bool) {
+	nowUTC := time.Now().UTC()
+	if s, isStr := raw.(string); isStr {
+		if tsType == "date_nanos" {
+			if ns, ok := ParseESDateWithFormatAndLocaleToEpochNanos(s, format, "", nowUTC); ok {
+				t := time.Unix(0, ns).UTC()
+				return t, t.UnixMilli(), true
+			}
+		}
+		if pt, ok := parseISODateString(strings.TrimSpace(s)); ok && format == "" {
+			pt = pt.UTC()
+			return pt, pt.UnixMilli(), true
+		}
+	}
+	if tsType == "date_nanos" {
+		switch v := raw.(type) {
+		case int64:
+			if v > 1e15 || v < -1e15 {
+				t := time.Unix(0, v).UTC()
+				return t, v / 1_000_000, true
+			}
+		case json.Number:
+			if iv, err := v.Int64(); err == nil && (iv > 1e15 || iv < -1e15) {
+				t := time.Unix(0, iv).UTC()
+				return t, iv / 1_000_000, true
+			}
+		}
+	}
+	ms, ok := parseTSDBTimestampMillisWithLocale(raw, tsType, format, "")
+	if !ok {
+		return time.Time{}, 0, false
+	}
+	return time.UnixMilli(ms).UTC(), ms, true
 }
 
 func parseTSDBTimestampMillis(raw any, tsType, format string) (int64, bool) {

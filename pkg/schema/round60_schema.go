@@ -198,15 +198,19 @@ func expandDottedPropertiesWithBase(props, base map[string]esast.FieldProperty, 
 	for _, k := range keys {
 		prop := props[k]
 		if len(prop.Properties) > 0 {
-			childSubFalse := subobjectsFalse || (prop.Subobjects != nil && !*prop.Subobjects)
+			isPassthrough := strings.EqualFold(strings.TrimSpace(prop.Type), "passthrough")
+			childSubFalse := subobjectsFalse || isPassthrough || (prop.Subobjects != nil && !*prop.Subobjects)
 			if !childSubFalse && base != nil {
-				if bProp, ok := base[k]; ok && bProp.Subobjects != nil && !*bProp.Subobjects {
+				if bProp, ok := base[k]; ok && ((bProp.Subobjects != nil && !*bProp.Subobjects) || strings.EqualFold(strings.TrimSpace(bProp.Type), "passthrough")) {
 					childSubFalse = true
 				}
 			}
 			expSub, err := expandDottedPropertiesWithBase(prop.Properties, nil, childSubFalse)
 			if err != nil {
 				return nil, err
+			}
+			if isPassthrough {
+				expSub = flattenPassthroughSubobjectProps(expSub)
 			}
 			prop.Properties = expSub
 		}
@@ -276,15 +280,39 @@ func expandDottedPropertiesWithBase(props, base map[string]esast.FieldProperty, 
 	return out, nil
 }
 
+func flattenPassthroughSubobjectProps(props map[string]esast.FieldProperty) map[string]esast.FieldProperty {
+	if len(props) == 0 {
+		return props
+	}
+	out := make(map[string]esast.FieldProperty, len(props))
+	var walk func(m map[string]esast.FieldProperty, prefix string)
+	walk = func(m map[string]esast.FieldProperty, prefix string) {
+		for k, p := range m {
+			full := k
+			if prefix != "" {
+				full = prefix + "." + k
+			}
+			ft := strings.ToLower(strings.TrimSpace(p.Type))
+			if len(p.Properties) > 0 && (ft == "" || ft == "object") {
+				walk(p.Properties, full)
+				continue
+			}
+			out[full] = p
+		}
+	}
+	walk(props, "")
+	return out
+}
+
 func checkObjectMergeConflict(fieldName string, a, b esast.FieldProperty) error {
 	aHasProps := len(a.Properties) > 0
 	bHasProps := len(b.Properties) > 0
 	aType := strings.ToLower(strings.TrimSpace(a.Type))
 	bType := strings.ToLower(strings.TrimSpace(b.Type))
-	if bHasProps && aType != "" && aType != "object" && aType != "nested" {
+	if bHasProps && aType != "" && aType != "object" && aType != "nested" && aType != "passthrough" {
 		return fmt.Errorf("illegal_argument_exception: Can't merge a non object mapping [%s] with an object mapping", fieldName)
 	}
-	if aHasProps && bType != "" && bType != "object" && bType != "nested" {
+	if aHasProps && bType != "" && bType != "object" && bType != "nested" && bType != "passthrough" {
 		return fmt.Errorf("illegal_argument_exception: Can't merge a non object mapping [%s] with an object mapping", fieldName)
 	}
 	return nil
@@ -297,7 +325,13 @@ func SerializeMappings(s *IndexSchema) map[string]any {
 		return map[string]any{}
 	}
 	if s.RawMapping != nil {
-		return SerializeMappingSpec(s.RawMapping)
+		out := SerializeMappingSpec(s.RawMapping)
+		if strings.EqualFold(strings.TrimSpace(s.IndexMode), "time_series") {
+			if _, ok := out["_data_stream_timestamp"]; !ok {
+				out["_data_stream_timestamp"] = map[string]any{"enabled": true}
+			}
+		}
+		return out
 	}
 	if len(s.Fields) == 0 {
 		return map[string]any{}
@@ -368,6 +402,9 @@ func SerializeMappingSpec(m *esast.MappingSpec) map[string]any {
 		if serializedSrc := serializeSourceMap(m.Source); len(serializedSrc) > 0 {
 			out["_source"] = serializedSrc
 		}
+	}
+	if m.DataStreamTimestamp != nil {
+		out["_data_stream_timestamp"] = deepCloneAny(m.DataStreamTimestamp)
 	}
 	if len(m.DynamicTemplates) > 0 {
 		out["dynamic_templates"] = m.DynamicTemplates
@@ -665,6 +702,9 @@ func SerializeFieldProperty(fp esast.FieldProperty) map[string]any {
 	}
 	if fp.DepthLimit != nil {
 		out["depth_limit"] = *fp.DepthLimit
+	}
+	if fp.Priority != nil {
+		out["priority"] = *fp.Priority
 	}
 	if len(fp.Relations) > 0 {
 		out["relations"] = fp.Relations
@@ -972,6 +1012,9 @@ func reconstructSyntheticValue(
 		if ignoredSet[fullPath] && !ignMalformed {
 			return nil, false
 		}
+		if esType == "histogram" {
+			return reconstructSyntheticHistogramValue(idxSchema, rawVal, fullPath, ignMalformed)
+		}
 		if esType == "geo_point" {
 			if strings.EqualFold(strings.TrimSpace(b.TimeSeriesMetric), "position") {
 				if posObj, ok := reconstructSyntheticPositionGeoPoint(rawVal); ok {
@@ -1029,6 +1072,9 @@ func reconstructSyntheticValue(
 
 	case []any:
 		if len(v) == 0 {
+			if hasBinding && esType == "rank_features" {
+				return []any{}, true
+			}
 			return nil, false
 		}
 		// Check if array contains objects (e.g. `nested` or object array)
@@ -1040,7 +1086,8 @@ func reconstructSyntheticValue(
 			}
 		}
 		if hasMaps {
-			if isNested || idxSchema == nil || hasExplicitStoreArraySourceAtPath(idxSchema, fullPath) || shouldPreserveSyntheticObjectArray(idxSchema, fullPath, v) {
+			isStoredArray := hasExplicitStoreArraySourceAtPath(idxSchema, fullPath)
+			if isNested || idxSchema == nil || isStoredArray || shouldPreserveSyntheticObjectArray(idxSchema, fullPath, v) {
 				// Preserve nested / store_array_source:true / dynamic:false|runtime / schemaless array order
 				objs := make([]any, 0, len(v))
 				for _, elem := range v {
@@ -1048,7 +1095,12 @@ func reconstructSyntheticValue(
 					if !ok || em == nil {
 						continue
 					}
-					re := reconstructSyntheticObject(idxSchema, em, fullPath, ignoredSet)
+					var re map[string]any
+					if isStoredArray {
+						re = reconstructIgnoredSourceObject(idxSchema, em, fullPath)
+					} else {
+						re = reconstructSyntheticObject(idxSchema, em, fullPath, ignoredSet)
+					}
 					if len(re) > 0 {
 						objs = append(objs, re)
 					}
@@ -1101,14 +1153,11 @@ func reconstructSyntheticValue(
 		flattenScalars(v)
 		if !preserveArrayOrder && len(scalars) > 1 {
 			sortSyntheticScalars(scalars, esType)
-			if hasBinding && isSyntheticDocValuesDedupType(esType) {
+			if hasBinding && isSyntheticDocValuesDedupType(esType) && !strings.EqualFold(strings.TrimSpace(b.TimeSeriesMetric), "gauge") {
 				scalars = deduplicateSortedSyntheticScalars(scalars)
 			}
 		}
 		if len(malformedScalars) > 0 {
-			if len(malformedScalars) > 1 {
-				sortSyntheticScalars(malformedScalars, "")
-			}
 			scalars = append(scalars, malformedScalars...)
 		}
 		if len(ignoredAboveScalars) > 0 {
@@ -1138,6 +1187,69 @@ func reconstructSyntheticValue(
 		}
 		return normVal, true
 	}
+}
+
+func reconstructSyntheticHistogramValue(idxSchema *IndexSchema, rawVal any, fullPath string, ignMalformed bool) (any, bool) {
+	if arr, isArr := rawVal.([]any); isArr {
+		var validObjs []any
+		var malformedItems []any
+		var walkSlice func(items []any)
+		walkSlice = func(items []any) {
+			for _, elem := range items {
+				if elem == nil {
+					continue
+				}
+				if subSlice, okS := elem.([]any); okS {
+					walkSlice(subSlice)
+					continue
+				}
+				nzVals, nzCnts, _, _, err := validateSingleHistogramObject(elem, fullPath)
+				if err == nil {
+					if len(nzVals) > 0 {
+						validObjs = append(validObjs, map[string]any{
+							"values": nzVals,
+							"counts": nzCnts,
+						})
+					}
+					continue
+				}
+				if ignMalformed {
+					if normElem, okN := reconstructIgnoredSourceValue(idxSchema, elem, fullPath); okN {
+						malformedItems = append(malformedItems, normElem)
+					}
+				}
+			}
+		}
+		walkSlice(arr)
+		out := make([]any, 0, len(validObjs)+len(malformedItems))
+		out = append(out, validObjs...)
+		if ignMalformed {
+			out = append(out, malformedItems...)
+		}
+		if len(out) == 0 {
+			return nil, false
+		}
+		if len(out) == 1 && !ignMalformed {
+			return out[0], true
+		}
+		return out, true
+	}
+	if _, isMap := rawVal.(map[string]any); isMap {
+		nzVals, nzCnts, _, _, err := validateSingleHistogramObject(rawVal, fullPath)
+		if err == nil {
+			if len(nzVals) == 0 {
+				return nil, false
+			}
+			return map[string]any{
+				"values": nzVals,
+				"counts": nzCnts,
+			}, true
+		}
+	}
+	if ignMalformed {
+		return reconstructIgnoredSourceValue(idxSchema, rawVal, fullPath)
+	}
+	return nil, false
 }
 
 func isEffectiveIgnoreMalformedForSynthetic(idxSchema *IndexSchema, b FieldBinding) bool {
@@ -1288,7 +1400,7 @@ func isSyntheticDocValuesDedupType(esType string) bool {
 	case "keyword", "constant_keyword", "wildcard", "version", "ip",
 		"long", "integer", "short", "byte", "unsigned_long",
 		"double", "float", "half_float", "scaled_float",
-		"date", "date_nanos", "boolean":
+		"date", "date_nanos":
 		return true
 	default:
 		return false

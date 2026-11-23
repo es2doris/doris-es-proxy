@@ -20,9 +20,11 @@ package proxy
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"hash"
 	"net/http"
 	"sort"
 	"strings"
@@ -250,9 +252,9 @@ func (s *Server) buildShardRequestCacheKeyR63(
 		_, _ = h.Write([]byte{0})
 	}
 
-	// Bind key to live schema content + write sequence numbers + unrefreshed pending counts
-	// so any mapping update (`PUT /_mapping`, dynamic promotion) or document mutation automatically busts the cache,
-	// without depending on `*schema.IndexSchema` pointer identity (which changes when `/_stats` calls `syncCatalogFromBackend`)!
+	// Bind key to live schema content + write sequence numbers + unrefreshed pending counts + auth/principal identity
+	// so any mapping update (`PUT /_mapping`, dynamic promotion), document mutation, or security/credential change
+	// automatically isolates/busts the cache, without depending on `*schema.IndexSchema` pointer identity.
 	s.mu.RLock()
 	for _, t := range targets {
 		sc := s.indices[t]
@@ -275,6 +277,7 @@ func (s *Server) buildShardRequestCacheKeyR63(
 		_, _ = h.Write(rawMapBytes)
 		_, _ = h.Write([]byte{';'})
 	}
+	s.appendAuthPrincipalToCacheKeyLockedR65(h, httpReq)
 	s.mu.RUnlock()
 
 	if httpReq != nil && httpReq.URL != nil {
@@ -295,6 +298,95 @@ func (s *Server) buildShardRequestCacheKeyR63(
 		}
 	}
 	return hex.EncodeToString(h.Sum(nil))
+}
+
+func (s *Server) appendUserAndRolesToCacheKeyLockedR65(h hash.Hash, label, username string) {
+	u := strings.TrimSpace(username)
+	if u == "" {
+		return
+	}
+	_, _ = fmt.Fprintf(h, "%s=%s|", label, u)
+	uObj, okU := s.securityUsers[u]
+	if !okU || uObj == nil {
+		return
+	}
+	if ub, err := json.Marshal(uObj); err == nil {
+		_, _ = h.Write(ub)
+		_, _ = h.Write([]byte{'|'})
+	}
+	var roleNames []string
+	switch rv := uObj["roles"].(type) {
+	case []string:
+		roleNames = append(roleNames, rv...)
+	case []any:
+		for _, item := range rv {
+			if rs, ok := item.(string); ok && strings.TrimSpace(rs) != "" {
+				roleNames = append(roleNames, strings.TrimSpace(rs))
+			}
+		}
+	}
+	sort.Strings(roleNames)
+	for _, rn := range roleNames {
+		if rObj, okR := s.securityRoles[rn]; okR && rObj != nil {
+			if rb, err := json.Marshal(rObj); err == nil {
+				_, _ = fmt.Fprintf(h, "role:%s=", rn)
+				_, _ = h.Write(rb)
+				_, _ = h.Write([]byte{'|'})
+			}
+		}
+	}
+}
+
+func (s *Server) appendAuthPrincipalToCacheKeyLockedR65(h hash.Hash, httpReq *http.Request) {
+	if httpReq == nil {
+		_, _ = h.Write([]byte("auth:nil;"))
+		return
+	}
+	authHdr := strings.TrimSpace(httpReq.Header.Get("Authorization"))
+	runAs := strings.TrimSpace(httpReq.Header.Get("es-security-runas-user"))
+	if authHdr == "" && runAs == "" {
+		_, _ = h.Write([]byte("auth:anon;"))
+		return
+	}
+	credSum := sha256.Sum256([]byte(authHdr + "\x00" + runAs))
+	_, _ = fmt.Fprintf(h, "auth:%x|", credSum[:])
+	if authHdr != "" {
+		parts := strings.SplitN(authHdr, " ", 2)
+		if len(parts) == 2 {
+			scheme := strings.ToLower(strings.TrimSpace(parts[0]))
+			token := strings.TrimSpace(parts[1])
+			switch scheme {
+			case "basic":
+				if decoded, err := base64.StdEncoding.DecodeString(token); err == nil {
+					cred := string(decoded)
+					if colon := strings.IndexByte(cred, ':'); colon >= 0 {
+						s.appendUserAndRolesToCacheKeyLockedR65(h, "user", cred[:colon])
+					}
+				}
+			case "apikey":
+				if decoded, err := base64.StdEncoding.DecodeString(token); err == nil {
+					cred := string(decoded)
+					if colon := strings.IndexByte(cred, ':'); colon > 0 {
+						keyID := cred[:colon]
+						_, _ = fmt.Fprintf(h, "apikey=%s|", keyID)
+						if kObj := s.securityAPIKeys[keyID]; kObj != nil {
+							if kb, err := json.Marshal(kObj); err == nil {
+								_, _ = h.Write(kb)
+								_, _ = h.Write([]byte{'|'})
+							}
+							if owner, ok := kObj["username"].(string); ok {
+								s.appendUserAndRolesToCacheKeyLockedR65(h, "keyuser", owner)
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	if runAs != "" {
+		s.appendUserAndRolesToCacheKeyLockedR65(h, "runas", runAs)
+	}
+	_, _ = h.Write([]byte{';'})
 }
 
 func (st *shardRequestCacheStoreR63) removeFromOrderLocked(key string) {

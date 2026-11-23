@@ -167,14 +167,18 @@ func (t *Transpiler) validateCollapseRequest(req *esast.SearchRequest) error {
 	if req == nil || req.Collapse == nil {
 		return nil
 	}
-	if len(req.Rescore) > 0 {
+	if !t.Opts.ES8Compat && len(req.Rescore) > 0 {
 		return fmt.Errorf("illegal_argument_exception: cannot use `collapse` in conjunction with `rescore`")
 	}
 	if req.Slice != nil {
 		return fmt.Errorf("illegal_argument_exception: cannot use [collapse] in conjunction with [slice]")
 	}
 	if len(req.SearchAfter) > 0 {
-		if len(req.Sort) == 0 || !t.collapseFieldMatchesSortField(req.Collapse.Field, req.Sort[0].Entry.Field) {
+		multiSortDisallowed := t.Opts.ES8Compat && len(req.Sort) > 1
+		if len(req.Sort) == 0 || !t.collapseFieldMatchesSortField(req.Collapse.Field, req.Sort[0].Entry.Field) || multiSortDisallowed {
+			if t.Opts.ES8Compat {
+				return fmt.Errorf("illegal_argument_exception: Cannot use [collapse] in conjunction with [search_after] unless the search is sorted on the same field. Multiple sort fields are not allowed.") //nolint:staticcheck // Exact Elasticsearch error message
+			}
 			return fmt.Errorf("illegal_argument_exception: cannot use `collapse` in conjunction with `search_after` unless the sort is on the collapse field")
 		}
 	}
@@ -838,10 +842,29 @@ func FormatESDateWithNamedOrJavaPattern(epochMillis int64, epochNanos int64, for
 			} else {
 				fmt.Fprintf(&sb, "%0*d", runLen, tm.Nanosecond())
 			}
-		case 'E', 'e', 'c':
+		case 'E':
 			if runLen <= 3 {
 				sb.WriteString(tm.Format("Mon"))
 			} else {
+				sb.WriteString(tm.Format("Monday"))
+			}
+		case 'e', 'c':
+			switch runLen {
+			case 1:
+				dow := int(tm.Weekday())
+				if dow == 0 {
+					dow = 7
+				}
+				sb.WriteString(strconv.Itoa(dow))
+			case 2:
+				dow := int(tm.Weekday())
+				if dow == 0 {
+					dow = 7
+				}
+				fmt.Fprintf(&sb, "%02d", dow)
+			case 3:
+				sb.WriteString(tm.Format("Mon"))
+			default:
 				sb.WriteString(tm.Format("Monday"))
 			}
 		case 'a':

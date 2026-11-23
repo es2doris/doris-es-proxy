@@ -1656,7 +1656,7 @@ func (c *runnerContext) trackCreatedResources(action string, params map[string]a
 		if name := paramString(params, "name"); name != "" {
 			c.createdTemplates[name] = true
 		}
-	case "indices.put_template":
+	case "indices.put_template", "indices.put_template_with_param":
 		if name := paramString(params, "name"); name != "" {
 			c.createdLegacyTmpls[name] = true
 		}
@@ -2071,7 +2071,7 @@ func (c *runnerContext) trackCreatedResources(action string, params map[string]a
 		if name := firstNonEmptyParam(params, "name", "id"); name != "" {
 			c.createdSecurityRoleMappings[name] = true
 		}
-	case "cluster.post_voting_config_exclusions":
+	case "cluster.post_voting_config_exclusions", "cluster.post_voting_config_exclusions_with_node_name_part":
 		c.createdVotingExclusions = true
 	case "put_script":
 		if id := paramString(params, "id"); id != "" {
@@ -3034,11 +3034,11 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		}
 		reqPath = "/_data_stream/_promote/" + name
 
-	case "indices.put_template":
+	case "indices.put_template", "indices.put_template_with_param":
 		method = http.MethodPut
 		name := popString("name")
 		if name == "" {
-			return nil, fmt.Errorf("indices.put_template requires name parameter")
+			return nil, fmt.Errorf("%s requires name parameter", action)
 		}
 		reqPath = "/_template/" + escapeIDSeg(name)
 
@@ -4115,6 +4115,14 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 	case "cluster.post_voting_config_exclusions":
 		method = http.MethodPost
 		reqPath = "/_cluster/voting_config_exclusions"
+
+	case "cluster.post_voting_config_exclusions_with_node_name_part":
+		method = http.MethodPost
+		nodeName := popString("node_name")
+		if nodeName == "" {
+			return nil, fmt.Errorf("cluster.post_voting_config_exclusions_with_node_name_part requires node_name parameter")
+		}
+		reqPath = "/_cluster/voting_config_exclusions/" + escapeIDSeg(nodeName)
 
 	case "cluster.delete_voting_config_exclusions":
 		method = http.MethodDelete

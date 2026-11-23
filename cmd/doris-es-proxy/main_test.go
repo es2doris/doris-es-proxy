@@ -19,6 +19,9 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"errors"
+	"flag"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -359,5 +362,173 @@ func TestRound62CLISecurityHardening(t *testing.T) {
 	}
 	if !envBoolOrDefault("DORIS_ES_REINDEX_REMOTE_ALLOW_PRIVATE", false) {
 		t.Fatalf("expected DORIS_ES_REINDEX_REMOTE_ALLOW_PRIVATE=true")
+	}
+	if got := redactURLCredentials(""); got != "" {
+		t.Fatalf("expected empty string for empty shadow URL, got %q", got)
+	}
+	if got := redactURLCredentials("  \r\n "); got != "" {
+		t.Fatalf("expected empty string for whitespace shadow URL, got %q", got)
+	}
+}
+
+func TestRound65_ServerCLIAndSubcommandErrors(t *testing.T) {
+	// 1. Flag validation and help output without starting listeners.
+	var helpBuf bytes.Buffer
+	err := runServerErr(context.Background(), []string{"--help"}, &helpBuf, nil)
+	if !errors.Is(err, flag.ErrHelp) {
+		t.Fatalf("expected flag.ErrHelp, got %v", err)
+	}
+	if !strings.Contains(helpBuf.String(), "Usage: doris-es-proxy") || !strings.Contains(helpBuf.String(), "Server Flags:") {
+		t.Fatalf("expected custom usage text, got:\n%s", helpBuf.String())
+	}
+
+	var stderrBuf bytes.Buffer
+	for _, badArgs := range [][]string{
+		{"--basic-auth-user", "elastic"},
+		{"--basic-auth-pass", "secret"},
+		{"--tls-cert", "/tmp/cert.pem"},
+		{"--tls-key", "/tmp/key.pem"},
+		{"--no-such-flag"},
+	} {
+		stderrBuf.Reset()
+		if err := runServerErr(context.Background(), badArgs, &stderrBuf, nil); err == nil {
+			t.Fatalf("expected error for args %v", badArgs)
+		}
+	}
+
+	// 2. Full in-memory server configuration + TLS branch + graceful shutdown via mock listenFn (no sockets bound).
+	ctx, cancel := context.WithCancel(context.Background())
+	var observedAddr string
+	var observedCert string
+	var observedKey string
+	var rootRespCode int
+	err = runCLI(ctx, []string{
+		"--listen", "127.0.0.1:0",
+		"--doris-db", "r65_cli_db",
+		"--in-memory",
+		"--es-version", "8.15.5",
+		"--shadow-es-url", "https://user:pass@shadow.internal:9200",
+		"--auto-promote",
+		"--bulk-coalesce-ms", "15",
+		"--bulk-coalesce-bytes", "65536",
+		"--query-cache-ttl", "5s",
+		"--basic-auth-user", "elastic",
+		"--basic-auth-pass", "changeme",
+		"--api-key", "api-key-token",
+		"--tls-cert", "/tmp/fake-cert.pem",
+		"--tls-key", "/tmp/fake-key.pem",
+		"--reindex-remote-whitelist", "es.remote:9200",
+		"--reindex-remote-allow-private",
+	}, strings.NewReader(""), &bytes.Buffer{}, &stderrBuf, func(s *http.Server, certFile, keyFile string) error {
+		observedAddr = s.Addr
+		observedCert = certFile
+		observedKey = keyFile
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		req.SetBasicAuth("elastic", "changeme")
+		rec := httptest.NewRecorder()
+		s.Handler.ServeHTTP(rec, req)
+		rootRespCode = rec.Code
+		cancel()
+		return http.ErrServerClosed
+	})
+	if err != nil {
+		t.Fatalf("expected clean shutdown in-memory server run, got %v", err)
+	}
+	if observedAddr != "127.0.0.1:0" || observedCert != "/tmp/fake-cert.pem" || observedKey != "/tmp/fake-key.pem" {
+		t.Fatalf("unexpected listen parameters: addr=%q cert=%q key=%q", observedAddr, observedCert, observedKey)
+	}
+	if rootRespCode != http.StatusOK {
+		t.Fatalf("expected authenticated root handler 200 OK, got %d", rootRespCode)
+	}
+
+	// 3. Non-in-memory Doris SQL backend initialization path + unexpected listen error propagation.
+	sqlCtx, sqlCancel := context.WithCancel(context.Background())
+	defer sqlCancel()
+	listenBoom := errors.New("synthetic bind failure")
+	err = runServerErr(sqlCtx, []string{
+		"--listen", "127.0.0.1:0",
+		"--doris-dsn", "root:@tcp(127.0.0.1:1)/?timeout=20ms",
+		"--doris-http", "http://127.0.0.1:1",
+		"--doris-user", "admin",
+		"--doris-password", "pw",
+		"--doris-db", "es_sql_cli",
+	}, &stderrBuf, func(s *http.Server, certFile, keyFile string) error {
+		return listenBoom
+	})
+	if !errors.Is(err, listenBoom) {
+		t.Fatalf("expected wrapped listenBoom error, got %v", err)
+	}
+
+	// 4. Error branches for transpile, ddl, doctor, migrate-schema subcommands + runCLI dispatch.
+	tmpDir := t.TempDir()
+	badJSONFile := filepath.Join(tmpDir, "bad.json")
+	if err := os.WriteFile(badJSONFile, []byte(`{invalid`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	validMappingFile := filepath.Join(tmpDir, "map.json")
+	if err := os.WriteFile(validMappingFile, []byte(`{"properties":{"msg":{"type":"text"}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var outBuf bytes.Buffer
+	for _, tc := range [][]string{
+		{"transpile", "--unknown-flag"},
+		{"transpile", "--mapping", filepath.Join(tmpDir, "missing.json")},
+		{"transpile", "--mapping", badJSONFile},
+		{"transpile", "--mapping", validMappingFile, "--query", filepath.Join(tmpDir, "missing-query.json")},
+	} {
+		outBuf.Reset()
+		stderrBuf.Reset()
+		if err := runCLI(context.Background(), tc, strings.NewReader(`{}`), &outBuf, &stderrBuf, nil); err == nil {
+			t.Fatalf("expected error for %v", tc)
+		}
+	}
+	if err := runCLI(context.Background(), []string{"transpile"}, strings.NewReader(`{bad-json`), &outBuf, &stderrBuf, nil); err == nil {
+		t.Fatal("expected invalid search JSON error")
+	}
+	if err := runCLI(context.Background(), []string{"transpile"}, strings.NewReader(`{"query":{"unsupported_fake_clause":{}}}`), &outBuf, &stderrBuf, nil); err == nil {
+		t.Fatal("expected transpile error for unsupported query clause")
+	}
+
+	for _, tc := range [][]string{
+		{"ddl", "--unknown-flag"},
+		{"ddl", "--mapping", filepath.Join(tmpDir, "missing.json")},
+		{"ddl", "--mapping", badJSONFile},
+	} {
+		if err := runCLI(context.Background(), tc, strings.NewReader(``), &outBuf, &stderrBuf, nil); err == nil {
+			t.Fatalf("expected error for %v", tc)
+		}
+	}
+
+	if err := runCLI(context.Background(), []string{"doctor", "--unknown-flag"}, strings.NewReader(""), &outBuf, &stderrBuf, nil); err == nil {
+		t.Fatal("expected error for unknown doctor flag")
+	}
+
+	httpErrSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`internal error`))
+	}))
+	defer httpErrSrv.Close()
+
+	httpBadJSONSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{not-json`))
+	}))
+	defer httpBadJSONSrv.Close()
+
+	httpGoodSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"orders":{"mappings":{"properties":{"id":{"type":"keyword"}}}}}`))
+	}))
+	defer httpGoodSrv.Close()
+
+	for _, tc := range [][]string{
+		{"migrate-schema", "--unknown-flag"},
+		{"migrate-schema", "--es-url", "http://127.0.0.1:0\x7f"},
+		{"migrate-schema", "--es-url", "http://127.0.0.1:1"},
+		{"migrate-schema", "--es-url", httpErrSrv.URL},
+		{"migrate-schema", "--es-url", httpBadJSONSrv.URL},
+		{"migrate-schema", "--es-url", httpGoodSrv.URL, "--out-dir", badJSONFile},
+	} {
+		if err := runCLI(context.Background(), tc, strings.NewReader(""), &outBuf, &stderrBuf, nil); err == nil {
+			t.Fatalf("expected error for %v", tc)
+		}
 	}
 }

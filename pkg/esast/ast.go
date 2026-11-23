@@ -593,8 +593,9 @@ func lowerRetrieverNode(ret *RetrieverSpec, req *SearchRequest) {
 		}
 		req.Rank = &RankSpec{
 			RRF: &RRFSpec{
-				WindowSize:   ret.RRF.RankWindowSize,
-				RankConstant: ret.RRF.RankConstant,
+				WindowSize:     ret.RRF.RankWindowSize,
+				RankWindowSize: ret.RRF.RankWindowSize,
+				RankConstant:   ret.RRF.RankConstant,
 			},
 		}
 		if len(ret.RRF.Filter) > 0 {
@@ -753,6 +754,9 @@ func (r *SearchRequest) UnmarshalJSON(data []byte) error {
 		if _, hasSub := rawMap["sub_searches"]; hasSub {
 			return fmt.Errorf("parsing_exception: cannot specify both [retriever] and [sub_searches]")
 		}
+		if _, hasRank := rawMap["rank"]; hasRank {
+			return fmt.Errorf("parsing_exception: cannot specify both [retriever] and [rank]")
+		}
 	}
 	type plain SearchRequest
 	var raw struct {
@@ -887,13 +891,9 @@ func (r *SearchRequest) UnmarshalJSON(data []byte) error {
 		r.Retriever = &ret
 		LowerRetrieverToSearchRequest(r)
 	}
-	if r.Rank != nil && r.Rank.RRF != nil && r.Rank.RRF.WindowSize != nil {
-		effSize := 10
-		if r.Size != nil {
-			effSize = *r.Size
-		}
-		if *r.Rank.RRF.WindowSize < effSize {
-			return fmt.Errorf("illegal_argument_exception: [rank] requires [rank_window_size: %d] be greater than or equal to [size: %d]", *r.Rank.RRF.WindowSize, effSize)
+	if r.Size != nil {
+		if err := r.ValidateRRFWindowSize(*r.Size); err != nil {
+			return err
 		}
 	}
 	if hasPointInTime {
@@ -946,6 +946,21 @@ func (r *SearchRequest) UnmarshalJSON(data []byte) error {
 	}
 	if err := validateSearchRequestAggMap(r.EffectiveAggs()); err != nil {
 		return err
+	}
+	return nil
+}
+
+// ValidateRRFWindowSize validates that any RRF rank_window_size/window_size is >= effective size.
+func (r *SearchRequest) ValidateRRFWindowSize(defaultSize int) error {
+	if r == nil || r.Rank == nil || r.Rank.RRF == nil || r.Rank.RRF.WindowSize == nil {
+		return nil
+	}
+	effSize := defaultSize
+	if r.Size != nil {
+		effSize = *r.Size
+	}
+	if *r.Rank.RRF.WindowSize < effSize {
+		return fmt.Errorf("illegal_argument_exception: [rank] requires [rank_window_size: %d] be greater than or equal to [size: %d]", *r.Rank.RRF.WindowSize, effSize)
 	}
 	return nil
 }
@@ -1876,7 +1891,7 @@ func (kq *KNNQuery) UnmarshalJSON(data []byte) error {
 		}
 		if hasK {
 			if kq.K <= 0 {
-				return fmt.Errorf("x_content_parse_exception: [knn] failed to parse: %w", fmt.Errorf("illegal_argument_exception: [k] must be greater than 0"))
+				return fmt.Errorf("x_content_parse_exception: illegal_argument_exception: [k] must be greater than 0")
 			}
 			if kq.K > 10000 {
 				return fmt.Errorf("illegal_argument_exception: [k] cannot be greater than [10000]")
@@ -1887,10 +1902,10 @@ func (kq *KNNQuery) UnmarshalJSON(data []byte) error {
 				return fmt.Errorf("illegal_argument_exception: [num_candidates] cannot be greater than [10000]")
 			}
 			if kq.NumCandidates <= 0 {
-				return fmt.Errorf("x_content_parse_exception: [knn] failed to parse: %w", fmt.Errorf("illegal_argument_exception: [num_candidates] must be greater than 0"))
+				return fmt.Errorf("x_content_parse_exception: illegal_argument_exception: [num_candidates] must be greater than 0")
 			}
 			if hasK && kq.NumCandidates < kq.K {
-				return fmt.Errorf("x_content_parse_exception: [knn] failed to parse: %w", fmt.Errorf("illegal_argument_exception: [num_candidates] cannot be less than [k]"))
+				return fmt.Errorf("x_content_parse_exception: illegal_argument_exception: [num_candidates] cannot be less than [k]")
 			}
 		}
 		return nil
@@ -2899,7 +2914,49 @@ type Query struct {
 	Percolate         *PercolateQuery             `json:"percolate,omitempty"`
 	Rule              *RuleQuerySpec              `json:"rule,omitempty"`
 	SparseVector      *SparseVectorQuerySpec      `json:"sparse_vector,omitempty"`
+	Type              *TypeQuerySpec              `json:"type,omitempty"`
 	Name              string                      `json:"_name,omitempty"`
+}
+
+// TypeQuerySpec models the legacy ES `type` query (`{"type": {"value": "_doc"}}`).
+type TypeQuerySpec struct {
+	Value string   `json:"value,omitempty"`
+	Boost *float64 `json:"boost,omitempty"`
+	Name  string   `json:"_name,omitempty"`
+}
+
+func (tq *TypeQuerySpec) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+		return fmt.Errorf("parsing_exception: [type] query must be an object: %w", err)
+	}
+	for k := range rawMap {
+		switch k {
+		case "value", "boost", "_name":
+		default:
+			return fmt.Errorf("parsing_exception: [type] unknown field [%s]", k)
+		}
+	}
+	if rawBoost, ok := rawMap["boost"]; ok {
+		b, err := parseOptionalNonNegativeBoost(rawBoost)
+		if err != nil {
+			return err
+		}
+		tq.Boost = b
+	}
+	if rawVal, ok := rawMap["value"]; ok {
+		if err := json.Unmarshal(rawVal, &tq.Value); err != nil {
+			return fmt.Errorf("parsing_exception: [type] invalid [value]: %w", err)
+		}
+	}
+	if rawName, ok := rawMap["_name"]; ok {
+		_ = json.Unmarshal(rawName, &tq.Name)
+	}
+	return nil
 }
 
 // RuleQuerySpec models an ES `rule` / `rule_query` query.
@@ -3186,6 +3243,7 @@ var knownQueryClauses = map[string]bool{
 	"sparse_vector":       true,
 	"text_expansion":      true,
 	"weighted_tokens":     true,
+	"type":                true,
 	"_name":               true,
 	"boost":               true,
 }
@@ -3728,6 +3786,9 @@ func (q *Query) UnmarshalJSON(data []byte) error {
 	}
 	if alias.Name == "" && alias.SparseVector != nil && alias.SparseVector.Name != "" {
 		alias.Name = alias.SparseVector.Name
+	}
+	if alias.Name == "" && alias.Type != nil && alias.Type.Name != "" {
+		alias.Name = alias.Type.Name
 	}
 	if alias.Name == "" && alias.GeoGrid != nil && alias.GeoGrid.Name != "" {
 		alias.Name = alias.GeoGrid.Name
@@ -4624,11 +4685,12 @@ func (wq *WrapperQuery) UnmarshalJSON(data []byte) error {
 
 // PinnedQuery models an ES `pinned` query (`{"pinned": {"ids": [...], "organic": {...}}}`).
 type PinnedQuery struct {
-	IDs     []string         `json:"ids,omitempty"`
-	Docs    []map[string]any `json:"docs,omitempty"`
-	Organic *Query           `json:"organic,omitempty"`
-	Boost   *float64         `json:"boost,omitempty"`
-	Name    string           `json:"_name,omitempty"`
+	IDs                 []string         `json:"ids,omitempty"`
+	Docs                []map[string]any `json:"docs,omitempty"`
+	Organic             *Query           `json:"organic,omitempty"`
+	Boost               *float64         `json:"boost,omitempty"`
+	Name                string           `json:"_name,omitempty"`
+	HasDocsMissingIndex bool             `json:"-"`
 }
 
 func (pq *PinnedQuery) EffectiveIDs() []string {
@@ -4650,9 +4712,10 @@ func (pq *PinnedQuery) EffectiveIDs() []string {
 
 // PinnedDoc models an item in a `pinned` query's `docs` array.
 type PinnedDoc struct {
-	Index string `json:"_index,omitempty"`
-	ID    string `json:"_id"`
-	Type  string `json:"_type,omitempty"`
+	Index    string `json:"_index,omitempty"`
+	ID       string `json:"_id"`
+	Type     string `json:"_type,omitempty"`
+	HasIndex bool   `json:"-"`
 }
 
 func (d *PinnedDoc) UnmarshalJSON(data []byte) error {
@@ -4672,15 +4735,25 @@ func (d *PinnedDoc) UnmarshalJSON(data []byte) error {
 		}
 	}
 	var raw struct {
-		Index string `json:"_index"`
-		ID    any    `json:"_id"`
-		Type  string `json:"_type"`
+		ID   any    `json:"_id"`
+		Type string `json:"_type"`
 	}
 	if err := json.Unmarshal(trimmed, &raw); err != nil {
 		return err
 	}
-	if strings.TrimSpace(raw.Index) == "" {
-		return fmt.Errorf("parsing_exception: [pinned.docs] [_index] must not be null or empty")
+	d.HasIndex = false
+	d.Index = ""
+	if rawIdx, hasIdx := rawMap["_index"]; hasIdx {
+		idxTrim := bytes.TrimSpace(rawIdx)
+		var idxStr string
+		if len(idxTrim) == 0 || bytes.Equal(idxTrim, []byte("null")) || json.Unmarshal(idxTrim, &idxStr) != nil {
+			return fmt.Errorf("parsing_exception: [pinned.docs] [_index] must be a string")
+		}
+		if strings.TrimSpace(idxStr) == "" {
+			return fmt.Errorf("parsing_exception: [pinned.docs] [_index] must not be empty")
+		}
+		d.Index = strings.TrimSpace(idxStr)
+		d.HasIndex = true
 	}
 	if raw.ID == nil {
 		return fmt.Errorf("parsing_exception: [pinned.docs] [_id] must not be null or empty")
@@ -4696,7 +4769,6 @@ func (d *PinnedDoc) UnmarshalJSON(data []byte) error {
 	if d.ID == "" {
 		return fmt.Errorf("parsing_exception: [pinned.docs] [_id] must not be empty")
 	}
-	d.Index = strings.TrimSpace(raw.Index)
 	d.Type = raw.Type
 	return nil
 }
@@ -4722,10 +4794,17 @@ func (pq *PinnedQuery) UnmarshalJSON(data []byte) error {
 	if hasIDs && hasDocs {
 		return fmt.Errorf("parsing_exception: [pinned] cannot specify both [ids] and [docs]")
 	}
+	hasDocsMissingIndex := false
 	if hasDocs {
 		var pDocs []PinnedDoc
 		if err := json.Unmarshal(rawMap["docs"], &pDocs); err != nil {
 			return err
+		}
+		for _, pd := range pDocs {
+			if !pd.HasIndex {
+				hasDocsMissingIndex = true
+				break
+			}
 		}
 	}
 	var raw struct {
@@ -4756,6 +4835,7 @@ func (pq *PinnedQuery) UnmarshalJSON(data []byte) error {
 	pq.Docs = raw.Docs
 	pq.Organic = raw.Organic
 	pq.Name = raw.Name
+	pq.HasDocsMissingIndex = hasDocsMissingIndex
 	if len(pq.EffectiveIDs()) == 0 {
 		return fmt.Errorf("parsing_exception: [pinned] requires non-empty [ids] or [docs]")
 	}
@@ -8173,6 +8253,7 @@ func (r *RegexpEntry) UnmarshalJSON(data []byte) error {
 
 type MatchEntry struct {
 	Query                           any     `json:"query"`
+	Type                            string  `json:"type,omitempty"`
 	Operator                        string  `json:"operator,omitempty"`
 	Analyzer                        string  `json:"analyzer,omitempty"`
 	Boost                           float64 `json:"boost,omitempty"`
@@ -8197,6 +8278,7 @@ func (m MatchEntry) MarshalJSON() ([]byte, error) {
 	}
 	return json.Marshal(struct {
 		Query                           any      `json:"query"`
+		Type                            string   `json:"type,omitempty"`
 		Operator                        string   `json:"operator,omitempty"`
 		Analyzer                        string   `json:"analyzer,omitempty"`
 		Boost                           *float64 `json:"boost,omitempty"`
@@ -8212,6 +8294,7 @@ func (m MatchEntry) MarshalJSON() ([]byte, error) {
 		AutoGenerateSynonymsPhraseQuery *bool    `json:"auto_generate_synonyms_phrase_query,omitempty"`
 	}{
 		Query:                           m.Query,
+		Type:                            m.Type,
 		Operator:                        m.Operator,
 		Analyzer:                        m.Analyzer,
 		Boost:                           boostPtr,
@@ -8240,7 +8323,7 @@ func (m *MatchEntry) UnmarshalJSON(data []byte) error {
 		}
 		for k := range rawMap {
 			switch k {
-			case "query", "operator", "boost", "zero_terms_query", "minimum_should_match", "fuzziness", "lenient",
+			case "query", "type", "operator", "boost", "zero_terms_query", "minimum_should_match", "fuzziness", "lenient",
 				"analyzer", "auto_generate_synonyms_phrase_query", "fuzzy_transpositions", "fuzzy_rewrite",
 				"max_expansions", "prefix_length", "cutoff_frequency", "_name":
 			default:
@@ -8250,8 +8333,10 @@ func (m *MatchEntry) UnmarshalJSON(data []byte) error {
 		if _, hasQ := rawMap["query"]; !hasQ {
 			return fmt.Errorf("parsing_exception: [match] missing required [query] field")
 		}
+		_, hasCutoff := rawMap["cutoff_frequency"]
 		var full struct {
 			Query                           any             `json:"query"`
+			Type                            string          `json:"type"`
 			Operator                        string          `json:"operator"`
 			Analyzer                        string          `json:"analyzer"`
 			Boost                           json.RawMessage `json:"boost"`
@@ -8272,7 +8357,11 @@ func (m *MatchEntry) UnmarshalJSON(data []byte) error {
 		if isNonScalarOrNullValue(full.Query) {
 			return fmt.Errorf("parsing_exception: [match] query does not support non-scalar or null value")
 		}
+		if _, hasType := rawMap["type"]; hasType && !hasCutoff {
+			return fmt.Errorf("parsing_exception: [match] unknown field [type]")
+		}
 		m.Query = full.Query
+		m.Type = strings.ToLower(strings.TrimSpace(full.Type))
 		m.Analyzer = strings.TrimSpace(full.Analyzer)
 		m.CutoffFrequency = full.CutoffFrequency
 		if full.Operator != "" {
@@ -8342,6 +8431,7 @@ func (m *MatchEntry) UnmarshalJSON(data []byte) error {
 
 type CommonTermsEntry struct {
 	Query              any     `json:"query"`
+	Type               string  `json:"type,omitempty"`
 	CutoffFrequency    float64 `json:"cutoff_frequency,omitempty"`
 	LowFreqOperator    string  `json:"low_freq_operator,omitempty"`
 	HighFreqOperator   string  `json:"high_freq_operator,omitempty"`
@@ -8359,6 +8449,7 @@ func (c CommonTermsEntry) MarshalJSON() ([]byte, error) {
 	}
 	return json.Marshal(struct {
 		Query              any      `json:"query"`
+		Type               string   `json:"type,omitempty"`
 		CutoffFrequency    float64  `json:"cutoff_frequency,omitempty"`
 		LowFreqOperator    string   `json:"low_freq_operator,omitempty"`
 		HighFreqOperator   string   `json:"high_freq_operator,omitempty"`
@@ -8367,6 +8458,7 @@ func (c CommonTermsEntry) MarshalJSON() ([]byte, error) {
 		Boost              *float64 `json:"boost,omitempty"`
 	}{
 		Query:              c.Query,
+		Type:               c.Type,
 		CutoffFrequency:    c.CutoffFrequency,
 		LowFreqOperator:    c.LowFreqOperator,
 		HighFreqOperator:   c.HighFreqOperator,
@@ -8387,7 +8479,7 @@ func (c *CommonTermsEntry) UnmarshalJSON(data []byte) error {
 		}
 		for k := range rawMap {
 			switch k {
-			case "query", "cutoff_frequency", "low_freq_operator", "high_freq_operator", "minimum_should_match", "analyzer", "boost", "_name":
+			case "query", "type", "cutoff_frequency", "low_freq_operator", "high_freq_operator", "minimum_should_match", "analyzer", "boost", "_name":
 			default:
 				return fmt.Errorf("parsing_exception: [common] unknown field [%s]", k)
 			}
@@ -8395,8 +8487,10 @@ func (c *CommonTermsEntry) UnmarshalJSON(data []byte) error {
 		if _, hasQuery := rawMap["query"]; !hasQuery {
 			return fmt.Errorf("parsing_exception: [common] missing required [query] field")
 		}
+		_, hasCutoff := rawMap["cutoff_frequency"]
 		var full struct {
 			Query              any             `json:"query"`
+			Type               string          `json:"type"`
 			CutoffFrequency    float64         `json:"cutoff_frequency"`
 			LowFreqOperator    string          `json:"low_freq_operator"`
 			HighFreqOperator   string          `json:"high_freq_operator"`
@@ -8410,7 +8504,11 @@ func (c *CommonTermsEntry) UnmarshalJSON(data []byte) error {
 		if isNonScalarOrNullValue(full.Query) {
 			return fmt.Errorf("parsing_exception: [common] query does not support non-scalar or null value")
 		}
+		if _, hasType := rawMap["type"]; hasType && !hasCutoff {
+			return fmt.Errorf("parsing_exception: [common] unknown field [type]")
+		}
 		c.Query = full.Query
+		c.Type = strings.ToLower(strings.TrimSpace(full.Type))
 		c.CutoffFrequency = full.CutoffFrequency
 		c.Analyzer = strings.TrimSpace(full.Analyzer)
 		if full.LowFreqOperator != "" {
@@ -9929,13 +10027,52 @@ func (f *FrequentItemSetsAggSpec) UnmarshalJSON(data []byte) error {
 
 // MovingPercentilesAggSpec models an ES `moving_percentiles` pipeline aggregation.
 type MovingPercentilesAggSpec struct {
-	BucketsPath string `json:"buckets_path"`
-	Window      *int   `json:"window,omitempty"`
-	Shift       *int   `json:"shift,omitempty"`
-	Keyed       *bool  `json:"keyed,omitempty"`
+	BucketsPath string    `json:"buckets_path"`
+	Window      *int      `json:"window,omitempty"`
+	Shift       *int      `json:"shift,omitempty"`
+	Keyed       *bool     `json:"keyed,omitempty"`
+	Percents    []float64 `json:"percents,omitempty"`
+	Percentiles []float64 `json:"percentiles,omitempty"`
+	Script      any       `json:"script,omitempty"`
+	Format      string    `json:"format,omitempty"`
+	GapPolicy   string    `json:"gap_policy,omitempty"`
 }
 
 type MovingPercentilesAgg = MovingPercentilesAggSpec
+
+func (mp *MovingPercentilesAggSpec) EffectivePath() string {
+	if mp == nil {
+		return ""
+	}
+	return strings.TrimSpace(mp.BucketsPath)
+}
+
+func (mp *MovingPercentilesAggSpec) EffectiveWindow() int {
+	if mp == nil || mp.Window == nil || *mp.Window <= 0 {
+		return 10
+	}
+	return *mp.Window
+}
+
+func (mp *MovingPercentilesAggSpec) EffectiveShift() int {
+	if mp == nil || mp.Shift == nil || *mp.Shift < 0 {
+		return 0
+	}
+	return *mp.Shift
+}
+
+func (mp *MovingPercentilesAggSpec) EffectivePercents() []float64 {
+	if mp == nil {
+		return nil
+	}
+	if len(mp.Percents) > 0 {
+		return mp.Percents
+	}
+	if len(mp.Percentiles) > 0 {
+		return mp.Percentiles
+	}
+	return nil
+}
 
 func (mp *MovingPercentilesAggSpec) UnmarshalJSON(data []byte) error {
 	trimmed := bytes.TrimSpace(data)
@@ -9948,24 +10085,54 @@ func (mp *MovingPercentilesAggSpec) UnmarshalJSON(data []byte) error {
 	}
 	for k := range rawMap {
 		switch k {
-		case "buckets_path", "window", "shift", "keyed", "meta":
+		case "buckets_path", "window", "shift", "keyed", "percents", "percentiles", "script", "format", "gap_policy", "meta":
 		default:
 			return fmt.Errorf("parsing_exception: [moving_percentiles] unknown field [%s]", k)
 		}
 	}
 	type plain MovingPercentilesAggSpec
-	var p plain
-	if err := json.Unmarshal(trimmed, &p); err != nil {
+	var raw struct {
+		plain
+		Percents    json.RawMessage `json:"percents"`
+		Percentiles json.RawMessage `json:"percentiles"`
+	}
+	if err := json.Unmarshal(trimmed, &raw); err != nil {
 		return err
 	}
+	p := raw.plain
 	if strings.TrimSpace(p.BucketsPath) == "" {
 		return fmt.Errorf("parsing_exception: [moving_percentiles] requires non-empty [buckets_path]")
 	}
 	if p.Window != nil && *p.Window <= 0 {
-		return fmt.Errorf("illegal_argument_exception: [moving_percentiles] [window] must be > 0")
+		return fmt.Errorf("parsing_exception: [moving_percentiles] [window] must be a positive, non-zero integer.") //nolint:staticcheck // Exact Elasticsearch error message
 	}
 	if p.Shift != nil && *p.Shift < 0 {
 		return fmt.Errorf("illegal_argument_exception: [moving_percentiles] [shift] must be >= 0")
+	}
+	if rawPct, hasPercents := rawMap["percents"]; hasPercents {
+		pcts, err := parseFlexiblePercentsSlice(rawPct, "moving_percentiles")
+		if err != nil {
+			return err
+		}
+		p.Percents = pcts
+	}
+	if rawPct, hasPercentiles := rawMap["percentiles"]; hasPercentiles {
+		pcts, err := parseFlexiblePercentsSlice(rawPct, "moving_percentiles")
+		if err != nil {
+			return err
+		}
+		p.Percentiles = pcts
+		if len(p.Percents) == 0 {
+			p.Percents = pcts
+		}
+	}
+	if p.Script != nil {
+		if err := validateScriptValue(p.Script); err != nil {
+			return err
+		}
+	}
+	if err := validateGapPolicy(p.GapPolicy, "moving_percentiles"); err != nil {
+		return err
 	}
 	*mp = MovingPercentilesAggSpec(p)
 	return nil
@@ -11028,10 +11195,45 @@ func (a *AggSpec) UnmarshalJSON(data []byte) error {
 			return fmt.Errorf("illegal_argument_exception: Invalid execution mode for cardinality aggregation: [%s]", p.Cardinality.ExecutionHint)
 		}
 	}
+	if p.CumulativeSum != nil {
+		if err := validateCumulativePipelineRaw(rawMap["cumulative_sum"], "cumulative_sum", p.CumulativeSum); err != nil {
+			return err
+		}
+	}
+	if p.CumulativeCardinality != nil {
+		if err := validateCumulativePipelineRaw(rawMap["cumulative_cardinality"], "cumulative_cardinality", p.CumulativeCardinality); err != nil {
+			return err
+		}
+	}
 	if _, hasMeta := rawMap["meta"]; hasMeta && p.Meta == nil {
 		p.Meta = map[string]any{}
 	}
 	*a = AggSpec(p)
+	return nil
+}
+
+func validateCumulativePipelineRaw(raw json.RawMessage, aggName string, spec *PipelineAggSpec) error {
+	if spec == nil {
+		return nil
+	}
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) > 0 && !bytes.Equal(trimmed, []byte("null")) {
+		var m map[string]json.RawMessage
+		if err := json.Unmarshal(trimmed, &m); err != nil {
+			return err
+		}
+		for k := range m {
+			switch k {
+			case "buckets_path", "format", "gap_policy", "meta":
+			default:
+				return fmt.Errorf("parsing_exception: [%s] unknown field [%s]", aggName, k)
+			}
+		}
+	}
+	pathStr, ok := spec.BucketsPath.(string)
+	if !ok || strings.TrimSpace(pathStr) == "" {
+		return fmt.Errorf("parsing_exception: [%s] [buckets_path] must be a non-empty string", aggName)
+	}
 	return nil
 }
 
@@ -11071,11 +11273,34 @@ func (a *AggSpec) EffectiveMovingAvg() *MovingAvgAggSpec {
 }
 
 // EffectiveCumulative returns the pipeline specification for `cumulative_sum` or `cumulative_cardinality`.
+// Deprecated: prefer EffectiveCumulativeSum / EffectiveCumulativeCardinality so `cumulative_cardinality`
+// is not conflated with `cumulative_sum`.
 func (a *AggSpec) EffectiveCumulative() *PipelineAggSpec {
 	if a.CumulativeSum != nil {
 		return a.CumulativeSum
 	}
 	return a.CumulativeCardinality
+}
+
+// EffectiveCumulativeSum returns the pipeline specification when this aggregation is `cumulative_sum`.
+func (a *AggSpec) EffectiveCumulativeSum() *PipelineAggSpec {
+	if a == nil {
+		return nil
+	}
+	return a.CumulativeSum
+}
+
+// EffectiveCumulativeCardinality returns the pipeline specification when this aggregation is `cumulative_cardinality`.
+func (a *AggSpec) EffectiveCumulativeCardinality() *PipelineAggSpec {
+	if a == nil {
+		return nil
+	}
+	return a.CumulativeCardinality
+}
+
+// IsCumulativeCardinality reports whether this aggregation is `cumulative_cardinality`.
+func (a *AggSpec) IsCumulativeCardinality() bool {
+	return a != nil && a.CumulativeCardinality != nil
 }
 
 // SamplerAggSpec models a `sampler` or `diversified_sampler` aggregation.
@@ -11916,7 +12141,7 @@ func (p *PipelineAggSpec) UnmarshalJSON(data []byte) error {
 	}
 	for k := range rawMap {
 		switch k {
-		case "buckets_path", "gap_policy", "format", "sigma", "unit":
+		case "buckets_path", "gap_policy", "format", "sigma", "unit", "meta":
 		default:
 			return fmt.Errorf("parsing_exception: [pipeline_aggregation] unknown field [%s]", k)
 		}
@@ -13666,16 +13891,18 @@ func (ns *NestedSortSpec) UnmarshalJSON(data []byte) error {
 type SortEntry = SortFieldSpec
 
 type SortFieldSpec struct {
-	Field          string
-	Order          string
-	Mode           string
-	Missing        string
-	Script         any
-	Type           string
-	NumericType    string `json:"numeric_type,omitempty"`
-	Format         string
-	IgnoreUnmapped bool
-	Nested         *NestedSortSpec
+	Field                 string
+	Order                 string
+	Mode                  string
+	Missing               string
+	Script                any
+	Type                  string
+	NumericType           string `json:"numeric_type,omitempty"`
+	Format                string
+	IgnoreUnmapped        bool
+	Nested                *NestedSortSpec
+	WasLegacyNestedPath   bool `json:"-"`
+	WasLegacyNestedFilter bool `json:"-"`
 }
 
 type SortSpec struct {
@@ -14088,14 +14315,20 @@ func (s *SortSpec) UnmarshalJSON(data []byte) error {
 				nestedSpec = &NestedSortSpec{Path: np, Filter: nf}
 			}
 		}
+		_, hasInnerNP := innerRawMap["nested_path"]
+		_, hasOuterNP := m["nested_path"]
+		_, hasInnerNF := innerRawMap["nested_filter"]
+		_, hasOuterNF := m["nested_filter"]
 		s.Entry = SortFieldSpec{
-			Field:   "_script",
-			Order:   normOrder,
-			Script:  obj.Script,
-			Type:    scriptType,
-			Mode:    normMode,
-			Missing: missing,
-			Nested:  nestedSpec,
+			Field:                 "_script",
+			Order:                 normOrder,
+			Script:                obj.Script,
+			Type:                  scriptType,
+			Mode:                  normMode,
+			Missing:               missing,
+			Nested:                nestedSpec,
+			WasLegacyNestedPath:   hasInnerNP || hasOuterNP,
+			WasLegacyNestedFilter: hasInnerNF || hasOuterNF,
 		}
 		return nil
 	}
@@ -14262,7 +14495,22 @@ func (s *SortSpec) UnmarshalJSON(data []byte) error {
 		if utStr, okUT := geoMap["unmapped_type"].(string); okUT {
 			unmappedType = strings.ToLower(strings.TrimSpace(utStr))
 		}
-		s.Entry = SortFieldSpec{Field: "_geo_distance", Order: normOrder, Mode: normMode, Missing: missing, Type: unmappedType, IgnoreUnmapped: ignoreUnmapped, Nested: nestedSpec, Script: geoMap}
+		_, hasGeoNP := geoMap["nested_path"]
+		_, hasOuterGeoNP := m["nested_path"]
+		_, hasGeoNF := geoMap["nested_filter"]
+		_, hasOuterGeoNF := m["nested_filter"]
+		s.Entry = SortFieldSpec{
+			Field:                 "_geo_distance",
+			Order:                 normOrder,
+			Mode:                  normMode,
+			Missing:               missing,
+			Type:                  unmappedType,
+			IgnoreUnmapped:        ignoreUnmapped,
+			Nested:                nestedSpec,
+			Script:                geoMap,
+			WasLegacyNestedPath:   hasGeoNP || hasOuterGeoNP,
+			WasLegacyNestedFilter: hasGeoNF || hasOuterGeoNF,
+		}
 		return nil
 	}
 
@@ -14374,6 +14622,10 @@ func (s *SortSpec) UnmarshalJSON(data []byte) error {
 		ignoreUnmapped = bv
 	}
 	var nestedSpec *NestedSortSpec
+	_, hasOuterNP := m["nested_path"]
+	_, hasOuterNF := m["nested_filter"]
+	wasLegacyNP := hasOuterNP && field != "nested_path"
+	wasLegacyNF := hasOuterNF && field != "nested_filter"
 	if rawNested, hasNested := m["nested"]; hasNested && field != "nested" {
 		var ns NestedSortSpec
 		if err := json.Unmarshal(rawNested, &ns); err != nil {
@@ -14416,7 +14668,7 @@ func (s *SortSpec) UnmarshalJSON(data []byte) error {
 		if err != nil {
 			return err
 		}
-		s.Entry = SortFieldSpec{Field: field, Order: normOrder, Mode: normMode, Missing: missing, Type: strings.ToLower(sortType), NumericType: numericType, Format: sortFormat, IgnoreUnmapped: ignoreUnmapped, Nested: nestedSpec}
+		s.Entry = SortFieldSpec{Field: field, Order: normOrder, Mode: normMode, Missing: missing, Type: strings.ToLower(sortType), NumericType: numericType, Format: sortFormat, IgnoreUnmapped: ignoreUnmapped, Nested: nestedSpec, WasLegacyNestedPath: wasLegacyNP, WasLegacyNestedFilter: wasLegacyNF}
 		return nil
 	}
 	if valTrimmed[0] == '{' {
@@ -14431,6 +14683,10 @@ func (s *SortSpec) UnmarshalJSON(data []byte) error {
 				return fmt.Errorf("parsing_exception: [sort] unknown field [%s] for [%s]", ik, field)
 			}
 		}
+		_, hasInnerNP := innerMap["nested_path"]
+		_, hasInnerNF := innerMap["nested_filter"]
+		wasLegacyNP = wasLegacyNP || hasInnerNP
+		wasLegacyNF = wasLegacyNF || hasInnerNF
 		var obj struct {
 			Order          string          `json:"order"`
 			Mode           string          `json:"mode"`
@@ -14482,9 +14738,6 @@ func (s *SortSpec) UnmarshalJSON(data []byte) error {
 		if obj.Nested != nil {
 			nestedSpec = obj.Nested
 		} else if obj.NestedPath != "" || obj.NestedFilter != nil {
-			if strings.TrimSpace(obj.NestedPath) == "" {
-				return fmt.Errorf("parsing_exception: [sort] [nested_filter] requires [nested_path]")
-			}
 			nestedSpec = &NestedSortSpec{Path: obj.NestedPath, Filter: obj.NestedFilter}
 		}
 		if obj.UnmappedType != "" {
@@ -14499,7 +14752,7 @@ func (s *SortSpec) UnmarshalJSON(data []byte) error {
 			}
 			numericType = ntLower
 		}
-		s.Entry = SortFieldSpec{Field: field, Order: normOrder, Mode: normMode, Missing: missing, Type: strings.ToLower(sortType), NumericType: numericType, Format: sortFormat, IgnoreUnmapped: ignoreUnmapped, Nested: nestedSpec}
+		s.Entry = SortFieldSpec{Field: field, Order: normOrder, Mode: normMode, Missing: missing, Type: strings.ToLower(sortType), NumericType: numericType, Format: sortFormat, IgnoreUnmapped: ignoreUnmapped, Nested: nestedSpec, WasLegacyNestedPath: wasLegacyNP, WasLegacyNestedFilter: wasLegacyNF}
 		return nil
 	}
 	return fmt.Errorf("parsing_exception: sort option for [%s] must be a string or object", field)
@@ -14788,6 +15041,7 @@ type FieldProperty struct {
 	PositiveScoreImpact      *bool                    `json:"positive_score_impact,omitempty"`
 	MaxShingleSize           *int                     `json:"max_shingle_size,omitempty"`
 	DepthLimit               *int                     `json:"depth_limit,omitempty"`
+	Priority                 *int                     `json:"priority,omitempty"`
 	TermVector               string                   `json:"term_vector,omitempty"`
 	Relations                map[string]any           `json:"relations,omitempty"`
 	Fields                   map[string]FieldProperty `json:"fields,omitempty"`

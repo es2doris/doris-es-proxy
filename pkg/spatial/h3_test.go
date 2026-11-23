@@ -387,3 +387,248 @@ func TestBBoxGridDiskPentagonsAndValidation(t *testing.T) {
 	}
 	_ = fmt.Sprintf("validated %d antimeridian cells", len(antiCells))
 }
+
+func TestRound65H3RotationsAzimuthAndSafetyCaps(t *testing.T) {
+	// 1. getRes0Cells: 122 unique valid resolution-0 base cells (12 pentagons, 110 hexagons).
+	res0 := getRes0Cells()
+	if len(res0) != numBaseCells {
+		t.Fatalf("getRes0Cells len = %d, want %d", len(res0), numBaseCells)
+	}
+	seen := make(map[uint64]bool, len(res0))
+	pentCount := 0
+	for _, h := range res0 {
+		if !IsValidCell(h) || Resolution(h) != 0 || seen[h] {
+			t.Fatalf("invalid or duplicate res-0 cell %#x", h)
+		}
+		seen[h] = true
+		if IsPentagon(h) {
+			pentCount++
+		}
+	}
+	if pentCount != numPentagons {
+		t.Fatalf("res-0 pentagon count = %d, want %d", pentCount, numPentagons)
+	}
+
+	// 2. ijkRotate60cw: 6 CW rotations return original coordinate; CW+CCW is identity.
+	for _, orig := range []coordIJK{{1, 0, 0}, {0, 1, 0}, {0, 0, 1}, {2, 1, 0}, {0, 0, 0}} {
+		c := orig
+		for i := 0; i < 6; i++ {
+			ijkRotate60cw(&c)
+		}
+		if c != orig {
+			t.Fatalf("ijkRotate60cw*6(%v) = %v, want %v", orig, c, orig)
+		}
+		c2 := orig
+		ijkRotate60cw(&c2)
+		ijkRotate60ccw(&c2)
+		if c2 != orig {
+			t.Fatalf("ijkRotate60ccw(ijkRotate60cw(%v)) = %v, want %v", orig, c2, orig)
+		}
+	}
+
+	// 3. rotate60cw: all digits 0..7, 6 rotations and inverse of rotate60ccw.
+	for d := centerDigit; d <= invalidDigit; d++ {
+		cur := d
+		for i := 0; i < 6; i++ {
+			cur = rotate60cw(cur)
+		}
+		if cur != d {
+			t.Fatalf("rotate60cw*6(%d) = %d, want %d", d, cur, d)
+		}
+		if got := rotate60ccw(rotate60cw(d)); got != d {
+			t.Fatalf("rotate60ccw(rotate60cw(%d)) = %d, want %d", d, got, d)
+		}
+	}
+
+	// 4. geoAzDistanceRads across zero distance, due north/south, polar clamping, and general azimuth.
+	pOrig := latLng{lat: degsToRads(10), lng: degsToRads(20)}
+	if pSame := geoAzDistanceRads(pOrig, 1.0, 0); pSame != pOrig {
+		t.Fatalf("zero distance geoAzDistanceRads = %v, want %v", pSame, pOrig)
+	}
+	pNorth := geoAzDistanceRads(pOrig, 0.0, degsToRads(5))
+	if math.Abs(radsToDegs(pNorth.lat)-15.0) > 1e-9 || math.Abs(radsToDegs(pNorth.lng)-20.0) > 1e-9 {
+		t.Fatalf("due north geoAzDistanceRads = (%v, %v)", radsToDegs(pNorth.lat), radsToDegs(pNorth.lng))
+	}
+	pNorthPole := geoAzDistanceRads(latLng{lat: degsToRads(80), lng: degsToRads(20)}, 0.0, degsToRads(10))
+	if pNorthPole.lat != pi2 || pNorthPole.lng != 0 {
+		t.Fatalf("expected North Pole clamping, got %v", pNorthPole)
+	}
+	pSouthPole := geoAzDistanceRads(latLng{lat: degsToRads(-80), lng: degsToRads(20)}, pi, degsToRads(10))
+	if pSouthPole.lat != -pi2 || pSouthPole.lng != 0 {
+		t.Fatalf("expected South Pole clamping, got %v", pSouthPole)
+	}
+	pSouth := geoAzDistanceRads(pOrig, pi, degsToRads(5))
+	if math.Abs(radsToDegs(pSouth.lat)-5.0) > 1e-9 {
+		t.Fatalf("due south geoAzDistanceRads lat = %v, want 5", radsToDegs(pSouth.lat))
+	}
+	pDiag := geoAzDistanceRads(pOrig, pi/3, degsToRads(4))
+	if dist := greatCircleDistanceRads(pOrig, pDiag); math.Abs(dist-degsToRads(4)) > 1e-9 {
+		t.Fatalf("greatCircleDistanceRads round-trip = %v, want %v", dist, degsToRads(4))
+	}
+	// Trigger polar branch inside general-azimuth path (lat ~ +-pi2)
+	pPolarGen := geoAzDistanceRads(latLng{lat: degsToRads(89.9999), lng: 0}, 0.1, degsToRads(0.0001))
+	if math.IsNaN(pPolarGen.lat) || math.IsNaN(pPolarGen.lng) {
+		t.Fatalf("polar general-azimuth returned NaN: %v", pPolarGen)
+	}
+	// Antipodal and +/-pi longitude distance checks
+	if d := greatCircleDistanceRads(latLng{lat: 0, lng: 0}, latLng{lat: 0, lng: pi}); math.Abs(d-pi) > 1e-12 {
+		t.Fatalf("antipodal distance = %v, want pi", d)
+	}
+	if d := greatCircleDistanceRads(latLng{lat: 0, lng: -pi}, latLng{lat: 0, lng: pi}); d > 1e-12 {
+		t.Fatalf("same meridian (-pi vs +pi) greatCircleDistanceRads = %v, want 0", d)
+	}
+
+	// 5. GridDisk caps: negative k, maxSize > maxGridCellsLimit, integer overflow, pentagon fallback cap.
+	h5, _ := StringToCell("85196953fffffff")
+	pent10 := getPentagons(10)[0]
+	for _, badK := range []int{-1, -100, 577, 578, 1 << 30, math.MaxInt} {
+		if got := GridDisk(h5, badK); got != nil {
+			t.Fatalf("GridDisk(hex, %d) expected nil, got len=%d", badK, len(got))
+		}
+		if got := GridDisk(pent10, badK); got != nil {
+			t.Fatalf("GridDisk(pent10, %d) expected nil, got len=%d", badK, len(got))
+		}
+	}
+	if got := GridDisk(0, 1); got != nil {
+		t.Fatalf("GridDisk(0, 1) expected nil, got %v", got)
+	}
+	if sz, ok := gridDiskMaxSize(576); !ok || sz != 997057 {
+		t.Fatalf("gridDiskMaxSize(576) = (%d, %v), want (997057, true)", sz, ok)
+	}
+	if got := gridDiskBFS(pent10, 5, 10); got != nil {
+		t.Fatalf("gridDiskBFS capped at 10 expected nil, got len=%d", len(got))
+	}
+	if got := gridDiskBFS(pent10, 1, 0); got != nil {
+		t.Fatalf("gridDiskBFS limit=0 expected nil, got %v", got)
+	}
+	if got := gridDiskBFS(getPentagons(0)[0], 1, 100); len(got) != 6 {
+		t.Fatalf("gridDiskBFS pent0 k=1 len=%d, want 6", len(got))
+	}
+
+	// 6. Cumulative polygon edge cap across outer + hole edges (each edge < 1M, sum > 1M).
+	// At res 15, pentRadiusKm ~ 0.000509 km => 4 deg ~ 445 km => ~437k steps per edge (< 1M), 4 edges ~ 1.75M (> 1M).
+	cumPoly := [][2]float64{{0, 0}, {0, 4}, {4, 4}, {4, 0}}
+	if _, err := PolygonToCells(cumPoly, nil, 15); err != ErrCellLimitExceeded {
+		t.Fatalf("PolygonToCells cumulative cap err = %v, want ErrCellLimitExceeded", err)
+	}
+	if _, err := PolygonIntersectingCells(cumPoly, nil, 15); err != ErrCellLimitExceeded {
+		t.Fatalf("PolygonIntersectingCells cumulative cap err = %v, want ErrCellLimitExceeded", err)
+	}
+	// Outer triangle under cap (~550k steps), hole pushes cumulative sum over 1M.
+	smallOuter := [][2]float64{{0, 0}, {0, 1.5}, {1.5, 0}}
+	bigHole := [][2]float64{{0.1, 0.1}, {0.1, 2.5}, {2.5, 0.1}}
+	if _, err := PolygonToCells(smallOuter, [][][2]float64{bigHole}, 15); err != ErrCellLimitExceeded {
+		t.Fatalf("PolygonToCells outer+hole cumulative cap err = %v, want ErrCellLimitExceeded", err)
+	}
+	// Invalid coordinates & antimeridian polygon interpolation
+	if _, err := PolygonToCells([][2]float64{{math.NaN(), 0}, {0, 1}, {1, 0}}, nil, 3); err != ErrInvalidCoordinate {
+		t.Fatalf("PolygonToCells NaN err = %v, want ErrInvalidCoordinate", err)
+	}
+	if _, err := PolygonIntersectingCells([][2]float64{{0, 0}, {0, 1}, {1, 0}}, [][][2]float64{{{0, math.Inf(1)}, {0, 1}, {1, 0}}}, 3); err != ErrInvalidCoordinate {
+		t.Fatalf("PolygonIntersectingCells Inf hole err = %v, want ErrInvalidCoordinate", err)
+	}
+	antiPoly := [][2]float64{{0.0, 179.5}, {0.0, -179.5}, {0.5, -179.5}, {0.5, 179.5}}
+	antiPolyCells, err := PolygonIntersectingCells(antiPoly, nil, 3)
+	if err != nil || len(antiPolyCells) == 0 {
+		t.Fatalf("antimeridian PolygonIntersectingCells failed: len=%d err=%v", len(antiPolyCells), err)
+	}
+	for _, c := range antiPolyCells {
+		_, cLon := CellToLatLon(c)
+		if math.Abs(cLon) < 170.0 {
+			t.Fatalf("antimeridian PolygonIntersectingCells emitted non-antimeridian cell at lon=%v", cLon)
+		}
+	}
+
+	// 7. -180..+180 and wide-span BBoxToCells sampling (res <= 4 strips, res >= 5 belts & cap).
+	res1All, err := BBoxToCells(90, -180, -90, 180, 1)
+	if err != nil || len(res1All) != 842 {
+		t.Fatalf("BBoxToCells global res=1 len=%d err=%v, want 842", len(res1All), err)
+	}
+	if _, err := BBoxToCells(90, -180, -90, 180, 5); err != ErrCellLimitExceeded {
+		t.Fatalf("BBoxToCells global res=5 err=%v, want ErrCellLimitExceeded", err)
+	}
+	// Near-global strip at res=2 (-30..30 x -180..180) must cover all 4 longitude quadrants.
+	stripRes2, err := BBoxToCells(30, -180, -30, 180, 2)
+	if err != nil || len(stripRes2) < 100 {
+		t.Fatalf("BBoxToCells res=2 strip failed: len=%d err=%v", len(stripRes2), err)
+	}
+	var seenQ1, seenQ2, seenQ3, seenQ4 bool
+	for _, c := range stripRes2 {
+		_, lon := CellToLatLon(c)
+		switch {
+		case lon >= 0 && lon < 90:
+			seenQ1 = true
+		case lon >= 90:
+			seenQ2 = true
+		case lon < 0 && lon > -90:
+			seenQ3 = true
+		case lon <= -90:
+			seenQ4 = true
+		}
+	}
+	if !seenQ1 || !seenQ2 || !seenQ3 || !seenQ4 {
+		t.Fatalf("BBoxToCells res=2 -180..+180 undersampled longitudes: q1=%v q2=%v q3=%v q4=%v", seenQ1, seenQ2, seenQ3, seenQ4)
+	}
+	// Narrow equatorial -180..+180 strip at res >= 5.
+	eqRes5, err := BBoxToCells(0.05, -180, -0.05, 180, 5)
+	if err != nil || len(eqRes5) < 1000 {
+		t.Fatalf("BBoxToCells equatorial res=5 -180..+180 failed: len=%d err=%v", len(eqRes5), err)
+	}
+	// Wide-span [-179, +179] box at res=5 and transmeridian [10, -10] at res=2.
+	wideRes5, err := BBoxToCells(0.05, -179.0, -0.05, 179.0, 5)
+	if err != nil || len(wideRes5) < 1000 {
+		t.Fatalf("BBoxToCells wide-span [-179..179] res=5 failed: len=%d err=%v", len(wideRes5), err)
+	}
+	transWide, err := BBoxToCells(1.0, 10.0, -1.0, -10.0, 2)
+	if err != nil || len(transWide) < 50 {
+		t.Fatalf("BBoxToCells wide transmeridian [10..-10] res=2 failed: len=%d err=%v", len(transWide), err)
+	}
+	// Single point bbox, clamped latitudes > 90 / < -90, huge finite lon (1e300), invalid res/NaN.
+	if ptCells, err := BBoxToCells(52.37, 4.91, 52.37, 4.91, 5); err != nil || len(ptCells) != 1 {
+		t.Fatalf("single point BBoxToCells = (%v, %v)", ptCells, err)
+	}
+	if _, err := BBoxToCells(95, 1e300, -95, 1e300+10, 1); err != nil {
+		t.Fatalf("huge finite lon BBoxToCells unexpected error: %v", err)
+	}
+	if _, err := BBoxToCells(1, 0, -1, 1, -1); err == nil {
+		t.Fatal("expected invalid res error")
+	}
+	if _, err := BBoxToCells(math.NaN(), 0, -1, 1, 2); err == nil {
+		t.Fatal("expected NaN coordinate error")
+	}
+
+	// 8. Additional validation / error branches across CellTo*, IsValidCell, StringToCell.
+	if cLat, cLon := CellToLatLon(0); cLat != 0 || cLon != 0 {
+		t.Fatalf("CellToLatLon(0) = (%v, %v), want (0, 0)", cLat, cLon)
+	}
+	if b := CellToBoundary(0); b != nil {
+		t.Fatalf("CellToBoundary(0) = %v, want nil", b)
+	}
+	if _, err := CellToParent(0, 0); err == nil {
+		t.Fatal("expected CellToParent(0, 0) error")
+	}
+	if _, err := CellToParent(h5, 6); err == nil {
+		t.Fatal("expected CellToParent(h5, 6) resolution mismatch error")
+	}
+	if _, err := CellToCenterChild(0, 1); err == nil {
+		t.Fatal("expected CellToCenterChild(0, 1) error")
+	}
+	if _, err := CellToCenterChild(h5, 4); err == nil {
+		t.Fatal("expected CellToCenterChild(h5, 4) resolution mismatch error")
+	}
+	if _, err := CellToChildren(0, 1); err == nil {
+		t.Fatal("expected CellToChildren(0, 1) error")
+	}
+	if _, err := CellToChildren(h5, 16); err == nil {
+		t.Fatal("expected CellToChildren(h5, 16) error")
+	}
+	if IsPentagon(0) {
+		t.Fatal("expected IsPentagon(0) == false")
+	}
+	if IsValidCell(h3SetBaseCell(h3SetMode(h3Init, h3CellMode), 125)) {
+		t.Fatal("expected baseCell=125 to be invalid")
+	}
+	if IsValidCell(h3SetMode(h5, 2)) || IsValidCell(h5|h3HighBitMask) || IsValidCell(h5|h3ReservedMask) {
+		t.Fatal("expected invalid mode/highbit/reserved cell to fail IsValidCell")
+	}
+}

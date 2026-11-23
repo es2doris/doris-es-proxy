@@ -666,6 +666,10 @@ func deepCloneFieldProperty(fp esast.FieldProperty) esast.FieldProperty {
 		v := *fp.DepthLimit
 		cp.DepthLimit = &v
 	}
+	if fp.Priority != nil {
+		v := *fp.Priority
+		cp.Priority = &v
+	}
 	if fp.StoreArraySource != nil {
 		v := *fp.StoreArraySource
 		cp.StoreArraySource = &v
@@ -1334,7 +1338,7 @@ func extractTSDBTypedDimensionsFromDoc(idx *IndexSchema, doc map[string]any) ([]
 	fieldKeys := sortedFieldKeys(idx.Fields)
 	for _, k := range fieldKeys {
 		b := idx.Fields[k]
-		if b.AliasTarget != "" || strings.HasSuffix(k, ".keyword") || strings.HasPrefix(k, "_") {
+		if b.AliasTarget != "" || strings.EqualFold(b.ESType, "passthrough") || strings.HasSuffix(k, ".keyword") || strings.HasPrefix(k, "_") {
 			continue
 		}
 		if b.TimeSeriesDimension != nil && *b.TimeSeriesDimension {
@@ -1517,6 +1521,27 @@ func ApplyIndexModeDefaults(s *IndexSchema) {
 			}
 		}
 	case "time_series":
+		if s.RawMapping == nil {
+			s.RawMapping = &esast.MappingSpec{}
+		} else {
+			rmCopy := *s.RawMapping
+			s.RawMapping = &rmCopy
+		}
+		if s.RawMapping.DataStreamTimestamp == nil {
+			s.RawMapping.DataStreamTimestamp = map[string]any{"enabled": true}
+		}
+		if _, hasTSProp := s.RawMapping.Properties["@timestamp"]; !hasTSProp {
+			clonedProps := make(map[string]esast.FieldProperty, len(s.RawMapping.Properties)+1)
+			for k, v := range s.RawMapping.Properties {
+				clonedProps[k] = v
+			}
+			clonedProps["@timestamp"] = esast.FieldProperty{Type: "date"}
+			s.RawMapping.Properties = clonedProps
+		}
+		if _, hasTSField := s.Fields["@timestamp"]; !hasTSField {
+			s.registerLeafField("@timestamp", []string{"@timestamp"}, "", 0, esast.FieldProperty{Type: "date"})
+			s.finalizeCompiledSlices()
+		}
 		s.BindTSDBFields()
 		if !s.SourceDisabled() && !strings.EqualFold(s.SourceMode, "stored") {
 			s.SyntheticSource = true
@@ -1528,8 +1553,12 @@ func ApplyIndexModeDefaults(s *IndexSchema) {
 }
 
 // ValidateIndexModeSettings validates `index.mode` and ensures TSDB-only settings (`index.routing_path`,
-// `index.time_series.start_time`, `index.time_series.end_time`) are rejected when `effectiveMode != "time_series"`.
+// `index.time_series.start_time`, `index.time_series.end_time`) and incompatible TSDB settings (`index.sort.*`, `index.routing_partition_size`) match ES 8.x rules.
 func ValidateIndexModeSettings(effectiveMode string, settings map[string]any) error {
+	return validateIndexModeSettingsWithOpts(effectiveMode, settings, false)
+}
+
+func validateIndexModeSettingsWithOpts(effectiveMode string, settings map[string]any, allowOmittedRoutingPath bool) error {
 	mode := strings.ToLower(strings.TrimSpace(effectiveMode))
 	switch mode {
 	case "", "standard", "time_series", "logsdb", "lookup":
@@ -1537,30 +1566,65 @@ func ValidateIndexModeSettings(effectiveMode string, settings map[string]any) er
 		return esWireError(fmt.Sprintf("illegal_argument_exception: unknown index mode [%s]", effectiveMode))
 	}
 	if len(settings) == 0 {
+		if mode == "time_series" && !allowOmittedRoutingPath {
+			return esWireError("illegal_argument_exception: [index.mode=time_series] requires a non-empty [index.routing_path]")
+		}
 		return nil
 	}
+	raw, _ := extractRawTSDBSettingsWithPresence(settings)
 	if mode == "time_series" {
-		for _, sortKey := range []string{"index.sort.field", "sort.field", "index.sort.order", "sort.order", "index.sort.mode", "sort.mode", "index.sort.missing", "sort.missing"} {
-			if _, hasSort := lookupIndexSettingPath(settings, sortKey); hasSort {
-				return esWireError("illegal_argument_exception: index sorting cannot be configured explicitly in [time_series] mode")
+		for _, suffix := range []string{"field", "order", "mode", "missing"} {
+			if _, hasSort := lookupIndexSettingPath(settings, "index.sort."+suffix, "sort."+suffix); hasSort {
+				return esWireError(fmt.Sprintf("illegal_argument_exception: [index.mode=time_series] is incompatible with [index.sort.%s]", suffix))
 			}
 		}
 		if rps, hasRPS := lookupIndexSettingPath(settings, "index.routing_partition_size", "routing_partition_size"); hasRPS {
-			if fmt.Sprintf("%v", rps) != "1" {
-				return esWireError("illegal_argument_exception: [index.routing_partition_size] is not supported in [time_series] mode")
+			if formatRawTSDBSettingValue(rps) != "1" {
+				return esWireError("illegal_argument_exception: [index.mode=time_series] is incompatible with [index.routing_partition_size]")
 			}
+		}
+		if raw.hasStart && raw.startTime == "" {
+			return esWireError("illegal_argument_exception: cannot parse empty datetime for [index.time_series.start_time]")
+		}
+		if raw.hasEnd && raw.endTime == "" {
+			return esWireError("illegal_argument_exception: cannot parse empty datetime for [index.time_series.end_time]")
+		}
+		if raw.hasRP && len(raw.routingPath) == 0 {
+			return esWireError("illegal_argument_exception: [index.mode=time_series] requires a non-empty [index.routing_path]")
+		}
+		if !allowOmittedRoutingPath && len(raw.routingPath) == 0 {
+			return esWireError("illegal_argument_exception: [index.mode=time_series] requires a non-empty [index.routing_path]")
 		}
 		return nil
 	}
-	_, rp, st, et, _ := extractRawTSDBSettingsValues(settings)
-	if len(rp) > 0 {
+	if raw.hasRP || len(raw.routingPath) > 0 {
 		return esWireError("illegal_argument_exception: [index.routing_path] requires [index.mode=time_series]")
 	}
-	if st != "" {
+	if raw.hasStart || raw.startTime != "" {
 		return esWireError("illegal_argument_exception: [index.time_series.start_time] requires [index.mode=time_series]")
 	}
-	if et != "" {
+	if raw.hasEnd || raw.endTime != "" {
 		return esWireError("illegal_argument_exception: [index.time_series.end_time] requires [index.mode=time_series]")
+	}
+	return nil
+}
+
+// ValidateTSDBEndTimeUpdate validates an `index.time_series.end_time` increase on a live TSDB index (`tsdb/10_settings.yml:284`).
+func ValidateTSDBEndTimeUpdate(currentEndTime, nextEndTime any) error {
+	nextStr := formatRawTSDBSettingValue(nextEndTime)
+	if nextStr == "" {
+		return esWireError("illegal_argument_exception: cannot parse empty datetime for [index.time_series.end_time]")
+	}
+	nowUTC := time.Now().UTC()
+	nextT, okN := parseTSDBSettingTime(nextStr, nowUTC)
+	if !okN {
+		return esWireError(fmt.Sprintf("illegal_argument_exception: failed to parse [index.time_series.end_time] [%s]", nextStr))
+	}
+	curStr := formatRawTSDBSettingValue(currentEndTime)
+	if curStr != "" {
+		if curT, okC := parseTSDBSettingTime(curStr, nowUTC); okC && !nextT.After(curT) {
+			return esWireError(fmt.Sprintf("illegal_argument_exception: index.time_series.end_time must be larger than current value [%d]", curT.UnixMilli()))
+		}
 	}
 	return nil
 }
@@ -1830,7 +1894,7 @@ func expandInferDocKeysOneLevel(obj map[string]any, dst map[string]esast.FieldPr
 		tail := k[dotIdx+1:]
 		if existing, ok := dst[head]; ok {
 			exType := strings.ToLower(strings.TrimSpace(existing.Type))
-			if exType != "" && exType != "object" && exType != "nested" {
+			if exType != "" && exType != "object" && exType != "nested" && exType != "passthrough" {
 				out[k] = val
 				continue
 			}

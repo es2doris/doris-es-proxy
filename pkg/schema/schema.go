@@ -117,6 +117,7 @@ type FieldBinding struct {
 	AdoptedConstantValue     bool
 	IgnoreAbove              int
 	AliasTarget              string
+	IsPassthroughAlias       bool
 	ScalingFactor            float64
 	Coerce                   *bool
 	IgnoreMalformed          *bool
@@ -246,6 +247,13 @@ type IndexSchema struct {
 	IsRuntimeEvalSchema      bool
 	NestedEvalRoot           string
 	AnalysisConfig           *analysis.IndexAnalysisConfig
+	passthroughNodes         []passthroughNodeSpec
+}
+
+type passthroughNodeSpec struct {
+	prefix      string
+	priority    int
+	hasPriority bool
 }
 
 // CopyIndexMappingSettingsFrom copies index-level mapping/search limits and defaults from src into s.
@@ -344,6 +352,7 @@ func (s *IndexSchema) CopyIndexMappingSettingsFrom(src *IndexSchema) {
 	}
 	if src.AnalysisConfig != nil && s.AnalysisConfig == nil {
 		s.AnalysisConfig = src.AnalysisConfig
+		s.refreshNormalizerFlags()
 	}
 	for fn, srcFB := range src.Fields {
 		if srcFB.AdoptedConstantValue {
@@ -490,7 +499,7 @@ func CompileIndexSchema(dorisDB, indexName string, mapping *esast.MappingSpec) *
 			if expanded, err := ExpandDottedPropertiesWithSubobjects(mapping.Properties, mapping.Subobjects != nil && !*mapping.Subobjects); err == nil {
 				mapping.Properties = expanded
 			}
-			s.compileProperties(nil, nil, "", 0, mapping.Properties)
+			s.compileProperties(nil, nil, "", 0, false, mapping.Properties)
 		}
 	}
 	s.finalizeCompiledSlices()
@@ -516,9 +525,17 @@ func (s *IndexSchema) SetAnalysisSettings(settings map[string]any) error {
 		return err
 	}
 	s.AnalysisConfig = cfg
+	s.refreshNormalizerFlags()
+	return nil
+}
+
+func (s *IndexSchema) refreshNormalizerFlags() {
+	if s == nil {
+		return
+	}
 	for k, b := range s.Fields {
 		if b.NormalizerName != "" {
-			b.LowercaseNormalizer = normalizerUsesLowercaseFilter(b.NormalizerName, cfg)
+			b.LowercaseNormalizer = normalizerUsesLowercaseFilter(b.NormalizerName, s.AnalysisConfig)
 			s.Fields[k] = b
 		}
 	}
@@ -535,7 +552,6 @@ func (s *IndexSchema) SetAnalysisSettings(settings map[string]any) error {
 			s.OrderedFields[i] = updated
 		}
 	}
-	return nil
 }
 
 func normalizerUsesLowercaseFilter(normName string, cfg *analysis.IndexAnalysisConfig) bool {
@@ -580,7 +596,88 @@ func normalizerUsesLowercaseFilter(normName string, cfg *analysis.IndexAnalysisC
 	return false
 }
 
+func (s *IndexSchema) registerPassthroughAliases() {
+	if s == nil || len(s.passthroughNodes) == 0 || len(s.Fields) == 0 {
+		return
+	}
+	fieldKeys := make([]string, 0, len(s.Fields))
+	for k := range s.Fields {
+		fieldKeys = append(fieldKeys, k)
+	}
+	sort.Strings(fieldKeys)
+
+	hasConcreteConflict := func(rel string) bool {
+		if existing, exists := s.Fields[rel]; exists && !existing.IsPassthroughAlias {
+			return true
+		}
+		prefix := rel + "."
+		for _, fk := range fieldKeys {
+			if strings.HasPrefix(fk, prefix) {
+				if fb := s.Fields[fk]; !fb.IsPassthroughAlias {
+					return true
+				}
+			}
+		}
+		return false
+	}
+
+	type candidate struct {
+		target      string
+		priority    int
+		hasPriority bool
+	}
+	winners := make(map[string]candidate)
+
+	for _, k := range fieldKeys {
+		b := s.Fields[k]
+		if b.AliasTarget != "" || strings.EqualFold(b.ESType, "passthrough") || strings.EqualFold(b.ESType, "object") || strings.EqualFold(b.ESType, "nested") {
+			continue
+		}
+		if strings.HasPrefix(k, "_") || strings.HasSuffix(k, ".keyword") {
+			continue
+		}
+		var bestNode *passthroughNodeSpec
+		for i := range s.passthroughNodes {
+			pn := &s.passthroughNodes[i]
+			if strings.HasPrefix(k, pn.prefix+".") {
+				if bestNode == nil || len(pn.prefix) > len(bestNode.prefix) {
+					bestNode = pn
+				}
+			}
+		}
+		if bestNode == nil {
+			continue
+		}
+		rel := strings.TrimPrefix(k, bestNode.prefix+".")
+		if rel == "" || hasConcreteConflict(rel) {
+			continue
+		}
+		cand := candidate{
+			target:      k,
+			priority:    bestNode.priority,
+			hasPriority: bestNode.hasPriority,
+		}
+		prev, hasPrev := winners[rel]
+		if !hasPrev ||
+			(cand.hasPriority && !prev.hasPriority) ||
+			(cand.hasPriority == prev.hasPriority && cand.priority > prev.priority) ||
+			(cand.hasPriority == prev.hasPriority && cand.priority == prev.priority && cand.target < prev.target) {
+			winners[rel] = cand
+		}
+	}
+
+	for rel, win := range winners {
+		s.Fields[rel] = FieldBinding{
+			ESFieldPath:        rel,
+			ESType:             "alias",
+			AliasTarget:        win.target,
+			IsPassthroughAlias: true,
+		}
+	}
+}
+
 func (s *IndexSchema) finalizeCompiledSlices() {
+	s.registerPassthroughAliases()
 	// First resolve alias chains (e.g. a1 -> a2 -> target) with cycle detection so copy_to targeting an alias resolves to the underlying field.
 	for k, b := range s.Fields {
 		if b.AliasTarget == "" {
@@ -704,6 +801,7 @@ func (s *IndexSchema) finalizeCompiledSlices() {
 					aliased := tb
 					aliased.ESFieldPath = k
 					aliased.AliasTarget = b.AliasTarget
+					aliased.IsPassthroughAlias = b.IsPassthroughAlias
 					aliased.CopyTo = nil
 					s.Fields[k] = aliased
 					changed = true
@@ -723,6 +821,7 @@ func (s *IndexSchema) finalizeCompiledSlices() {
 				aliased := tb
 				aliased.ESFieldPath = k
 				aliased.AliasTarget = b.AliasTarget
+				aliased.IsPassthroughAlias = b.IsPassthroughAlias
 				aliased.CopyTo = nil
 				s.Fields[k] = aliased
 				continue
@@ -1351,7 +1450,15 @@ func validateSingleFieldProperty(fullPath, fType string, prop esast.FieldPropert
 		}
 	}
 	if prop.Subobjects != nil && fType != "" && fType != "object" {
-		return fmt.Errorf("mapper_parsing_exception: Mapping definition for [%s] has unsupported parameters: [subobjects : %v]", fullPath, *prop.Subobjects)
+		return fmt.Errorf("mapper_parsing_exception: Mapping definition for [%s] has unsupported parameters:  [subobjects : %v]", fullPath, *prop.Subobjects)
+	}
+	if prop.Priority != nil {
+		if fType != "passthrough" {
+			return fmt.Errorf("mapper_parsing_exception: Mapping definition for [%s] has unsupported parameters:  [priority : %d]", fullPath, *prop.Priority)
+		}
+		if *prop.Priority < 0 {
+			return fmt.Errorf("mapper_parsing_exception: [priority] must be >= 0 for field [%s], got [%d]", fullPath, *prop.Priority)
+		}
 	}
 	if err := validateDynamicModeVal(prop.Dynamic, fullPath); err != nil {
 		return err
@@ -1743,7 +1850,25 @@ func validateDynamicTemplatesSpec(templates []map[string]any) error {
 			}
 			clonedMapping := make(map[string]any, len(mappingMap))
 			for mk, mv := range mappingMap {
+				switch mk {
+				case "match_mapping_type", "unmatch_mapping_type", "match", "unmatch", "path_match", "path_unmatch", "match_pattern":
+					continue
+				}
 				clonedMapping[mk] = mv
+			}
+			if mmtFirst == "" {
+				if rawMMT, hasMMT := mappingMap["match_mapping_type"]; hasMMT && rawMMT != nil {
+					if mmtStr, okS := rawMMT.(string); okS {
+						norm := strings.ToLower(strings.TrimSpace(mmtStr))
+						if !validDynamicMatchMappingTypes[norm] {
+							return fmt.Errorf("mapper_parsing_exception: dynamic template [%s] has invalid [match_mapping_type] [%s]", tmplName, mmtStr)
+						}
+						mmtFirst = norm
+						if norm == "object" || norm == "*" {
+							mmtIsObjectOrWildcard = true
+						}
+					}
+				}
 			}
 			rawType, hasType := clonedMapping["type"]
 			if hasType && rawType != nil {
@@ -1821,6 +1946,41 @@ func (n normalizedMappingSource) effectiveMode() string {
 		return n.mode
 	}
 	return "stored"
+}
+
+func parseTSDBBoolOptionR61(v any) (bool, bool) {
+	switch tv := v.(type) {
+	case bool:
+		return tv, true
+	case string:
+		s := strings.ToLower(strings.TrimSpace(tv))
+		if s == "true" {
+			return true, true
+		}
+		if s == "false" {
+			return false, true
+		}
+	}
+	return false, false
+}
+
+func validateDataStreamTimestampSpec(raw any) error {
+	if raw == nil {
+		return nil
+	}
+	obj, ok := raw.(map[string]any)
+	if !ok {
+		return fmt.Errorf("mapper_parsing_exception: Failed to parse mapping: [_data_stream_timestamp] config must be an object")
+	}
+	for k, v := range obj {
+		if k != "enabled" {
+			return fmt.Errorf("mapper_parsing_exception: Failed to parse mapping: [_data_stream_timestamp] does not support parameter [%s]", k)
+		}
+		if _, ok := parseTSDBBoolOptionR61(v); !ok {
+			return fmt.Errorf("mapper_parsing_exception: Failed to parse value [%v] as only [true] or [false] are allowed.", v) //nolint:staticcheck // Exact Elasticsearch error message
+		}
+	}
+	return nil
 }
 
 func validateAndNormalizeMappingSourceSpec(src map[string]any) (normalizedMappingSource, error) {
@@ -2025,6 +2185,9 @@ func ValidateMappingSpec(m *esast.MappingSpec) error {
 			return err
 		}
 	}
+	if err := validateDataStreamTimestampSpec(m.DataStreamTimestamp); err != nil {
+		return err
+	}
 	if m.Size != nil {
 		if _, _, err := ValidateSizeMetaSpec(m.Size); err != nil {
 			return err
@@ -2130,8 +2293,11 @@ func ValidateMappingSpec(m *esast.MappingSpec) error {
 	}
 	var copyToRefs []copyToRef
 
-	var collect func(props map[string]esast.FieldProperty, prefix string, inSubobjectsFalse bool) error
-	collect = func(props map[string]esast.FieldProperty, prefix string, inSubobjectsFalse bool) error {
+	var collect func(props map[string]esast.FieldProperty, prefix string, inSubobjectsFalse bool, inNested bool) error
+	tsdbDims := make(map[string]bool)
+	tsdbMetrics := make(map[string]bool)
+	passthroughPriorities := make(map[int][]string)
+	collect = func(props map[string]esast.FieldProperty, prefix string, inSubobjectsFalse bool, inNested bool) error {
 		for k, prop := range props {
 			fullPath := k
 			if prefix != "" {
@@ -2140,6 +2306,19 @@ func ValidateMappingSpec(m *esast.MappingSpec) error {
 			fType := strings.ToLower(strings.TrimSpace(prop.Type))
 			if fType == "" && (len(prop.Properties) > 0 || prop.Enabled != nil || prop.Dynamic != nil || prop.Subobjects != nil) {
 				fType = "object"
+			}
+			childNested := inNested || fType == "nested"
+			if childNested && prop.TimeSeriesDimension != nil && *prop.TimeSeriesDimension {
+				return fmt.Errorf("mapper_parsing_exception: time_series_dimension can't be configured in nested field [%s]", fullPath)
+			}
+			if prop.TimeSeriesDimension != nil && *prop.TimeSeriesDimension {
+				tsdbDims[fullPath] = true
+			}
+			if prop.TimeSeriesMetric != "" {
+				tsdbMetrics[fullPath] = true
+			}
+			if fType == "passthrough" && prop.Priority != nil {
+				passthroughPriorities[*prop.Priority] = append(passthroughPriorities[*prop.Priority], fullPath)
 			}
 			if inSubobjectsFalse {
 				isDisabledObj := (fType == "" || fType == "object") && prop.Enabled != nil && !*prop.Enabled
@@ -2197,7 +2376,7 @@ func ValidateMappingSpec(m *esast.MappingSpec) error {
 			}
 			if len(prop.Properties) > 0 {
 				childSubobjectsFalse := inSubobjectsFalse || (prop.Subobjects != nil && !*prop.Subobjects)
-				if err := collect(prop.Properties, fullPath, childSubobjectsFalse); err != nil {
+				if err := collect(prop.Properties, fullPath, childSubobjectsFalse, childNested); err != nil {
 					return err
 				}
 			}
@@ -2205,8 +2384,30 @@ func ValidateMappingSpec(m *esast.MappingSpec) error {
 		return nil
 	}
 	rootSubobjectsFalse := m.Subobjects != nil && !*m.Subobjects
-	if err := collect(m.Properties, "", rootSubobjectsFalse); err != nil {
+	if err := collect(m.Properties, "", rootSubobjectsFalse, false); err != nil {
 		return err
+	}
+	if len(passthroughPriorities) > 0 {
+		prios := make([]int, 0, len(passthroughPriorities))
+		for p := range passthroughPriorities {
+			prios = append(prios, p)
+		}
+		sort.Ints(prios)
+		for _, p := range prios {
+			paths := passthroughPriorities[p]
+			if len(paths) > 1 {
+				sort.Strings(paths)
+				return fmt.Errorf("mapper_parsing_exception: field [%s] has a conflicting param [priority: %d] with field [%s]", paths[1], p, paths[0])
+			}
+		}
+	}
+	for rtName := range m.Runtime {
+		if tsdbDims[rtName] {
+			return fmt.Errorf("illegal_argument_exception: Field [%s] attempted to shadow a time_series_dimension", rtName)
+		}
+		if tsdbMetrics[rtName] {
+			return fmt.Errorf("illegal_argument_exception: Field [%s] attempted to shadow a time_series_metric", rtName)
+		}
 	}
 
 	for _, ref := range copyToRefs {
@@ -2441,6 +2642,9 @@ func validatePropertiesCompatibility(oldProps, newProps map[string]esast.FieldPr
 		}
 		if newProp.Analyzer != "" && newProp.Analyzer != oldProp.Analyzer {
 			return fmt.Errorf("illegal_argument_exception: Mapper for [%s] conflicts with existing mapper: cannot update parameter [analyzer] from [%s] to [%s]", fullPath, oldProp.Analyzer, newProp.Analyzer)
+		}
+		if newProp.Priority != nil && oldProp.Priority != nil && *newProp.Priority != *oldProp.Priority {
+			return fmt.Errorf("illegal_argument_exception: Mapper for [%s] conflicts with existing mapper: cannot update parameter [priority] from [%d] to [%d]", fullPath, *oldProp.Priority, *newProp.Priority)
 		}
 		if newProp.ScalingFactor != 0 && newProp.ScalingFactor != oldProp.ScalingFactor {
 			return fmt.Errorf("illegal_argument_exception: Mapper for [%s] conflicts with existing mapper: cannot update parameter [scaling_factor] from [%v] to [%v] for field [%s]", fullPath, oldProp.ScalingFactor, newProp.ScalingFactor, fullPath)
@@ -2801,6 +3005,10 @@ func deepMergeMappingPropertiesWithSubobjects(
 				dl := *v.DepthLimit
 				merged.DepthLimit = &dl
 			}
+			if v.Priority != nil {
+				pr := *v.Priority
+				merged.Priority = &pr
+			}
 			if v.Relations != nil {
 				merged.Relations = v.Relations
 			}
@@ -2873,6 +3081,7 @@ func (s *IndexSchema) compileProperties(
 	jsonPathPrefix []string,
 	activeNestedRoot string,
 	nestedRootDepth int,
+	inPassthroughTSDim bool,
 	props map[string]esast.FieldProperty,
 ) {
 	keys := make([]string, 0, len(props))
@@ -2900,6 +3109,23 @@ func (s *IndexSchema) compileProperties(
 			continue
 		}
 
+		isPassthrough := strings.EqualFold(strings.TrimSpace(prop.Type), "passthrough")
+		if isPassthrough {
+			prio := -1
+			hasPrio := false
+			if prop.Priority != nil {
+				prio = *prop.Priority
+				hasPrio = true
+			}
+			s.passthroughNodes = append(s.passthroughNodes, passthroughNodeSpec{
+				prefix:      dotPath,
+				priority:    prio,
+				hasPriority: hasPrio,
+			})
+		}
+		propTSDim := prop.TimeSeriesDimension != nil && *prop.TimeSeriesDimension
+		childPassthroughTSDim := inPassthroughTSDim || (isPassthrough && propTSDim)
+
 		if strings.EqualFold(prop.Type, "nested") {
 			corrCol := "n__" + SanitizeDorisIdentifier(dotPath)
 			s.NestedRoots[dotPath] = corrCol
@@ -2908,18 +3134,22 @@ func (s *IndexSchema) compileProperties(
 			}
 			s.nestedRootPaths[dotPath] = currJSONPath
 			if len(prop.Properties) > 0 {
-				s.compileProperties(currESPath, currJSONPath, dotPath, len(currJSONPath), prop.Properties)
+				s.compileProperties(currESPath, currJSONPath, dotPath, len(currJSONPath), childPassthroughTSDim, prop.Properties)
 			}
 			continue
 		}
 
 		// Recurse into sub-object properties if present
 		if len(prop.Properties) > 0 {
-			s.compileProperties(currESPath, currJSONPath, activeNestedRoot, nestedRootDepth, prop.Properties)
+			s.compileProperties(currESPath, currJSONPath, activeNestedRoot, nestedRootDepth, childPassthroughTSDim, prop.Properties)
 		}
 
 		// If leaf type is declared, register the field binding
 		if prop.Type != "" && !strings.EqualFold(prop.Type, "object") {
+			if inPassthroughTSDim && !isPassthrough && prop.TimeSeriesDimension == nil && prop.TimeSeriesMetric == "" && IsValidTSDBDimensionFieldType(prop.Type) {
+				t := true
+				prop.TimeSeriesDimension = &t
+			}
 			s.registerLeafField(dotPath, currJSONPath, activeNestedRoot, nestedRootDepth, prop)
 		}
 
@@ -3052,7 +3282,7 @@ func (s *IndexSchema) registerLeafField(
 		aggMetricsCopy = append([]string(nil), prop.Metrics...)
 	}
 
-	if IsRangeFieldType(esType) || esType == "histogram" || esType == "flattened" || esType == "sparse_vector" || esType == "rank_features" || esType == "percolator" || esType == "geo_shape" {
+	if IsRangeFieldType(esType) || esType == "histogram" || esType == "flattened" || esType == "sparse_vector" || esType == "rank_features" || esType == "percolator" || esType == "geo_shape" || esType == "passthrough" {
 		s.Fields[dotPath] = FieldBinding{
 			ESFieldPath:              dotPath,
 			SourceJSONPath:           sourceJSONPath,
@@ -3640,6 +3870,7 @@ type inferOptions struct {
 	dateDetection      bool
 	numericDetection   bool
 	subobjects         bool
+	inPassthroughTSDim bool
 	dynamicDateFormats []string
 	dynamicTemplates   []map[string]any
 	dynamicMode        string
@@ -3999,11 +4230,11 @@ func mergeInferredIntoExistingPropsWithSubobjects(
 			continue
 		}
 		if (exProp.Enabled != nil && !*exProp.Enabled) ||
-			(exProp.Type != "" && !strings.EqualFold(exProp.Type, "object") && !strings.EqualFold(exProp.Type, "nested")) {
+			(exProp.Type != "" && !strings.EqualFold(exProp.Type, "object") && !strings.EqualFold(exProp.Type, "nested") && !strings.EqualFold(exProp.Type, "passthrough")) {
 			continue
 		}
 		if len(infProp.Properties) > 0 {
-			childSubFalse := subobjectsFalse || (exProp.Subobjects != nil && !*exProp.Subobjects) || (infProp.Subobjects != nil && !*infProp.Subobjects)
+			childSubFalse := subobjectsFalse || strings.EqualFold(exProp.Type, "passthrough") || (exProp.Subobjects != nil && !*exProp.Subobjects) || (infProp.Subobjects != nil && !*infProp.Subobjects)
 			exProp.Properties = mergeInferredIntoExistingPropsWithSubobjects(exProp.Properties, infProp.Properties, childSubFalse)
 			out[k] = exProp
 		}
@@ -4041,7 +4272,7 @@ func inferObjectPropertiesWithOpts(obj map[string]any, dst map[string]esast.Fiel
 			fullPath = pathPrefix + "." + k
 		}
 		existing, exists := dst[k]
-		if exists && (len(existing.Properties) > 0 || strings.EqualFold(existing.Type, "object") || strings.EqualFold(existing.Type, "nested")) {
+		if exists && (len(existing.Properties) > 0 || strings.EqualFold(existing.Type, "object") || strings.EqualFold(existing.Type, "nested") || strings.EqualFold(existing.Type, "passthrough")) {
 			if existing.Enabled != nil && !*existing.Enabled {
 				continue
 			}
@@ -4049,7 +4280,12 @@ func inferObjectPropertiesWithOpts(obj map[string]any, dst map[string]esast.Fiel
 			if existing.Dynamic != nil {
 				childOpts.dynamicMode = normalizeDynamicMode(existing.Dynamic)
 			}
-			if existing.Subobjects != nil {
+			if strings.EqualFold(existing.Type, "passthrough") {
+				childOpts.subobjects = false
+				if existing.TimeSeriesDimension != nil && *existing.TimeSeriesDimension {
+					childOpts.inPassthroughTSDim = true
+				}
+			} else if existing.Subobjects != nil {
 				childOpts.subobjects = *existing.Subobjects
 			}
 			if existing.Properties == nil {
@@ -4088,6 +4324,10 @@ func inferObjectPropertiesWithOpts(obj map[string]any, dst map[string]esast.Fiel
 		inferred, ok := inferValuePropertyWithOpts(val, k, fullPath, depth, totalFields, opts)
 		if !ok {
 			continue
+		}
+		if opts.inPassthroughTSDim && inferred.TimeSeriesDimension == nil && inferred.TimeSeriesMetric == "" && IsValidTSDBDimensionFieldType(inferred.Type) {
+			t := true
+			inferred.TimeSeriesDimension = &t
 		}
 		if exists {
 			if declType := opts.declared[fullPath]; declType != "" && !strings.EqualFold(declType, "object") && !strings.EqualFold(declType, "nested") {
@@ -4303,30 +4543,61 @@ func applyMatchingDynamicTemplate(fieldName, fullPath, detectedType string, temp
 			}
 		}
 		for _, rule := range rules {
-			if !matchesDynamicMappingType(rule["match_mapping_type"], detectedType) {
-				continue
-			}
-			if rawUMMT := rule["unmatch_mapping_type"]; rawUMMT != nil && matchesDynamicMappingType(rawUMMT, detectedType) {
-				continue
-			}
-			mpType, _ := rule["match_pattern"].(string)
-			if hasPats, matched := matchesAnyDynamicTemplatePattern(rule["match"], fieldName, mpType); hasPats && !matched {
-				continue
-			}
-			if hasPats, matched := matchesAnyDynamicTemplatePattern(rule["unmatch"], fieldName, mpType); hasPats && matched {
-				continue
-			}
-			if hasPats, matched := matchesAnyDynamicTemplatePattern(rule["path_match"], fullPath, mpType); hasPats && !matched {
-				continue
-			}
-			if hasPats, matched := matchesAnyDynamicTemplatePattern(rule["path_unmatch"], fullPath, mpType); hasPats && matched {
-				continue
-			}
 			rawMapping, hasMap := rule["mapping"]
 			if !hasMap || rawMapping == nil {
 				continue
 			}
-			b, err := json.Marshal(rawMapping)
+			mappingMap, _ := rawMapping.(map[string]any)
+			lookupMatcher := func(key string) any {
+				if v, ok := rule[key]; ok && v != nil {
+					return v
+				}
+				if mappingMap != nil {
+					return mappingMap[key]
+				}
+				return nil
+			}
+			rawMMT := lookupMatcher("match_mapping_type")
+			rawUMMT := lookupMatcher("unmatch_mapping_type")
+			rawMatch := lookupMatcher("match")
+			rawUnmatch := lookupMatcher("unmatch")
+			rawPathMatch := lookupMatcher("path_match")
+			rawPathUnmatch := lookupMatcher("path_unmatch")
+			if rawMMT == nil && rawUMMT == nil && rawMatch == nil && rawUnmatch == nil && rawPathMatch == nil && rawPathUnmatch == nil {
+				continue
+			}
+			if !matchesDynamicMappingType(rawMMT, detectedType) {
+				continue
+			}
+			if rawUMMT != nil && matchesDynamicMappingType(rawUMMT, detectedType) {
+				continue
+			}
+			mpType, _ := lookupMatcher("match_pattern").(string)
+			if hasPats, matched := matchesAnyDynamicTemplatePattern(rawMatch, fieldName, mpType); hasPats && !matched {
+				continue
+			}
+			if hasPats, matched := matchesAnyDynamicTemplatePattern(rawUnmatch, fieldName, mpType); hasPats && matched {
+				continue
+			}
+			if hasPats, matched := matchesAnyDynamicTemplatePattern(rawPathMatch, fullPath, mpType); hasPats && !matched {
+				continue
+			}
+			if hasPats, matched := matchesAnyDynamicTemplatePattern(rawPathUnmatch, fullPath, mpType); hasPats && matched {
+				continue
+			}
+			toMarshal := rawMapping
+			if mappingMap != nil {
+				cleaned := make(map[string]any, len(mappingMap))
+				for mk, mv := range mappingMap {
+					switch mk {
+					case "match_mapping_type", "unmatch_mapping_type", "match", "unmatch", "path_match", "path_unmatch", "match_pattern":
+						continue
+					}
+					cleaned[mk] = mv
+				}
+				toMarshal = cleaned
+			}
+			b, err := json.Marshal(toMarshal)
 			if err != nil {
 				continue
 			}
@@ -4392,6 +4663,9 @@ func inferValuePropertyWithOpts(val any, fieldName, fullPath string, depth int, 
 			}
 		}
 		if opts.es8Mode {
+			if opts.inPassthroughTSDim {
+				return esast.FieldProperty{Type: "keyword"}, true
+			}
 			return esast.FieldProperty{
 				Type: "text",
 				Fields: map[string]esast.FieldProperty{

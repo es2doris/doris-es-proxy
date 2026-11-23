@@ -347,8 +347,15 @@ func TestRound61ServerCRUD_F4_F9_FilterPathDeprecationsClusterHealthAndTelemetry
 		t.Fatalf("GET /_nodes/stats failed (%d): %s", code, raw)
 	}
 	nodesMap, _ := nsResp["nodes"].(map[string]any)
-	if len(nodesMap) != 2 {
-		t.Fatalf("expected 2 Doris BE nodes in /_nodes/stats, got %d: %s", len(nodesMap), raw)
+	if len(nodesMap) != 1 || nodesMap[taskLocalNodeID] == nil {
+		t.Fatalf("expected 1 symmetric local node (%s) in /_nodes/stats, got %d: %s", taskLocalNodeID, len(nodesMap), raw)
+	}
+	feNode, _ := nodesMap[taskLocalNodeID].(map[string]any)
+	feFS, _ := feNode["fs"].(map[string]any)
+	feFSTotal, _ := feFS["total"].(map[string]any)
+	wantBytes := fmt.Sprintf("%d", int64(200<<30))
+	if fmt.Sprintf("%v", feFSTotal["total_in_bytes"]) != wantBytes {
+		t.Fatalf("expected aggregated fs.total.total_in_bytes=%s from 2 Doris BEs in /_nodes/stats, got %v: %s", wantBytes, feFSTotal["total_in_bytes"], raw)
 	}
 	for _, v := range nodesMap {
 		nm, _ := v.(map[string]any)

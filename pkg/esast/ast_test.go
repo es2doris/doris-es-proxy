@@ -2697,8 +2697,8 @@ func TestRound57ASTValidation(t *testing.T) {
 		{`{"size":0,"aggs":{"comp":{"composite":{"sources":[{"s1":{"terms":{"field":"a"}}},{"s2":{"terms":{"field":"b"}}}],"after":{"s1":"x"}}}}}`, "after"},
 		{`{"size":0,"aggs":{"comp":{"composite":{"sources":[{"s1":{"terms":{"field":"a"}}}],"after":{"s1":"x","extra":"y"}}}}}`, "after"},
 		{`{"size":0,"aggs":{"comp":{"composite":{"sources":[{"s1":{"terms":{"field":"a"}}}],"after":{"wrong":"x"}}}}}`, "after"},
-		// F11: pinned.docs missing/blank/null _index + rule validation
-		{`{"query":{"pinned":{"docs":[{"_id":"1"}],"organic":{"match_all":{}}}}}`, "[_index]"},
+		// F11: pinned.docs explicit blank/null _index + rule validation
+		// (omitted _index became valid in ES 8.11+, tracked via PinnedQuery.HasDocsMissingIndex in Round 65)
 		{`{"query":{"pinned":{"docs":[{"_index":"","_id":"1"}],"organic":{"match_all":{}}}}}`, "[_index]"},
 		{`{"query":{"pinned":{"docs":[{"_index":"   ","_id":"1"}],"organic":{"match_all":{}}}}}`, "[_index]"},
 		{`{"query":{"pinned":{"docs":[{"_index":null,"_id":"1"}],"organic":{"match_all":{}}}}}`, "[_index]"},

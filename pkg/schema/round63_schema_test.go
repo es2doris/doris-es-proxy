@@ -371,12 +371,12 @@ func TestRound63_F5_SyntheticSourceFidelity(t *testing.T) {
 	dec.UseNumber()
 	_ = dec.Decode(&gotRich)
 
-	// constant_keyword omitted when absent from doc; empty rank_features `[]` omitted
+	// constant_keyword omitted when absent from doc; empty rank_features `[]` preserved (`rank_features/20_synthetic_source.yml:54`)
 	if _, hasCK := gotRich["ck"]; hasCK {
 		t.Fatalf("expected absent constant_keyword omitted from synthetic _source, got %#v", gotRich["ck"])
 	}
-	if _, hasRFS := gotRich["rfs"]; hasRFS {
-		t.Fatalf("expected empty rank_features omitted from synthetic _source, got %#v", gotRich["rfs"])
+	if rfsSlice, okRFS := gotRich["rfs"].([]any); !okRFS || len(rfsSlice) != 0 {
+		t.Fatalf("expected empty rank_features `[]` preserved in synthetic _source, got %#v", gotRich["rfs"])
 	}
 	// search_as_you_type preserves exact input array order
 	if !reflect.DeepEqual(gotRich["sayt"], []any{"quick brown", "fox", "jumps"}) {

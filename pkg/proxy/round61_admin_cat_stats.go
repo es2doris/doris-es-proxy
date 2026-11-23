@@ -20,8 +20,10 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"runtime"
 	"sort"
@@ -3305,6 +3307,8 @@ var disallowedTopLevelWithRetrieverKeysRound61 = []string{
 	"min_score",
 	"knn",
 	"rescore",
+	"rank",
+	"sub_searches",
 }
 
 // validateAndRewriteStandardRetrieverRound61 validates `retriever` (including `retriever.standard`)
@@ -3856,13 +3860,14 @@ func (s *Server) handleFieldCapsRound61(w http.ResponseWriter, r *http.Request) 
 	}
 
 	type capEntryFlags struct {
-		isMeta       bool
-		isMultifield bool
-		isNested     bool
-		isParent     bool
-		isRuntime    bool
-		tsDimension  bool
-		tsMetric     string
+		isMeta        bool
+		metadataField bool
+		isMultifield  bool
+		isNested      bool
+		isParent      bool
+		isRuntime     bool
+		tsDimension   bool
+		tsMetric      string
 	}
 
 	addCap := func(idxName, field, esType string, searchable, aggregatable bool, fl capEntryFlags) {
@@ -3900,12 +3905,19 @@ func (s *Server) handleFieldCapsRound61(w http.ResponseWriter, r *http.Request) 
 				existing["searchable"] = prevS || searchable
 				existing["aggregatable"] = prevA || aggregatable
 			}
+			if fl.metadataField {
+				existing["metadata_field"] = true
+			}
 		} else {
-			caps[field][esType] = map[string]any{
+			entry := map[string]any{
 				"type":         esType,
 				"searchable":   searchable,
 				"aggregatable": aggregatable,
 			}
+			if fl.metadataField {
+				entry["metadata_field"] = true
+			}
+			caps[field][esType] = entry
 		}
 		appendUniqueIdx(indicesByFieldType, field, esType, idxName)
 		if !searchable {
@@ -4041,8 +4053,11 @@ func (s *Server) handleFieldCapsRound61(w http.ResponseWriter, r *http.Request) 
 				}
 			}
 		}
-		if isTimeSeriesMode && idxSchema.RawMapping != nil && len(idxSchema.RawMapping.Properties) > 0 {
-			rawPropMeta(idxSchema.RawMapping.Properties, "", tsDims, tsMetrics)
+		if isTimeSeriesMode {
+			addCap(idxName, "_tsid", "_tsid", false, true, capEntryFlags{isMeta: true, metadataField: true})
+			if idxSchema.RawMapping != nil && len(idxSchema.RawMapping.Properties) > 0 {
+				rawPropMeta(idxSchema.RawMapping.Properties, "", tsDims, tsMetrics)
+			}
 		}
 
 		augSchema := s.augmentSchemaWithRuntimeMappings(idxSchema, reqRuntimeMappings)
@@ -4335,7 +4350,6 @@ func (s *Server) handleFieldCapsRound61(w http.ResponseWriter, r *http.Request) 
 				entry["non_aggregatable_indices"] = nonA
 			}
 			if dimIdx := dimIndicesByFieldType[field][esType]; len(dimIdx) > 0 {
-				entry["time_series_dimension"] = true
 				if len(dimIdx) < len(allIdxForType) {
 					dimSet := make(map[string]bool, len(dimIdx))
 					for _, di := range dimIdx {
@@ -4350,7 +4364,11 @@ func (s *Server) handleFieldCapsRound61(w http.ResponseWriter, r *http.Request) 
 					if len(nonDim) > 0 {
 						sort.Strings(nonDim)
 						entry["non_dimension_indices"] = nonDim
+					} else {
+						entry["time_series_dimension"] = true
 					}
+				} else {
+					entry["time_series_dimension"] = true
 				}
 			}
 			if mTypes := metricTypesByFieldType[field][esType]; len(mTypes) > 0 {
@@ -4373,4 +4391,192 @@ func (s *Server) handleFieldCapsRound61(w http.ResponseWriter, r *http.Request) 
 		"indices": targets,
 		"fields":  caps,
 	})
+}
+
+func (s *Server) handleMonitoringBulkR65(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPut && r.Method != http.MethodPost {
+		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+		return
+	}
+	if authHdr := strings.TrimSpace(r.Header.Get("Authorization")); strings.HasPrefix(strings.ToLower(authHdr), "basic ") {
+		rawTok := strings.TrimSpace(authHdr[6:])
+		if dec, err := base64.StdEncoding.DecodeString(rawTok); err == nil {
+			if user, _, ok := strings.Cut(string(dec), ":"); ok && user != "" {
+				s.mu.RLock()
+				uObj := s.securityUsers[user]
+				var roleNames []string
+				authorized := uObj == nil
+				if uObj != nil {
+					switch rv := uObj["roles"].(type) {
+					case []string:
+						roleNames = append(roleNames, rv...)
+					case []any:
+						for _, item := range rv {
+							if rs, okS := item.(string); okS && rs != "" {
+								roleNames = append(roleNames, rs)
+							}
+						}
+					}
+					for _, rn := range roleNames {
+						if rn == "superuser" || rn == "remote_monitoring_agent" || rn == "remote_monitoring_collector" || rn == "beats_system" || rn == "kibana_system" || rn == "logstash_system" || rn == "apm_system" {
+							authorized = true
+							break
+						}
+						role := s.securityRoles[rn]
+						if role == nil {
+							continue
+						}
+						var clPrivs []string
+						switch cp := role["cluster"].(type) {
+						case []string:
+							clPrivs = append(clPrivs, cp...)
+						case []any:
+							for _, item := range cp {
+								if ps, okS := item.(string); okS {
+									clPrivs = append(clPrivs, ps)
+								}
+							}
+						}
+						for _, priv := range clPrivs {
+							if priv == "all" || priv == "manage" || priv == "manage_monitoring" || strings.HasPrefix(priv, "cluster:admin/xpack/monitoring/") {
+								authorized = true
+								break
+							}
+						}
+						if authorized {
+							break
+						}
+					}
+				}
+				s.mu.RUnlock()
+				if !authorized {
+					writeESError(w, http.StatusForbidden, "security_exception",
+						fmt.Sprintf("action [cluster:admin/xpack/monitoring/bulk] is unauthorized for user [%s] with effective roles [%s], this action is granted by the cluster privileges [manage,all]", user, strings.Join(roleNames, ",")))
+					return
+				}
+			}
+		}
+	}
+
+	q := r.URL.Query()
+	systemID := strings.TrimSpace(q.Get("system_id"))
+	if systemID == "" {
+		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "Validation Failed: 1: system_id is missing;")
+		return
+	}
+	sysAPIVer := strings.TrimSpace(q.Get("system_api_version"))
+	if sysAPIVer == "" {
+		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "Validation Failed: 1: system_api_version is missing;")
+		return
+	}
+	intervalStr := strings.TrimSpace(q.Get("interval"))
+	if intervalStr == "" {
+		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "Validation Failed: 1: interval is missing;")
+		return
+	}
+	intervalMs, err := parseESDurationMillisRound59(intervalStr)
+	if err != nil {
+		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", err.Error())
+		return
+	}
+
+	bodyBytes, ok := readRequestBody(w, r)
+	if !ok {
+		return
+	}
+	defaultType := strings.TrimSpace(r.PathValue("type"))
+	if defaultType == "" {
+		var segs []string
+		for _, seg := range strings.Split(strings.Trim(r.URL.Path, "/"), "/") {
+			if seg != "" {
+				segs = append(segs, seg)
+			}
+		}
+		if len(segs) == 3 && segs[0] == "_monitoring" && segs[2] == "bulk" {
+			defaultType = segs[1]
+		}
+	}
+	targetIdx := fmt.Sprintf(".monitoring-%s-%s-%s", strings.ToLower(systemID), sysAPIVer, time.Now().UTC().Format("2006.01.02"))
+	if s.findClosedTargetIndex(r, fmt.Sprintf(".monitoring-%s-*", strings.ToLower(systemID))) != "" || s.isIndexClosed(targetIdx) {
+		writeESError(w, http.StatusInternalServerError, "export_exception", fmt.Sprintf("closed [%s]", targetIdx))
+		return
+	}
+
+	lines := strings.Split(strings.ReplaceAll(string(bodyBytes), "\r\n", "\n"), "\n")
+	var nonEmpty []string
+	for _, ln := range lines {
+		if strings.TrimSpace(ln) != "" {
+			nonEmpty = append(nonEmpty, ln)
+		}
+	}
+	if len(nonEmpty)%2 != 0 {
+		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "The bulk request must be terminated by a newline [\\n]")
+		return
+	}
+
+	var bulkBuf bytes.Buffer
+	numIndexed := 0
+	for i := 0; i < len(nonEmpty); i += 2 {
+		var actionMap map[string]map[string]any
+		if err := json.Unmarshal([]byte(nonEmpty[i]), &actionMap); err != nil || len(actionMap) != 1 {
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "Malformed monitoring bulk action line")
+			return
+		}
+		var meta map[string]any
+		for _, m := range actionMap {
+			meta = m
+			break
+		}
+		rawIdx, _ := meta["_index"].(string)
+		if strings.TrimSpace(rawIdx) == "_data" {
+			continue
+		}
+		var docMap map[string]any
+		dec := json.NewDecoder(strings.NewReader(nonEmpty[i+1]))
+		dec.UseNumber()
+		if err := dec.Decode(&docMap); err != nil || docMap == nil {
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "Malformed monitoring bulk document line")
+			return
+		}
+		docType, _ := meta["_type"].(string)
+		docType = strings.TrimSpace(docType)
+		if docType == "" {
+			docType = defaultType
+		}
+		if docType != "" {
+			if _, exists := docMap["type"]; !exists {
+				docMap["type"] = docType
+			}
+		}
+		if _, exists := docMap["interval_ms"]; !exists {
+			docMap["interval_ms"] = intervalMs
+		}
+		if _, exists := docMap["timestamp"]; !exists {
+			docMap["timestamp"] = time.Now().UTC().Format("2006-01-02T15:04:05.000Z")
+		}
+		newMeta := map[string]any{"_index": targetIdx}
+		if idStr, _ := meta["_id"].(string); idStr != "" {
+			newMeta["_id"] = idStr
+		}
+		actBytes, _ := json.Marshal(map[string]any{"index": newMeta})
+		docBytes, _ := json.Marshal(docMap)
+		bulkBuf.Write(actBytes)
+		bulkBuf.WriteByte('\n')
+		bulkBuf.Write(docBytes)
+		bulkBuf.WriteByte('\n')
+		numIndexed++
+	}
+	if numIndexed == 0 {
+		writeJSONWithRequest(w, r, http.StatusOK, map[string]any{
+			"took":   int64(1),
+			"errors": false,
+			"items":  []any{},
+		})
+		return
+	}
+	bulkReq := r.Clone(r.Context())
+	bulkReq.URL.Path = "/_bulk"
+	bulkReq.Body = io.NopCloser(bytes.NewReader(bulkBuf.Bytes()))
+	bulkReq.ContentLength = int64(bulkBuf.Len())
+	s.handleBulk(w, bulkReq)
 }

@@ -2001,17 +2001,24 @@ type GeoPointVal struct {
 
 const earthMeanRadiusMetersES = 6371008.7714
 
+func isFiniteGeoCoordRound60(lat, lon float64) bool {
+	return !math.IsNaN(lat) && !math.IsNaN(lon) && !math.IsInf(lat, 0) && !math.IsInf(lon, 0)
+}
+
 func parseGeoPointValRound60(v any) (*GeoPointVal, bool) {
 	if v == nil {
 		return nil, false
 	}
 	switch tv := v.(type) {
 	case *GeoPointVal:
-		if tv == nil {
+		if tv == nil || !isFiniteGeoCoordRound60(tv.Lat, tv.Lon) {
 			return nil, false
 		}
 		return tv, true
 	case GeoPointVal:
+		if !isFiniteGeoCoordRound60(tv.Lat, tv.Lon) {
+			return nil, false
+		}
 		return &tv, true
 	case map[string]any:
 		latV, hasLat := tv["lat"]
@@ -2022,14 +2029,14 @@ func parseGeoPointValRound60(v any) (*GeoPointVal, bool) {
 		if hasLat && hasLon {
 			lat, ok1 := toFloat64(latV)
 			lon, ok2 := toFloat64(lonV)
-			if ok1 && ok2 {
+			if ok1 && ok2 && isFiniteGeoCoordRound60(lat, lon) {
 				return &GeoPointVal{Lat: lat, Lon: lon}, true
 			}
 		}
 		if coords, ok := tv["coordinates"].([]any); ok && len(coords) >= 2 {
 			lon, ok1 := toFloat64(coords[0])
 			lat, ok2 := toFloat64(coords[1])
-			if ok1 && ok2 {
+			if ok1 && ok2 && isFiniteGeoCoordRound60(lat, lon) {
 				return &GeoPointVal{Lat: lat, Lon: lon}, true
 			}
 		}
@@ -2038,12 +2045,12 @@ func parseGeoPointValRound60(v any) (*GeoPointVal, bool) {
 		if len(tv) >= 2 {
 			lon, ok1 := toFloat64(tv[0])
 			lat, ok2 := toFloat64(tv[1])
-			if ok1 && ok2 {
+			if ok1 && ok2 && isFiniteGeoCoordRound60(lat, lon) {
 				return &GeoPointVal{Lat: lat, Lon: lon}, true
 			}
 		}
 	case []float64:
-		if len(tv) >= 2 {
+		if len(tv) >= 2 && isFiniteGeoCoordRound60(tv[1], tv[0]) {
 			return &GeoPointVal{Lat: tv[1], Lon: tv[0]}, true
 		}
 	case string:
@@ -2060,7 +2067,7 @@ func parseGeoPointValRound60(v any) (*GeoPointVal, bool) {
 				if len(fields) >= 2 {
 					lon, err1 := strconv.ParseFloat(fields[0], 64)
 					lat, err2 := strconv.ParseFloat(fields[1], 64)
-					if err1 == nil && err2 == nil {
+					if err1 == nil && err2 == nil && isFiniteGeoCoordRound60(lat, lon) {
 						return &GeoPointVal{Lat: lat, Lon: lon}, true
 					}
 				}
@@ -2071,12 +2078,12 @@ func parseGeoPointValRound60(v any) (*GeoPointVal, bool) {
 			parts := strings.SplitN(s, ",", 2)
 			lat, err1 := strconv.ParseFloat(strings.TrimSpace(parts[0]), 64)
 			lon, err2 := strconv.ParseFloat(strings.TrimSpace(parts[1]), 64)
-			if err1 == nil && err2 == nil {
+			if err1 == nil && err2 == nil && isFiniteGeoCoordRound60(lat, lon) {
 				return &GeoPointVal{Lat: lat, Lon: lon}, true
 			}
 			return nil, false
 		}
-		if lat, lon, ok := decodeGeohashRound60(s); ok {
+		if lat, lon, ok := decodeGeohashRound60(s); ok && isFiniteGeoCoordRound60(lat, lon) {
 			return &GeoPointVal{Lat: lat, Lon: lon}, true
 		}
 	}
@@ -3152,15 +3159,20 @@ func resolveDocValuesSliceWithParamsRound60(sourceMap, params map[string]any, fi
 		dateFmt := lookupFieldFormatFromMapsRound61(sourceMap, params, fieldPath)
 		quantizeGeo := isGeoQuantizeEnabledRound61(sourceMap, params)
 		// Check if raw value in sourceMap was `[lon, lat]` before resolveDocValuesSlice flattened it
-		rawVal := resolveParamPath(sourceMap, strings.Split(fieldPath, "."))
+		rawVal := resolveParamPath(sourceMap, strings.Split(cleanPath, "."))
+		if rawVal == nil {
+			if rawSrc, ok := rawSourceFromSourceMapPainless(sourceMap); ok && rawSrc != nil {
+				rawVal = resolveParamPath(rawSrc, strings.Split(cleanPath, "."))
+			}
+		}
 		if rawVal != nil {
 			return normalizeSingleFieldDocValuesWithOptsRound61(rawVal, ft, keepBoolDups, false, dateFmt, quantizeGeo), nil
 		}
 		return normalizeSingleFieldDocValuesWithOptsRound61(rawSlice, ft, keepBoolDups, false, dateFmt, quantizeGeo), nil
 	}
 	// Check if raw value in sourceMap was `[lon, lat]` for geo_point heuristic
-	if rawVal := resolveParamPath(sourceMap, strings.Split(fieldPath, ".")); rawVal != nil {
-		cleanName := strings.ToLower(strings.ReplaceAll(fieldPath, "\x00", "."))
+	if rawVal := resolveParamPath(sourceMap, strings.Split(cleanPath, ".")); rawVal != nil {
+		cleanName := strings.ToLower(cleanPath)
 		if cleanName == "geo" || cleanName == "point" || cleanName == "location" || strings.Contains(cleanName, "geo_point") {
 			return normalizeSingleFieldDocValuesWithOptsRound61(rawVal, "geo_point", false, false, "", isGeoQuantizeEnabledRound61(sourceMap, params)), nil
 		}
@@ -4078,6 +4090,29 @@ func extractFloatVectorRound60(val any, sourceMap, params map[string]any, isDocA
 func evalVectorSimilarityRound60(fnName string, qArg, fArg any, sourceMap, params map[string]any) (float64, error) {
 	if fieldStr, isFieldName := fArg.(string); isFieldName {
 		return evalVectorSimilarityRound61(fnName, qArg, strings.TrimSpace(fieldStr), sourceMap, params)
+	}
+	if dvf, isDVF := fArg.(*DenseVectorFieldVal); isDVF && dvf != nil && dvf.Name != "" {
+		return evalVectorSimilarityRound61(fnName, qArg, dvf.Name, sourceMap, params)
+	}
+	if dvv, isDV := fArg.(*DenseVectorVal); isDV && dvv != nil {
+		if dvv.Name != "" {
+			return evalVectorSimilarityRound61(fnName, qArg, dvv.Name, sourceMap, params)
+		}
+		if dvv.ElemType == "bit" || dvv.ElemType == "byte" || fnName == "hamming" {
+			elemType := strings.ToLower(strings.TrimSpace(dvv.ElemType))
+			if elemType == "" {
+				elemType = "float"
+			}
+			dF32, dI8, dErr := parseVectorValueRound61(dvv, elemType)
+			if dErr != nil {
+				return 0, dErr
+			}
+			qF32, qI8, qErr := parseVectorValueRound61(qArg, elemType)
+			if qErr != nil {
+				return 0, qErr
+			}
+			return computeVectorPairMetricRound61(fnName, qF32, qI8, dF32, dI8, elemType, dvv.Name)
+		}
 	}
 	qv, err := extractFloatVectorRound60(qArg, sourceMap, params, false)
 	if err != nil {

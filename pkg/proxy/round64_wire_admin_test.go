@@ -12,6 +12,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -51,7 +52,8 @@ func TestRound64_WireLicenseFeatureUsageAndRepositoryURL(t *testing.T) {
 	httpFS := httptest.NewServer(http.FileServer(http.Dir(fsDir)))
 	defer httpFS.Close()
 
-	settingsPayload := `{"persistent":{"repositories.url.allowed_urls":["http://127.0.0.1:*","file://*"]}}`
+	filePrefix := "file:///" + strings.TrimPrefix(filepath.ToSlash(fsDir), "/") + "/"
+	settingsPayload := fmt.Sprintf(`{"persistent":{"path.repo":[%q],"repositories.url.allowed_urls":["http://127.0.0.1:*",%q]}}`, filepath.ToSlash(fsDir), filePrefix+"*")
 	rec = doRound63Req(t, h, http.MethodPut, "/_cluster/settings", []byte(settingsPayload), nil)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("put cluster settings failed: %d %s", rec.Code, rec.Body.String())

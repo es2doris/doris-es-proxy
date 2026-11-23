@@ -31,7 +31,7 @@ jobs:
   live-doris-e2e:
     name: E2E against Live Apache Doris Container
     runs-on: ubuntu-24.04
-    timeout-minutes: 35
+    timeout-minutes: 50
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -101,8 +101,8 @@ jobs:
           DORIS_E2E_DSN: "root:@tcp(127.0.0.1:9030)/?interpolateParams=true&timeout=5s&readTimeout=30s&writeTimeout=30s"
           DORIS_E2E_HTTP: "http://127.0.0.1:8030"
           DORIS_E2E_DB: "es_yaml_e2e"
-          DORIS_LIVE_YAML_MIN_PASSED: "1400"
-        run: go test -v -race -count=1 -timeout 20m ./e2e/... -run TestLiveDorisUpstreamYAMLConformance_E2E
+          DORIS_LIVE_YAML_MIN_PASSED: "2350"
+        run: go test -v -race -count=1 -timeout 35m ./e2e/... -run TestLiveDorisUpstreamYAMLConformance_E2E
 
       - name: Dump Doris logs on failure
         if: failure()

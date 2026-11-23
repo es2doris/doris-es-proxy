@@ -16,7 +16,7 @@
 # under the License.
 
 FROM golang:1.26-alpine AS builder
-ARG VERSION=v0.20.0
+ARG VERSION=v0.21.0
 WORKDIR /src
 COPY go.mod go.sum ./
 COPY cmd ./cmd

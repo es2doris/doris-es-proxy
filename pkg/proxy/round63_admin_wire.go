@@ -932,6 +932,7 @@ var validIndexSettingExactKeysR63 = map[string]bool{
 	"index.verified_before_close":             true,
 	"index.source_only":                       true,
 	"index.mode":                              true,
+	"index.routing_path":                      true,
 	"index.lookahead_time":                    true,
 	"index.gc_deletes":                        true,
 	"index.default_pipeline":                  true,

@@ -42,6 +42,10 @@ type headResponseWriterR64 struct {
 	http.ResponseWriter
 }
 
+func (hw *headResponseWriterR64) Unwrap() http.ResponseWriter {
+	return hw.ResponseWriter
+}
+
 func (hw *headResponseWriterR64) Write(b []byte) (int, error) {
 	// Suppress body writes on HEAD while preserving ResponseWriter byte-count semantics.
 	return len(b), nil
@@ -71,6 +75,14 @@ func unwrapResponseFormatAndHeadR64(w http.ResponseWriter) (esResponseFormatOpti
 			}
 			w = tw.ResponseWriter
 		default:
+			if uw, ok := w.(interface{ Unwrap() http.ResponseWriter }); ok {
+				next := uw.Unwrap()
+				if next == nil || next == w {
+					return opts, hasOpts, isHead
+				}
+				w = next
+				continue
+			}
 			return opts, hasOpts, isHead
 		}
 	}
@@ -101,6 +113,15 @@ func refreshFormatOptionsMultiFilterPathR64(w http.ResponseWriter, r *http.Reque
 			tw.opts = opts
 			return w
 		default:
+			if uw, ok := cur.(interface{ Unwrap() http.ResponseWriter }); ok {
+				next := uw.Unwrap()
+				if next == nil || next == cur {
+					cur = nil
+				} else {
+					cur = next
+				}
+				continue
+			}
 			cur = nil
 		}
 	}
@@ -934,6 +955,10 @@ func splitTopLevelWKTR64(s string) []string {
 	return items
 }
 
+func isFiniteCoordR64(v float64) bool {
+	return !math.IsNaN(v) && !math.IsInf(v, 0)
+}
+
 func parseWKTCoordSeqR64(seqStr string, quantize bool) ([][2]float64, bool) {
 	items := strings.Split(seqStr, ",")
 	out := make([][2]float64, 0, len(items))
@@ -944,7 +969,7 @@ func parseWKTCoordSeqR64(seqStr string, quantize bool) ([][2]float64, bool) {
 		}
 		x, errX := strconv.ParseFloat(fields[0], 64)
 		y, errY := strconv.ParseFloat(fields[1], 64)
-		if errX != nil || errY != nil || math.IsNaN(x) || math.IsNaN(y) {
+		if errX != nil || errY != nil || !isFiniteCoordR64(x) || !isFiniteCoordR64(y) {
 			return nil, false
 		}
 		out = append(out, quantizeCoordIfR64(y, x, quantize))
@@ -960,12 +985,12 @@ func parseJSONCoordPairR64(raw any, quantize bool) ([2]float64, bool) {
 		}
 		x, okX := toFloat64(v[0])
 		y, okY := toFloat64(v[1])
-		if !okX || !okY || math.IsNaN(x) || math.IsNaN(y) {
+		if !okX || !okY || !isFiniteCoordR64(x) || !isFiniteCoordR64(y) {
 			return [2]float64{}, false
 		}
 		return quantizeCoordIfR64(y, x, quantize), true
 	case []float64:
-		if len(v) < 2 {
+		if len(v) < 2 || !isFiniteCoordR64(v[0]) || !isFiniteCoordR64(v[1]) {
 			return [2]float64{}, false
 		}
 		return quantizeCoordIfR64(v[1], v[0], quantize), true
@@ -979,9 +1004,10 @@ func parseJSONCoordSeqR64(raw any, quantize bool) ([][2]float64, bool) {
 		if fa, okF := raw.([][]float64); okF {
 			out := make([][2]float64, 0, len(fa))
 			for _, pt := range fa {
-				if len(pt) >= 2 {
-					out = append(out, quantizeCoordIfR64(pt[1], pt[0], quantize))
+				if len(pt) < 2 || !isFiniteCoordR64(pt[0]) || !isFiniteCoordR64(pt[1]) {
+					return nil, false
 				}
+				out = append(out, quantizeCoordIfR64(pt[1], pt[0], quantize))
 			}
 			return out, len(out) > 0
 		}
@@ -1009,13 +1035,15 @@ func parseRawShapesR64(raw any, quantize bool) ([]parsedGeomR64, bool) {
 		}
 		return parseRawShapesR64(v.ToGeoJSONMap(), quantize)
 	case *painless.GeoPointVal:
-		if v == nil {
+		if v == nil || !isFiniteCoordR64(v.Lat) || !isFiniteCoordR64(v.Lon) {
 			return nil, false
 		}
 		pt := quantizeCoordIfR64(v.Lat, v.Lon, quantize)
 		return []parsedGeomR64{{kind: geomPointR64, pt: pt}}, true
 	case *painless.GeoBoundingBoxVal:
-		if v == nil {
+		if v == nil ||
+			!isFiniteCoordR64(v.GetMaxLat()) || !isFiniteCoordR64(v.GetMinLon()) ||
+			!isFiniteCoordR64(v.GetMinLat()) || !isFiniteCoordR64(v.GetMaxLon()) {
 			return nil, false
 		}
 		tl := quantizeCoordIfR64(v.GetMaxLat(), v.GetMinLon(), quantize)
@@ -1158,7 +1186,7 @@ func parseRawShapesR64(raw any, quantize bool) ([]parsedGeomR64, bool) {
 				}
 			}
 		}
-		if lat, lon, okPt := parseGeoPointLatLon(str); okPt {
+		if lat, lon, okPt := parseGeoPointLatLon(str); okPt && isFiniteCoordR64(lat) && isFiniteCoordR64(lon) {
 			pt := quantizeCoordIfR64(lat, lon, quantize)
 			return []parsedGeomR64{{kind: geomPointR64, pt: pt}}, true
 		}
@@ -1263,12 +1291,12 @@ func parseRawShapesR64(raw any, quantize bool) ([]parsedGeomR64, bool) {
 				}
 			}
 		}
-		if lat, lon, okLatLon := parseGeoPointLatLon(v); okLatLon {
+		if lat, lon, okLatLon := parseGeoPointLatLon(v); okLatLon && isFiniteCoordR64(lat) && isFiniteCoordR64(lon) {
 			pt := quantizeCoordIfR64(lat, lon, quantize)
 			return []parsedGeomR64{{kind: geomPointR64, pt: pt}}, true
 		}
-		if xv, okX := toFloat64(v["x"]); okX {
-			if yv, okY := toFloat64(v["y"]); okY {
+		if xv, okX := toFloat64(v["x"]); okX && isFiniteCoordR64(xv) {
+			if yv, okY := toFloat64(v["y"]); okY && isFiniteCoordR64(yv) {
 				pt := quantizeCoordIfR64(yv, xv, quantize)
 				return []parsedGeomR64{{kind: geomPointR64, pt: pt}}, true
 			}
@@ -1294,7 +1322,7 @@ func extractDocFieldRawValueR64(doc map[string]any, field string, idxSchema *sch
 	if doc == nil || field == "" {
 		return nil, false
 	}
-	if v, ok := doc[field]; ok && v != nil {
+	if v, ok := doc[field]; ok {
 		return v, true
 	}
 	clean := strings.TrimSuffix(strings.TrimSuffix(field, ".keyword"), ".ngram")
@@ -1309,14 +1337,44 @@ func extractDocFieldRawValueR64(doc map[string]any, field string, idxSchema *sch
 
 func parseDocShapesR64(doc map[string]any, field string, idxSchema *schema.IndexSchema, quantize bool) ([]parsedGeomR64, string) {
 	esType := ""
+	var nullVal any
 	if idxSchema != nil {
-		if b := idxSchema.ResolveField(field); b.ESType != "" {
+		b := idxSchema.ResolveField(field)
+		if b.ESType != "" {
 			esType = strings.ToLower(strings.TrimSpace(b.ESType))
 		}
+		nullVal = b.NullValue
 	}
 	raw, ok := extractDocFieldRawValueR64(doc, field, idxSchema)
-	if !ok || raw == nil {
+	if !ok {
 		return nil, esType
+	}
+	if raw == nil {
+		if nullVal == nil {
+			return nil, esType
+		}
+		shapes, _ := parseRawShapesR64(nullVal, quantize)
+		return shapes, esType
+	}
+	if arr, isArr := raw.([]any); isArr && nullVal != nil {
+		hasNil := false
+		for _, el := range arr {
+			if el == nil {
+				hasNil = true
+				break
+			}
+		}
+		if hasNil {
+			expanded := make([]any, 0, len(arr))
+			for _, el := range arr {
+				if el == nil {
+					expanded = append(expanded, nullVal)
+				} else {
+					expanded = append(expanded, el)
+				}
+			}
+			raw = expanded
+		}
 	}
 	shapes, _ := parseRawShapesR64(raw, quantize)
 	return shapes, esType
@@ -1801,14 +1859,72 @@ func geotileCoordsForLatLonR64(lat, lon float64, zoom int) (int, int) {
 	return x, y
 }
 
+func geoBoxIntersectsBoxR64(aTop, aLeft, aBot, aRight, bTop, bLeft, bBot, bRight float64) bool {
+	if aBot > bTop || aTop < bBot {
+		return false
+	}
+	if bLeft <= bRight {
+		if aLeft <= aRight {
+			return !(aLeft > bRight || aRight < bLeft)
+		}
+		return aRight >= bLeft || aLeft <= bRight
+	}
+	// Dateline-wrapping bounds box [bLeft, 180] U [-180, bRight]
+	if aLeft <= aRight {
+		return aRight >= bLeft || aLeft <= bRight
+	}
+	return true
+}
+
+func clampGeoGridPrecisionR65(gridKind string, prec int) int {
+	switch gridKind {
+	case "geotile":
+		if prec < 0 {
+			return 0
+		}
+		if prec > 29 {
+			return 29
+		}
+		return prec
+	case "geohex":
+		if prec < 0 {
+			return 0
+		}
+		if prec > spatial.MaxRes {
+			return spatial.MaxRes
+		}
+		return prec
+	default: // geohash
+		if prec < 1 {
+			return 1
+		}
+		if prec > 12 {
+			return 12
+		}
+		return prec
+	}
+}
+
 func enumerateGeotileCellsForGeomR64(g parsedGeomR64, zoom int, hasBounds bool, bTop, bLeft, bBot, bRight float64) []string {
+	zoom = clampGeoGridPrecisionR65("geotile", zoom)
 	if g.kind == geomPointR64 {
-		if hasBounds && !geoPointInBox(g.pt[0], g.pt[1], bTop, bLeft, bBot, bRight) {
+		if !isFiniteCoordR64(g.pt[0]) || !isFiniteCoordR64(g.pt[1]) {
 			return nil
 		}
-		return []string{encodeGeotile(g.pt[0], g.pt[1], zoom)}
+		tx, ty := geotileCoordsForLatLonR64(g.pt[0], g.pt[1], zoom)
+		tile := fmt.Sprintf("%d/%d/%d", zoom, tx, ty)
+		if hasBounds {
+			cTop, cLeft, cBot, cRight, _, _, _, ok := decodeGeotileBoundsR64(tile)
+			if !ok || !geoBoxIntersectsBoxR64(cTop, cLeft, cBot, cRight, bTop, bLeft, bBot, bRight) {
+				return nil
+			}
+		}
+		return []string{tile}
 	}
 	gTop, gLeft, gBot, gRight := g.bbox()
+	if !isFiniteCoordR64(gTop) || !isFiniteCoordR64(gLeft) || !isFiniteCoordR64(gBot) || !isFiniteCoordR64(gRight) {
+		return nil
+	}
 	if hasBounds {
 		gTop = math.Min(gTop, bTop)
 		gBot = math.Max(gBot, bBot)
@@ -1818,6 +1934,8 @@ func enumerateGeotileCellsForGeomR64(g parsedGeomR64, zoom int, hasBounds bool, 
 			if gLeft > gRight || gBot > gTop {
 				return nil
 			}
+		} else if gBot > gTop {
+			return nil
 		}
 	}
 	xMin, yMin := geotileCoordsForLatLonR64(gTop, gLeft, zoom)
@@ -1829,18 +1947,30 @@ func enumerateGeotileCellsForGeomR64(g parsedGeomR64, zoom int, hasBounds bool, 
 		yMin, yMax = yMax, yMin
 	}
 	nMax := (1 << uint(zoom)) - 1
-	if (xMax-xMin+1)*(yMax-yMin+1) > 4096 {
+	dx := int64(xMax) - int64(xMin) + 1
+	dy := int64(yMax) - int64(yMin) + 1
+	if dx <= 0 || dy <= 0 || dx > 4096 || dy > 4096 || dx*dy > 4096 {
 		// Fallback sparse sampling along vertices for extreme zooms
 		seen := make(map[string]bool)
 		var out []string
 		for _, v := range g.vertices() {
-			if hasBounds && !geoPointInBox(v[0], v[1], bTop, bLeft, bBot, bRight) {
+			if !isFiniteCoordR64(v[0]) || !isFiniteCoordR64(v[1]) {
 				continue
 			}
-			k := encodeGeotile(v[0], v[1], zoom)
+			tx, ty := geotileCoordsForLatLonR64(v[0], v[1], zoom)
+			k := fmt.Sprintf("%d/%d/%d", zoom, tx, ty)
+			if hasBounds {
+				cTop, cLeft, cBot, cRight, _, _, _, ok := decodeGeotileBoundsR64(k)
+				if !ok || !geoBoxIntersectsBoxR64(cTop, cLeft, cBot, cRight, bTop, bLeft, bBot, bRight) {
+					continue
+				}
+			}
 			if !seen[k] {
 				seen[k] = true
 				out = append(out, k)
+				if len(out) >= 4096 {
+					break
+				}
 			}
 		}
 		return out
@@ -1856,7 +1986,7 @@ func enumerateGeotileCellsForGeomR64(g parsedGeomR64, zoom int, hasBounds bool, 
 		for ty := yMin; ty <= yMax && ty <= nMax; ty++ {
 			cTop := latFromY(float64(ty))
 			cBot := latFromY(float64(ty + 1))
-			if hasBounds && (cBot > bTop || cTop < bBot || (bLeft <= bRight && (cLeft > bRight || cRight < bLeft))) {
+			if hasBounds && !geoBoxIntersectsBoxR64(cTop, cLeft, cBot, cRight, bTop, bLeft, bBot, bRight) {
 				continue
 			}
 			if geomIntersectsSimpleBoxR64(g, cTop, cLeft, cBot, cRight) {
@@ -1868,13 +1998,27 @@ func enumerateGeotileCellsForGeomR64(g parsedGeomR64, zoom int, hasBounds bool, 
 }
 
 func enumerateGeohashCellsForGeomR64(g parsedGeomR64, prec int, hasBounds bool, bTop, bLeft, bBot, bRight float64) []string {
+	prec = clampGeoGridPrecisionR65("geohash", prec)
 	if g.kind == geomPointR64 {
-		if hasBounds && !geoPointInBox(g.pt[0], g.pt[1], bTop, bLeft, bBot, bRight) {
+		if !isFiniteCoordR64(g.pt[0]) || !isFiniteCoordR64(g.pt[1]) {
 			return nil
 		}
-		return []string{encodeGeohash(g.pt[0], g.pt[1], prec)}
+		h := encodeGeohash(g.pt[0], g.pt[1], prec)
+		if h == "" {
+			return nil
+		}
+		if hasBounds {
+			cBot, cTop, cLeft, cRight, okB := decodeGeohashBBoxR61Search(h)
+			if !okB || !geoBoxIntersectsBoxR64(cTop, cLeft, cBot, cRight, bTop, bLeft, bBot, bRight) {
+				return nil
+			}
+		}
+		return []string{h}
 	}
 	gTop, gLeft, gBot, gRight := g.bbox()
+	if !isFiniteCoordR64(gTop) || !isFiniteCoordR64(gLeft) || !isFiniteCoordR64(gBot) || !isFiniteCoordR64(gRight) {
+		return nil
+	}
 	if hasBounds {
 		gTop = math.Min(gTop, bTop)
 		gBot = math.Max(gBot, bBot)
@@ -1884,6 +2028,8 @@ func enumerateGeohashCellsForGeomR64(g parsedGeomR64, prec int, hasBounds bool, 
 			if gLeft > gRight || gBot > gTop {
 				return nil
 			}
+		} else if gBot > gTop {
+			return nil
 		}
 	}
 	// Determine cell dimensions from sample cell
@@ -1895,8 +2041,8 @@ func enumerateGeohashCellsForGeomR64(g parsedGeomR64, prec int, hasBounds bool, 
 		dLat = math.Max(1e-6, latMaxC-latMinC)
 		dLon = math.Max(1e-6, lonMaxC-lonMinC)
 	}
-	stepsLat := int(math.Ceil((gTop-gBot)/dLat)) + 2
-	stepsLon := int(math.Ceil((gRight-gLeft)/dLon)) + 2
+	rawStepsLat := math.Ceil((gTop-gBot)/dLat) + 2
+	rawStepsLon := math.Ceil((gRight-gLeft)/dLon) + 2
 	seen := make(map[string]bool)
 	var out []string
 	tryCell := func(h string) {
@@ -1908,14 +2054,18 @@ func enumerateGeohashCellsForGeomR64(g parsedGeomR64, prec int, hasBounds bool, 
 		if !okB {
 			return
 		}
-		if hasBounds && (cBot > bTop || cTop < bBot || (bLeft <= bRight && (cLeft > bRight || cRight < bLeft))) {
+		if hasBounds && !geoBoxIntersectsBoxR64(cTop, cLeft, cBot, cRight, bTop, bLeft, bBot, bRight) {
 			return
 		}
 		if geomIntersectsSimpleBoxR64(g, cTop, cLeft, cBot, cRight) {
 			out = append(out, h)
 		}
 	}
-	if stepsLat*stepsLon <= 4096 {
+	if isFiniteCoordR64(rawStepsLat) && isFiniteCoordR64(rawStepsLon) &&
+		rawStepsLat >= 1 && rawStepsLon >= 1 && rawStepsLat <= 4096 && rawStepsLon <= 4096 &&
+		int64(rawStepsLat)*int64(rawStepsLon) <= 4096 {
+		stepsLat := int(rawStepsLat)
+		stepsLon := int(rawStepsLon)
 		for i := 0; i <= stepsLat; i++ {
 			lat := math.Min(90.0, math.Max(-90.0, gBot+float64(i)*dLat*0.75))
 			for j := 0; j <= stepsLon; j++ {
@@ -1925,12 +2075,19 @@ func enumerateGeohashCellsForGeomR64(g parsedGeomR64, prec int, hasBounds bool, 
 		}
 	}
 	for _, v := range g.vertices() {
+		if len(out) >= 4096 {
+			break
+		}
+		if !isFiniteCoordR64(v[0]) || !isFiniteCoordR64(v[1]) {
+			continue
+		}
 		tryCell(encodeGeohash(v[0], v[1], prec))
 	}
 	return out
 }
 
 func enumerateGeohexCellsForGeomR64(g parsedGeomR64, res int, hasBounds bool, bTop, bLeft, bBot, bRight float64, boundsSet map[uint64]bool) []string {
+	res = clampGeoGridPrecisionR65("geohex", res)
 	allowCell := func(cell uint64) bool {
 		if cell == 0 {
 			return false
@@ -1954,26 +2111,33 @@ func enumerateGeohexCellsForGeomR64(g parsedGeomR64, res int, hasBounds bool, bT
 	}
 	switch g.kind {
 	case geomPointR64:
-		if hasBounds && !geoPointInBox(g.pt[0], g.pt[1], bTop, bLeft, bBot, bRight) {
+		if !isFiniteCoordR64(g.pt[0]) || !isFiniteCoordR64(g.pt[1]) {
 			return nil
 		}
 		cell, err := spatial.LatLonToCell(g.pt[0], g.pt[1], res)
-		if err != nil || !allowCell(cell) {
-			return nil
-		}
-		return []string{spatial.CellToString(cell)}
-	case geomEnvelopeR64:
-		cells, err := spatial.BBoxToCells(g.topLat, g.leftLon, g.botLat, g.rightLon, res)
 		if err != nil {
 			return nil
 		}
-		out := make([]string, 0, len(cells))
-		for _, cell := range cells {
-			if allowCell(cell) {
-				out = append(out, spatial.CellToString(cell))
+		if !allowCell(cell) {
+			if !hasBounds || boundsSet != nil || !geoPointInBox(g.pt[0], g.pt[1], bTop, bLeft, bBot, bRight) {
+				return nil
 			}
 		}
-		return out
+		return []string{spatial.CellToString(cell)}
+	case geomEnvelopeR64:
+		if !isFiniteCoordR64(g.topLat) || !isFiniteCoordR64(g.leftLon) || !isFiniteCoordR64(g.botLat) || !isFiniteCoordR64(g.rightLon) {
+			return nil
+		}
+		cells, err := spatial.BBoxToCells(g.topLat, g.leftLon, g.botLat, g.rightLon, res)
+		if err == nil {
+			out := make([]string, 0, len(cells))
+			for _, cell := range cells {
+				if allowCell(cell) {
+					out = append(out, spatial.CellToString(cell))
+				}
+			}
+			return out
+		}
 	case geomPolygonR64:
 		cells, err := spatial.PolygonIntersectingCells(g.outer, g.holes, res)
 		if err == nil && len(cells) > 0 {
@@ -1986,10 +2150,13 @@ func enumerateGeohexCellsForGeomR64(g parsedGeomR64, res int, hasBounds bool, bT
 			return out
 		}
 	}
-	// Fallback / LineString: sample along segments + vertices + ring neighbors
+	// Fallback / LineString: sample along segments + vertices
 	seen := make(map[string]bool)
 	var out []string
 	addPt := func(lat, lon float64) {
+		if !isFiniteCoordR64(lat) || !isFiniteCoordR64(lon) || len(out) >= 4096 {
+			return
+		}
 		cell, err := spatial.LatLonToCell(lat, lon, res)
 		if err == nil && allowCell(cell) {
 			s := spatial.CellToString(cell)
@@ -2006,6 +2173,9 @@ func enumerateGeohexCellsForGeomR64(g parsedGeomR64, res int, hasBounds bool, bT
 	if g.kind == geomLineR64 {
 		for i := 0; i < len(g.line)-1; i++ {
 			a, b := g.line[i], g.line[i+1]
+			if !isFiniteCoordR64(a[0]) || !isFiniteCoordR64(a[1]) || !isFiniteCoordR64(b[0]) || !isFiniteCoordR64(b[1]) {
+				continue
+			}
 			distKm := haversineDistanceMeters(a[0], a[1], b[0], b[1]) / 1000.0
 			steps := int(math.Ceil(distKm / 5.0))
 			if steps < 4 {
@@ -2036,6 +2206,9 @@ func extractGeoGridCellKeysForDocR64(
 	hasBounds := false
 	if bounds != nil {
 		bTopLat, bLeftLon, bBotLat, bRightLon, hasBounds = extractGeoBoundingBoxMapCoords(bounds)
+		if hasBounds && (!isFiniteCoordR64(bTopLat) || !isFiniteCoordR64(bLeftLon) || !isFiniteCoordR64(bBotLat) || !isFiniteCoordR64(bRightLon)) {
+			hasBounds = false
+		}
 	}
 	effSchema := md.EffectiveSchema(idxSchema)
 	shapes, _ := parseDocShapesR64(md.doc, field, effSchema, true)
@@ -2096,11 +2269,30 @@ func emitRuntimeGeoGridAggRowsR64(
 	if spec.Precision != nil {
 		prec = *spec.Precision
 	}
+	prec = clampGeoGridPrecisionR65(gridKind, prec)
+	maxSize := 10000
+	if spec.Size > 0 {
+		maxSize = spec.Size
+	}
+	const maxGeoGridBucketsCapR65 = 100000
+	if maxSize > maxGeoGridBucketsCapR65 {
+		maxSize = maxGeoGridBucketsCapR65
+	}
+	maxTrackedBuckets := maxSize * 4
+	if maxTrackedBuckets < 65536 {
+		maxTrackedBuckets = 65536
+	}
+	if maxTrackedBuckets > maxGeoGridBucketsCapR65 {
+		maxTrackedBuckets = maxGeoGridBucketsCapR65
+	}
 	var bTopLat, bLeftLon, bBotLat, bRightLon float64
 	hasBounds := false
 	var boundsHexSet map[uint64]bool
 	if spec.Bounds != nil {
 		bTopLat, bLeftLon, bBotLat, bRightLon, hasBounds = extractGeoBoundingBoxMapCoords(spec.Bounds)
+		if hasBounds && (!isFiniteCoordR64(bTopLat) || !isFiniteCoordR64(bLeftLon) || !isFiniteCoordR64(bBotLat) || !isFiniteCoordR64(bRightLon)) {
+			hasBounds = false
+		}
 		if hasBounds && gridKind == "geohex" {
 			if cells, err := spatial.BBoxToCells(bTopLat, bLeftLon, bBotLat, bRightLon, prec); err == nil && len(cells) > 0 {
 				boundsHexSet = make(map[uint64]bool, len(cells))
@@ -2116,6 +2308,9 @@ func emitRuntimeGeoGridAggRowsR64(
 		cells := extractGeoGridCellKeysForDocR64(md, spec.Field, gridKind, prec, spec.Bounds, boundsHexSet, idxSchema)
 		for _, cell := range cells {
 			if _, exists := byBucket[cell]; !exists {
+				if len(byBucket) >= maxTrackedBuckets {
+					continue
+				}
 				keys = append(keys, cell)
 			}
 			byBucket[cell] = append(byBucket[cell], md)
@@ -2129,12 +2324,8 @@ func emitRuntimeGeoGridAggRowsR64(
 		if gridKind == "geotile" {
 			return compareGeotileStringsR62Search(keys[i], keys[j]) > 0
 		}
-		return keys[i] < keys[j]
+		return keys[i] > keys[j]
 	})
-	maxSize := 10000
-	if spec.Size > 0 {
-		maxSize = spec.Size
-	}
 	if len(keys) > maxSize {
 		keys = keys[:maxSize]
 	}
@@ -2688,6 +2879,20 @@ func validateSpatialAndTimeSeriesAggTreeR64(aggs map[string]esast.AggSpec, under
 					fmt.Sprintf("Precision [%d] must be between 0 and %d", p, spatial.MaxRes)
 			}
 		}
+		if spec.GeotileGrid != nil && spec.GeotileGrid.Precision != nil {
+			p := *spec.GeotileGrid.Precision
+			if p < 0 || p > 29 {
+				return http.StatusBadRequest, "illegal_argument_exception",
+					fmt.Sprintf("Precision [%d] must be between 0 and 29", p)
+			}
+		}
+		if spec.GeohashGrid != nil && spec.GeohashGrid.Precision != nil {
+			p := *spec.GeohashGrid.Precision
+			if p < 1 || p > 12 {
+				return http.StatusBadRequest, "illegal_argument_exception",
+					fmt.Sprintf("Precision [%d] must be between 1 and 12", p)
+			}
+		}
 		if spec.GeoLine != nil && underTimeSeries {
 			if spec.GeoLine.Sort != nil && spec.GeoLine.Sort.Field != "" && spec.GeoLine.Sort.Field != "@timestamp" {
 				return http.StatusBadRequest, "illegal_argument_exception",
@@ -2801,14 +3006,15 @@ func evalDocGeoPolygonQueryR64(idxSchema *schema.IndexSchema, doc map[string]any
 	}
 	ring := make([][2]float64, 0, len(gp.Points))
 	for _, pt := range gp.Points {
-		if lat, lon, err := esast.ParseGeoPoint(pt); err == nil {
-			ring = append(ring, [2]float64{lat, lon})
+		if isFiniteCoordR64(pt[0]) && isFiniteCoordR64(pt[1]) {
+			ring = append(ring, [2]float64{pt[0], pt[1]})
 		}
 	}
 	if len(ring) < 3 {
 		return false
 	}
-	poly := parsedGeomR64{kind: geomPolygonR64, outer: ring}
+	cd := checkSeqDatelineR64(ring, false)
+	poly := parsedGeomR64{kind: geomPolygonR64, outer: ring, crossesDateline: cd}
 	for _, sh := range shapes {
 		if geomIntersectsQueryShapeR64(sh, poly) {
 			return true

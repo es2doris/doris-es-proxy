@@ -185,7 +185,7 @@ func ValidateUpdateCtxOp(op string) error {
 	case "", "index", "noop", "none", "delete":
 		return nil
 	default:
-		return fmt.Errorf("illegal_argument_exception: Invalidctx.op [%s]; must be one of [index, noop, none, delete]", op)
+		return fmt.Errorf("illegal_argument_exception: Invalid ctx.op [%s]; must be one of [index, noop, none, delete]", op)
 	}
 }
 

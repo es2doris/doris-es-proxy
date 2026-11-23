@@ -221,7 +221,7 @@ func ShredDocumentWithNow(
 	if s != nil && len(s.Fields) > 0 {
 		aliasFieldKeys := make([]string, 0)
 		for k, b := range s.Fields {
-			if b.AliasTarget != "" && b.ESFieldPath != "" {
+			if b.AliasTarget != "" && !b.IsPassthroughAlias && b.ESFieldPath != "" {
 				aliasFieldKeys = append(aliasFieldKeys, k)
 			}
 		}
@@ -291,7 +291,7 @@ func ShredDocumentWithNow(
 		sort.Strings(histogramFieldKeys)
 		for _, k := range histogramFieldKeys {
 			b := s.withEffectiveDefaults(s.Fields[k])
-			modified, err := validateAndNormalizeHistogramFieldInDoc(parsedDoc, b.SourceJSONPath, b)
+			modified, err := validateAndNormalizeHistogramFieldInDocWithIgnored(parsedDoc, b.SourceJSONPath, b, recordIgnored)
 			if err != nil {
 				if b.IgnoreMalformed != nil && *b.IgnoreMalformed {
 					recordIgnored(b.ESFieldPath)
@@ -562,7 +562,7 @@ func ShredDocumentWithNow(
 							}
 						}
 					}
-					if strVal, isStr := rv.(string); isStr && strings.TrimSpace(strVal) == "" && b.ESType != "token_count" && b.ESType != "murmur3" && b.ESType != "rank_feature" && (b.Coerce == nil || *b.Coerce) && (b.ESType == "ip" || b.ESType == "geo_point" || (b.DorisType != DorisString && b.DorisType != DorisVarchar)) {
+					if strVal, isStr := rv.(string); isStr && strings.TrimSpace(strVal) == "" && b.ESType != "token_count" && b.ESType != "murmur3" && b.ESType != "rank_feature" && b.ESType != "ip" && (b.Coerce == nil || *b.Coerce) && (b.ESType == "geo_point" || (b.DorisType != DorisString && b.DorisType != DorisVarchar)) {
 						if b.NullValue != nil {
 							rv = b.NullValue
 						} else {
@@ -633,7 +633,7 @@ func ShredDocumentWithNow(
 				}
 			}
 			if val != nil {
-				if strVal, isStr := val.(string); isStr && strings.TrimSpace(strVal) == "" && b.ESType != "token_count" && b.ESType != "murmur3" && b.ESType != "rank_feature" && (b.Coerce == nil || *b.Coerce) && (b.ESType == "ip" || b.ESType == "geo_point" || (b.DorisType != DorisString && b.DorisType != DorisVarchar)) {
+				if strVal, isStr := val.(string); isStr && strings.TrimSpace(strVal) == "" && b.ESType != "token_count" && b.ESType != "murmur3" && b.ESType != "rank_feature" && b.ESType != "ip" && (b.Coerce == nil || *b.Coerce) && (b.ESType == "geo_point" || (b.DorisType != DorisString && b.DorisType != DorisVarchar)) {
 					if b.NullValue != nil {
 						val = coerceScalarBindingForDorisWithSchema(s, b.NullValue, b, getNow())
 					} else {
@@ -747,7 +747,7 @@ func ShredDocumentWithNow(
 					if rv == nil {
 						continue
 					}
-					if strVal, isStr := rv.(string); isStr && strings.TrimSpace(strVal) == "" && b.ESType != "token_count" && b.ESType != "murmur3" && b.ESType != "version" && b.ESType != "rank_feature" && (b.Coerce == nil || *b.Coerce) {
+					if strVal, isStr := rv.(string); isStr && strings.TrimSpace(strVal) == "" && b.ESType != "token_count" && b.ESType != "murmur3" && b.ESType != "version" && b.ESType != "rank_feature" && b.ESType != "ip" && (b.Coerce == nil || *b.Coerce) {
 						if b.NullValue != nil {
 							rv = b.NullValue
 						} else {
@@ -3054,6 +3054,9 @@ func ParseESDateBoundWithFormatAndLocaleToEpochMillis(input, format, locale stri
 						cand = translateLocalizedDateInputForPattern(prefix, locale, fmtPart)
 					}
 					if t, err := time.Parse(layout, cand); err == nil {
+						if !strings.ContainsAny(fmtPart, "Sn") && (t.Nanosecond() != 0 || (strings.HasSuffix(layout, "05") && strings.Contains(cand, "."))) {
+							continue
+						}
 						dateOnly := !strings.ContainsAny(fmtPart, "HhmsS")
 						return finalizeFormatMatch(t, dateOnly)
 					}
@@ -3783,6 +3786,19 @@ func isASCIIDigits4(s string) bool {
 }
 
 func parseISODateString(s string) (time.Time, bool) {
+	if len(s) >= 5 && s[0] == '-' && isASCIIDigits4(s[1:5]) {
+		yr, err := strconv.Atoi(s[:5])
+		if err == nil {
+			surrogate := "2001"
+			if yr%4 == 0 && (yr%100 != 0 || yr%400 == 0) {
+				surrogate = "2000"
+			}
+			if t, ok := parseISODateString(surrogate + s[5:]); ok {
+				return time.Date(yr, t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), t.Location()).UTC(), true
+			}
+		}
+		return time.Time{}, false
+	}
 	if isASCIIDigits4(s) {
 		if t, err := time.Parse("2006", s); err == nil {
 			return t.UTC(), true
@@ -4263,9 +4279,6 @@ func propagateCopyToCustomMultiFields(s *IndexSchema, row map[string]any, target
 }
 
 func buildVariantDocPayload(trimmed []byte, parsedDoc map[string]any, prunedDynamic bool, s *IndexSchema) json.RawMessage {
-	if !prunedDynamic && (s == nil || len(s.Fields) == 0) {
-		return json.RawMessage(trimmed)
-	}
 	var enabledFalsePaths [][]string
 	if s != nil {
 		for _, b := range s.Fields {
@@ -4274,12 +4287,16 @@ func buildVariantDocPayload(trimmed []byte, parsedDoc map[string]any, prunedDyna
 			}
 		}
 	}
-	if !prunedDynamic && len(enabledFalsePaths) == 0 {
+	hasDotted := hasAnyDottedKeyInMap(parsedDoc)
+	if !prunedDynamic && len(enabledFalsePaths) == 0 && !hasDotted {
 		return json.RawMessage(trimmed)
 	}
 	if prunedDynamic && parsedDoc != nil {
 		for _, p := range enabledFalsePaths {
 			deletePathInMap(parsedDoc, p)
+		}
+		if normDoc, _ := normalizeVariantDocMap(parsedDoc, s, ""); normDoc != nil {
+			parsedDoc = normDoc
 		}
 		b, err := json.Marshal(parsedDoc)
 		if err != nil {
@@ -4299,6 +4316,10 @@ func buildVariantDocPayload(trimmed []byte, parsedDoc map[string]any, prunedDyna
 			modified = true
 		}
 	}
+	if normDoc, normMod := normalizeVariantDocMap(docMap, s, ""); normMod {
+		docMap = normDoc
+		modified = true
+	}
 	if !modified {
 		return json.RawMessage(trimmed)
 	}
@@ -4307,6 +4328,168 @@ func buildVariantDocPayload(trimmed []byte, parsedDoc map[string]any, prunedDyna
 		return json.RawMessage(trimmed)
 	}
 	return json.RawMessage(b)
+}
+
+func hasAnyDottedKeyInMap(v any) bool {
+	switch tv := v.(type) {
+	case map[string]any:
+		for k, val := range tv {
+			if strings.IndexByte(k, '.') >= 0 {
+				return true
+			}
+			if hasAnyDottedKeyInMap(val) {
+				return true
+			}
+		}
+	case []any:
+		for _, elem := range tv {
+			if hasAnyDottedKeyInMap(elem) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func mergeVariantValue(dst, src any) any {
+	if dst == nil {
+		return src
+	}
+	if src == nil {
+		return dst
+	}
+	if dm, dIsMap := dst.(map[string]any); dIsMap {
+		if sm, sIsMap := src.(map[string]any); sIsMap {
+			merged := make(map[string]any, len(dm)+len(sm))
+			for k, v := range dm {
+				merged[k] = v
+			}
+			for k, v := range sm {
+				if prev, exists := merged[k]; exists {
+					merged[k] = mergeVariantValue(prev, v)
+				} else {
+					merged[k] = v
+				}
+			}
+			return merged
+		}
+		return dst
+	}
+	if _, sIsMap := src.(map[string]any); sIsMap {
+		return src
+	}
+	var out []any
+	if ds, ok := dst.([]any); ok {
+		out = append(out, ds...)
+	} else {
+		out = append(out, dst)
+	}
+	if ss, ok := src.([]any); ok {
+		out = append(out, ss...)
+	} else {
+		out = append(out, src)
+	}
+	return out
+}
+
+func normalizeVariantDocSlice(arr []any, s *IndexSchema, prefix string) ([]any, bool) {
+	if len(arr) == 0 {
+		return arr, false
+	}
+	modified := false
+	var out []any
+	ensureOut := func() {
+		if out == nil {
+			out = make([]any, len(arr))
+			copy(out, arr)
+		}
+	}
+	for i, elem := range arr {
+		switch tv := elem.(type) {
+		case map[string]any:
+			if sub, subMod := normalizeVariantDocMap(tv, s, prefix); subMod {
+				ensureOut()
+				out[i] = sub
+				modified = true
+			}
+		case []any:
+			if sub, subMod := normalizeVariantDocSlice(tv, s, prefix); subMod {
+				ensureOut()
+				out[i] = sub
+				modified = true
+			}
+		}
+	}
+	if !modified {
+		return arr, false
+	}
+	return out, true
+}
+
+func normalizeVariantDocMap(m map[string]any, s *IndexSchema, prefix string) (map[string]any, bool) {
+	if len(m) == 0 {
+		return m, false
+	}
+	subFalse := isSubobjectsFalseAtPrefix(s, prefix)
+	nonDotted := make([]string, 0, len(m))
+	dotted := make([]string, 0)
+	for k := range m {
+		if !subFalse && strings.IndexByte(k, '.') > 0 {
+			dotted = append(dotted, k)
+		} else {
+			nonDotted = append(nonDotted, k)
+		}
+	}
+	sort.Strings(nonDotted)
+	sort.Strings(dotted)
+
+	modified := len(dotted) > 0
+	out := make(map[string]any, len(m))
+	for _, k := range nonDotted {
+		out[k] = m[k]
+	}
+	for _, k := range dotted {
+		dotIdx := strings.IndexByte(k, '.')
+		head := k[:dotIdx]
+		tail := k[dotIdx+1:]
+		if tail == "" {
+			out[k] = m[k]
+			continue
+		}
+		nested := map[string]any{tail: m[k]}
+		if existing, exists := out[head]; exists {
+			out[head] = mergeVariantValue(existing, nested)
+		} else {
+			out[head] = nested
+		}
+	}
+	childKeys := make([]string, 0, len(out))
+	for k := range out {
+		childKeys = append(childKeys, k)
+	}
+	sort.Strings(childKeys)
+	for _, k := range childKeys {
+		childPrefix := k
+		if prefix != "" {
+			childPrefix = prefix + "." + k
+		}
+		switch tv := out[k].(type) {
+		case map[string]any:
+			if sub, subMod := normalizeVariantDocMap(tv, s, childPrefix); subMod {
+				out[k] = sub
+				modified = true
+			}
+		case []any:
+			if sub, subMod := normalizeVariantDocSlice(tv, s, childPrefix); subMod {
+				out[k] = sub
+				modified = true
+			}
+		}
+	}
+	if !modified {
+		return m, false
+	}
+	return out, true
 }
 
 func isPrimaryFieldBinding(b FieldBinding) bool {
@@ -4454,7 +4637,7 @@ func cleanMalformedNestedLeafValue(val any, b FieldBinding, now time.Time) (any,
 			}
 			return val, true, false
 		}
-		if strVal, isStr := val.(string); isStr && strings.TrimSpace(strVal) == "" && (b.Coerce == nil || *b.Coerce) {
+		if strVal, isStr := val.(string); isStr && strings.TrimSpace(strVal) == "" && b.ESType != "ip" && (b.Coerce == nil || *b.Coerce) {
 			return nil, false, true
 		}
 		if coerceScalarBindingForDoris(val, b, now) == nil {
@@ -5590,7 +5773,7 @@ func normalizeNestedLeafValueWithSchema(idx *IndexSchema, val any, b FieldBindin
 		}
 	}
 	if isTypedNonStringBinding(b) {
-		if strVal, isStr := val.(string); isStr && strings.TrimSpace(strVal) == "" && b.ESType != "rank_feature" && (b.Coerce == nil || *b.Coerce) {
+		if strVal, isStr := val.(string); isStr && strings.TrimSpace(strVal) == "" && b.ESType != "rank_feature" && b.ESType != "ip" && (b.Coerce == nil || *b.Coerce) {
 			return nil
 		}
 	}
@@ -5959,8 +6142,8 @@ func validateAndNormalizeSparseVectorFieldInDoc(curr map[string]any, path []stri
 			}
 		} else if b.ESType == "rank_features" {
 			if rawSlice, isSlice := raw.([]any); isSlice && len(rawSlice) == 0 {
-				delete(m, key)
-				return true, nil
+				m[key] = []any{}
+				return false, nil
 			}
 		}
 		tokMap, ok := raw.(map[string]any)
@@ -6007,7 +6190,7 @@ func validateAndNormalizeFlattenedFieldInDocWithSchema(curr map[string]any, path
 	})
 }
 
-func validateAndNormalizeHistogramFieldInDoc(curr map[string]any, path []string, b FieldBinding) (bool, error) {
+func validateAndNormalizeHistogramFieldInDocWithIgnored(curr map[string]any, path []string, b FieldBinding, recordIgnored func(string)) (bool, error) {
 	return traverseFieldInDocMap(curr, path, func(m map[string]any, key string) (bool, error) {
 		raw, exists := m[key]
 		if !exists {
@@ -6015,6 +6198,55 @@ func validateAndNormalizeHistogramFieldInDoc(curr map[string]any, path []string,
 		}
 		if raw == nil {
 			delete(m, key)
+			return true, nil
+		}
+		if arr, isArr := raw.([]any); isArr {
+			ignMal := b.IgnoreMalformed != nil && *b.IgnoreMalformed
+			var allVals []any
+			var allCnts []any
+			var allPairs []any
+			hadMalformed := false
+			var walkSlice func(items []any) error
+			walkSlice = func(items []any) error {
+				for _, item := range items {
+					if item == nil {
+						continue
+					}
+					if sub, okS := item.([]any); okS {
+						if err := walkSlice(sub); err != nil {
+							return err
+						}
+						continue
+					}
+					nzVals, nzCnts, hPairs, _, err := validateSingleHistogramObject(item, b.ESFieldPath)
+					if err != nil {
+						if ignMal {
+							hadMalformed = true
+							continue
+						}
+						return err
+					}
+					allVals = append(allVals, nzVals...)
+					allCnts = append(allCnts, nzCnts...)
+					allPairs = append(allPairs, hPairs...)
+				}
+				return nil
+			}
+			if err := walkSlice(arr); err != nil {
+				return false, err
+			}
+			if hadMalformed && recordIgnored != nil {
+				recordIgnored(b.ESFieldPath)
+			}
+			if len(allPairs) == 0 {
+				delete(m, key)
+				return true, nil
+			}
+			m[key] = map[string]any{
+				"values": allVals,
+				"counts": allCnts,
+				"_h":     allPairs,
+			}
 			return true, nil
 		}
 		norm, modified, err := validateAndNormalizeHistogramValue(raw, b)
@@ -6028,6 +6260,76 @@ func validateAndNormalizeHistogramFieldInDoc(curr map[string]any, path []string,
 	})
 }
 
+func validateSingleHistogramObject(raw any, fieldPath string) (nzVals []any, nzCnts []any, hPairs []any, hadZero bool, err error) {
+	hm, ok := raw.(map[string]any)
+	if !ok {
+		return nil, nil, nil, false, fmt.Errorf("mapper_parsing_exception: failed to parse histogram field [%s]: expected object with [values] and [counts]", fieldPath)
+	}
+	for k := range hm {
+		switch k {
+		case "values", "counts", "_h":
+		default:
+			return nil, nil, nil, false, fmt.Errorf("mapper_parsing_exception: [histogram] field [%s] unknown field [%s]", fieldPath, k)
+		}
+	}
+	rawValues, hasValues := hm["values"]
+	rawCounts, hasCounts := hm["counts"]
+	if !hasValues || !hasCounts {
+		return nil, nil, nil, false, fmt.Errorf("mapper_parsing_exception: [histogram] field [%s] requires both [values] and [counts] arrays", fieldPath)
+	}
+	valArr, okV := rawValues.([]any)
+	cntArr, okC := rawCounts.([]any)
+	if !okV || !okC {
+		return nil, nil, nil, false, fmt.Errorf("mapper_parsing_exception: [histogram] field [%s] [values] and [counts] must be arrays", fieldPath)
+	}
+	if len(valArr) != len(cntArr) {
+		return nil, nil, nil, false, fmt.Errorf("mapper_parsing_exception: [histogram] field [%s] [values] length (%d) must equal [counts] length (%d)", fieldPath, len(valArr), len(cntArr))
+	}
+	hPairs = make([]any, 0, len(valArr))
+	nzVals = make([]any, 0, len(valArr))
+	nzCnts = make([]any, 0, len(cntArr))
+	var prevVal float64
+	for i := 0; i < len(valArr); i++ {
+		fv, okVal := parseStrictHistogramFloat(valArr[i])
+		if !okVal {
+			return nil, nil, nil, false, fmt.Errorf("mapper_parsing_exception: [histogram] field [%s] [values] element at index %d must be a finite number", fieldPath, i)
+		}
+		if i > 0 && fv < prevVal {
+			formatHistNum := func(orig any, v float64) string {
+				if jn, ok := orig.(json.Number); ok {
+					s := strings.TrimSpace(jn.String())
+					if s != "" {
+						if !strings.ContainsAny(s, ".eE") {
+							return s + ".0"
+						}
+						return s
+					}
+				}
+				s := strconv.FormatFloat(v, 'g', -1, 64)
+				if !strings.ContainsAny(s, ".eE") {
+					s += ".0"
+				}
+				return s
+			}
+			return nil, nil, nil, false, fmt.Errorf("mapper_parsing_exception: error parsing field [%s], [values] values must be in increasing order, got [%s] but previous value was [%s]", fieldPath, formatHistNum(valArr[i], fv), formatHistNum(valArr[i-1], prevVal))
+		}
+		prevVal = fv
+
+		cnt, okCnt := parseStrictHistogramCount(cntArr[i])
+		if !okCnt {
+			return nil, nil, nil, false, fmt.Errorf("mapper_parsing_exception: [histogram] field [%s] [counts] element at index %d must be a non-negative integer", fieldPath, i)
+		}
+		if cnt > 0 {
+			nzVals = append(nzVals, fv)
+			nzCnts = append(nzCnts, cnt)
+			hPairs = append(hPairs, strconv.FormatFloat(fv, 'g', -1, 64)+","+strconv.FormatInt(cnt, 10))
+		} else {
+			hadZero = true
+		}
+	}
+	return nzVals, nzCnts, hPairs, hadZero, nil
+}
+
 func validateAndNormalizeHistogramValue(raw any, b FieldBinding) (any, bool, error) {
 	if raw == nil {
 		return nil, true, nil
@@ -6036,52 +6338,20 @@ func validateAndNormalizeHistogramValue(raw any, b FieldBinding) (any, bool, err
 	if !ok {
 		return nil, false, fmt.Errorf("mapper_parsing_exception: failed to parse histogram field [%s]: expected object with [values] and [counts]", b.ESFieldPath)
 	}
-	for k := range hm {
-		switch k {
-		case "values", "counts", "_h":
-		default:
-			return nil, false, fmt.Errorf("mapper_parsing_exception: [histogram] field [%s] unknown field [%s]", b.ESFieldPath, k)
-		}
-	}
-	rawValues, hasValues := hm["values"]
-	rawCounts, hasCounts := hm["counts"]
-	if !hasValues || !hasCounts {
-		return nil, false, fmt.Errorf("mapper_parsing_exception: [histogram] field [%s] requires both [values] and [counts] arrays", b.ESFieldPath)
-	}
-	valArr, okV := rawValues.([]any)
-	cntArr, okC := rawCounts.([]any)
-	if !okV || !okC {
-		return nil, false, fmt.Errorf("mapper_parsing_exception: [histogram] field [%s] [values] and [counts] must be arrays", b.ESFieldPath)
-	}
-	if len(valArr) != len(cntArr) {
-		return nil, false, fmt.Errorf("mapper_parsing_exception: [histogram] field [%s] [values] length (%d) must equal [counts] length (%d)", b.ESFieldPath, len(valArr), len(cntArr))
-	}
-	hPairs := make([]any, 0, len(valArr))
-	var prevVal float64
-	for i := 0; i < len(valArr); i++ {
-		fv, okVal := parseStrictHistogramFloat(valArr[i])
-		if !okVal {
-			return nil, false, fmt.Errorf("mapper_parsing_exception: [histogram] field [%s] [values] element at index %d must be a finite number", b.ESFieldPath, i)
-		}
-		if i > 0 && fv < prevVal {
-			return nil, false, fmt.Errorf("mapper_parsing_exception: [histogram] field [%s] [values] must be in ascending order", b.ESFieldPath)
-		}
-		prevVal = fv
-
-		cnt, okCnt := parseStrictHistogramCount(cntArr[i])
-		if !okCnt {
-			return nil, false, fmt.Errorf("mapper_parsing_exception: [histogram] field [%s] [counts] element at index %d must be a non-negative integer", b.ESFieldPath, i)
-		}
-		if cnt > 0 {
-			hPairs = append(hPairs, strconv.FormatFloat(fv, 'g', -1, 64)+","+strconv.FormatInt(cnt, 10))
-		}
+	nzVals, nzCnts, hPairs, hadZero, err := validateSingleHistogramObject(hm, b.ESFieldPath)
+	if err != nil {
+		return nil, false, err
 	}
 	if len(hPairs) == 0 {
 		hPairs = []any{""}
 	}
-	out := make(map[string]any, len(hm)+1)
-	for k, v := range hm {
-		out[k] = v
+	out := make(map[string]any, 3)
+	if hadZero {
+		out["values"] = nzVals
+		out["counts"] = nzCnts
+	} else {
+		out["values"] = hm["values"]
+		out["counts"] = hm["counts"]
 	}
 	out["_h"] = hPairs
 	return out, true, nil
@@ -6289,11 +6559,21 @@ func normalizeFlattenedInnerValue(v any, b FieldBinding, recordIgnored func(stri
 		return sv, mod, nil
 	default:
 		sv := fmt.Sprintf("%v", tv)
+		mod := false
+		if b.NormalizerName != "" || b.LowercaseNormalizer {
+			if norm := normalizeValueForBinding(sv, b, idx); norm != sv {
+				sv = norm
+				mod = true
+			}
+		}
 		if b.IgnoreAbove > 0 && len([]rune(sv)) > b.IgnoreAbove {
 			if recordIgnored != nil {
 				recordIgnored(b.ESFieldPath)
 			}
 			return nil, true, nil
+		}
+		if mod {
+			return sv, true, nil
 		}
 		return tv, false, nil
 	}

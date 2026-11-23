@@ -126,6 +126,15 @@ func TestRound62_Coverage_RRF_Profile_SAYT_And_SignificantText(t *testing.T) {
 		t.Fatalf("expected per-item dynamic_templates errors in bulk, got (%d): %v", st, res)
 	}
 
+	// Both top-level `retriever` and top-level `rank` must be rejected in ES 8.15.
+	st, res = doStatusR62Cov(t, srv, http.MethodPost, "/r62_hybrid/_search", `{
+		"retriever": {"standard": {"query": {"match_all": {}}}},
+		"rank": {"rrf": {"window_size": 10, "rank_constant": 20}}
+	}`)
+	if st != http.StatusBadRequest {
+		t.Fatalf("expected 400 when specifying both [retriever] and [rank], got (%d): %v", st, res)
+	}
+
 	// 2. RRF via `retriever.rrf` (with standard, knn, nested rule/text_similarity_reranker, filter, explain, profile, aggs)
 	st, res = doStatusR62Cov(t, srv, http.MethodPost, "/r62_hybrid/_search", `{
 		"from": 0,
@@ -159,7 +168,6 @@ func TestRound62_Coverage_RRF_Profile_SAYT_And_SignificantText(t *testing.T) {
 				"inference_text": "quick"
 			}
 		},
-		"rank": {"rrf": {"window_size": 10, "rank_constant": 20}},
 		"aggs": {
 			"by_cat": {"meta": {"env": "test"}, "terms": {"field": "cat"}}
 		}

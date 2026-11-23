@@ -150,8 +150,8 @@ func TestRound18_DateNanosBoundsDateMathAndPlusZeroOffset(t *testing.T) {
 	if !strings.Contains(plan.HitsSQL, "1700000000000000000") {
 		t.Fatalf("expected HitsSQL to preserve full nanosecond precision for date_nanos sort missing & search_after, got:\n%s", plan.HitsSQL)
 	}
-	if !strings.Contains(plan.AggsSQL, "COALESCE((CAST(`f__ts_ns` AS DOUBLE) / 1000000.0), 1700000000000)") ||
-		!strings.Contains(plan.AggsSQL, "(CAST(`f__ts_ns` AS DOUBLE) / 1000000.0) >= 1700000000000 AND (CAST(`f__ts_ns` AS DOUBLE) / 1000000.0) < 1700003600000") {
+	if !strings.Contains(plan.AggsSQL, "COALESCE((TRY_CAST(`f__ts_ns` AS DOUBLE) / 1000000.0), 1700000000000)") ||
+		!strings.Contains(plan.AggsSQL, "(TRY_CAST(`f__ts_ns` AS DOUBLE) / 1000000.0) >= 1700000000000 AND (TRY_CAST(`f__ts_ns` AS DOUBLE) / 1000000.0) < 1700003600000") {
 		t.Fatalf("expected AggsSQL to scale nanosecond column to epoch millis for date_histogram missing & date_range bounds, got:\n%s", plan.AggsSQL)
 	}
 }
@@ -353,7 +353,7 @@ func TestRound18_Doris4SearchLuceneOperatorsWildcardFieldsAndSort(t *testing.T) 
 	if !strings.Contains(plan2.HitsSQL, "'hello'") {
 		t.Fatalf("expected match on LowercaseNormalizer keyword to lowercase 'HeLLo' to 'hello', got:\n%s", plan2.HitsSQL)
 	}
-	if !strings.Contains(plan2.HitsSQL, "array_min(array_map(_x -> CAST(_x AS DOUBLE), `f__scores`)) ASC") {
+	if !strings.Contains(plan2.HitsSQL, "array_min(array_map(_x -> TRY_CAST(_x AS DOUBLE), `f__scores`)) ASC") {
 		t.Fatalf("expected array_min on numeric array to map elements to DOUBLE, got:\n%s", plan2.HitsSQL)
 	}
 }

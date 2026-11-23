@@ -8532,7 +8532,8 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 			isSafeNav := strings.HasSuffix(rawRecBeforeSuffix, "?")
 			recExpr := strings.TrimSpace(strings.TrimSuffix(rawRecBeforeSuffix, "?"))
 			if (mSuffix == ".length()" || mSuffix == ".size()") && (strings.HasPrefix(recExpr, "doc.") || strings.HasPrefix(recExpr, "doc?.")) &&
-				!strings.HasSuffix(recExpr, ".value") && !strings.Contains(recExpr, ".values.") {
+				!strings.HasSuffix(recExpr, ".value") && !strings.Contains(recExpr, ".values.") &&
+				!strings.Contains(recExpr, ".value.") && !strings.Contains(recExpr, "(") {
 				docPath := strings.TrimSuffix(strings.TrimPrefix(strings.TrimPrefix(recExpr, "doc?."), "doc."), ".values")
 				dv, dvErr := resolveDocValuesSliceWithParamsRound60(sourceMap, params, docPath)
 				if dvErr != nil {
@@ -8544,7 +8545,8 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 				mSuffix == ".getDimensionalType()" || mSuffix == ".getShapeType()" || mSuffix == ".getMercatorWidth()" || mSuffix == ".getMercatorHeight()" ||
 				mSuffix == ".topLeft()" || mSuffix == ".bottomRight()") &&
 				(strings.HasPrefix(recExpr, "doc.") || strings.HasPrefix(recExpr, "doc?.")) &&
-				!strings.HasSuffix(recExpr, ".value") && !strings.Contains(recExpr, ".values.") {
+				!strings.HasSuffix(recExpr, ".value") && !strings.Contains(recExpr, ".values.") &&
+				!strings.Contains(recExpr, ".value.") && !strings.Contains(recExpr, "(") {
 				docPath := strings.TrimSuffix(strings.TrimPrefix(strings.TrimPrefix(recExpr, "doc?."), "doc."), ".values")
 				dv, dvErr := resolveDocValuesSliceWithParamsRound60(sourceMap, params, docPath)
 				if dvErr != nil {
@@ -9589,7 +9591,8 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 		isSafeNav := strings.HasSuffix(rawRec, "?")
 		recExpr := strings.TrimSpace(strings.TrimSuffix(rawRec, "?"))
 		if (strings.HasPrefix(recExpr, "doc.") || strings.HasPrefix(recExpr, "doc?.")) &&
-			!strings.HasSuffix(recExpr, ".value") && !strings.Contains(recExpr, ".values.") {
+			!strings.HasSuffix(recExpr, ".value") && !strings.Contains(recExpr, ".values.") &&
+			!strings.Contains(recExpr, ".value.") && !strings.Contains(recExpr, "(") {
 			docPath := strings.TrimSuffix(strings.TrimPrefix(strings.TrimPrefix(recExpr, "doc?."), "doc."), ".values")
 			vals, err := resolveDocValuesSliceWithParamsRound60(sourceMap, params, docPath)
 			if err != nil {
@@ -13174,7 +13177,7 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 			}
 		}
 	}
-	if strings.HasPrefix(rhs, "doc.") || strings.HasPrefix(rhs, "doc?.") {
+	if (strings.HasPrefix(rhs, "doc.") || strings.HasPrefix(rhs, "doc?.")) && !strings.Contains(rhs, "(") {
 		trimmed := strings.TrimPrefix(strings.TrimPrefix(rhs, "doc?."), "doc.")
 		if strings.HasSuffix(trimmed, ".vectorValue") {
 			return docVectorValueAndMagnitudeRound60(sourceMap, params, strings.TrimSuffix(trimmed, ".vectorValue"), false)
@@ -17068,7 +17071,8 @@ func evalStaticCallPainless(sourceMap map[string]any, rhs string, params map[str
 				colExpr := strings.TrimSpace(args[1])
 				var colVal any
 				if (strings.HasPrefix(colExpr, "doc.") || strings.HasPrefix(colExpr, "doc?.")) &&
-					!strings.HasSuffix(colExpr, ".value") && !strings.Contains(colExpr, ".values.") {
+					!strings.HasSuffix(colExpr, ".value") && !strings.Contains(colExpr, ".values.") &&
+					!strings.Contains(colExpr, ".value.") && !strings.Contains(colExpr, "(") {
 					docPath := strings.TrimSuffix(strings.TrimPrefix(strings.TrimPrefix(colExpr, "doc?."), "doc."), ".values")
 					colVal = resolveDocValuesSlice(sourceMap, docPath)
 				} else {

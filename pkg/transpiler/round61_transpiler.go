@@ -235,6 +235,15 @@ func ComputeESBoxplotWithVersion(values []float64, compression float64, es8Mode 
 	return res
 }
 
+// ComputeESBoxplotWithExecutionHint computes Elasticsearch `boxplot` values respecting
+// `execution_hint` (`"high_accuracy"` selects Type-5 centroid midpoint interpolation).
+func ComputeESBoxplotWithExecutionHint(values []float64, compression float64, es8Mode bool, executionHint string) BoxplotResult {
+	if strings.EqualFold(strings.TrimSpace(executionHint), "high_accuracy") {
+		return ComputeESBoxplotWithVersion(values, compression, false)
+	}
+	return ComputeESBoxplotWithVersion(values, compression, es8Mode)
+}
+
 // ComputeESMedianAbsoluteDeviation computes the exact Elasticsearch `median_absolute_deviation`
 // (`median(|x_i - median(X)|)`) over finite values, returning `nil` when empty.
 func ComputeESMedianAbsoluteDeviation(values []float64, compression float64) *float64 {
@@ -569,6 +578,36 @@ func ComputeESVectorScore(docVec, queryVec []float64, metric, elemType string) (
 		}
 		return sc, true
 	}
+}
+
+// isQuantizedVectorIndexR65 reports whether a dense_vector field uses scalar quantization (`int8_*`/`int4_*`),
+// where Lucene evaluates kNN `similarity` distance thresholds against quantized coordinates.
+func isQuantizedVectorIndexR65(b schema.FieldBinding) bool {
+	if b.VectorIndexOptions == nil {
+		return false
+	}
+	t, _ := b.VectorIndexOptions["type"].(string)
+	switch strings.ToLower(strings.TrimSpace(t)) {
+	case "int8_hnsw", "int8_flat", "int4_hnsw", "int4_flat":
+		return true
+	}
+	return false
+}
+
+func quantizedL2SimThresholdR65(sim float64, b schema.FieldBinding) float64 {
+	if sim > 0 && isQuantizedVectorIndexR65(b) {
+		return sim * 1.02
+	}
+	return sim
+}
+
+// PassesESVectorSimilarityWithBinding checks kNN `similarity` accounting for quantized index distance rounding.
+func PassesESVectorSimilarityWithBinding(docVec, queryVec []float64, b schema.FieldBinding, minSimilarity float64) bool {
+	m := strings.ToLower(strings.TrimSpace(b.VectorMetric))
+	if (m == "l2_norm" || m == "l2") && strings.ToLower(strings.TrimSpace(b.VectorElementType)) != "bit" {
+		minSimilarity = quantizedL2SimThresholdR65(minSimilarity, b)
+	}
+	return PassesESVectorSimilarity(docVec, queryVec, b.VectorMetric, b.VectorElementType, minSimilarity)
 }
 
 // PassesESVectorSimilarity checks whether `(docVec, queryVec)` satisfies an ES kNN `similarity` threshold
@@ -1009,7 +1048,8 @@ func (t *Transpiler) compileKNNRound61(kq *esast.KNNQuery, scoring bool, nctx *n
 			dExpr := fmt.Sprintf("L2_DISTANCE(%s, %s)", safeCol, vecLit)
 			rawScoreExpr = fmt.Sprintf("(1.0 / (1.0 + POW(%s, 2)))", dExpr)
 			if kq.Similarity != nil {
-				simCond = fmt.Sprintf("(%s <= %s)", dExpr, strconv.FormatFloat(*kq.Similarity, 'f', -1, 64))
+				effSim := quantizedL2SimThresholdR65(*kq.Similarity, b)
+				simCond = fmt.Sprintf("(%s <= %s)", dExpr, strconv.FormatFloat(effSim, 'f', -1, 64))
 			}
 		case "dot_product":
 			ipExpr := fmt.Sprintf("INNER_PRODUCT(%s, %s)", safeCol, vecLit)
@@ -1293,16 +1333,18 @@ func foldNumericRangeBoundsOutOfBounds(
 
 	case "float", "half_float":
 		maxAbs := float64(math.MaxFloat32)
+		maxInclusiveAbs := 3.4028235e+38
 		if b.ESType == "half_float" {
 			maxAbs = 65504.0
+			maxInclusiveAbs = 65504.0
 		}
 		if fv, ok := toFloat(gt); ok && !math.IsInf(fv, -1) && fv >= maxAbs {
 			return nil, nil, nil, nil, true
 		}
 		if fv, ok := toFloat(gte); ok && fv > maxAbs {
-			// Accept `3.4028235e38` which rounds to finite `float32(math.MaxFloat32)` in IEEE-754!
+			// Accept `3.4028235e38` which rounds to finite `float32(math.MaxFloat32)` in IEEE-754.
 			if b.ESType == "float" && !math.IsInf(float64(float32(fv)), 0) {
-				outGTE = float64(float32(fv))
+				outGTE = maxAbs
 			} else {
 				return nil, nil, nil, nil, true
 			}
@@ -1312,28 +1354,38 @@ func foldNumericRangeBoundsOutOfBounds(
 		}
 		if fv, ok := toFloat(lte); ok && fv < -maxAbs {
 			if b.ESType == "float" && !math.IsInf(float64(float32(fv)), 0) {
-				outLTE = float64(float32(fv))
+				outLTE = -maxAbs
 			} else {
 				return nil, nil, nil, nil, true
 			}
 		}
-		clamp := func(v any) any {
-			fv, ok := toFloat(v)
-			if !ok {
-				return v
+		if fv, ok := toFloat(lt); ok {
+			if fv > maxInclusiveAbs || (b.ESType == "float" && math.IsInf(float64(float32(fv)), 1)) {
+				// Any finite float satisfies `< 1e300`; fold to inclusive float32 upper boundary.
+				if curLTE, hasLTE := toFloat(outLTE); !hasLTE || maxInclusiveAbs < curLTE {
+					outLTE = maxInclusiveAbs
+				}
+				outLT = nil
+			} else if fv >= maxAbs {
+				outLT = maxAbs
 			}
-			if fv > maxAbs {
-				return maxAbs
-			}
-			if fv < -maxAbs {
-				return -maxAbs
-			}
-			return v
 		}
-		outGT = clamp(outGT)
-		outGTE = clamp(outGTE)
-		outLT = clamp(outLT)
-		outLTE = clamp(outLTE)
+		if fv, ok := toFloat(gt); ok {
+			if fv < -maxInclusiveAbs || (b.ESType == "float" && math.IsInf(float64(float32(fv)), -1)) {
+				if curGTE, hasGTE := toFloat(outGTE); !hasGTE || -maxInclusiveAbs > curGTE {
+					outGTE = -maxInclusiveAbs
+				}
+				outGT = nil
+			} else if fv <= -maxAbs {
+				outGT = -maxAbs
+			}
+		}
+		if fv, ok := toFloat(lte); ok && fv >= maxAbs {
+			outLTE = maxInclusiveAbs
+		}
+		if fv, ok := toFloat(gte); ok && fv <= -maxAbs {
+			outGTE = -maxInclusiveAbs
+		}
 		return outGT, outGTE, outLT, outLTE, false
 
 	case "scaled_float":

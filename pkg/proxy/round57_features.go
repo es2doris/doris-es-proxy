@@ -6569,9 +6569,43 @@ func (s *Server) resolveSparseEmbeddingFromEndpointLocked(infID, queryText strin
 // 1) knn query_vector_builder.text_embedding -> query_vector via _inference
 // 2) sparse_vector inference_id + query -> query_vector via _inference
 // Returns (possiblyUpdatedBodyBytes, true) on success, or writes an ES error and returns (nil, false).
+func recordAnalyticsAggsMapR65(s *Server, aggs map[string]any) {
+	if s == nil || len(aggs) == 0 {
+		return
+	}
+	tr := getAnalyticsUsageTrackerR65(s)
+	for _, rawSpec := range aggs {
+		specMap, okM := rawSpec.(map[string]any)
+		if !okM || specMap == nil {
+			continue
+		}
+		for k, v := range specMap {
+			switch k {
+			case "boxplot", "top_metrics", "cumulative_cardinality", "t_test", "string_stats", "moving_percentiles", "normalize", "rate", "multi_terms":
+				tr.record(k)
+			case "aggs", "aggregations":
+				if sub, okSub := v.(map[string]any); okSub {
+					recordAnalyticsAggsMapR65(s, sub)
+				}
+			}
+		}
+	}
+}
+
 func (s *Server) preprocessSearchBodyRound57(w http.ResponseWriter, rawIndex string, bodyBytes []byte) ([]byte, bool) {
 	if len(bytes.TrimSpace(bodyBytes)) == 0 {
 		return bodyBytes, true
+	}
+	if bytes.Contains(bodyBytes, []byte(`"aggs"`)) || bytes.Contains(bodyBytes, []byte(`"aggregations"`)) {
+		var bodyMap map[string]any
+		if json.Unmarshal(bodyBytes, &bodyMap) == nil && bodyMap != nil {
+			if am, ok := bodyMap["aggs"].(map[string]any); ok {
+				recordAnalyticsAggsMapR65(s, am)
+			}
+			if am, ok := bodyMap["aggregations"].(map[string]any); ok {
+				recordAnalyticsAggsMapR65(s, am)
+			}
+		}
 	}
 	needsInferenceRewrite := bytes.Contains(bodyBytes, []byte("query_vector_builder")) ||
 		(bytes.Contains(bodyBytes, []byte("sparse_vector")) && (bytes.Contains(bodyBytes, []byte("inference_id")) || bytes.Contains(bodyBytes, []byte("model_id"))))
@@ -8475,30 +8509,41 @@ func (s *Server) handleSimulateIndexIngestRound57(w http.ResponseWriter, r *http
 		}
 
 		if docErr == nil && effPipe != "" && effPipe != "_none" {
-			pipeSpec, exists := lookupPipe(effPipe)
-			if !exists {
-				docErr = fmt.Errorf("pipeline with id [%s] does not exist", effPipe)
-			} else {
-				executedPipelines = append(executedPipelines, effPipe)
+			curPipe := effPipe
+			seenReroutes := map[string]bool{curPipe: true}
+			for curPipe != "" && curPipe != "_none" && docErr == nil && !dropped {
+				pipeSpec, exists := lookupPipe(curPipe)
+				if !exists {
+					docErr = fmt.Errorf("pipeline with id [%s] does not exist", curPipe)
+					break
+				}
+				prevDocIdx := docIndex
+				executedPipelines = append(executedPipelines, curPipe)
 				out, outIdx, outID, _, outRt, isDrop, trace, nextMeta, pErr := applyIngestPipelineSpecWithNameAndRoutingAndIngestMeta(
-					s, pipeSpec, effPipe, docIndex, docID, docRouting, curBytes, verbose, ingestMeta,
+					s, pipeSpec, curPipe, docIndex, docID, docRouting, curBytes, verbose, ingestMeta,
 				)
 				if pErr != nil {
 					docErr = pErr
-				} else {
-					curBytes = out
-					if outIdx != "" && outIdx != docIndex {
-						docIndex = outIdx
-						baseMapping, _, finalPipe = resolveIndexIngestConfig(docIndex)
-						compiledSchema = schema.CompileIndexSchema(s.dorisDB, docIndex, baseMapping)
+					break
+				}
+				curBytes = out
+				if outID != "" {
+					docID = outID
+				}
+				docRouting = outRt
+				dropped = isDrop
+				ingestMeta = nextMeta
+				allProcResults = append(allProcResults, trace...)
+				curPipe = ""
+				if outIdx != "" && outIdx != prevDocIdx {
+					docIndex = outIdx
+					var nextDefPipe string
+					baseMapping, nextDefPipe, finalPipe = resolveIndexIngestConfig(docIndex)
+					compiledSchema = schema.CompileIndexSchema(s.dorisDB, docIndex, baseMapping)
+					if nextDefPipe != "" && nextDefPipe != "_none" && !seenReroutes[nextDefPipe] {
+						seenReroutes[nextDefPipe] = true
+						curPipe = nextDefPipe
 					}
-					if outID != "" {
-						docID = outID
-					}
-					docRouting = outRt
-					dropped = isDrop
-					ingestMeta = nextMeta
-					allProcResults = append(allProcResults, trace...)
 				}
 			}
 		}
@@ -8541,13 +8586,19 @@ func (s *Server) handleSimulateIndexIngestRound57(w http.ResponseWriter, r *http
 
 		if docErr != nil {
 			errType := ingestSpecValidationErrorType(docErr)
+			errObj := map[string]any{
+				"root_cause": []map[string]any{{"type": errType, "reason": docErr.Error()}},
+				"type":       errType,
+				"reason":     docErr.Error(),
+			}
 			simResults = append(simResults, map[string]any{
 				"pipelines": executedPipelines,
-				"error": map[string]any{
-					"root_cause": []map[string]any{{"type": errType, "reason": docErr.Error()}},
-					"type":       errType,
-					"reason":     docErr.Error(),
+				"doc": map[string]any{
+					"_index": docIndex,
+					"_id":    docID,
+					"error":  errObj,
 				},
+				"error": errObj,
 			})
 			continue
 		}
@@ -8920,7 +8971,11 @@ func (s *Server) handleMigrationSystemFeaturesRound57(w http.ResponseWriter, r *
 		s.mu.Unlock()
 		writeJSON(w, http.StatusOK, map[string]any{
 			"acknowledged": true,
-			"features":     []string{"kibana", "security"},
+			"accepted":     true,
+			"features": []any{
+				map[string]any{"feature_name": "kibana"},
+				map[string]any{"feature_name": "security"},
+			},
 		})
 	default:
 		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")

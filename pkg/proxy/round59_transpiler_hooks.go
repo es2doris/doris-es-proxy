@@ -310,6 +310,8 @@ func parseAndApplyIndexMappingSettingsRound59(settings map[string]any, idxSchema
 		maxRegexLenLim  int
 		hasSourceMode   bool
 		sourceModeVal   string
+		hasIgnoreDyn    bool
+		ignoreDynVal    bool
 	)
 
 	if raw, ok := extractIndexSettingValueRound59(settings, "index.mapping.total_fields.limit"); ok {
@@ -405,6 +407,11 @@ func parseAndApplyIndexMappingSettingsRound59(settings map[string]any, idxSchema
 			return fmt.Errorf("illegal_argument_exception: unknown [index.mapping.source.mode] [%v]", raw)
 		}
 	}
+	if ignVal, hasIgn, err := schema.ExtractIgnoreDynamicBeyondLimitSetting(settings); err != nil {
+		return err
+	} else if hasIgn {
+		hasIgnoreDyn, ignoreDynVal = true, ignVal
+	}
 
 	if idxSchema == nil {
 		return nil
@@ -454,6 +461,9 @@ func parseAndApplyIndexMappingSettingsRound59(settings map[string]any, idxSchema
 	if hasSourceMode {
 		cand.SourceMode = sourceModeVal
 		cand.SyntheticSource = sourceModeVal == "synthetic"
+	}
+	if hasIgnoreDyn {
+		cand.IgnoreDynamicBeyondLimit = ignoreDynVal
 	}
 	if cand.RawMapping != nil {
 		if err := schema.ValidateMappingLimits(&cand, cand.RawMapping); err != nil {
@@ -854,7 +864,7 @@ func evalRuntimeSearchScoreWithErrorRound59(
 				cp[k] = v
 			}
 			cp["_score"] = baseScore
-			evalDoc := prepareDocForRuntimeScript(idxSchema, doc)
+			evalDoc := PrepareDocForRuntimeScriptRound61(idxSchema, doc, resolveRuntimeScriptES8ModeR61Search(idxSchema, doc))
 			fv, ok, err := painless.EvalNumber(evalDoc, src, cp)
 			if err != nil {
 				return 0, fmt.Errorf("search_phase_execution_exception: script_score runtime error: %w", err)
@@ -883,7 +893,7 @@ func evalRuntimeSearchScoreWithErrorRound59(
 				baseScore = scoreNonScriptClauseOnDoc(idxSchema, doc, q.FunctionScore.Query)
 			}
 		}
-		evalDoc := prepareDocForRuntimeScript(idxSchema, doc)
+		evalDoc := PrepareDocForRuntimeScriptRound61(idxSchema, doc, resolveRuntimeScriptES8ModeR61Search(idxSchema, doc))
 		var fnScores []float64
 		if q.FunctionScore.ScriptScore != nil && q.FunctionScore.ScriptScore.Script != nil {
 			src, params := extractScriptSourceAndParams(q.FunctionScore.ScriptScore.Script)

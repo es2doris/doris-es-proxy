@@ -1598,7 +1598,7 @@ func buildVectorSourceFallbackColExprR63(resolvedField string, b schema.FieldBin
 	nestedPath, _, _ := BuildQuotedDorisJSONPaths(pathField)
 	srcVecExpr := fmt.Sprintf("TRY_CAST(json_extract_string(`_source`, %s) AS ARRAY<FLOAT>)", quoteStr(nestedPath))
 	if b.ColumnName != "" {
-		return fmt.Sprintf("COALESCE(`%s`, %s)", b.ColumnName, srcVecExpr)
+		return fmt.Sprintf("IF(`%s` IS NOT NULL AND array_size(`%s`) > 0, `%s`, %s)", b.ColumnName, b.ColumnName, b.ColumnName, srcVecExpr)
 	}
 	var pathBuilder strings.Builder
 	segs := b.SourceJSONPath
@@ -1805,7 +1805,8 @@ func (t *Transpiler) compileNestedKNNQueryR63(nq *esast.NestedQuery, scoring boo
 			dExpr := fmt.Sprintf("L2_DISTANCE(%s, %s)", safeCol, vecLit)
 			rawScoreExpr = fmt.Sprintf("(1.0 / (1.0 + POW(%s, 2)))", dExpr)
 			if kq.Similarity != nil {
-				simCond = fmt.Sprintf("(%s <= %s)", dExpr, strconv.FormatFloat(*kq.Similarity, 'f', -1, 64))
+				effSim := quantizedL2SimThresholdR65(*kq.Similarity, b)
+				simCond = fmt.Sprintf("(%s <= %s)", dExpr, strconv.FormatFloat(effSim, 'f', -1, 64))
 			}
 		case "dot_product":
 			ipExpr := fmt.Sprintf("INNER_PRODUCT(%s, %s)", safeCol, vecLit)
@@ -2029,7 +2030,7 @@ func (t *Transpiler) compileSparseVectorTermQueryR63(cleanField string, val any,
 	pred := fmt.Sprintf("(%s IS NOT NULL AND %s > 0)", wExpr, wExpr)
 	score := "0.0"
 	if scoring && effBoost > 0 {
-		score = fmt.Sprintf("(CASE WHEN %s THEN (%s * GREATEST(COALESCE(CAST(%s AS DOUBLE), 0.0), 0.0)) ELSE 0.0 END)",
+		score = fmt.Sprintf("(CASE WHEN %s THEN (%s * GREATEST(COALESCE(TRY_CAST(%s AS DOUBLE), 0.0), 0.0)) ELSE 0.0 END)",
 			pred, strconv.FormatFloat(effBoost, 'g', -1, 64), wExpr)
 	}
 	return CompiledQuery{WhereSQL: pred, SafeWhereSQL: pred, ScoreSQL: score}, true
