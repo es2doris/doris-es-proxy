@@ -224,7 +224,7 @@ func (fw *esFormatResponseWriter) Write(b []byte) (int, error) {
 		fw.ResponseWriter.Header().Del("Content-Length")
 		fw.ResponseWriter.WriteHeader(status)
 		if fw.yamlBuf.Len() > 0 {
-			_, _ = fw.ResponseWriter.Write(fw.yamlBuf.Bytes())
+			_, _ = fw.ResponseWriter.Write(fw.yamlBuf.Bytes()) // #nosec G705 -- flushes already-encoded JSON/NDJSON API response bytes on YAML buffer overflow
 			fw.yamlBuf.Reset()
 		}
 		return fw.ResponseWriter.Write(b)

@@ -286,7 +286,7 @@ func runServerErr(ctx context.Context, args []string, flagOut io.Writer, listenF
 		defer close(shutdownDone)
 		<-sigCtx.Done()
 		log.Printf("shutting down doris-es-proxy gracefully...")
-		shutCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		shutCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
 		defer cancel()
 		_ = httpServer.Shutdown(shutCtx)
 		_ = srv.Close(shutCtx)

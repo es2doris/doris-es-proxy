@@ -1048,7 +1048,20 @@ func fetchURLSnapshotCatalogBytesR64(rawURL string, pathRepos []string, allowedP
 		if lErr != nil || !lfi.Mode().IsRegular() || lfi.Size() > maxSnapshotURLCatalogBytesR65 {
 			return nil, false
 		}
-		f, openErr := os.Open(resolvedCatalog)
+		resolvedRoot, rrErr := resolveSymlinkBestEffortR65(v.matchedPathRepo)
+		if rrErr != nil {
+			return nil, false
+		}
+		relCatalog, relErr := filepath.Rel(resolvedRoot, resolvedCatalog)
+		if relErr != nil || relCatalog == "." || strings.HasPrefix(relCatalog, "..") || filepath.IsAbs(relCatalog) {
+			return nil, false
+		}
+		root, rootErr := os.OpenRoot(resolvedRoot)
+		if rootErr != nil {
+			return nil, false
+		}
+		defer func() { _ = root.Close() }()
+		f, openErr := root.Open(relCatalog)
 		if openErr != nil {
 			return nil, false
 		}

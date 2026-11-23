@@ -33203,7 +33203,10 @@ func parseAnyDateValueMillisR65(v any, fmtHint string) (int64, bool) {
 	case int64:
 		return tv, true
 	case uint64:
-		return int64(tv), true
+		if tv <= math.MaxInt64 {
+			return int64(tv), true // #nosec G115 -- bounds-checked against math.MaxInt64
+		}
+		return 0, false
 	case int:
 		return int64(tv), true
 	case float64:
