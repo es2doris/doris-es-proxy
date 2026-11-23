@@ -3079,6 +3079,15 @@ func formatESQLBoundLiteral(val any) string {
 	if val == nil {
 		return "null"
 	}
+	// Named parameters may be wrapped in single-entry objects like {"n1": "1"}.
+	if m, ok := val.(map[string]any); ok && len(m) == 1 {
+		for _, mv := range m {
+			val = mv
+		}
+		if val == nil {
+			return "null"
+		}
+	}
 	switch v := val.(type) {
 	case string:
 		b, _ := json.Marshal(v)
@@ -3088,6 +3097,19 @@ func formatESQLBoundLiteral(val any) string {
 			return "true"
 		}
 		return "false"
+	case json.Number:
+		return v.String()
+	case float64:
+		if !math.IsNaN(v) && !math.IsInf(v, 0) && math.Abs(v) < 1e18 {
+			return strconv.FormatFloat(v, 'f', -1, 64)
+		}
+		return strconv.FormatFloat(v, 'g', -1, 64)
+	case float32:
+		f64 := float64(v)
+		if !math.IsNaN(f64) && !math.IsInf(f64, 0) && math.Abs(f64) < 1e18 {
+			return strconv.FormatFloat(f64, 'f', -1, 32)
+		}
+		return strconv.FormatFloat(f64, 'g', -1, 32)
 	default:
 		return fmt.Sprintf("%v", v)
 	}
@@ -3215,20 +3237,26 @@ func tokenizeESQLExpr(expr string) []esqlTok {
 		}
 		if ch >= '0' && ch <= '9' {
 			start := i
-			hasDot := false
+			hasDotOrExp := false
 			for i < len(expr) {
 				c := expr[i]
 				if c >= '0' && c <= '9' {
 					i++
-				} else if c == '.' && !hasDot {
-					hasDot = true
+				} else if c == '.' && !hasDotOrExp {
+					hasDotOrExp = true
 					i++
+				} else if (c == 'e' || c == 'E') && i > start {
+					hasDotOrExp = true
+					i++
+					if i < len(expr) && (expr[i] == '+' || expr[i] == '-') {
+						i++
+					}
 				} else {
 					break
 				}
 			}
 			numStr := expr[start:i]
-			if hasDot {
+			if hasDotOrExp {
 				fv, _ := strconv.ParseFloat(numStr, 64)
 				toks = append(toks, esqlTok{kind: esqlTokLit, val: fv})
 			} else {
@@ -3694,14 +3722,31 @@ func evalESQLFunc(name string, args []any) any {
 	case "CONCAT":
 		var sb strings.Builder
 		for _, a := range args {
-			if a != nil {
-				_, _ = fmt.Fprintf(&sb, "%v", a)
+			if a == nil {
+				return nil
 			}
+			_, _ = fmt.Fprintf(&sb, "%v", a)
 		}
 		return sb.String()
 	case "TO_STRING":
 		if len(args) == 0 || args[0] == nil {
 			return nil
+		}
+		switch arr := args[0].(type) {
+		case []any:
+			out := make([]any, len(arr))
+			for i, el := range arr {
+				if el != nil {
+					out[i] = fmt.Sprintf("%v", el)
+				}
+			}
+			return out
+		case []string:
+			out := make([]any, len(arr))
+			for i, el := range arr {
+				out[i] = el
+			}
+			return out
 		}
 		return fmt.Sprintf("%v", args[0])
 	case "TO_INTEGER", "TO_INT", "TO_LONG":
@@ -3995,10 +4040,25 @@ func computeESQLAggregate(fn, arg string, grpRows []map[string]any) (any, string
 
 	case "COUNT_DISTINCT":
 		seen := make(map[string]bool)
+		addDistinct := func(val any) {
+			if val != nil {
+				seen[fmt.Sprintf("%T:%v", val, val)] = true
+			}
+		}
 		for _, r := range grpRows {
 			v := evalESQLExpr(arg, r)
-			if v != nil {
-				seen[fmt.Sprintf("%T:%v", v, v)] = true
+			switch sv := v.(type) {
+			case nil:
+			case []any:
+				for _, el := range sv {
+					addDistinct(el)
+				}
+			case []string:
+				for _, el := range sv {
+					addDistinct(el)
+				}
+			default:
+				addDistinct(sv)
 			}
 		}
 		return int64(len(seen)), "long"
@@ -4074,16 +4134,31 @@ func computeESQLAggregate(fn, arg string, grpRows []map[string]any) (any, string
 		seen := make(map[string]bool)
 		vals := []any{}
 		elemType := "keyword"
-		for _, r := range grpRows {
-			v := evalESQLExpr(arg, r)
-			if v == nil {
-				continue
+		addVal := func(val any) {
+			if val == nil {
+				return
 			}
-			k := fmt.Sprintf("%T:%v", v, v)
+			k := fmt.Sprintf("%T:%v", val, val)
 			if !seen[k] {
 				seen[k] = true
-				vals = append(vals, v)
-				elemType = inferESQLValueType(v)
+				vals = append(vals, val)
+				elemType = inferESQLValueType(val)
+			}
+		}
+		for _, r := range grpRows {
+			v := evalESQLExpr(arg, r)
+			switch sv := v.(type) {
+			case nil:
+			case []any:
+				for _, el := range sv {
+					addVal(el)
+				}
+			case []string:
+				for _, el := range sv {
+					addVal(el)
+				}
+			default:
+				addVal(sv)
 			}
 		}
 		return vals, elemType
@@ -4096,6 +4171,51 @@ func computeESQLAggregate(fn, arg string, grpRows []map[string]any) (any, string
 	return nil, "keyword"
 }
 
+func computeESQLAggregateWithSummaryR64(fn, arg string, grpRows []map[string]any, colTypes map[string]string, fromSummary esqlIndexFieldSummaryRound63) (any, string) {
+	evalRows := grpRows
+	if len(fromSummary.ambiguousError) > 0 && strings.Contains(strings.ToUpper(arg), "TO_") && len(grpRows) > 0 {
+		evalRows = make([]map[string]any, len(grpRows))
+		for i, r := range grpRows {
+			evalRows[i] = esqlRowWithRawAmbiguousForExprR64(arg, r, fromSummary.ambiguousError)
+		}
+	}
+	val, tName := computeESQLAggregate(fn, arg, evalRows)
+	upFn := strings.ToUpper(strings.TrimSpace(fn))
+	staticArgT := inferESQLExprStaticTypeRound63(arg, colTypes)
+	switch upFn {
+	case "COUNT", "COUNT_DISTINCT":
+		return val, "long"
+	case "SUM":
+		wantT := esqlStaticSumTypeR64(arg, colTypes)
+		if val == nil {
+			return nil, wantT
+		}
+		if wantT == "double" {
+			if fv, ok := toFloat64(val); ok {
+				return fv, "double"
+			}
+			return val, "double"
+		}
+		if iv, ok := esqlAsInt64Exact(val); ok && wantT == "long" {
+			return iv, "long"
+		}
+		if wantT == "unsigned_long" {
+			return val, "unsigned_long"
+		}
+		return val, tName
+	case "AVG", "MEDIAN", "PERCENTILE", "MEDIAN_ABSOLUTE_DEVIATION":
+		return val, "double"
+	case "VALUES", "MIN", "MAX":
+		if staticArgT != "" && staticArgT != "null" && staticArgT != "unsupported" {
+			return val, staticArgT
+		}
+		if val == nil {
+			return nil, "keyword"
+		}
+	}
+	return val, tName
+}
+
 func (s *Server) executeESQLQueryEngine(w http.ResponseWriter, r *http.Request, body map[string]any, queryStr string) {
 	params, _ := body["params"].([]any)
 	paramCursor := 0
@@ -4106,6 +4226,7 @@ func (s *Server) executeESQLQueryEngine(w http.ResponseWriter, r *http.Request, 
 	colTypes := make(map[string]string)
 	var fromSummary esqlIndexFieldSummaryRound63
 	limit := 1000
+	hasExplicitLimit := false
 
 	for idx, rawStage := range stages {
 		st := strings.TrimSpace(rawStage)
@@ -4340,13 +4461,26 @@ func (s *Server) executeESQLQueryEngine(w http.ResponseWriter, r *http.Request, 
 		case esqlStageHasKeyword(upper, "LIMIT") && len(st) > 5:
 			if n, err := strconv.Atoi(strings.TrimSpace(st[5:])); err == nil && n >= 0 {
 				limit = n
+				hasExplicitLimit = true
+				if len(rows) > n {
+					rows = rows[:n]
+				}
 			}
 
 		case esqlStageHasKeyword(upper, "WHERE") && len(st) > 5:
 			cond := rewriteESQLDoubleColonCastsRound63(strings.TrimSpace(st[5:]))
+			if ambMsg := esqlCheckAmbiguousExprR64(cond, fromSummary); ambMsg != "" {
+				writeESError(w, http.StatusBadRequest, "verification_exception", "Found 1 problem\nline 1:1: "+ambMsg)
+				return
+			}
+			if cntMsg := esqlFindBareCounterColumnR64(cond, colTypes); cntMsg != "" {
+				writeESError(w, http.StatusBadRequest, "verification_exception", "Found 1 problem\nline 1:1: "+cntMsg)
+				return
+			}
 			filtered := make([]map[string]any, 0, len(rows))
 			for _, row := range rows {
-				if evalESQLCond(cond, row) {
+				evalRow := esqlRowWithRawAmbiguousForExprR64(cond, row, fromSummary.ambiguousError)
+				if evalESQLCond(cond, evalRow) {
 					filtered = append(filtered, row)
 				}
 			}
@@ -4365,40 +4499,18 @@ func (s *Server) executeESQLQueryEngine(w http.ResponseWriter, r *http.Request, 
 					exprStr = a
 				}
 				exprStr = rewriteESQLDoubleColonCastsRound63(exprStr)
-				// Check multi-index ambiguous column conversion compatibility
-				upExpr := strings.ToUpper(strings.TrimSpace(exprStr))
-				for ambCol, ambMsg := range fromSummary.ambiguousError {
-					if strings.Contains(exprStr, ambCol) {
-						if strings.HasPrefix(upExpr, "TO_IP(") && strings.Contains(ambMsg, "[long]") {
-							writeESError(w, http.StatusBadRequest, "verification_exception", "Found 1 problem\nline 1:1: "+ambMsg)
-							return
-						}
-						if strings.HasPrefix(upExpr, "TO_LONG(") && strings.Contains(ambMsg, "[ip]") {
-							writeESError(w, http.StatusBadRequest, "verification_exception", "Found 1 problem\nline 1:1: "+ambMsg)
-							return
-						}
-					}
+				if ambMsg := esqlCheckAmbiguousExprR64(exprStr, fromSummary); ambMsg != "" {
+					writeESError(w, http.StatusBadRequest, "verification_exception", "Found 1 problem\nline 1:1: "+ambMsg)
+					return
+				}
+				if cntMsg := esqlFindBareCounterColumnR64(exprStr, colTypes); cntMsg != "" {
+					writeESError(w, http.StatusBadRequest, "verification_exception", "Found 1 problem\nline 1:1: "+cntMsg)
+					return
 				}
 				staticT := inferESQLExprStaticTypeRound63(exprStr, colTypes)
 				inferred := ""
 				for _, row := range rows {
-					evalRow := row
-					clonedEvalRow := false
-					// Expose raw ambiguous values to explicit `TO_*` conversion functions
-					if strings.HasPrefix(upExpr, "TO_") {
-						for ambCol := range fromSummary.ambiguousError {
-							if rawAmb, hasRaw := row["__raw_"+ambCol]; hasRaw {
-								if !clonedEvalRow {
-									clonedEvalRow = true
-									evalRow = make(map[string]any, len(row))
-									for rk, rv := range row {
-										evalRow[rk] = rv
-									}
-								}
-								evalRow[ambCol] = rawAmb
-							}
-						}
-					}
+					evalRow := esqlRowWithRawAmbiguousForExprR64(exprStr, row, fromSummary.ambiguousError)
 					val := evalESQLExpr(exprStr, evalRow)
 					if arr, okA := val.([]any); okA && len(arr) == 1 {
 						val = arr[0]
@@ -4456,13 +4568,30 @@ func (s *Server) executeESQLQueryEngine(w http.ResponseWriter, r *http.Request, 
 							"Found 1 problem\nline 1:1: COUNT_DISTINCT(_source) is not supported")
 						return
 					}
+					if arg != "" && arg != "*" {
+						if ambMsg := esqlCheckAmbiguousExprR64(arg, fromSummary); ambMsg != "" {
+							writeESError(w, http.StatusBadRequest, "verification_exception", "Found 1 problem\nline 1:1: "+ambMsg)
+							return
+						}
+						if !strings.EqualFold(fn, "SUM") && !strings.EqualFold(fn, "COUNT") && !strings.EqualFold(fn, "COUNT_DISTINCT") {
+							if cntMsg := esqlFindBareCounterColumnR64(arg, colTypes); cntMsg != "" {
+								writeESError(w, http.StatusBadRequest, "verification_exception", "Found 1 problem\nline 1:1: "+cntMsg)
+								return
+							}
+						}
+					}
 					if strings.EqualFold(fn, "VALUES") {
 						switch colTypes[argClean] {
-						case "geo_point", "cartesian_point", "geo_shape", "cartesian_shape":
+						case "geo_point", "cartesian_point", "geo_shape", "cartesian_shape", "unsupported", "_source":
 							writeESError(w, http.StatusBadRequest, "verification_exception",
 								fmt.Sprintf("Found 1 problem\nline 1:1: 1st argument of [VALUES(%s)] must be [boolean, date, double, integer, ip, keyword, long, null, text, unsigned_long or version], found value [%s] of type [%s]", arg, arg, colTypes[argClean]))
 							return
 						}
+					}
+					if strings.HasPrefix(colTypes[argClean], "aggregate_metric") || (colTypes[argClean] == "unsupported" && argClean != "*") {
+						writeESError(w, http.StatusBadRequest, "verification_exception",
+							fmt.Sprintf("Found 1 problem\nline 1:1: Unknown or unsupported column [%s] of type [%s] in [%s]", argClean, colTypes[argClean], fn))
+						return
 					}
 					if argClean != "" && argClean != "*" && !strings.ContainsAny(arg, "()+-*/'\"0123456789") && fromSummary.hasMappings && colTypes[argClean] == "" {
 						writeESError(w, http.StatusBadRequest, "verification_exception",
@@ -4486,8 +4615,12 @@ func (s *Server) executeESQLQueryEngine(w http.ResponseWriter, r *http.Request, 
 					}
 					exprStr = rewriteESQLDoubleColonCastsRound63(exprStr)
 					exprClean := unquoteESQLIdent(exprStr)
-					if ambMsg := fromSummary.ambiguousError[exprClean]; ambMsg != "" {
+					if ambMsg := esqlCheckAmbiguousExprR64(exprStr, fromSummary); ambMsg != "" {
 						writeESError(w, http.StatusBadRequest, "verification_exception", "Found 1 problem\nline 1:1: "+ambMsg)
+						return
+					}
+					if cntMsg := esqlFindBareCounterColumnR64(exprStr, colTypes); cntMsg != "" {
+						writeESError(w, http.StatusBadRequest, "verification_exception", "Found 1 problem\nline 1:1: "+cntMsg)
 						return
 					}
 					if exprClean != "" && !strings.ContainsAny(exprStr, "()+-*/'\"0123456789") && fromSummary.hasMappings && colTypes[exprClean] == "" {
@@ -4509,22 +4642,26 @@ func (s *Server) executeESQLQueryEngine(w http.ResponseWriter, r *http.Request, 
 				bucketOrder = []string{""}
 				buckets[""] = &grpBucket{rows: nil}
 			} else {
+				gExprs := make([]string, len(grpSpecs))
+				for gi, gs := range grpSpecs {
+					gExprs[gi] = gs.expr
+				}
 				for _, row := range rows {
-					gVals := make([]any, len(grpSpecs))
-					var kb strings.Builder
-					for gi, gs := range grpSpecs {
-						gv := evalESQLExpr(gs.expr, row)
-						gVals[gi] = gv
-						_, _ = fmt.Fprintf(&kb, "%T:%v|", gv, gv)
+					tuples := expandESQLGroupTuplesR64(row, gExprs, fromSummary.ambiguousError)
+					for _, gVals := range tuples {
+						var kb strings.Builder
+						for _, gv := range gVals {
+							_, _ = fmt.Fprintf(&kb, "%T:%v|", gv, gv)
+						}
+						key := kb.String()
+						b, exists := buckets[key]
+						if !exists {
+							b = &grpBucket{gVals: gVals}
+							buckets[key] = b
+							bucketOrder = append(bucketOrder, key)
+						}
+						b.rows = append(b.rows, row)
 					}
-					key := kb.String()
-					b, exists := buckets[key]
-					if !exists {
-						b = &grpBucket{gVals: gVals}
-						buckets[key] = b
-						bucketOrder = append(bucketOrder, key)
-					}
-					b.rows = append(b.rows, row)
 				}
 			}
 
@@ -4532,9 +4669,18 @@ func (s *Server) executeESQLQueryEngine(w http.ResponseWriter, r *http.Request, 
 			newColTypes := make(map[string]string)
 			for _, as := range aggSpecs {
 				newColOrder = append(newColOrder, as.outCol)
+				_, stT := computeESQLAggregateWithSummaryR64(as.fn, as.arg, nil, colTypes, fromSummary)
+				if stT != "" {
+					newColTypes[as.outCol] = stT
+				}
 			}
 			for _, gs := range grpSpecs {
 				newColOrder = append(newColOrder, gs.outCol)
+				if stT := inferESQLExprStaticTypeRound63(gs.expr, colTypes); stT != "" {
+					newColTypes[gs.outCol] = stT
+				} else if colTypes[gs.outCol] != "" {
+					newColTypes[gs.outCol] = colTypes[gs.outCol]
+				}
 			}
 
 			nextRows := make([]map[string]any, 0, len(bucketOrder))
@@ -4542,9 +4688,9 @@ func (s *Server) executeESQLQueryEngine(w http.ResponseWriter, r *http.Request, 
 				b := buckets[bk]
 				outRow := make(map[string]any, len(aggSpecs)+len(grpSpecs))
 				for _, as := range aggSpecs {
-					val, tName := computeESQLAggregate(as.fn, as.arg, b.rows)
+					val, tName := computeESQLAggregateWithSummaryR64(as.fn, as.arg, b.rows, colTypes, fromSummary)
 					outRow[as.outCol] = val
-					if newColTypes[as.outCol] == "" || val != nil {
+					if newColTypes[as.outCol] == "" || (val != nil && tName != "") {
 						newColTypes[as.outCol] = tName
 					}
 				}
@@ -4564,6 +4710,7 @@ func (s *Server) executeESQLQueryEngine(w http.ResponseWriter, r *http.Request, 
 			rows = nextRows
 			colOrder = newColOrder
 			colTypes = newColTypes
+			fromSummary.ambiguousError = make(map[string]string)
 
 		case esqlStageHasKeyword(upper, "KEEP") && len(st) > 4:
 			var nextCols []string
@@ -4612,6 +4759,8 @@ func (s *Server) executeESQLQueryEngine(w http.ResponseWriter, r *http.Request, 
 			for _, c := range colOrder {
 				if !shouldDrop(c) {
 					nextCols = append(nextCols, c)
+				} else {
+					delete(fromSummary.ambiguousError, c)
 				}
 			}
 			for _, row := range rows {
@@ -4644,6 +4793,12 @@ func (s *Server) executeESQLQueryEngine(w http.ResponseWriter, r *http.Request, 
 				if colTypes[oldCol] != "" {
 					colTypes[newCol] = colTypes[oldCol]
 				}
+				if ambMsg := fromSummary.ambiguousError[oldCol]; ambMsg != "" {
+					fromSummary.ambiguousError[newCol] = ambMsg
+					if oldCol != newCol {
+						delete(fromSummary.ambiguousError, oldCol)
+					}
+				}
 				for _, row := range rows {
 					if val, exists := row[oldCol]; exists {
 						row[newCol] = val
@@ -4667,6 +4822,15 @@ func (s *Server) executeESQLQueryEngine(w http.ResponseWriter, r *http.Request, 
 					continue
 				}
 				sc := sortClause{col: unquoteESQLIdent(toks[0])}
+				if ambMsg := fromSummary.ambiguousError[sc.col]; ambMsg != "" {
+					writeESError(w, http.StatusBadRequest, "verification_exception", "Found 1 problem\nline 1:1: "+ambMsg)
+					return
+				}
+				if esqlIsCounterTypeR64(colTypes[sc.col]) {
+					writeESError(w, http.StatusBadRequest, "verification_exception",
+						fmt.Sprintf("Found 1 problem\nline 1:1: cannot sort on %s column [%s]", colTypes[sc.col], sc.col))
+					return
+				}
 				switch colTypes[sc.col] {
 				case "geo_point", "cartesian_point", "geo_shape", "cartesian_shape":
 					writeESError(w, http.StatusBadRequest, "verification_exception",
@@ -4738,7 +4902,7 @@ func (s *Server) executeESQLQueryEngine(w http.ResponseWriter, r *http.Request, 
 		}
 	}
 
-	if len(rows) > limit {
+	if !hasExplicitLimit && len(rows) > limit {
 		rows = rows[:limit]
 	}
 
@@ -4841,9 +5005,21 @@ func (s *Server) executeESQLQueryEngine(w http.ResponseWriter, r *http.Request, 
 			"drivers": []any{
 				map[string]any{
 					"took_nanos": 1000,
+					"cpu_nanos":  500,
 					"operators": []any{
 						map[string]any{
 							"operator":    opName,
+							"status":      map[string]any{"rows_processed": len(rows)},
+							"pages_added": 1,
+						},
+					},
+				},
+				map[string]any{
+					"took_nanos": 500,
+					"cpu_nanos":  250,
+					"operators": []any{
+						map[string]any{
+							"operator":    "ExchangeSinkOperator",
 							"status":      map[string]any{"rows_processed": len(rows)},
 							"pages_added": 1,
 						},

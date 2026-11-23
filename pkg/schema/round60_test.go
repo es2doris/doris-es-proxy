@@ -41,6 +41,19 @@ func TestRound60_F11_SyntheticSource_SerializeMappings_DottedProperties(t *testi
 	}
 
 	// 3. Dotted property key expansion during parsing, compilation, and serialization
+	var invalidSynSpec esast.MappingSpec
+	if err := json.Unmarshal([]byte(`{
+		"_source": {"mode": "synthetic"},
+		"properties": {
+			"secret": {"type": "keyword", "doc_values": false}
+		}
+	}`), &invalidSynSpec); err != nil {
+		t.Fatalf("unmarshal invalidSynSpec failed: %v", err)
+	}
+	if err := ValidateMappingSpec(&invalidSynSpec); err == nil {
+		t.Fatalf("expected ValidateMappingSpec to reject doc_values:false without store:true under synthetic _source")
+	}
+
 	var dottedSpec esast.MappingSpec
 	if err := json.Unmarshal([]byte(`{
 		"_source": {"mode": "synthetic"},
@@ -48,7 +61,6 @@ func TestRound60_F11_SyntheticSource_SerializeMappings_DottedProperties(t *testi
 			"subfield.text3": {"type": "text", "meta": {"owner": "search"}},
 			"subfield.num": {"type": "integer"},
 			"tags": {"type": "keyword"},
-			"secret": {"type": "keyword", "doc_values": false},
 			"disabled_obj": {"type": "object", "enabled": false}
 		}
 	}`), &dottedSpec); err != nil {
@@ -92,7 +104,6 @@ func TestRound60_F11_SyntheticSource_SerializeMappings_DottedProperties(t *testi
 	rawDoc := []byte(`{
 		"tags": ["zeta", "alpha", "beta"],
 		"subfield": {"text3": "hello", "num": [30, 10, 20]},
-		"secret": "hidden_no_dv",
 		"disabled_obj": {"foo": "bar"}
 	}`)
 	shreddedBytes, err := ShredDocument(idx, "1", 1, false, rawDoc)
@@ -106,9 +117,6 @@ func TestRound60_F11_SyntheticSource_SerializeMappings_DottedProperties(t *testi
 	var gotSyn map[string]any
 	if err := json.Unmarshal([]byte(shreddedRow["_source"].(string)), &gotSyn); err != nil {
 		t.Fatalf("unmarshal synthetic _source failed: %v", err)
-	}
-	if _, hasSecret := gotSyn["secret"]; hasSecret {
-		t.Fatalf("expected doc_values:false field 'secret' omitted from synthetic _source: %#v", gotSyn)
 	}
 	if disMap, ok := gotSyn["disabled_obj"].(map[string]any); !ok || disMap["foo"] != "bar" {
 		t.Fatalf("expected enabled:false object 'disabled_obj' retained in ES 8.4+ synthetic _source, got %#v", gotSyn["disabled_obj"])

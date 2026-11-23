@@ -30,6 +30,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/es2doris/doris-es-proxy/pkg/analysis"
 	"github.com/es2doris/doris-es-proxy/pkg/esast"
 )
 
@@ -90,8 +91,10 @@ type FieldBinding struct {
 	DorisType           DorisScalarType
 	ESType              string // Declared Elasticsearch field type (e.g. "date", "long", "keyword")
 	Format              string // Optional ES date/number format
+	Locale              string // Optional ES date locale (e.g. "fr")
 	Analyzer            string
 	SearchAnalyzer      string
+	NormalizerName      string
 	LowercaseNormalizer bool
 	KeywordCompanion    string // Optional untokenized `.keyword` column for `text` fields
 	KeywordNormalizer   bool   // Whether `KeywordCompanion` has a lowercase normalizer
@@ -241,6 +244,8 @@ type IndexSchema struct {
 	TimeSeriesEndTime        string
 	IgnoreDynamicBeyondLimit bool
 	IsRuntimeEvalSchema      bool
+	NestedEvalRoot           string
+	AnalysisConfig           *analysis.IndexAnalysisConfig
 }
 
 // CopyIndexMappingSettingsFrom copies index-level mapping/search limits and defaults from src into s.
@@ -336,6 +341,9 @@ func (s *IndexSchema) CopyIndexMappingSettingsFrom(src *IndexSchema) {
 	}
 	if src.IsRuntimeEvalSchema {
 		s.IsRuntimeEvalSchema = true
+	}
+	if src.AnalysisConfig != nil && s.AnalysisConfig == nil {
+		s.AnalysisConfig = src.AnalysisConfig
 	}
 	for fn, srcFB := range src.Fields {
 		if srcFB.AdoptedConstantValue {
@@ -487,6 +495,89 @@ func CompileIndexSchema(dorisDB, indexName string, mapping *esast.MappingSpec) *
 	}
 	s.finalizeCompiledSlices()
 	return s
+}
+
+// CompileIndexSchemaWithSettings compiles an IndexSchema with optional ES index settings (e.g. `analysis.normalizer`).
+func CompileIndexSchemaWithSettings(dorisDB, indexName string, mapping *esast.MappingSpec, settings map[string]any) *IndexSchema {
+	s := CompileIndexSchema(dorisDB, indexName, mapping)
+	if len(settings) > 0 {
+		_ = s.SetAnalysisSettings(settings)
+	}
+	return s
+}
+
+// SetAnalysisSettings parses and attaches ES index analysis settings to s and refreshes field normalizer flags.
+func (s *IndexSchema) SetAnalysisSettings(settings map[string]any) error {
+	if s == nil {
+		return nil
+	}
+	cfg, err := analysis.ParseIndexAnalysisConfig(settings, analysis.Options{})
+	if err != nil {
+		return err
+	}
+	s.AnalysisConfig = cfg
+	for k, b := range s.Fields {
+		if b.NormalizerName != "" {
+			b.LowercaseNormalizer = normalizerUsesLowercaseFilter(b.NormalizerName, cfg)
+			s.Fields[k] = b
+		}
+	}
+	for k, b := range s.Fields {
+		if b.KeywordCompanion != "" {
+			if kwB, ok := s.Fields[k+".keyword"]; ok {
+				b.KeywordNormalizer = kwB.LowercaseNormalizer
+				s.Fields[k] = b
+			}
+		}
+	}
+	for i, ob := range s.OrderedFields {
+		if updated, ok := s.Fields[ob.ESFieldPath]; ok {
+			s.OrderedFields[i] = updated
+		}
+	}
+	return nil
+}
+
+func normalizerUsesLowercaseFilter(normName string, cfg *analysis.IndexAnalysisConfig) bool {
+	trimmed := strings.TrimSpace(normName)
+	if trimmed == "" || strings.EqualFold(trimmed, "none") {
+		return false
+	}
+	if strings.EqualFold(trimmed, "lowercase") {
+		return true
+	}
+	if cfg == nil {
+		return true
+	}
+	def, ok := cfg.NormalizerDefs[trimmed]
+	if !ok {
+		return false
+	}
+	var names []string
+	switch fv := def["filter"].(type) {
+	case string:
+		names = []string{fv}
+	case []string:
+		names = fv
+	case []any:
+		for _, item := range fv {
+			if sv, okS := item.(string); okS {
+				names = append(names, sv)
+			}
+		}
+	}
+	for _, fn := range names {
+		lf := strings.ToLower(strings.TrimSpace(fn))
+		if lf == "lowercase" || lf == "icu_normalizer" || lf == "icu_folding" {
+			return true
+		}
+		if fDef, hasF := cfg.FilterDefs[fn]; hasF {
+			if ft, _ := fDef["type"].(string); strings.EqualFold(strings.TrimSpace(ft), "lowercase") {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (s *IndexSchema) finalizeCompiledSlices() {
@@ -1056,7 +1147,7 @@ func validateNullValueForField(fullPath, fType string, prop esast.FieldProperty)
 	case "", "text", "match_only_text", "annotated-text", "annotated_text", "search_as_you_type",
 		"nested", "object", "flattened", "percolator", "join", "dense_vector", "knn_vector", "sparse_vector",
 		"rank_features", "rank_vector",
-		"alias", "binary", "wildcard", "completion", "token_count", "murmur3",
+		"alias", "binary", "completion", "token_count", "murmur3",
 		"histogram", "aggregate_metric_double", "geo_shape", "shape", "constant_keyword":
 		return fmt.Errorf("mapper_parsing_exception:Mapping definition for [%s] has unsupported parameters: [null_value] is not supported on [%s]", fullPath, fType)
 	}
@@ -1090,7 +1181,7 @@ func validateNullValueForField(fullPath, fType string, prop esast.FieldProperty)
 		return fmt.Errorf("mapper_parsing_exception: [null_value] on field [%s] must be a scalar value", fullPath)
 	}
 	switch fType {
-	case "keyword", "passthrough":
+	case "keyword", "wildcard", "passthrough":
 		return nil
 	case "boolean":
 		if prop.Coerce != nil && !*prop.Coerce {
@@ -1154,12 +1245,14 @@ func validateNullValueForField(fullPath, fType string, prop esast.FieldProperty)
 		}
 	}
 	tmpB := FieldBinding{
-		ESFieldPath:   fullPath,
-		ESType:        fType,
-		DorisType:     mapESTypeToDoris(fType),
-		Format:        prop.Format,
-		Coerce:        prop.Coerce,
-		ScalingFactor: prop.ScalingFactor,
+		ESFieldPath:    fullPath,
+		ESType:         fType,
+		DorisType:      mapESTypeToDoris(fType),
+		Format:         prop.Format,
+		Locale:         prop.Locale,
+		NormalizerName: prop.Normalizer,
+		Coerce:         prop.Coerce,
+		ScalingFactor:  prop.ScalingFactor,
 	}
 	if coerceScalarBindingForDoris(prop.NullValue, tmpB, time.Now().UTC()) == nil {
 		return fmt.Errorf("mapper_parsing_exception: failed to parse [null_value] on [%s] field [%s]", fType, fullPath)
@@ -1196,7 +1289,7 @@ func validateSingleFieldProperty(fullPath, fType string, prop esast.FieldPropert
 			prop.Value != nil || prop.Script != nil || prop.OnScriptError != "" ||
 			prop.IncludeInParent != nil || prop.IncludeInRoot != nil ||
 			prop.Analyzer != "" || prop.SearchAnalyzer != "" || prop.Normalizer != "" ||
-			prop.Format != "" || prop.TimeZone != "" ||
+			prop.Format != "" || prop.Locale != "" || prop.TimeZone != "" ||
 			prop.Dims != 0 || prop.Dimension != 0 || prop.Similarity != "" || prop.ElementType != "" ||
 			prop.MultiValued || prop.UpgradedArray ||
 			prop.NullValue != nil || prop.IgnoreAbove != 0 ||
@@ -1472,15 +1565,7 @@ func validateSingleFieldProperty(fullPath, fType string, prop esast.FieldPropert
 		default:
 			return fmt.Errorf("mapper_parsing_exception: [copy_to] on field [%s] must be a string or array of strings", fullPath)
 		}
-		shortName := fullPath
-		if dot := strings.LastIndex(fullPath, "."); dot >= 0 {
-			shortName = fullPath[dot+1:]
-		}
-		for _, target := range targets {
-			if target == fullPath || target == shortName {
-				return fmt.Errorf("mapper_parsing_exception: Cannot copy field [%s] to itself", fullPath)
-			}
-		}
+		_ = targets
 	}
 	return nil
 }
@@ -1491,6 +1576,7 @@ var validRuntimeFieldTypes = map[string]bool{
 	"date":      true,
 	"double":    true,
 	"geo_point": true,
+	"geo_shape": true,
 	"ip":        true,
 	"keyword":   true,
 	"long":      true,
@@ -2580,6 +2666,9 @@ func deepMergeMappingPropertiesWithSubobjects(
 			if v.Format != "" {
 				merged.Format = v.Format
 			}
+			if v.Locale != "" {
+				merged.Locale = v.Locale
+			}
 			if v.Dims > 0 {
 				merged.Dims = v.Dims
 			}
@@ -2919,7 +3008,7 @@ func (s *IndexSchema) registerLeafField(
 		}
 		return
 	}
-	lowerNorm := prop.Normalizer != "" && !strings.EqualFold(prop.Normalizer, "none")
+	lowerNorm := normalizerUsesLowercaseFilter(prop.Normalizer, s.AnalysisConfig)
 	copyTo := parseCopyToTargets(prop.CopyTo)
 	notIndexed := (prop.Index != nil && !*prop.Index) || (prop.Enabled != nil && !*prop.Enabled)
 	docValuesFalse := (prop.DocValues != nil && !*prop.DocValues) || (prop.Enabled != nil && !*prop.Enabled)
@@ -2972,8 +3061,10 @@ func (s *IndexSchema) registerLeafField(
 			DorisType:                DorisVariant,
 			ESType:                   esType,
 			Format:                   prop.Format,
+			Locale:                   prop.Locale,
 			Analyzer:                 prop.Analyzer,
 			SearchAnalyzer:           prop.SearchAnalyzer,
+			NormalizerName:           prop.Normalizer,
 			LowercaseNormalizer:      lowerNorm,
 			NestedPath:               activeNestedRoot,
 			CopyTo:                   copyTo,
@@ -3044,8 +3135,10 @@ func (s *IndexSchema) registerLeafField(
 			DorisType:                dorisType,
 			ESType:                   esType,
 			Format:                   prop.Format,
+			Locale:                   prop.Locale,
 			Analyzer:                 prop.Analyzer,
 			SearchAnalyzer:           prop.SearchAnalyzer,
+			NormalizerName:           prop.Normalizer,
 			LowercaseNormalizer:      lowerNorm,
 			VectorDims:               nVecDims,
 			AutoDims:                 nAutoDims,
@@ -3163,8 +3256,10 @@ func (s *IndexSchema) registerLeafField(
 			DorisType:                DorisString,
 			ESType:                   esType,
 			Format:                   prop.Format,
+			Locale:                   prop.Locale,
 			Analyzer:                 prop.Analyzer,
 			SearchAnalyzer:           prop.SearchAnalyzer,
+			NormalizerName:           prop.Normalizer,
 			LowercaseNormalizer:      lowerNorm,
 			IsMultiValued:            true,
 			CopyTo:                   copyTo,
@@ -3204,8 +3299,10 @@ func (s *IndexSchema) registerLeafField(
 		DorisType:                dorisType,
 		ESType:                   esType,
 		Format:                   prop.Format,
+		Locale:                   prop.Locale,
 		Analyzer:                 prop.Analyzer,
 		SearchAnalyzer:           prop.SearchAnalyzer,
+		NormalizerName:           prop.Normalizer,
 		LowercaseNormalizer:      lowerNorm,
 		CopyTo:                   copyTo,
 		NullValue:                prop.NullValue,
@@ -3347,6 +3444,7 @@ func (s *IndexSchema) ResolveField(esFieldPath string) FieldBinding {
 					DorisType:           dorisType,
 					ESType:              pb.ESType,
 					NestedPath:          pb.NestedPath,
+					NormalizerName:      pb.NormalizerName,
 					LowercaseNormalizer: pb.LowercaseNormalizer,
 					IgnoreAbove:         pb.IgnoreAbove,
 					NotIndexed:          pb.NotIndexed,
@@ -3548,6 +3646,37 @@ type inferOptions struct {
 	es8Mode            bool
 	inArray            bool
 	copyToTargets      map[string]bool
+	declared           map[string]string
+}
+
+func seedDeclaredPropertyTypes(props map[string]esast.FieldProperty, prefix string, subobjects bool, dst map[string]string) {
+	if len(props) == 0 || dst == nil {
+		return
+	}
+	for k, prop := range props {
+		full := k
+		if prefix != "" {
+			full = prefix + "." + k
+		}
+		if prop.Type != "" {
+			dst[full] = prop.Type
+		}
+		if len(prop.Properties) > 0 {
+			childSub := subobjects
+			if prop.Subobjects != nil {
+				childSub = *prop.Subobjects
+			}
+			seedDeclaredPropertyTypes(prop.Properties, full, childSub, dst)
+		}
+	}
+}
+
+func cloneDeclaredMap(in map[string]string) map[string]string {
+	out := make(map[string]string, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
 }
 
 func newInferOptions(existing *esast.MappingSpec) inferOptions {
@@ -3556,6 +3685,7 @@ func newInferOptions(existing *esast.MappingSpec) inferOptions {
 		numericDetection: false,
 		subobjects:       true,
 		dynamicMode:      "true",
+		declared:         make(map[string]string),
 	}
 	if existing != nil {
 		if existing.DateDetection != nil {
@@ -3570,6 +3700,9 @@ func newInferOptions(existing *esast.MappingSpec) inferOptions {
 		opts.dynamicDateFormats = existing.DynamicDateFormats
 		opts.dynamicTemplates = existing.DynamicTemplates
 		opts.dynamicMode = normalizeDynamicMode(existing.Dynamic)
+		if len(existing.Properties) > 0 {
+			seedDeclaredPropertyTypes(existing.Properties, "", opts.subobjects, opts.declared)
+		}
 	}
 	return opts
 }
@@ -3957,6 +4090,13 @@ func inferObjectPropertiesWithOpts(obj map[string]any, dst map[string]esast.Fiel
 			continue
 		}
 		if exists {
+			if declType := opts.declared[fullPath]; declType != "" && !strings.EqualFold(declType, "object") && !strings.EqualFold(declType, "nested") {
+				if _, isSlice := val.([]any); isSlice && !existing.MultiValued {
+					markPropertyMultiValued(&existing)
+					dst[k] = existing
+				}
+				continue
+			}
 			if opts.es8Mode && (existing.Type == "dense_vector" || existing.Type == "knn_vector" || existing.Type == "float") && len(existing.Properties) == 0 {
 				continue
 			}
@@ -4026,7 +4166,7 @@ func matchInferredDateFormat(v string, dynamicDateFormats []string) (string, boo
 		}
 		return "", false
 	}
-	if looksLikeISODateString(v) {
+	if looksLikeISODateString(v) || looksLikeSlashDateString(v) {
 		if _, ok := ParseESDateToEpochMillis(v, time.Time{}); ok {
 			return "", true
 		}
@@ -4251,6 +4391,14 @@ func inferValuePropertyWithOpts(val any, fieldName, fullPath string, depth int, 
 				return esast.FieldProperty{Type: "float"}, true
 			}
 		}
+		if opts.es8Mode {
+			return esast.FieldProperty{
+				Type: "text",
+				Fields: map[string]esast.FieldProperty{
+					"keyword": {Type: "keyword", IgnoreAbove: 256},
+				},
+			}, true
+		}
 		if strings.ContainsAny(v, " \t\n") || len(v) > 128 {
 			return esast.FieldProperty{
 				Type: "text",
@@ -4272,6 +4420,7 @@ func inferValuePropertyWithOpts(val any, fieldName, fullPath string, depth int, 
 				}
 				if depth+1 < maxInferredDepth {
 					childOpts := opts
+					childOpts.declared = cloneDeclaredMap(opts.declared)
 					if tmplProp.Dynamic != nil {
 						childOpts.dynamicMode = normalizeDynamicMode(tmplProp.Dynamic)
 					}
@@ -4281,6 +4430,7 @@ func inferValuePropertyWithOpts(val any, fieldName, fullPath string, depth int, 
 					childProps := make(map[string]esast.FieldProperty)
 					if len(tmplProp.Properties) > 0 {
 						childProps = deepMergeMappingPropertiesWithSubobjects(nil, tmplProp.Properties, !childOpts.subobjects)
+						seedDeclaredPropertyTypes(childProps, fullPath, childOpts.subobjects, childOpts.declared)
 					}
 					inferObjectPropertiesWithOpts(v, childProps, fullPath, depth+1, totalFields, childOpts)
 					if len(childProps) > 0 {
@@ -4308,11 +4458,18 @@ func inferValuePropertyWithOpts(val any, fieldName, fullPath string, depth int, 
 		if opts.es8Mode {
 			allNumeric = len(v) >= 128 && len(v) <= 2048 && !opts.inArray && !opts.copyToTargets[fullPath]
 		}
+		allStrings := len(v) >= 50 && !opts.inArray
+		nonNilStrings := 0
 		hasFloat := false
 		for _, elem := range v {
 			if elem == nil {
 				allNumeric = false
 				continue
+			}
+			if _, isStr := elem.(string); isStr {
+				nonNilStrings++
+			} else {
+				allStrings = false
 			}
 			switch n := elem.(type) {
 			case float64:
@@ -4372,6 +4529,23 @@ func inferValuePropertyWithOpts(val any, fieldName, fullPath string, depth int, 
 		}
 		if (merged.Type == "dense_vector" || merged.Type == "knn_vector") && merged.EffectiveDims() == 0 && !opts.inArray && len(v) > 0 {
 			merged.Dims = len(v)
+		}
+		if allStrings && nonNilStrings >= 50 && merged.Type == "keyword" {
+			matchedTmpl := false
+			if len(opts.dynamicTemplates) > 0 {
+				if _, ok := applyMatchingDynamicTemplate(fieldName, fullPath, "string", opts.dynamicTemplates); ok {
+					matchedTmpl = true
+				}
+			}
+			if !matchedTmpl {
+				merged = esast.FieldProperty{
+					Type:        "text",
+					MultiValued: true,
+					Fields: map[string]esast.FieldProperty{
+						"keyword": {Type: "keyword", IgnoreAbove: 256, MultiValued: true},
+					},
+				}
+			}
 		}
 		markPropertyMultiValued(&merged)
 		return merged, true
@@ -4490,4 +4664,19 @@ func looksLikeISODateString(s string) bool {
 		return false
 	}
 	return s[4] == '-' && s[7] == '-' && (len(s) == 10 || s[10] == 'T' || s[10] == ' ')
+}
+
+func looksLikeSlashDateString(s string) bool {
+	if len(s) < 10 || len(s) > 40 {
+		return false
+	}
+	if s[4] != '/' || s[7] != '/' || (len(s) > 10 && s[10] != ' ') {
+		return false
+	}
+	for _, i := range [...]int{0, 1, 2, 3, 5, 6, 8, 9} {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
 }

@@ -462,8 +462,8 @@ func (t *Transpiler) resolveGeoPointLatLonSQL(rawField string, nctx *nestedCtx) 
 	resolvedField, b := t.resolveFieldInNestedCtx(rawField, false, nctx)
 	if nctx != nil && nctx.elemVar != "" && ((b.Kind == schema.StorageNestedSubfield && nctx.nestedPath == b.NestedPath) || strings.HasPrefix(resolvedField, nctx.nestedPath+".")) {
 		elemExpr := t.sqlColumnRef(resolvedField, true, nctx)
-		latExpr = fmt.Sprintf("CAST(SPLIT_PART(%s, ',', 1) AS DOUBLE)", elemExpr)
-		lonExpr = fmt.Sprintf("CAST(SPLIT_PART(%s, ',', 2) AS DOUBLE)", elemExpr)
+		latExpr = fmt.Sprintf("TRY_CAST(SPLIT_PART(%s, ',', 1) AS DOUBLE)", elemExpr)
+		lonExpr = fmt.Sprintf("TRY_CAST(SPLIT_PART(%s, ',', 2) AS DOUBLE)", elemExpr)
 		notNullCond = fmt.Sprintf("%s IS NOT NULL AND %s != ''", elemExpr, elemExpr)
 		return latExpr, lonExpr, notNullCond
 	}
@@ -1114,7 +1114,7 @@ func (t *Transpiler) compileKNNRound61(kq *esast.KNNQuery, scoring bool, nctx *n
 	var colExpr string
 	if nctx != nil && nctx.elemVar != "" {
 		relPath := t.nestedRelativeJSONPath(resolvedField, false, nctx.nestedPath)
-		colExpr = fmt.Sprintf("CAST(json_extract_string(%s, %s) AS ARRAY<FLOAT>)", nctx.elemVar, quoteStr(relPath))
+		colExpr = fmt.Sprintf("TRY_CAST(json_extract_string(%s, %s) AS ARRAY<FLOAT>)", nctx.elemVar, quoteStr(relPath))
 	} else {
 		if b.ColumnName == "" && t.unindexedFields != nil && resolvedField != "" {
 			t.unindexedFields[strings.TrimSuffix(resolvedField, ".keyword")] = true

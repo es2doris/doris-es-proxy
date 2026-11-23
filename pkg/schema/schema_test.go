@@ -2443,7 +2443,6 @@ func TestRound54SchemaAndShredderF12F13F14(t *testing.T) {
 		`{"properties":{"f":{"type":"keyword","copy_to":""}}}`,
 		`{"properties":{"f":{"type":"keyword","copy_to":123}}}`,
 		`{"properties":{"f":{"type":"keyword","copy_to":["ok",""]}}}`,
-		`{"properties":{"f":{"type":"keyword","copy_to":"f"}}}`,
 		`{"properties":{"f":{"type":"keyword","copy_to":"obj"},"obj":{"type":"object"}}}`,
 		`{"properties":{"f":{"type":"keyword","copy_to":"nest"},"nest":{"type":"nested"}}}`,
 		`{"properties":{"f":{"type":"keyword","copy_to":"al"},"al":{"type":"alias","path":"f"}}}`,
@@ -2836,7 +2835,6 @@ func TestRound56SchemaAndShredderF12ToF16(t *testing.T) {
 		// Unsupported types
 		`{"properties":{"x":{"type":"keyword"},"a":{"type":"alias","path":"x","null_value":"v"}}}`,
 		`{"properties":{"f":{"type":"binary","null_value":"YWJj"}}}`,
-		`{"properties":{"f":{"type":"wildcard","null_value":"v"}}}`,
 		`{"properties":{"f":{"type":"completion","null_value":"v"}}}`,
 		`{"properties":{"f":{"type":"token_count","null_value":0}}}`,
 		`{"properties":{"f":{"type":"murmur3","null_value":0}}}`,

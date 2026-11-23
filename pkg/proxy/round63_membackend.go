@@ -75,7 +75,109 @@ func checkStrictNereidsSQLTypesR63Mem(sqlStr string) error {
 			return fmt.Errorf("errCode = 2, detailMessage = Unexpected exception: cannot resolve bitand(BIGINT, VARCHAR) in Doris 4.1.3 Nereids; wrap CONV(...) in CAST(... AS BIGINT)")
 		}
 	}
+	// Enforce Doris 4.1.3 2-argument `JSON_TYPE(doc, path)` signature across all SQL expressions.
+	searchFrom = 0
+	for {
+		idx := strings.Index(upper[searchFrom:], "JSON_TYPE(")
+		if idx < 0 {
+			break
+		}
+		absIdx := searchFrom + idx
+		searchFrom = absIdx + len("JSON_TYPE(")
+		if absIdx > 0 && isIdentByteR63Mem(upper[absIdx-1]) {
+			continue
+		}
+		if isOffsetInsideQuotesOrBackticksR63Mem(sqlStr, absIdx) {
+			continue
+		}
+		argCount := countTopLevelSQLCallArgsR64Mem(sqlStr, absIdx+len("JSON_TYPE"))
+		if argCount >= 0 && argCount != 2 {
+			return fmt.Errorf("errCode = 2, detailMessage = Unexpected exception: Can not found function 'json_type' with %d arguments in Doris 4.1.3 Nereids; use JSON_TYPE(doc, path)", argCount)
+		}
+	}
 	return nil
+}
+
+func countTopLevelSQLCallArgsR64Mem(s string, openParenIdx int) int {
+	if openParenIdx < 0 || openParenIdx >= len(s) || s[openParenIdx] != '(' {
+		return -1
+	}
+	depth := 1
+	topCommas := 0
+	hasContent := false
+	inSingle, inDouble, inBacktick := false, false, false
+	for i := openParenIdx + 1; i < len(s); i++ {
+		c := s[i]
+		if inSingle {
+			hasContent = true
+			if c == '\\' && i+1 < len(s) {
+				i++
+				continue
+			}
+			if c == '\'' {
+				if i+1 < len(s) && s[i+1] == '\'' {
+					i++
+					continue
+				}
+				inSingle = false
+			}
+			continue
+		}
+		if inDouble {
+			hasContent = true
+			if c == '\\' && i+1 < len(s) {
+				i++
+				continue
+			}
+			if c == '"' {
+				inDouble = false
+			}
+			continue
+		}
+		if inBacktick {
+			hasContent = true
+			if c == '`' {
+				if i+1 < len(s) && s[i+1] == '`' {
+					i++
+					continue
+				}
+				inBacktick = false
+			}
+			continue
+		}
+		switch c {
+		case '\'':
+			inSingle = true
+			hasContent = true
+		case '"':
+			inDouble = true
+			hasContent = true
+		case '`':
+			inBacktick = true
+			hasContent = true
+		case '(':
+			depth++
+			hasContent = true
+		case ')':
+			depth--
+			if depth == 0 {
+				if !hasContent {
+					return 0
+				}
+				return topCommas + 1
+			}
+		case ',':
+			if depth == 1 {
+				topCommas++
+			}
+			hasContent = true
+		default:
+			if c != ' ' && c != '\t' && c != '\n' && c != '\r' {
+				hasContent = true
+			}
+		}
+	}
+	return -1
 }
 
 func isIdentByteR63Mem(b byte) bool {
@@ -329,10 +431,13 @@ func evalColumnFuncR63Mem(row map[string]any, colExpr string) (any, bool) {
 		}
 	}
 
-	// 2. `JSON_TYPE(expr)`
+	// 2. `JSON_TYPE(doc, path)` (strict 2-arg Doris 4.1.3 signature; 1-arg returns nil)
 	if strings.HasPrefix(upper, "JSON_TYPE(") && strings.HasSuffix(colExpr, ")") && hasMatchingOuterParens(colExpr, len("JSON_TYPE")) {
-		arg := strings.TrimSpace(colExpr[len("JSON_TYPE(") : len(colExpr)-1])
-		return evalDorisJSONTypeExprR63Mem(row, arg), true
+		args := splitTopLevelArgs(colExpr[len("JSON_TYPE(") : len(colExpr)-1])
+		if len(args) != 2 {
+			return nil, true
+		}
+		return evalDorisJSONTypeTwoArgR63Mem(row, args[0], args[1]), true
 	}
 
 	// 3. `MICROSECOND(dt)`
@@ -559,7 +664,9 @@ func evalTryCastBodyR63Mem(row map[string]any, innerAll string) any {
 
 	v := resolveColumnValue(row, srcExpr)
 	if v == nil {
-		if strings.HasPrefix(srcExpr, "'") && strings.HasSuffix(srcExpr, "'") {
+		if raw := extractRowJSONStringR62Mem(row, strings.Trim(srcExpr, "`")); raw != "" {
+			v = raw
+		} else if strings.HasPrefix(srcExpr, "'") && strings.HasSuffix(srcExpr, "'") {
 			v = unquoteSQLLiteral(srcExpr)
 		} else if f, err := strconv.ParseFloat(srcExpr, 64); err == nil {
 			v = f
@@ -572,56 +679,96 @@ func evalTryCastBodyR63Mem(row map[string]any, innerAll string) any {
 	case "BIGINT", "INT":
 		// Strict Doris `TRY_CAST(str AS BIGINT)`: ONLY valid signed integers (or exact integral numbers) succeed;
 		// ISO-8601 date strings like `"2026-05-01T12:00:00Z"` return `NULL` cleanly without error!
-		switch tv := v.(type) {
-		case int:
-			return int64(tv)
-		case int32:
-			return int64(tv)
-		case int64:
-			return tv
-		case uint64:
-			if tv <= math.MaxInt64 {
-				return int64(tv)
+		tryBigIntScalar := func(val any) (int64, bool) {
+			switch tv := val.(type) {
+			case int:
+				return int64(tv), true
+			case int32:
+				return int64(tv), true
+			case int64:
+				return tv, true
+			case uint64:
+				if tv <= math.MaxInt64 {
+					return int64(tv), true
+				}
+				return 0, false
+			case float64:
+				if math.IsNaN(tv) || math.IsInf(tv, 0) || tv < float64(math.MinInt64) || tv >= 9223372036854775808.0 {
+					return 0, false
+				}
+				return int64(math.Trunc(tv)), true
+			case json.Number:
+				if iv, err := tv.Int64(); err == nil {
+					return iv, true
+				}
+				return 0, false
+			case string:
+				trimmed := strings.TrimSpace(tv)
+				if trimmed == "" {
+					return 0, false
+				}
+				if iv, err := strconv.ParseInt(trimmed, 10, 64); err == nil {
+					return iv, true
+				}
+				return 0, false
+			default:
+				return 0, false
 			}
-			return nil
-		case float64:
-			if math.IsNaN(tv) || math.IsInf(tv, 0) || tv < float64(math.MinInt64) || tv >= 9223372036854775808.0 {
+		}
+		switch v.(type) {
+		case []any, []string:
+			var out []any
+			for _, elem := range asSliceOrSingle(v) {
+				if iv, ok := tryBigIntScalar(elem); ok {
+					out = append(out, iv)
+				}
+			}
+			if len(out) == 0 {
 				return nil
 			}
-			return int64(math.Trunc(tv))
-		case json.Number:
-			if iv, err := tv.Int64(); err == nil {
-				return iv
-			}
-			return nil
-		case string:
-			trimmed := strings.TrimSpace(tv)
-			if trimmed == "" {
-				return nil
-			}
-			if iv, err := strconv.ParseInt(trimmed, 10, 64); err == nil {
-				return iv
-			}
-			return nil
+			return out
 		default:
+			if iv, ok := tryBigIntScalar(v); ok {
+				return iv
+			}
 			return nil
 		}
 	case "LARGEINT":
 		return memCoerceSQLLargeInt(v)
 	case "DOUBLE", "FLOAT":
-		switch tv := v.(type) {
-		case string:
-			trimmed := strings.TrimSpace(tv)
-			if trimmed == "" {
+		tryDoubleScalar := func(val any) (float64, bool) {
+			switch tv := val.(type) {
+			case string:
+				trimmed := strings.TrimSpace(tv)
+				if trimmed == "" {
+					return 0, false
+				}
+				f, err := strconv.ParseFloat(trimmed, 64)
+				if err != nil || math.IsNaN(f) || math.IsInf(f, 0) {
+					return 0, false
+				}
+				return f, true
+			default:
+				if f, ok := toFloat(tv); ok && !math.IsNaN(f) && !math.IsInf(f, 0) {
+					return f, true
+				}
+				return 0, false
+			}
+		}
+		switch v.(type) {
+		case []any, []string:
+			var out []any
+			for _, elem := range asSliceOrSingle(v) {
+				if f, ok := tryDoubleScalar(elem); ok {
+					out = append(out, f)
+				}
+			}
+			if len(out) == 0 {
 				return nil
 			}
-			f, err := strconv.ParseFloat(trimmed, 64)
-			if err != nil || math.IsNaN(f) || math.IsInf(f, 0) {
-				return nil
-			}
-			return f
+			return out
 		default:
-			if f, ok := toFloat(tv); ok && !math.IsNaN(f) && !math.IsInf(f, 0) {
+			if f, ok := tryDoubleScalar(v); ok {
 				return f
 			}
 			return nil
@@ -636,7 +783,7 @@ func evalTryCastBodyR63Mem(row map[string]any, innerAll string) any {
 	case "ARRAY<STRING>":
 		if s, ok := v.(string); ok {
 			trimmed := strings.TrimSpace(s)
-			if !strings.HasPrefix(trimmed, "[") || !strings.HasSuffix(trimmed, "]") {
+			if !strings.HasPrefix(trimmed, "[") || !strings.HasSuffix(trimmed, "]") || !json.Valid([]byte(trimmed)) {
 				return nil
 			}
 			var arr []any
@@ -646,6 +793,9 @@ func evalTryCastBodyR63Mem(row map[string]any, innerAll string) any {
 				return nil
 			}
 			return toStringSlice(arr)
+		}
+		if _, isMap := v.(map[string]any); isMap {
+			return nil
 		}
 		return coerceCastArrayOfStringR62Mem(v)
 	case "ARRAY<FLOAT>", "ARRAY<DOUBLE>":
@@ -686,7 +836,7 @@ func evalTryCastBodyR63Mem(row map[string]any, innerAll string) any {
 			return out
 		case string:
 			trimmed := strings.TrimSpace(tv)
-			if !strings.HasPrefix(trimmed, "[") || !strings.HasSuffix(trimmed, "]") {
+			if !strings.HasPrefix(trimmed, "[") || !strings.HasSuffix(trimmed, "]") || !json.Valid([]byte(trimmed)) {
 				return nil
 			}
 			var arr []any
@@ -716,6 +866,23 @@ func evalTryCastBodyR63Mem(row map[string]any, innerAll string) any {
 			return out
 		default:
 			return nil
+		}
+	case "JSON":
+		switch tv := v.(type) {
+		case string:
+			trimmed := strings.TrimSpace(tv)
+			if trimmed == "" || !json.Valid([]byte(trimmed)) {
+				return nil
+			}
+			var decoded any
+			dec := json.NewDecoder(strings.NewReader(trimmed))
+			dec.UseNumber()
+			if err := dec.Decode(&decoded); err != nil {
+				return nil
+			}
+			return decoded
+		default:
+			return tv
 		}
 	default:
 		return resolveColumnValue(row, "CAST("+innerAll+")")
@@ -771,52 +938,43 @@ func evalCastDateTimeV2R63Mem(row map[string]any, srcExpr, targetType string) an
 	}
 }
 
-func evalDorisJSONTypeExprR63Mem(row map[string]any, arg string) any {
-	arg = trimOuterParens(strings.TrimSpace(arg))
-	if strings.HasPrefix(strings.ToLower(arg), "coalesce(") && strings.HasSuffix(arg, ")") && hasMatchingOuterParens(arg, len("coalesce")) {
-		subArgs := splitTopLevelArgs(arg[len("coalesce(") : len(arg)-1])
-		for _, sa := range subArgs {
-			if jt := evalDorisJSONTypeExprR63Mem(row, sa); jt != nil {
-				return jt
-			}
-		}
+func evalDorisJSONTypeTwoArgR63Mem(row map[string]any, docArg, pathArg string) any {
+	pathTrim := strings.TrimSpace(pathArg)
+	var rawPath string
+	if strings.HasPrefix(pathTrim, "'") && strings.HasSuffix(pathTrim, "'") {
+		rawPath = unquoteSQLLiteral(pathTrim)
+	} else if pv := resolveColumnValue(row, pathTrim); pv != nil {
+		rawPath = fmt.Sprintf("%v", pv)
+	}
+	if rawPath == "" {
 		return nil
 	}
-	if strings.HasPrefix(strings.ToLower(arg), "json_extract(") && strings.HasSuffix(arg, ")") && hasMatchingOuterParens(arg, len("json_extract")) {
-		subArgs := splitTopLevelArgs(arg[len("json_extract(") : len(arg)-1])
-		if len(subArgs) == 2 {
-			varExpr := strings.TrimSpace(subArgs[0])
-			varName := strings.Trim(varExpr, "`")
-			rawPath := unquoteSQLLiteral(strings.TrimSpace(subArgs[1]))
-			rawJSON := extractRowJSONStringR62Mem(row, varName)
-			if rawJSON == "" {
-				if rv := resolveColumnValue(row, varExpr); rv != nil {
-					if s, ok := rv.(string); ok {
-						rawJSON = s
-					} else if jb, err := json.Marshal(rv); err == nil {
-						rawJSON = string(jb)
-					}
-				}
-			}
-			segs := parseDorisJSONPathSegmentsR63Mem(rawPath)
+	segs := parseDorisJSONPathSegmentsR63Mem(rawPath)
+	docTrim := trimOuterParens(strings.TrimSpace(docArg))
+	if docName := strings.Trim(docTrim, "`"); docName != "" {
+		if rawJSON := extractRowJSONStringR62Mem(row, docName); rawJSON != "" {
 			val, exists := extractJSONTypedValueFromStrR63Mem(rawJSON, segs)
 			return dorisJSONTypeNameR63Mem(val, exists)
 		}
 	}
-	v := resolveColumnValue(row, arg)
+	v := resolveColumnValue(row, docTrim)
 	if v == nil {
 		return nil
 	}
 	if s, ok := v.(string); ok {
 		trimmed := strings.TrimSpace(s)
-		var decoded any
-		dec := json.NewDecoder(strings.NewReader(trimmed))
-		dec.UseNumber()
-		if err := dec.Decode(&decoded); err == nil {
-			return dorisJSONTypeNameR63Mem(decoded, true)
+		if trimmed == "" {
+			return nil
 		}
+		val, exists := extractJSONTypedValueFromStrR63Mem(trimmed, segs)
+		return dorisJSONTypeNameR63Mem(val, exists)
 	}
-	return dorisJSONTypeNameR63Mem(v, true)
+	jb, err := json.Marshal(v)
+	if err != nil {
+		return nil
+	}
+	val, exists := extractJSONTypedValueFromStrR63Mem(string(jb), segs)
+	return dorisJSONTypeNameR63Mem(val, exists)
 }
 
 // hasNullArithmeticOperandR63Mem ensures SQL `NULL` propagates through arithmetic (`+`, `-`, `*`, `/`)
@@ -836,6 +994,9 @@ func hasNullArithmeticOperandR63Mem(row map[string]any, expr string) bool {
 				if _, err := strconv.ParseFloat(pt, 64); err == nil {
 					continue
 				}
+				if hasUnwrappedNullColumnRef(row, pt) {
+					return true
+				}
 				if isArithmeticSQLExpr(pt) {
 					if hasNullArithmeticOperandR63Mem(row, pt) {
 						return true
@@ -848,6 +1009,87 @@ func hasNullArithmeticOperandR63Mem(row map[string]any, expr string) bool {
 						}
 					}
 				} else if resolveColumnValue(row, pt) == nil {
+					return true
+				}
+			}
+			return false
+		}
+	}
+	return hasNullScalarCallOperandR64Mem(row, trimmed)
+}
+
+func hasNullScalarCallOperandR64Mem(row map[string]any, trimmed string) bool {
+	upper := strings.ToUpper(trimmed)
+	if strings.HasPrefix(upper, "CAST(COALESCE(") && (strings.HasSuffix(upper, ", FALSE) AS INT)") || strings.HasSuffix(upper, ", TRUE) AS INT)")) {
+		return false
+	}
+	for _, pfx := range []string{"TRY_CAST(", "CAST("} {
+		if strings.HasPrefix(upper, pfx) && strings.HasSuffix(trimmed, ")") && hasMatchingOuterParens(trimmed, len(pfx)-1) {
+			innerAll := strings.TrimSpace(trimmed[len(pfx) : len(trimmed)-1])
+			if asIdx := findTopLevelLastAsR63Mem(innerAll); asIdx > 0 {
+				inner := trimOuterParens(strings.TrimSpace(innerAll[:asIdx]))
+				if inner == "" {
+					return false
+				}
+				if _, err := strconv.ParseFloat(inner, 64); err == nil {
+					return false
+				}
+				if hasUnwrappedNullColumnRef(row, inner) || hasNullArithmeticOperandR63Mem(row, inner) {
+					return true
+				}
+				if !isArithmeticSQLExpr(inner) && resolveColumnValue(row, inner) == nil {
+					return true
+				}
+				return false
+			}
+		}
+	}
+	for _, fn := range []string{"UNIX_TIMESTAMP", "TIMESTAMPDIFF", "MICROSECOND", "DATE_TRUNC", "SECONDS_ADD"} {
+		if strings.HasPrefix(upper, fn+"(") && strings.HasSuffix(trimmed, ")") && hasMatchingOuterParens(trimmed, len(fn)) {
+			return resolveColumnValue(row, trimmed) == nil
+		}
+	}
+	if strings.HasPrefix(upper, "COALESCE(") && strings.HasSuffix(trimmed, ")") && hasMatchingOuterParens(trimmed, len("COALESCE")) {
+		args := splitTopLevelArgs(trimmed[len("COALESCE(") : len(trimmed)-1])
+		for _, a := range args {
+			arg := trimOuterParens(strings.TrimSpace(a))
+			if arg == "" {
+				continue
+			}
+			if strings.EqualFold(arg, "NULL") {
+				continue
+			}
+			if strings.EqualFold(arg, "TRUE") || strings.EqualFold(arg, "FALSE") || (len(arg) >= 2 && arg[0] == '\'' && arg[len(arg)-1] == '\'') {
+				return false
+			}
+			if _, err := strconv.ParseFloat(arg, 64); err == nil {
+				return false
+			}
+			if hasUnwrappedNullColumnRef(row, arg) || hasNullArithmeticOperandR63Mem(row, arg) {
+				continue
+			}
+			if !isArithmeticSQLExpr(arg) && resolveColumnValue(row, arg) == nil {
+				continue
+			}
+			return false
+		}
+		return len(args) > 0
+	}
+	for _, fn := range []string{"FLOOR", "CEIL", "ROUND", "TRUNCATE", "ABS", "SQRT", "LN", "LOG10", "EXP", "SIN", "COS", "TAN", "ASIN", "ACOS", "ATAN", "ATAN2", "POW"} {
+		if strings.HasPrefix(upper, fn+"(") && strings.HasSuffix(trimmed, ")") && hasMatchingOuterParens(trimmed, len(fn)) {
+			args := splitTopLevelArgs(trimmed[len(fn)+1 : len(trimmed)-1])
+			for _, a := range args {
+				arg := trimOuterParens(strings.TrimSpace(a))
+				if arg == "" {
+					continue
+				}
+				if _, err := strconv.ParseFloat(arg, 64); err == nil {
+					continue
+				}
+				if hasUnwrappedNullColumnRef(row, arg) || hasNullArithmeticOperandR63Mem(row, arg) {
+					return true
+				}
+				if !isArithmeticSQLExpr(arg) && resolveColumnValue(row, arg) == nil {
 					return true
 				}
 			}
@@ -926,8 +1168,10 @@ func tokenizeBM25TextStringR63Mem(s string, caseSensitive bool) []string {
 	}
 	var out []string
 	var cur strings.Builder
-	for _, r := range s {
-		if unicode.IsLetter(r) || unicode.IsNumber(r) || r == '_' {
+	runes := []rune(s)
+	for i, r := range runes {
+		isApostrophe := (r == '\'' || r == '\u2019') && cur.Len() > 0 && i+1 < len(runes) && (unicode.IsLetter(runes[i+1]) || unicode.IsNumber(runes[i+1]))
+		if unicode.IsLetter(r) || unicode.IsNumber(r) || r == '_' || isApostrophe {
 			cur.WriteRune(r)
 		} else if cur.Len() > 0 {
 			out = append(out, cur.String())
@@ -1147,6 +1391,7 @@ func prepareScoreEvaluatorR63Mem(ctx context.Context, tbl map[string]map[string]
 
 	for idx := range specs {
 		sp := &specs[idx]
+		isTrailingPrefix := strings.Contains(sp.safePred, " REGEXP ") && !strings.Contains(sp.safePred, "($|[^[:alnum:]_])")
 		var docCount int
 		var sumDL int
 		dfs := make([]int, len(sp.terms))
@@ -1165,8 +1410,9 @@ func prepareScoreEvaluatorR63Mem(ctx context.Context, tbl map[string]map[string]
 			sumDL += luceneSmallFloatLengthR63Mem(dl)
 			for ti, qTok := range sp.terms {
 				found := false
+				allowPfx := isTrailingPrefix && ti == len(sp.terms)-1
 				for _, dt := range toks {
-					if dt == qTok {
+					if dt == qTok || (allowPfx && strings.HasPrefix(dt, qTok)) {
 						found = true
 						break
 					}
@@ -1502,4 +1748,47 @@ func coerceRowStringColumnsR63Mem(row map[string]any, strCols map[string]bool) {
 			row[col] = fmt.Sprintf("%v", tv)
 		}
 	}
+}
+
+// QueryTermDocFreqs counts live rows having non-empty tokens in `colExpr` and per-term
+// document frequencies across `m.tables[table]`, supporting exact `cutoff_frequency` splitting.
+func (m *MemoryBackend) QueryTermDocFreqs(table, colExpr string, terms []string, caseSensitive bool) (int, map[string]int) {
+	dfs := make(map[string]int, len(terms))
+	if m == nil || len(terms) == 0 {
+		return 0, dfs
+	}
+	need := make(map[string]bool, len(terms))
+	for _, tk := range terms {
+		k := tk
+		if !caseSensitive {
+			k = strings.ToLower(k)
+		}
+		need[k] = true
+	}
+	m.mu.RLock()
+	tbl := m.tables[table]
+	liveRows := make([]map[string]any, 0, len(tbl))
+	for _, r := range tbl {
+		if !isTombstoneRow(r) {
+			liveRows = append(liveRows, r)
+		}
+	}
+	m.mu.RUnlock()
+
+	docCount := 0
+	for _, r := range liveRows {
+		toks := tokenizeBM25FieldTokensR63Mem(r, colExpr, caseSensitive)
+		if len(toks) == 0 {
+			continue
+		}
+		docCount++
+		seen := make(map[string]bool, len(toks))
+		for _, dt := range toks {
+			if need[dt] && !seen[dt] {
+				seen[dt] = true
+				dfs[dt]++
+			}
+		}
+	}
+	return docCount, dfs
 }

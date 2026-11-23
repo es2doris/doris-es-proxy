@@ -114,16 +114,6 @@ func (s *Server) SetRemoteReindexWhitelistForTest(pattern string) {
 	st.mu.Unlock()
 }
 
-// refreshFormatOptionsMultiFilterPathR61Admin upgrades `esFormatResponseWriter` options so
-// repeated `?filter_path=a&filter_path=-b` query parameters compose across all endpoints (`F4`).
-func refreshFormatOptionsMultiFilterPathR61Admin(w http.ResponseWriter, r *http.Request) {
-	if fw, ok := w.(*esFormatResponseWriter); ok && fw != nil && r != nil {
-		if opts, hasOpts := parseESResponseFormatOptionsRound61(r); hasOpts {
-			fw.opts = opts
-		}
-	}
-}
-
 // formatESDurationR61Admin formats a `time.Duration` in Elasticsearch style (`5m` instead of `5m0s`).
 func formatESDurationR61Admin(d time.Duration) string {
 	if d <= 0 {
@@ -176,7 +166,6 @@ var unsupportedEndpointCapabilitiesR61Admin = map[string]bool{
 	"esql_async":                    true,
 	"esql_enrich":                   true,
 	"esql_lookup_join":              true,
-	"retriever_rrf":                 true,
 	"retriever_text_similarity":     true,
 	"searchable_snapshots_shared":   true,
 	"cross_cluster_replication_ilm": true,

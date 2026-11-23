@@ -2141,15 +2141,29 @@ func FuzzEvalPainless(f *testing.F) {
 		"return field('u').asBigInteger(BigInteger.ZERO).toString();",
 		"field('a.b').set('v'); return field('a.b').get(null);",
 		"return metadata().get('_routing');",
+		"return new BigDecimal('1e2147483647').toPlainString();",
+		"return new BigDecimal('1').movePointLeft(100000).toPlainString();",
+		"return new BigDecimal('1').setScale(100000);",
+		"return new BigDecimal('2').pow(100000);",
+		"return BigInteger.valueOf(2).pow(100000);",
+		"return BigInteger.ONE.shiftLeft(100000);",
+		"return BigInteger.ONE.shiftRight(-100000);",
+		"return BigInteger.ZERO.setBit(100000);",
+		"BitSet bs = new BitSet(); bs.set(1 << 25); return bs.cardinality();",
+		"BitSet bs = new BitSet(); bs.set(0, 20000); return bs.cardinality();",
+		"BitSet bs = new BitSet(); bs.flip(0, 20000); return bs.cardinality();",
+		"return 'abc'.repeat(1L << 62);",
+		"return field('nan_val').asBigInteger(0L);",
 	}
 	for _, s := range seeds {
 		f.Add(s)
 	}
 	f.Fuzz(func(t *testing.T, script string) {
 		doc := map[string]any{
-			"date": "2020/05/15",
-			"u":    uint64(18446744073709551615),
-			"a":    map[string]any{"b": "init"},
+			"date":    "2020/05/15",
+			"u":       uint64(18446744073709551615),
+			"a":       map[string]any{"b": "init"},
+			"nan_val": math.NaN(),
 		}
 		params := map[string]any{
 			"_ingest": map[string]any{"timestamp": "2020-05-15T00:00:00Z"},

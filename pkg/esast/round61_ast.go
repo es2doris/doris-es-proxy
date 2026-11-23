@@ -355,23 +355,50 @@ func parseFlexibleRangesArrayOrMap(rawRanges json.RawMessage) ([]RangeAggBucket,
 	return nil, false, fmt.Errorf("parsing_exception: [ranges] must be an array or keyed object")
 }
 
+func formatJavaDouble(v float64) string {
+	if math.IsNaN(v) {
+		return "NaN"
+	}
+	if math.IsInf(v, 1) {
+		return "Infinity"
+	}
+	if math.IsInf(v, -1) {
+		return "-Infinity"
+	}
+	if v == 0 {
+		if math.Signbit(v) {
+			return "-0.0"
+		}
+		return "0.0"
+	}
+	abs := math.Abs(v)
+	if abs >= 1e7 || abs < 1e-3 {
+		s := strconv.FormatFloat(v, 'e', -1, 64)
+		parts := strings.SplitN(s, "e", 2)
+		if len(parts) == 2 {
+			mantissa := parts[0]
+			if !strings.Contains(mantissa, ".") {
+				mantissa += ".0"
+			}
+			if exp, err := strconv.Atoi(parts[1]); err == nil {
+				return mantissa + "E" + strconv.Itoa(exp)
+			}
+		}
+	}
+	if v == math.Trunc(v) {
+		return strconv.FormatInt(int64(v), 10) + ".0"
+	}
+	return strconv.FormatFloat(v, 'f', -1, 64)
+}
+
 func formatRangeBoundKey(v any) string {
 	switch tv := v.(type) {
 	case float64:
-		if !math.IsNaN(tv) && !math.IsInf(tv, 0) && tv == math.Trunc(tv) && math.Abs(tv) < 1e15 {
-			return strconv.FormatInt(int64(tv), 10) + ".0"
-		}
-		return strconv.FormatFloat(tv, 'f', -1, 64)
+		return formatJavaDouble(tv)
 	case json.Number:
 		s := tv.String()
-		if !strings.ContainsAny(s, ".eE") {
-			return s + ".0"
-		}
 		if fv, err := tv.Float64(); err == nil {
-			if !math.IsNaN(fv) && !math.IsInf(fv, 0) && fv == math.Trunc(fv) && math.Abs(fv) < 1e15 {
-				return strconv.FormatInt(int64(fv), 10) + ".0"
-			}
-			return strconv.FormatFloat(fv, 'f', -1, 64)
+			return formatJavaDouble(fv)
 		}
 		return s
 	default:

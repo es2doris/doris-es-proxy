@@ -157,6 +157,8 @@ func validateAcyclicWalkRound60(val any, inProgress map[cycleNodeKeyRound60]bool
 				}
 			}
 		}
+	case *GeoShapeDocValues:
+		return nil
 	default:
 		rv := reflect.ValueOf(val)
 		switch rv.Kind() {
@@ -249,6 +251,8 @@ func cloneValueWalkRound60(val any, inProgress map[cycleNodeKeyRound60]bool, dep
 		}
 		cp := *tv
 		return &cp, nil
+	case *GeoShapeDocValues:
+		return tv, nil
 	case *BytesRefVal:
 		if tv == nil {
 			return nil, nil
@@ -272,7 +276,7 @@ func cloneValueWalkRound60(val any, inProgress map[cycleNodeKeyRound60]bool, dep
 // while guarding against cyclic Maps and Lists ("(this Map)" / "(this Collection)").
 func FormatValueSafe(val any) string {
 	seen := make(map[cycleNodeKeyRound60]bool)
-	return formatValueCycleWalkRound60(val, seen, false, 0)
+	return formatValueCycleWalkRound60(val, seen, true, 0)
 }
 
 func formatValueCycleWalkRound60(v any, seen map[cycleNodeKeyRound60]bool, javaMapBrace bool, depth int) string {
@@ -291,16 +295,7 @@ func formatValueCycleWalkRound60(v any, seen map[cycleNodeKeyRound60]bool, javaM
 		}
 		return "Optional[" + formatValueCycleWalkRound60(tv.val, seen, javaMapBrace, depth+1) + "]"
 	case float64:
-		if math.IsNaN(tv) {
-			return "NaN"
-		}
-		if math.IsInf(tv, 1) {
-			return "Infinity"
-		}
-		if math.IsInf(tv, -1) {
-			return "-Infinity"
-		}
-		return fmt.Sprintf("%v", tv)
+		return FormatJavaFloat64(tv)
 	case float32:
 		return FormatJavaFloat32(tv)
 	case *IPAddressVal:
@@ -360,6 +355,11 @@ func formatValueCycleWalkRound60(v any, seen map[cycleNodeKeyRound60]bool, javaM
 		}
 		return tv.String()
 	case *GeoPointVal:
+		if tv == nil {
+			return "null"
+		}
+		return tv.String()
+	case *GeoShapeDocValues:
 		if tv == nil {
 			return "null"
 		}
@@ -1356,7 +1356,7 @@ func isKnownCompileTypeNameRound60(name string, userClasses map[string]bool) boo
 		"Function", "BiFunction", "IntFunction", "LongFunction", "DoubleFunction",
 		"UnaryOperator", "BinaryOperator", "Predicate", "BiPredicate",
 		"Consumer", "BiConsumer", "Runnable",
-		"Metadata", "UpdateMetadata", "GeoPoint", "GeoBoundingBox", "IPAddress", "DenseVector", "DenseVectorField", "DenseVectorDocValue", "BytesRef", "ByteBuffer", "DayOfWeekEnum", "MonthEnum", "Grok", "Dissect",
+		"Metadata", "UpdateMetadata", "GeoPoint", "GeoBoundingBox", "GeoShapeDocValues", "Geometry", "GeoShape", "IPAddress", "DenseVector", "DenseVectorField", "DenseVectorDocValue", "BytesRef", "ByteBuffer", "DayOfWeekEnum", "MonthEnum", "Grok", "Dissect",
 		"ZonedDateTime", "OffsetDateTime", "Instant", "LocalDate", "LocalTime", "LocalDateTime",
 		"OffsetTime", "Clock", "Duration", "Period", "Year", "YearMonth", "MonthDay",
 		"DayOfWeek", "Month", "DateTimeFormatter", "ChronoUnit", "ChronoField", "IsoFields", "TextStyle", "Locale",
@@ -2554,7 +2554,7 @@ func normalizeSingleFieldDocValuesWithOptsRound61(raw any, fieldType string, kee
 		}
 		return []any{}
 	}
-	isGeo := ft == "geo_point"
+	isGeo := ft == "geo_point" || ft == "geo_shape" || ft == "shape"
 	items := flattenRawFieldItemsRound60(raw, isGeo)
 	if len(items) == 0 {
 		return []any{}
@@ -2715,6 +2715,18 @@ func normalizeSingleFieldDocValuesWithOptsRound61(raw any, fieldType string, kee
 		}
 		return out
 
+	case "geo_shape", "shape":
+		out := make([]any, 0, len(items))
+		for _, it := range items {
+			if gs, err := ParseGeoShapeDocValuesWithOpts(it, true); err == nil && gs != nil {
+				out = append(out, gs)
+			}
+		}
+		return out
+
+	case "murmur3":
+		return normalizeMurmur3DocValuesRound61(raw, false)
+
 	case "binary":
 		rawBytes := make([][]byte, 0, len(items))
 		for _, it := range items {
@@ -2848,7 +2860,7 @@ func inferImplicitDocValueWrapperRound60(fieldPath string, items []any) []any {
 	}
 	// If already wrapped, preserve as-is
 	switch items[0].(type) {
-	case *ZonedDateTimeVal, *GeoPointVal, *BytesRefVal, *ByteBufferVal, *painlessBigInteger:
+	case *ZonedDateTimeVal, *GeoPointVal, *GeoShapeDocValues, *BytesRefVal, *ByteBufferVal, *painlessBigInteger:
 		return items
 	}
 	cleanName := strings.ToLower(strings.ReplaceAll(fieldPath, "\x00", "."))
@@ -2926,6 +2938,45 @@ func inferImplicitDocValueWrapperRound60(fieldPath string, items []any) []any {
 					return out
 				}
 			}
+		}
+	}
+	// Infer geo_shape / GeoJSON maps when explicit __field_types wasn't provided
+	if m, isMap := items[0].(map[string]any); isMap {
+		rawT, hasT := m["type"].(string)
+		_, hasCoords := m["coordinates"]
+		_, hasGeoms := m["geometries"]
+		if hasT && (hasCoords || hasGeoms || cleanName == "geo_shape" || cleanName == "shape" || cleanName == "geometry") {
+			switch strings.ToUpper(strings.TrimSpace(rawT)) {
+			case "POINT", "LINESTRING", "POLYGON", "MULTIPOINT", "MULTILINESTRING", "MULTIPOLYGON", "GEOMETRYCOLLECTION", "ENVELOPE", "BBOX", "CIRCLE":
+				out := make([]any, 0, len(items))
+				allShapes := true
+				for _, it := range items {
+					gs, err := ParseGeoShapeDocValuesWithOpts(it, true)
+					if err != nil || gs == nil {
+						allShapes = false
+						break
+					}
+					out = append(out, gs)
+				}
+				if allShapes && len(out) > 0 {
+					return out
+				}
+			}
+		}
+	}
+	if cleanName == "geo_shape" || cleanName == "shape" || cleanName == "geometry" {
+		out := make([]any, 0, len(items))
+		allShapes := true
+		for _, it := range items {
+			gs, err := ParseGeoShapeDocValuesWithOpts(it, true)
+			if err != nil || gs == nil {
+				allShapes = false
+				break
+			}
+			out = append(out, gs)
+		}
+		if allShapes && len(out) > 0 {
+			return out
 		}
 	}
 	if cleanName == "binary" || strings.HasSuffix(cleanName, "_binary") {
@@ -3061,6 +3112,21 @@ func resolveDocValuesSliceWithParamsRound60(sourceMap, params map[string]any, fi
 	ft := lookupFieldTypeRound60(ftMap, fieldPath)
 	rawSlice := resolveDocValuesSlice(sourceMap, fieldPath)
 	if len(rawSlice) == 0 {
+		if ft == "murmur3" {
+			if dot := strings.LastIndexByte(cleanPath, '.'); dot > 0 {
+				parent := cleanPath[:dot]
+				var pVal any
+				if rawSrc, ok := rawSourceFromSourceMapPainless(sourceMap); ok && rawSrc != nil {
+					pVal = resolveParamPath(rawSrc, strings.Split(parent, "."))
+				}
+				if pVal == nil {
+					pVal = resolveParamPath(sourceMap, strings.Split(parent, "."))
+				}
+				if pVal != nil {
+					return normalizeMurmur3DocValuesRound61(pVal, true), nil
+				}
+			}
+		}
 		if cv, hasConst := lookupConstantKeywordValueRound63(sourceMap, params, cleanPath); hasConst {
 			return []any{cv}, nil
 		}
@@ -3070,6 +3136,9 @@ func resolveDocValuesSliceWithParamsRound60(sourceMap, params map[string]any, fi
 		return rawSlice, nil
 	}
 	if _, already := rawSlice[0].(*GeoPointVal); already {
+		return rawSlice, nil
+	}
+	if _, already := rawSlice[0].(*GeoShapeDocValues); already {
 		return rawSlice, nil
 	}
 	if _, already := rawSlice[0].(*BytesRefVal); already {
@@ -3187,11 +3256,26 @@ func resolveFieldValRound60(name string, sourceMap, params map[string]any) (*Fie
 
 	var vals []any
 	var rawVal any
+	usedMurmurParent := false
 	if root != nil {
 		rawVal = resolveParamPath(root, strings.Split(name, "."))
 	}
 	if rawVal == nil && sourceMap != nil && (root == nil || reflect.ValueOf(sourceMap).Pointer() != reflect.ValueOf(root).Pointer()) {
 		rawVal = resolveParamPath(sourceMap, strings.Split(name, "."))
+	}
+	if rawVal == nil && ft == "murmur3" {
+		if dot := strings.LastIndexByte(name, '.'); dot > 0 {
+			parent := name[:dot]
+			if root != nil {
+				rawVal = resolveParamPath(root, strings.Split(parent, "."))
+			}
+			if rawVal == nil && sourceMap != nil && (root == nil || reflect.ValueOf(sourceMap).Pointer() != reflect.ValueOf(root).Pointer()) {
+				rawVal = resolveParamPath(sourceMap, strings.Split(parent, "."))
+			}
+			if rawVal != nil {
+				usedMurmurParent = true
+			}
+		}
 	}
 	if rawVal == nil {
 		if cv, hasConst := lookupConstantKeywordValueRound63(sourceMap, params, name); hasConst {
@@ -3202,7 +3286,9 @@ func resolveFieldValRound60(name string, sourceMap, params map[string]any) (*Fie
 		keepBoolDups := true
 		dateFmt := lookupFieldFormatFromMapsRound61(sourceMap, params, name)
 		quantizeGeo := isGeoQuantizeEnabledRound61(sourceMap, params)
-		if ft != "" {
+		if ft == "murmur3" {
+			vals = normalizeMurmur3DocValuesRound61(rawVal, usedMurmurParent)
+		} else if ft != "" {
 			vals = normalizeSingleFieldDocValuesWithOptsRound61(rawVal, ft, keepBoolDups, true, dateFmt, quantizeGeo)
 		} else {
 			cleanLower := strings.ToLower(name)
@@ -3691,7 +3777,7 @@ func shouldSkipDynamicGetRewriteRound60(res string, recvStart, getIdx int, recvT
 		if v, exists := params[rootSeg]; exists {
 			switch v.(type) {
 			case *FieldVal, *FieldDocVal, *ByteBufferVal, *BytesRefVal, *PainlessLambda, *ZonedDateTimeVal, *painlessOptional,
-				*DenseVectorFieldVal, *DenseVectorVal, *IPAddressVal, *GeoBoundingBoxVal:
+				*DenseVectorFieldVal, *DenseVectorVal, *IPAddressVal, *GeoBoundingBoxVal, *GeoShapeDocValues:
 				return true
 			}
 		}
@@ -4197,6 +4283,32 @@ func coerceAndRecordEmitRound60(budget *evalBudget, rawArgs []any) (any, error) 
 		}
 		budget.emittedVals = append(budget.emittedVals, pt)
 		return pt, nil
+	case "geo_shape", "shape":
+		if arr, isArr := v.([]any); isArr {
+			if _, _, isCoord := parseGeoCoordPairRound61(arr); !isCoord {
+				if len(arr) == 0 {
+					return nil, &painlessExceptionError{exType: "IllegalArgumentException", message: "empty geo_shape emit value"}
+				}
+				emitted := make([]any, 0, len(arr))
+				for _, item := range arr {
+					gs, err := ParseGeoShapeDocValuesWithOpts(item, true)
+					if err != nil {
+						return nil, err
+					}
+					m := gs.ToGeoJSONMap()
+					budget.emittedVals = append(budget.emittedVals, m)
+					emitted = append(emitted, m)
+				}
+				return emitted, nil
+			}
+		}
+		gs, err := ParseGeoShapeDocValuesWithOpts(v, true)
+		if err != nil {
+			return nil, err
+		}
+		m := gs.ToGeoJSONMap()
+		budget.emittedVals = append(budget.emittedVals, m)
+		return m, nil
 	default:
 		if budget != nil {
 			budget.emittedVals = append(budget.emittedVals, v)
@@ -4206,16 +4318,16 @@ func coerceAndRecordEmitRound60(budget *evalBudget, rawArgs []any) (any, error) 
 }
 
 // EvalEmitContext evaluates a Painless runtime-field or `_scripts/painless/_execute`
-// field-context script and returns its emitted values for all 7 ES 8 field contexts:
+// field-context script and returns its emitted values for all ES 8 field contexts:
 // `boolean_field`, `long_field`, `double_field`, `keyword_field`, `date_field`,
-// `ip_field`, and `geo_point_field`.
+// `ip_field`, `geo_point_field`, `geo_shape_field`, and `composite`.
 func EvalEmitContext(src string, contextType string, doc map[string]any, source map[string]any, params map[string]any, fieldTypes map[string]string) ([]any, error) {
 	if err := CompileValidate(src); err != nil {
 		return nil, err
 	}
 	ctxKind := normalizeEmitContextNameRound60(contextType)
 	switch ctxKind {
-	case "boolean", "long", "double", "keyword", "date", "ip", "geo_point", "composite":
+	case "boolean", "long", "double", "keyword", "date", "ip", "geo_point", "geo_shape", "shape", "composite":
 	default:
 		return nil, fmt.Errorf("illegal_argument_exception: unsupported emit field context [%s]", contextType)
 	}
@@ -5908,6 +6020,9 @@ func evalRound60ZeroArgMethod(mSuffix string, recVal any, sourceMap, params map[
 	case *GeoBoundingBoxVal:
 		return evalGeoBoundingBoxMethodRound61(tv, mBare)
 
+	case *GeoShapeDocValues:
+		return evalGeoShapeMethodRound61(tv, mBare)
+
 	case *IPAddressVal:
 		return evalIPAddressMethodRound61(tv, mBare, nil, sourceMap, params, depth)
 
@@ -6210,6 +6325,22 @@ func evalRound60ReceiverMethod(recVal any, mBare, argStr string, sourceMap, para
 	case *GeoBoundingBoxVal:
 		if len(rawArgExprs) == 0 {
 			return evalGeoBoundingBoxMethodRound61(tv, mBare)
+		}
+
+	case *GeoShapeDocValues:
+		if len(rawArgExprs) == 0 {
+			return evalGeoShapeMethodRound61(tv, mBare)
+		}
+		if mBare == "get" {
+			args, err := evalCallArgs()
+			if err != nil {
+				return nil, true, err
+			}
+			if len(args) >= 1 {
+				idx, _ := toInt64Painless(args[0])
+				res, gErr := tv.Get(int(idx))
+				return res, true, gErr
+			}
 		}
 
 	case *GrokExtractor, *DissectExtractor:
@@ -6910,26 +7041,50 @@ func resolveWrapperPropertyRound60(curr any, seg string) (any, bool) {
 			return tv.TopLeft, true
 		case "bottom_right", "bottomRight":
 			return tv.BottomRight, true
-		case "top":
-			if tv.TopLeft != nil {
-				return tv.TopLeft.Lat, true
-			}
-			return 0.0, true
-		case "bottom":
-			if tv.BottomRight != nil {
-				return tv.BottomRight.Lat, true
-			}
-			return 0.0, true
-		case "left":
-			if tv.TopLeft != nil {
-				return tv.TopLeft.Lon, true
-			}
-			return 0.0, true
-		case "right":
-			if tv.BottomRight != nil {
-				return tv.BottomRight.Lon, true
-			}
-			return 0.0, true
+		case "top", "maxLat":
+			return tv.GetMaxLat(), true
+		case "bottom", "minLat":
+			return tv.GetMinLat(), true
+		case "left", "minLon":
+			return tv.GetMinLon(), true
+		case "right", "maxLon":
+			return tv.GetMaxLon(), true
+		}
+	case *GeoShapeDocValues:
+		if tv == nil {
+			return nil, false
+		}
+		switch seg {
+		case "top_left", "topLeft":
+			return tv.TopLeft(), true
+		case "bottom_right", "bottomRight":
+			return tv.BottomRight(), true
+		case "minLat":
+			return tv.GetBoundingBox().GetMinLat(), true
+		case "maxLat":
+			return tv.GetBoundingBox().GetMaxLat(), true
+		case "minLon":
+			return tv.GetBoundingBox().GetMinLon(), true
+		case "maxLon":
+			return tv.GetBoundingBox().GetMaxLon(), true
+		case "centroid":
+			return tv.GetCentroid(), true
+		case "boundingBox", "bounding_box":
+			return tv.GetBoundingBox(), true
+		case "labelPosition", "label_position":
+			return tv.GetLabelPosition(), true
+		case "dimensionalType", "dimensional_type":
+			return tv.GetDimensionalType(), true
+		case "shapeType", "shape_type":
+			return tv.GetShapeType(), true
+		case "mercatorWidth", "mercator_width":
+			return tv.GetMercatorWidth(), true
+		case "mercatorHeight", "mercator_height":
+			return tv.GetMercatorHeight(), true
+		case "empty":
+			return tv.IsEmpty(), true
+		case "size", "length":
+			return tv.Size(), true
 		}
 	case *IPAddressVal:
 		if tv == nil {
@@ -7179,7 +7334,7 @@ func isRound60WrapperExprRound60(expr string, params map[string]any) bool {
 		return false
 	}
 	switch v.(type) {
-	case *FieldVal, *FieldDocVal, *PainlessLambda, *DenseVectorFieldVal, *DenseVectorVal, *IPAddressVal, *GeoBoundingBoxVal:
+	case *FieldVal, *FieldDocVal, *PainlessLambda, *DenseVectorFieldVal, *DenseVectorVal, *IPAddressVal, *GeoBoundingBoxVal, *GeoShapeDocValues:
 		return true
 	}
 	return false
@@ -7203,6 +7358,18 @@ func round60WrapperEquals(a, b any) (bool, bool) {
 		tlEq, _ := round60WrapperEquals(ta.TopLeft, tb.TopLeft)
 		brEq, _ := round60WrapperEquals(ta.BottomRight, tb.BottomRight)
 		return tlEq && brEq, true
+	case *GeoShapeDocValues:
+		tb, ok := b.(*GeoShapeDocValues)
+		if !ok {
+			return false, true
+		}
+		if ta == nil || tb == nil {
+			return ta == tb, true
+		}
+		if ta.ShapeType != tb.ShapeType || ta.Size() != tb.Size() {
+			return false, true
+		}
+		return reflect.DeepEqual(ta.ToGeoJSONMap(), tb.ToGeoJSONMap()), true
 	case *DenseVectorVal:
 		if ta == nil {
 			return b == nil, true
@@ -7352,7 +7519,7 @@ func round60WrapperEquals(a, b any) (bool, bool) {
 
 	// Symmetric cases where `b` is the Round-60/61/63 wrapper and `a` is string/time.Time/[]any
 	switch b.(type) {
-	case *IPAddressVal, *GeoBoundingBoxVal, *DenseVectorVal, DayOfWeekEnum, *DayOfWeekEnum, MonthEnum, *MonthEnum, *ZonedDateTimeVal, *InstantVal, *GeoPointVal, *BytesRefVal, *ByteBufferVal, *VersionVal, []float64:
+	case *IPAddressVal, *GeoBoundingBoxVal, *GeoShapeDocValues, *DenseVectorVal, DayOfWeekEnum, *DayOfWeekEnum, MonthEnum, *MonthEnum, *ZonedDateTimeVal, *InstantVal, *GeoPointVal, *BytesRefVal, *ByteBufferVal, *VersionVal, []float64:
 		return round60WrapperEquals(b, a)
 	}
 	return false, false

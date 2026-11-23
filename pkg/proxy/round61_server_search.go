@@ -235,12 +235,16 @@ func extractNestedChildMapsPreservingOffsetsR61Search(doc map[string]any, nested
 		}
 		switch node := cur.(type) {
 		case map[string]any:
+			var out []map[string]any
 			if next, exists := node[segs[idx]]; exists {
-				return walk(next, idx+1)
+				out = append(out, walk(next, idx+1)...)
 			}
-			if rem := strings.Join(segs[idx:], "."); node[rem] != nil {
-				return walk(node[rem], len(segs))
+			if idx < len(segs)-1 {
+				if rem := strings.Join(segs[idx:], "."); node[rem] != nil {
+					out = append(out, walk(node[rem], len(segs))...)
+				}
 			}
+			return out
 		case []any:
 			var merged []map[string]any
 			for _, item := range node {
@@ -1148,6 +1152,20 @@ func extractRawStoredValuesForFieldR61Search(doc map[string]any, fieldName strin
 	if status != 0 {
 		return rawVals
 	}
+	if idxSchema != nil && strings.EqualFold(idxSchema.ResolveField(fieldName).ESType, "unsigned_long") {
+		strOut := make([]any, 0, len(formatted))
+		for _, fv := range formatted {
+			switch tv := fv.(type) {
+			case uint64:
+				strOut = append(strOut, strconv.FormatUint(tv, 10))
+			case int64:
+				strOut = append(strOut, strconv.FormatInt(tv, 10))
+			default:
+				strOut = append(strOut, fmt.Sprintf("%v", tv))
+			}
+		}
+		return strOut
+	}
 	return formatted
 }
 
@@ -1448,12 +1466,22 @@ func extractUnifiedFieldsR61Search(
 
 		// Expand candidate target fields
 		incUnmapped := includeUnmappedByPat[rawPattern]
+		srcDisabled := idxSchema != nil && idxSchema.SourceDisabled()
+		allowFieldWhenSourceDisabled := func(fn string) bool {
+			if isDocvalue || !srcDisabled {
+				return true
+			}
+			if _, isRT := mergedRuntimeDefs[fn]; isRT {
+				return true
+			}
+			return fieldIsStoredInSchemaR61Search(idxSchema, fn)
+		}
 		if strings.ContainsAny(rawPattern, "*?") {
 			matchedAny := make(map[string]bool)
 			if idxSchema != nil {
 				fieldNames := collectSchemaCandidateFetchFieldsR61Search(idxSchema, mergedRuntimeDefs, strings.Contains(rawPattern, "."))
 				for _, fn := range fieldNames {
-					if !matchWildcardPattern(rawPattern, fn) {
+					if !matchWildcardPattern(rawPattern, fn) || !allowFieldWhenSourceDisabled(fn) {
 						continue
 					}
 					matchedAny[fn] = true
@@ -1462,21 +1490,18 @@ func extractUnifiedFieldsR61Search(
 					}
 				}
 				if incUnmapped && !isDocvalue && !isIndexSourceDisabledRound59(idxSchema) {
-					// Emit `enabled: false` top-level/object fields directly from `_source` when `include_unmapped: true` (`330_fetch_fields.yml`)
+					// Flatten `enabled: false` object/array fields into scalar leaf paths (`330_fetch_fields.yml`).
 					for fn, fb := range idxSchema.Fields {
-						if !fb.EnabledFalse || matchedAny[fn] || !matchWildcardPattern(rawPattern, fn) {
+						if !fb.EnabledFalse || fb.NestedPath != "" {
 							continue
 						}
 						if rawVal, exists := lookupNestedMapPathR61Search(doc, strings.Split(fn, ".")); exists && rawVal != nil {
-							matchedAny[fn] = true
-							if arr, isArr := rawVal.([]any); isArr {
-								out[fn] = arr
-							} else {
-								out[fn] = []any{rawVal}
-							}
+							emitFlattenedEnabledFalseFieldR64(fn, rawPattern, rawVal, matchedAny, out)
 						}
 					}
-					// Also include unmapped leaf subfields inside `nested` objects when `include_unmapped: true`
+				}
+				if !isDocvalue && !isIndexSourceDisabledRound59(idxSchema) {
+					// Expand nested dynamic/unmapped leaf subfields (including doubly nested like `user.address.city`).
 					for nestedRoot := range idxSchema.NestedRoots {
 						if strings.Contains(nestedRoot, ".") {
 							continue
@@ -1485,29 +1510,48 @@ func extractUnifiedFieldsR61Search(
 						if len(children) == 0 {
 							continue
 						}
-						var unmappedRels []string
+						var dynamicRels []string
+						relHasString := make(map[string]bool)
 						seenRel := make(map[string]bool)
 						for _, ch := range children {
 							subLeaves := make(map[string][]any)
 							collectAllLeafScalarPathsExceptFlattenedR61Search(ch, "", nil, subLeaves)
-							for relK := range subLeaves {
+							for relK, vals := range subLeaves {
 								fullCand := nestedRoot + "." + relK
-								if seenRel[relK] || matchedAny[fullCand] || !matchWildcardPattern(rawPattern, fullCand) {
+								isDynBlocked := idxSchema.IsDynamicFalseUnmappedField(fullCand) || isUnderEnabledFalseInSchemaR64(idxSchema, fullCand)
+								if isDynBlocked && !incUnmapped {
 									continue
 								}
-								if _, isMapped := idxSchema.Fields[fullCand]; isMapped {
-									continue
+								for _, v := range vals {
+									if _, okS := v.(string); okS {
+										relHasString[relK] = true
+										break
+									}
 								}
-								seenRel[relK] = true
-								unmappedRels = append(unmappedRels, relK)
+								if !seenRel[relK] && !matchedAny[fullCand] && matchWildcardPattern(rawPattern, fullCand) {
+									if _, isMapped := idxSchema.Fields[fullCand]; !isMapped {
+										seenRel[relK] = true
+										dynamicRels = append(dynamicRels, relK)
+									}
+								}
 							}
 						}
-						sort.Strings(unmappedRels)
-						for _, relK := range unmappedRels {
+						sort.Strings(dynamicRels)
+						for _, relK := range dynamicRels {
 							fullCand := nestedRoot + "." + relK
 							matchedAny[fullCand] = true
 							if st, errT, errR := mergeNestedFieldIntoUnifiedOutR61Search(doc, nestedRoot, relK, fullCand, rawPattern, spec.Format, idxSchema, out); st != 0 {
 								return st, errT, errR
+							}
+							if relHasString[relK] && !strings.HasSuffix(relK, ".keyword") && !idxSchema.IsDynamicFalseUnmappedField(fullCand) && !isUnderEnabledFalseInSchemaR64(idxSchema, fullCand) {
+								kwRel := relK + ".keyword"
+								kwFull := fullCand + ".keyword"
+								if !matchedAny[kwFull] && matchWildcardPattern(rawPattern, kwFull) {
+									matchedAny[kwFull] = true
+									if st, errT, errR := mergeNestedFieldIntoUnifiedOutR61Search(doc, nestedRoot, kwRel, kwFull, rawPattern, spec.Format, idxSchema, out); st != 0 {
+										return st, errT, errR
+									}
+								}
 							}
 						}
 					}
@@ -1536,18 +1580,18 @@ func extractUnifiedFieldsR61Search(
 		}
 
 		if incUnmapped && !isDocvalue && idxSchema != nil && !isIndexSourceDisabledRound59(idxSchema) {
-			if fb, ok := idxSchema.Fields[rawPattern]; ok && fb.EnabledFalse {
+			if isUnderEnabledFalseInSchemaR64(idxSchema, rawPattern) && idxSchema.ResolveField(rawPattern).NestedPath == "" {
 				if rawVal, exists := lookupNestedMapPathR61Search(doc, strings.Split(rawPattern, ".")); exists && rawVal != nil {
-					if arr, isArr := rawVal.([]any); isArr {
-						out[rawPattern] = arr
-					} else {
-						out[rawPattern] = []any{rawVal}
-					}
+					matchedTmp := make(map[string]bool)
+					emitFlattenedEnabledFalseFieldR64(rawPattern, rawPattern, rawVal, matchedTmp, out)
 				}
 				return 0, "", ""
 			}
 		}
 
+		if !allowFieldWhenSourceDisabled(rawPattern) {
+			return 0, "", ""
+		}
 		return emitSingleMatchedFieldIntoOutR61Search(h, hitIdx, doc, runtimeDoc, mergedRuntimeDefs, rawPattern, rawPattern, spec.Format, isDocvalue, idxSchema, out)
 	}
 
@@ -1587,10 +1631,64 @@ func extractUnifiedFieldsR61Search(
 		}
 	}
 
+	stripEmptyNestedMapsInFieldsOutR64(out)
 	if len(out) == 0 {
 		return nil, 0, "", ""
 	}
 	return out, 0, "", ""
+}
+
+func stripEmptyNestedSliceR64(vals []any) ([]any, bool) {
+	if len(vals) == 0 {
+		return vals, false
+	}
+	hasMap := false
+	for _, item := range vals {
+		if _, ok := item.(map[string]any); ok {
+			hasMap = true
+			break
+		}
+	}
+	if !hasMap {
+		return vals, false
+	}
+	kept := make([]any, 0, len(vals))
+	for _, item := range vals {
+		em, ok := item.(map[string]any)
+		if !ok {
+			kept = append(kept, item)
+			continue
+		}
+		for k, v := range em {
+			if subSlice, isSlice := v.([]any); isSlice {
+				cleaned, wasNested := stripEmptyNestedSliceR64(subSlice)
+				if wasNested {
+					if len(cleaned) == 0 {
+						delete(em, k)
+					} else {
+						em[k] = cleaned
+					}
+				}
+			}
+		}
+		if len(em) > 0 {
+			kept = append(kept, em)
+		}
+	}
+	return kept, true
+}
+
+func stripEmptyNestedMapsInFieldsOutR64(out map[string][]any) {
+	for k, vals := range out {
+		cleaned, wasNested := stripEmptyNestedSliceR64(vals)
+		if wasNested {
+			if len(cleaned) == 0 {
+				delete(out, k)
+			} else {
+				out[k] = cleaned
+			}
+		}
+	}
 }
 
 func collectAllLeafScalarPathsExceptFlattenedR61Search(
@@ -1686,8 +1784,8 @@ func collectSchemaCandidateFetchFieldsR61Search(
 					continue
 				}
 			}
-			if !includeDefaultMultiFields && !subobjFalse && strings.HasSuffix(fn, ".keyword") {
-				// Include explicit multi-fields from RawMapping, skip auto synthetic `.keyword` unless pattern has `.` or `subobjects: false`
+			if !includeDefaultMultiFields && !subobjFalse && fb.NestedPath == "" && strings.HasSuffix(fn, ".keyword") {
+				// Include explicit multi-fields from RawMapping, skip auto synthetic `.keyword` unless pattern has `.` or `subobjects: false` or inside `nested`
 				if _, ok := lookupRawPropertyWithMultiFieldR61Search(idxSchema, fn); !ok {
 					continue
 				}
@@ -2043,6 +2141,56 @@ func emitSingleMatchedFieldIntoOutR61Search(
 			}
 			return 0, "", ""
 		}
+		if rtType == "geo_shape" || rtType == "shape" {
+			fLower := strings.ToLower(strings.TrimSpace(format))
+			if fLower == "use_field_mapping" {
+				fLower = ""
+			}
+			if fLower != "" && fLower != "geojson" && fLower != "wkt" {
+				return http.StatusBadRequest, "illegal_argument_exception",
+					fmt.Sprintf("Invalid format [%s] for [%s]: only [geojson] and [wkt] are supported", strings.TrimSpace(format), fieldName)
+			}
+			var rawShapes []any
+			if runtimeDoc != nil {
+				if v, ok := runtimeDoc[fieldName]; ok && v != nil {
+					if arr, isArr := v.([]any); isArr {
+						rawShapes = arr
+					} else {
+						rawShapes = []any{v}
+					}
+				} else if !inRTDefs || rtDefProp.Script == nil {
+					if v, ok := lookupNestedMapPathR61Search(runtimeDoc, strings.Split(fieldName, ".")); ok && v != nil {
+						if arr, isArr := v.([]any); isArr {
+							rawShapes = arr
+						} else {
+							rawShapes = []any{v}
+						}
+					}
+				}
+			}
+			if len(rawShapes) == 0 && doc != nil && (!inRTDefs || rtDefProp.Script == nil) {
+				if v, ok := doc[fieldName]; ok && v != nil {
+					if arr, isArr := v.([]any); isArr {
+						rawShapes = arr
+					} else {
+						rawShapes = []any{v}
+					}
+				} else if v, ok := lookupNestedMapPathR61Search(doc, strings.Split(fieldName, ".")); ok && v != nil {
+					if arr, isArr := v.([]any); isArr {
+						rawShapes = arr
+					} else {
+						rawShapes = []any{v}
+					}
+				}
+			}
+			if len(rawShapes) > 0 {
+				wantWKT := fLower == "wkt" || (isDocvalue && fLower == "")
+				if formatted := formatGeoShapeValuesForFieldsR64(rawShapes, wantWKT); len(formatted) > 0 {
+					out[fieldName] = formatted
+				}
+			}
+			return 0, "", ""
+		}
 		var rawRTVals []any
 		if runtimeDoc != nil {
 			if v, ok := runtimeDoc[fieldName]; ok && v != nil {
@@ -2175,6 +2323,70 @@ func emitSingleMatchedFieldIntoOutR61Search(
 		}
 	}
 
+	if hasBinding && esType == "aggregate_metric_double" {
+		if isDocvalue {
+			return http.StatusBadRequest, "illegal_argument_exception",
+				fmt.Sprintf("Can't load fielddata on [%s] because fielddata is unsupported on fields of type [%s]. Use doc values instead.", fieldName, esType)
+		}
+		rawObj, ok := lookupNestedMapPathR61Search(doc, effectiveSourceSegsR61Search(fieldName, b))
+		if !ok || rawObj == nil {
+			return 0, "", ""
+		}
+		normalizeAggMetricObj := func(m map[string]any) (map[string]any, bool) {
+			if len(m) == 0 {
+				return nil, false
+			}
+			res := make(map[string]any, len(m))
+			allowed := make(map[string]bool, len(b.AggregateMetrics))
+			for _, am := range b.AggregateMetrics {
+				allowed[strings.ToLower(strings.TrimSpace(am))] = true
+			}
+			for mk, mv := range m {
+				if len(allowed) > 0 && !allowed[strings.ToLower(mk)] {
+					continue
+				}
+				if mv == nil {
+					continue
+				}
+				switch tv := mv.(type) {
+				case json.Number:
+					if iv, err := tv.Int64(); err == nil {
+						res[mk] = iv
+					} else if fv, err := tv.Float64(); err == nil {
+						res[mk] = fv
+					} else {
+						res[mk] = tv
+					}
+				default:
+					res[mk] = mv
+				}
+			}
+			if len(res) == 0 {
+				return nil, false
+			}
+			return res, true
+		}
+		switch tv := rawObj.(type) {
+		case map[string]any:
+			if obj, okN := normalizeAggMetricObj(tv); okN {
+				out[fieldName] = []any{obj}
+			}
+		case []any:
+			var objs []any
+			for _, elem := range tv {
+				if m, okM := elem.(map[string]any); okM {
+					if obj, okN := normalizeAggMetricObj(m); okN {
+						objs = append(objs, obj)
+					}
+				}
+			}
+			if len(objs) > 0 {
+				out[fieldName] = objs
+			}
+		}
+		return 0, "", ""
+	}
+
 	// `token_count` multi-field or standalone field (`330_fetch_fields.yml:750-785`)
 	if hasBinding && esType == "token_count" {
 		segs := effectiveTokenCountSourceSegsR61Search(fieldName, b, idxSchema)
@@ -2204,6 +2416,9 @@ func emitSingleMatchedFieldIntoOutR61Search(
 	}
 
 	segs := effectiveSourceSegsR61Search(fieldName, b)
+	if hasBinding && esType == "murmur3" {
+		segs = effectiveTokenCountSourceSegsR61Search(fieldName, b, idxSchema)
+	}
 	rawVals := collectSchemaAwareScalarValues(doc, fieldName, segs, idxSchema)
 	fromIndexTimeScript := false
 	if idxSchema != nil && idxSchema.RawMapping != nil {
@@ -2537,30 +2752,9 @@ func mergeNestedFieldWithFullPrefixR63Search(
 	if !anyPopulated && out[localKey] == nil {
 		return 0, "", ""
 	}
-	// Preserve `existing` slice indices when more subfields may still be merged; strip empty maps only if none populated?
-	// Wait: if `out[localKey]` holds `existing` with `len(children)`, wait until final or filter empty maps?
-	// Notice `existing != nil && len(existing) != len(children)` above reset `existing` when empty maps were stripped!
-	// Let's keep `existing` aligned to `children` when all children are non-empty, or strip empty maps at return if needed:
-	allNonEmpty := true
-	for _, item := range existing {
-		if em, ok := item.(map[string]any); !ok || len(em) == 0 {
-			allNonEmpty = false
-			break
-		}
-	}
-	if allNonEmpty {
-		out[localKey] = existing
-		return 0, "", ""
-	}
-	nonEmpty := make([]any, 0, len(existing))
-	for _, item := range existing {
-		if em, ok := item.(map[string]any); ok && len(em) > 0 {
-			nonEmpty = append(nonEmpty, em)
-		}
-	}
-	if len(nonEmpty) > 0 {
-		out[localKey] = nonEmpty
-	}
+	// Preserve slot alignment in `existing` across subfields; `stripEmptyNestedMapsInFieldsOutR64`
+	// strips unpopulated nested objects right before `extractUnifiedFieldsR61Search` returns.
+	out[localKey] = existing
 	return 0, "", ""
 }
 
@@ -2920,6 +3114,15 @@ func extractFormattedSpatialFieldValuesR61Search(
 	}
 	// `geo_shape` / `shape`
 	wantWKT := fLower == "wkt"
+	var rawShapes []any
+	if arr, ok := rawNode.([]any); ok {
+		rawShapes = arr
+	} else if rawNode != nil {
+		rawShapes = []any{rawNode}
+	}
+	if formatted := formatGeoShapeValuesForFieldsR64(rawShapes, wantWKT); len(formatted) > 0 {
+		return formatted, 0, "", ""
+	}
 	if arr, ok := rawNode.([]any); ok {
 		conv := make([]any, 0, len(arr))
 		for _, el := range arr {
@@ -3065,6 +3268,13 @@ func formatUnifiedFieldSliceR61Search(
 			}
 
 		case "unsigned_long":
+			if strV, isStr := rawV.(string); isStr && strings.TrimSpace(strV) == "" {
+				if coerce && hasBinding && b.NullValue != nil {
+					rawV = b.NullValue
+				} else {
+					continue
+				}
+			}
 			uVal, asInt64, ok := parseExactUint64R61Search(rawV, coerce)
 			if !ok {
 				if ignoreMalformed {
@@ -3210,6 +3420,18 @@ func formatUnifiedFieldSliceR61Search(
 				s = strings.ToLower(s)
 			}
 			out = append(out, s)
+
+		case "murmur3":
+			if !isDocvalue {
+				out = append(out, rawV)
+				continue
+			}
+			hv := painless.ComputePainlessMurmur3Hash(formatRawScalarStringR61Search(rawV))
+			if format != "" {
+				out = append(out, formatNumericWithDecimalPatternR61Search(float64(hv), format))
+			} else {
+				out = append(out, hv)
+			}
 
 		default:
 			if jn, ok := rawV.(json.Number); ok {
@@ -3969,14 +4191,14 @@ func isSingleBucketAggSpecR61Search(spec esast.AggSpec) (string, bool) {
 }
 
 func isMultiBucketParentAggSpecR61Search(spec esast.AggSpec) bool {
-	return spec.Terms != nil || spec.MultiTerms != nil || spec.RareTerms != nil ||
+	return spec.Terms != nil || spec.CountedTerms != nil || spec.MultiTerms != nil || spec.RareTerms != nil ||
 		spec.SignificantTerms != nil || spec.SignificantText != nil ||
 		spec.Histogram != nil || spec.DateHistogram != nil ||
 		spec.AutoDateHistogram != nil || spec.VariableWidthHistogram != nil ||
 		spec.Range != nil || spec.DateRange != nil || spec.IPRange != nil ||
 		spec.Filters != nil || spec.AdjacencyMatrix != nil || spec.Composite != nil ||
 		spec.GeoDistance != nil || spec.GeohashGrid != nil || spec.GeotileGrid != nil ||
-		spec.CategorizeText != nil
+		spec.GeoHexGrid != nil || spec.CategorizeText != nil
 }
 
 func isChildMultiBucketPipelineAggSpecR61Search(spec esast.AggSpec) (string, bool) {
@@ -6964,7 +7186,32 @@ func evaluateCompletionSuggestSpecWithAliasesR61Search(
 				effAnalyzer = "simple"
 			}
 		}
-		normPrefix := normalizeCompletionStringR61Search(rawInputQuery, effAnalyzer)
+		idxAnalyzer := effAnalyzer
+		if b.Analyzer != "" && cs.Analyzer == "" {
+			idxAnalyzer = b.Analyzer
+		}
+		var anCfg *analysis.IndexAnalysisConfig
+		var anOpts analysis.Options
+		if s != nil && indexName != "" && !strings.EqualFold(effAnalyzer, "keyword") {
+			anCfg, anOpts = s.buildIndexAnalysisConfigR62Admin(indexName)
+		}
+		completionForms := func(raw, an string) []string {
+			if anCfg != nil && an != "" && !strings.EqualFold(an, "keyword") {
+				if graph, errA := analysis.AnalyzeForQuery(raw, an, anCfg, anOpts); errA == nil && !graph.IsEmpty() {
+					var analyzed []string
+					for _, p := range graph.PhrasePaths(64) {
+						if joined := strings.Join(p, " "); joined != "" {
+							analyzed = appendUniqueStringR61Search(analyzed, joined)
+						}
+					}
+					if len(analyzed) > 0 {
+						return analyzed
+					}
+				}
+			}
+			return []string{normalizeCompletionStringR61Search(raw, an)}
+		}
+		queryPrefixes := completionForms(rawInputQuery, effAnalyzer)
 		segs := effectiveSourceSegsR61Search(cs.Field, b)
 
 		for _, hr := range rows {
@@ -7014,14 +7261,30 @@ func evaluateCompletionSuggestSpecWithAliasesR61Search(
 				// Within one entry, find best matching input string (`entry.inputs`)
 				for _, inp := range entry.inputs {
 					matchedInput := false
+					inpForms := completionForms(inp, idxAnalyzer)
 					if isRegexMode {
-						normInp := normalizeCompletionStringR61Search(inp, effAnalyzer)
-						if compiledRegex.MatchString(normInp) || compiledRegex.MatchString(inp) {
+						if compiledRegex.MatchString(inp) {
 							matchedInput = true
+						} else {
+							for _, nf := range inpForms {
+								if compiledRegex.MatchString(nf) {
+									matchedInput = true
+									break
+								}
+							}
 						}
 					} else {
-						normInp := normalizeCompletionStringR61Search(inp, effAnalyzer)
-						matchedInput = matchesCompletionPrefixOrFuzzyR61Search(normInp, normPrefix, cs.Fuzzy)
+						for _, nf := range inpForms {
+							for _, qp := range queryPrefixes {
+								if matchesCompletionPrefixOrFuzzyR61Search(nf, qp, cs.Fuzzy) {
+									matchedInput = true
+									break
+								}
+							}
+							if matchedInput {
+								break
+							}
+						}
 					}
 					if !matchedInput {
 						continue
@@ -7199,6 +7462,12 @@ func expandCollapseInnerHitsAndSecondLevelR61Search(
 				if len(activeSort) > 0 {
 					if cmp := compareHitRowsBySortWithSchemas(sortedGroup[i], sortedGroup[j], activeSort, sI, sJ); cmp != 0 {
 						return cmp < 0
+					}
+					if !sortSpecsUseScore(activeSort) {
+						if sortedGroup[i].HasSeqNo && sortedGroup[j].HasSeqNo && sortedGroup[i].SeqNo != sortedGroup[j].SeqNo {
+							return sortedGroup[i].SeqNo < sortedGroup[j].SeqNo
+						}
+						return sortedGroup[i].ID < sortedGroup[j].ID
 					}
 				}
 				if sortedGroup[i].Score != sortedGroup[j].Score {
@@ -9223,4 +9492,104 @@ func rawBucketsNilOrSingleR61Search(aggMap map[string]any) bool {
 	}
 	_, hasBuckets := aggMap["buckets"]
 	return !hasBuckets
+}
+
+func isUnderEnabledFalseInSchemaR64(idxSchema *schema.IndexSchema, fieldPath string) bool {
+	if idxSchema == nil || fieldPath == "" {
+		return false
+	}
+	parts := strings.Split(fieldPath, ".")
+	for i := 1; i <= len(parts); i++ {
+		pref := strings.Join(parts[:i], ".")
+		if fb, ok := idxSchema.Fields[pref]; ok && fb.EnabledFalse {
+			return true
+		}
+		if fp, okRaw := lookupRawPropertyWithMultiFieldR61Search(idxSchema, pref); okRaw && fp.Enabled != nil && !*fp.Enabled {
+			return true
+		}
+	}
+	return false
+}
+
+func emitFlattenedEnabledFalseFieldR64(
+	prefix string,
+	rawPattern string,
+	val any,
+	matchedAny map[string]bool,
+	out map[string][]any,
+) {
+	leaves := make(map[string][]any)
+	var walk func(node any, curPath string)
+	walk = func(node any, curPath string) {
+		switch tv := node.(type) {
+		case map[string]any:
+			for k, v := range tv {
+				nextPath := k
+				if curPath != "" {
+					nextPath = curPath + "." + k
+				}
+				walk(v, nextPath)
+			}
+		case []any:
+			for _, item := range tv {
+				walk(item, curPath)
+			}
+		case nil:
+		default:
+			if curPath != "" {
+				leaves[curPath] = append(leaves[curPath], tv)
+			}
+		}
+	}
+	walk(val, prefix)
+
+	scalarRank := func(v any) (int, float64, string) {
+		switch tv := v.(type) {
+		case json.Number:
+			if f, err := tv.Float64(); err == nil {
+				return 0, f, tv.String()
+			}
+		case int:
+			return 0, float64(tv), strconv.Itoa(tv)
+		case int64:
+			return 0, float64(tv), strconv.FormatInt(tv, 10)
+		case uint64:
+			return 0, float64(tv), strconv.FormatUint(tv, 10)
+		case float64:
+			return 0, tv, strconv.FormatFloat(tv, 'g', -1, 64)
+		case bool:
+			if tv {
+				return 1, 1, "true"
+			}
+			return 1, 0, "false"
+		case string:
+			return 2, 0, tv
+		}
+		return 3, 0, fmt.Sprintf("%v", v)
+	}
+
+	keys := make([]string, 0, len(leaves))
+	for k := range leaves {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		if !matchWildcardPattern(rawPattern, k) {
+			continue
+		}
+		vals := leaves[k]
+		sort.SliceStable(vals, func(i, j int) bool {
+			ri, fi, si := scalarRank(vals[i])
+			rj, fj, sj := scalarRank(vals[j])
+			if ri != rj {
+				return ri < rj
+			}
+			if ri == 0 && fi != fj {
+				return fi < fj
+			}
+			return si < sj
+		})
+		matchedAny[k] = true
+		out[k] = vals
+	}
 }

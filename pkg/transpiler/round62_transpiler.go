@@ -1695,11 +1695,24 @@ func (t *Transpiler) fieldHasIndexPrefixes(field string, b schema.FieldBinding) 
 	return ok && fp.IndexPrefixes != nil
 }
 
+func (t *Transpiler) effectiveAnalysisConfig() *analysis.IndexAnalysisConfig {
+	if t == nil {
+		return nil
+	}
+	if t.Opts.AnalysisConfig != nil {
+		return t.Opts.AnalysisConfig
+	}
+	if t.Schema != nil {
+		return t.Schema.AnalysisConfig
+	}
+	return nil
+}
+
 func (t *Transpiler) fieldNormalizerName(field string, b schema.FieldBinding) string {
 	if fp, ok := t.lookupMappedFieldProperty(field, b); ok && strings.TrimSpace(fp.Normalizer) != "" {
 		return strings.TrimSpace(fp.Normalizer)
 	}
-	return ""
+	return strings.TrimSpace(b.NormalizerName)
 }
 
 // resolveRankFeatureBindingAndNullValue resolves a `rank_feature` or `rank_features.<token>` field
@@ -1938,7 +1951,7 @@ func (t *Transpiler) effectiveQueryAnalyzerName(b schema.FieldBinding, explicitA
 	if exp := strings.TrimSpace(explicitAnalyzer); exp != "" {
 		return exp
 	}
-	if cfg := t.Opts.AnalysisConfig; cfg != nil {
+	if cfg := t.effectiveAnalysisConfig(); cfg != nil {
 		if resolved := strings.TrimSpace(cfg.ResolveSearchAnalyzer(b.Analyzer, b.SearchAnalyzer)); resolved != "" {
 			return resolved
 		}
@@ -1954,7 +1967,8 @@ func (t *Transpiler) effectiveQueryAnalyzerName(b schema.FieldBinding, explicitA
 
 func (t *Transpiler) hasCustomQueryAnalysis(analyzerName string) bool {
 	an := strings.TrimSpace(analyzerName)
-	if t.Opts.AnalysisConfig == nil {
+	cfg := t.effectiveAnalysisConfig()
+	if cfg == nil {
 		if an == "" || !analysis.IsBuiltInAnalyzer(an) {
 			return false
 		}
@@ -1966,11 +1980,11 @@ func (t *Transpiler) hasCustomQueryAnalysis(analyzerName string) bool {
 		}
 	}
 	if an == "" {
-		_, hasDS := t.Opts.AnalysisConfig.AnalyzerDefs["default_search"]
-		_, hasD := t.Opts.AnalysisConfig.AnalyzerDefs["default"]
+		_, hasDS := cfg.AnalyzerDefs["default_search"]
+		_, hasD := cfg.AnalyzerDefs["default"]
 		return hasDS || hasD
 	}
-	if _, ok := t.Opts.AnalysisConfig.AnalyzerDefs[an]; ok {
+	if _, ok := cfg.AnalyzerDefs[an]; ok {
 		return true
 	}
 	// Also use `pkg/analysis` for built-in stemmer/language analyzers when `AnalysisConfig` is active.
@@ -1984,8 +1998,8 @@ func (t *Transpiler) hasCustomQueryAnalysis(analyzerName string) bool {
 
 func (t *Transpiler) normalizeKeywordOrAnalyzerTerm(raw string, b schema.FieldBinding, forceLower bool) string {
 	normName := t.fieldNormalizerName(b.ESFieldPath, b)
-	if normName != "" && t.Opts.AnalysisConfig != nil {
-		if norm, err := analysis.NormalizeTerm(raw, normName, t.Opts.AnalysisConfig, t.Opts.AnalysisOpts); err == nil {
+	if cfg := t.effectiveAnalysisConfig(); normName != "" && cfg != nil {
+		if norm, err := analysis.NormalizeTerm(raw, normName, cfg, t.Opts.AnalysisOpts); err == nil {
 			if forceLower {
 				return strings.ToLower(norm)
 			}
@@ -2048,15 +2062,25 @@ func (t *Transpiler) multiTokenExactPhraseSQL(field string, b schema.FieldBindin
 		sc := "0.0"
 		if scoring {
 			sc = fmt.Sprintf("(CASE WHEN %s THEN %s ELSE 0.0 END)", pred, strconv.FormatFloat(boost, 'g', -1, 64))
+			if bm25Sc, ok := t.compileBM25PhraseScoreR63(field, field, b, terms, caseSensitive, boost, pred, nctx); ok {
+				sc = bm25Sc
+			}
 		}
 		return CompiledQuery{WhereSQL: pred, SafeWhereSQL: pred, ScoreSQL: sc}
 	}
 
 	// Sloppy phrase (>0): all terms must appear in the field (within slop token gaps).
-	if slop > 0 && !trailingPrefix {
+	if slop > 0 && len(terms) > 1 {
 		var parts []string
-		for _, tk := range terms {
-			parts = append(parts, t.singleAnalyzedTokenSQL(field, b, tk, caseSensitive, 1.0, false, nctx).WhereSQL)
+		limit := len(terms)
+		if trailingPrefix {
+			limit = len(terms) - 1
+		}
+		for i := 0; i < limit; i++ {
+			parts = append(parts, t.singleAnalyzedTokenSQL(field, b, terms[i], caseSensitive, 1.0, false, nctx).WhereSQL)
+		}
+		if trailingPrefix {
+			parts = append(parts, t.compileAnalyzedTokenOrPhrasePrefixRegex(field, b, terms[len(terms)-1], !caseSensitive, nctx))
 		}
 		pred := "(" + strings.Join(parts, " AND ") + ")"
 		sc := "0.0"
@@ -2095,18 +2119,16 @@ func (t *Transpiler) multiTokenExactPhraseSQL(field string, b schema.FieldBindin
 	sc := "0.0"
 	if scoring {
 		sc = fmt.Sprintf("(CASE WHEN %s THEN %s ELSE 0.0 END)", pred, strconv.FormatFloat(boost, 'g', -1, 64))
-		if !trailingPrefix {
-			if bm25Sc, ok := t.compileBM25PhraseScoreR63(field, field, b, terms, caseSensitive, boost, pred, nctx); ok {
-				sc = bm25Sc
-			}
+		if bm25Sc, ok := t.compileBM25PhraseScoreR63(field, field, b, terms, caseSensitive, boost, pred, nctx); ok {
+			sc = bm25Sc
 		}
 	}
 	return CompiledQuery{WhereSQL: pred, SafeWhereSQL: pred, ScoreSQL: sc}
 }
 
-// compileMatchWithAnalysisGraph compiles `match` using `analysis.AnalyzeForQuery` when `AnalysisConfig`
-// defines a custom analyzer (supporting `ngram`, `edge_ngram`, `snowball`, `synonym`, `synonym_graph`,
-// `minimum_should_match`, and `zero_terms_query`).
+// compileMatchWithAnalysisGraph compiles `match` using `analysis.AnalyzeTokens` and `analysis.BuildQueryTokenGraph`
+// when `effectiveAnalysisConfig()` defines a custom analyzer or built-in non-trivial analyzer (supporting
+// `ngram`, `edge_ngram`, `snowball`, `synonym`, `synonym_graph`, `minimum_should_match`, and `zero_terms_query`).
 func (t *Transpiler) compileMatchWithAnalysisGraph(
 	origField string,
 	queryStr string,
@@ -2121,12 +2143,33 @@ func (t *Transpiler) compileMatchWithAnalysisGraph(
 	scoring bool,
 	nctx *nestedCtx,
 ) (CompiledQuery, bool) {
+	return t.compileMatchWithAnalysisGraphOpts(
+		origField, queryStr, operator, explicitAnalyzer, zeroTermsQuery,
+		msm, fuzziness, prefixLen, fuzzyTransp, nil, boost, scoring, nctx,
+	)
+}
+
+func (t *Transpiler) compileMatchWithAnalysisGraphOpts(
+	origField string,
+	queryStr string,
+	operator string,
+	explicitAnalyzer string,
+	zeroTermsQuery string,
+	msm any,
+	fuzziness any,
+	prefixLen int,
+	fuzzyTransp *bool,
+	autoSynPhrase *bool,
+	boost float64,
+	scoring bool,
+	nctx *nestedCtx,
+) (CompiledQuery, bool) {
 	cleanField, fBoost := parseFieldBoost(origField, 1.0)
 	if strings.ContainsAny(cleanField, "*?") {
 		return CompiledQuery{}, false
 	}
 	resolved, b := t.resolveFieldInNestedCtx(cleanField, false, nctx)
-	if isExactKeywordField(resolved, b) || schema.IsRangeFieldType(b.ESType) || b.ESType == "ip" {
+	if isExactKeywordField(resolved, b) || b.ESType == "wildcard" || schema.IsRangeFieldType(b.ESType) || b.ESType == "ip" {
 		return CompiledQuery{}, false
 	}
 	effAn := t.effectiveQueryAnalyzerName(b, explicitAnalyzer)
@@ -2137,28 +2180,59 @@ func (t *Transpiler) compileMatchWithAnalysisGraph(
 		return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}, true
 	}
 
-	graph, err := analysis.AnalyzeForQuery(queryStr, effAn, t.Opts.AnalysisConfig, t.Opts.AnalysisOpts)
+	effCfg := t.effectiveAnalysisConfig()
+	tokens, err := analysis.AnalyzeTokens(queryStr, effAn, effCfg, t.Opts.AnalysisOpts)
 	if err != nil {
 		if !t.inLenientQuery && t.searchErr == nil {
 			t.searchErr = esTranspilerError("illegal_argument_exception: " + err.Error())
 		}
 		return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}, true
 	}
+	graph := analysis.BuildQueryTokenGraph(tokens)
 	effBoost := boost * fBoost
+	return t.compileMatchGraphToSQLR64(
+		resolved, b, effAn, effCfg, graph, operator, msm, zeroTermsQuery,
+		fuzziness, prefixLen, fuzzyTransp, autoSynPhrase, effBoost, scoring, nctx,
+	), true
+}
+
+func (t *Transpiler) compileMatchGraphToSQLR64(
+	resolved string,
+	b schema.FieldBinding,
+	effAn string,
+	effCfg *analysis.IndexAnalysisConfig,
+	graph analysis.QueryTokenGraph,
+	operator string,
+	msm any,
+	zeroTermsQuery string,
+	fuzziness any,
+	prefixLen int,
+	fuzzyTransp *bool,
+	autoSynPhrase *bool,
+	effBoost float64,
+	scoring bool,
+	nctx *nestedCtx,
+) CompiledQuery {
 	if graph.IsEmpty() {
 		if strings.EqualFold(zeroTermsQuery, "all") {
 			return CompiledQuery{
 				WhereSQL:     "TRUE",
 				SafeWhereSQL: "TRUE",
 				ScoreSQL:     strconv.FormatFloat(effBoost, 'g', -1, 64),
-			}, true
+			}
 		}
-		return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}, true
+		return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
 	}
 
-	autoPhrase := !t.Opts.DisableSynonymsPhraseQuery
+	if autoSynPhrase == nil {
+		autoSynPhrase = t.autoGenSynPhraseQuery
+	}
+	autoPhrase := !t.Opts.DisableSynonymsPhraseQuery && graph.HasGraphSpans
+	if autoSynPhrase != nil {
+		autoPhrase = *autoSynPhrase && graph.HasGraphSpans
+	}
 	isAnd := strings.EqualFold(operator, "and")
-	caseSensitive, isWhitespace := analyzerCaseAndWhitespaceFlagsR63(effAn, t.Opts.AnalysisConfig, t.Opts.AnalysisOpts)
+	caseSensitive, isWhitespace := analyzerCaseAndWhitespaceFlagsR63(effAn, effCfg, t.Opts.AnalysisOpts)
 	var segPreds, segScores []string
 
 	for _, seg := range graph.Segments {
@@ -2166,45 +2240,62 @@ func (t *Transpiler) compileMatchWithAnalysisGraph(
 			continue
 		}
 		var altPreds, altScores []string
-		for _, alt := range seg.Alternatives {
-			if len(alt) == 0 {
-				continue
-			}
-			var cp CompiledQuery
-			if len(alt) == 1 {
+		if seg.IsSingleTermAlternatives() {
+			for _, tk := range seg.SingleTermAlternatives() {
+				var cp CompiledQuery
 				if hasNonZeroFuzziness(fuzziness) {
-					cp = t.compileFuzzyFieldWithOpts(resolved, alt[0], "or", fuzziness, false, prefixLen, fuzzyTransp, 1.0, scoring, nctx)
+					cp = t.compileFuzzyFieldWithOpts(resolved, tk, "or", fuzziness, false, prefixLen, fuzzyTransp, 1.0, scoring, nctx)
 				} else {
-					cp = t.singleAnalyzedTokenWithFlagsR63(resolved, b, alt[0], caseSensitive, isWhitespace, 1.0, scoring, nctx)
+					cp = t.singleAnalyzedTokenWithFlagsR63(resolved, b, tk, caseSensitive, isWhitespace, 1.0, scoring, nctx)
 				}
-			} else if autoPhrase {
-				cp = t.multiTokenExactPhraseSQL(resolved, b, alt, 0, false, caseSensitive, 1.0, scoring, nctx)
-			} else {
-				var subParts []string
-				for _, tk := range alt {
-					subParts = append(subParts, t.singleAnalyzedTokenWithFlagsR63(resolved, b, tk, caseSensitive, isWhitespace, 1.0, false, nctx).WhereSQL)
+				if cp.WhereSQL != "FALSE" {
+					altPreds = append(altPreds, cp.WhereSQL)
+					if scoring && cp.ScoreSQL != "0.0" {
+						altScores = append(altScores, cp.ScoreSQL)
+					}
 				}
-				joiner := " OR "
-				if isAnd {
-					joiner = " AND "
-				}
-				w := "(" + strings.Join(subParts, joiner) + ")"
-				sc := "0.0"
-				if scoring {
-					sc = fmt.Sprintf("(CASE WHEN %s THEN 1.0 ELSE 0.0 END)", w)
-				}
-				cp = CompiledQuery{WhereSQL: w, SafeWhereSQL: w, ScoreSQL: sc}
 			}
-			if cp.WhereSQL != "FALSE" {
-				altPreds = append(altPreds, cp.WhereSQL)
-				if scoring && cp.ScoreSQL != "0.0" {
-					altScores = append(altScores, cp.ScoreSQL)
+		} else {
+			for _, alt := range seg.Alternatives {
+				if len(alt) == 0 {
+					continue
+				}
+				var cp CompiledQuery
+				if len(alt) == 1 {
+					if hasNonZeroFuzziness(fuzziness) {
+						cp = t.compileFuzzyFieldWithOpts(resolved, alt[0], "or", fuzziness, false, prefixLen, fuzzyTransp, 1.0, scoring, nctx)
+					} else {
+						cp = t.singleAnalyzedTokenWithFlagsR63(resolved, b, alt[0], caseSensitive, isWhitespace, 1.0, scoring, nctx)
+					}
+				} else if autoPhrase {
+					cp = t.multiTokenExactPhraseSQL(resolved, b, alt, 0, false, caseSensitive, 1.0, scoring, nctx)
+				} else {
+					var subParts []string
+					for _, tk := range alt {
+						subParts = append(subParts, t.singleAnalyzedTokenWithFlagsR63(resolved, b, tk, caseSensitive, isWhitespace, 1.0, false, nctx).WhereSQL)
+					}
+					joiner := " OR "
+					if isAnd {
+						joiner = " AND "
+					}
+					w := "(" + strings.Join(subParts, joiner) + ")"
+					sc := "0.0"
+					if scoring {
+						sc = fmt.Sprintf("(CASE WHEN %s THEN 1.0 ELSE 0.0 END)", w)
+					}
+					cp = CompiledQuery{WhereSQL: w, SafeWhereSQL: w, ScoreSQL: sc}
+				}
+				if cp.WhereSQL != "FALSE" {
+					altPreds = append(altPreds, cp.WhereSQL)
+					if scoring && cp.ScoreSQL != "0.0" {
+						altScores = append(altScores, cp.ScoreSQL)
+					}
 				}
 			}
 		}
 		if len(altPreds) == 0 {
 			if isAnd {
-				return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}, true
+				return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
 			}
 			continue
 		}
@@ -2223,7 +2314,7 @@ func (t *Transpiler) compileMatchWithAnalysisGraph(
 	}
 
 	if len(segPreds) == 0 {
-		return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}, true
+		return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
 	}
 
 	var whereSQL string
@@ -2236,7 +2327,7 @@ func (t *Transpiler) compileMatchWithAnalysisGraph(
 	} else if msm != nil {
 		reqCount := parseMinShouldMatch(msm, len(segPreds), true)
 		if reqCount > len(segPreds) {
-			return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}, true
+			return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
 		}
 		if reqCount <= 1 {
 			whereSQL = "(" + strings.Join(segPreds, " OR ") + ")"
@@ -2261,6 +2352,254 @@ func (t *Transpiler) compileMatchWithAnalysisGraph(
 			sumSc := segScores[0]
 			if len(segScores) > 1 {
 				sumSc = "(" + strings.Join(segScores, " + ") + ")"
+			}
+			scoreSQL = fmt.Sprintf("(CASE WHEN %s THEN (%s * %s) ELSE 0.0 END)", whereSQL, strconv.FormatFloat(effBoost, 'g', -1, 64), sumSc)
+		} else {
+			scoreSQL = fmt.Sprintf("(CASE WHEN %s THEN %s ELSE 0.0 END)", whereSQL, strconv.FormatFloat(effBoost, 'g', -1, 64))
+		}
+	}
+	return CompiledQuery{WhereSQL: whereSQL, SafeWhereSQL: whereSQL, ScoreSQL: scoreSQL}
+}
+
+// compileCommonTermsQueryR64 compiles Elasticsearch `common` queries as well as `match` / `multi_match`
+// queries with `cutoff_frequency`, splitting analyzed query tokens (including stacked synonym tokens)
+// by corpus document frequency via `t.Opts.TermDocFreqFn` (falling back to English stopwords when nil).
+func (t *Transpiler) compileCommonTermsQueryR64(
+	origField string,
+	qStr string,
+	lowOp string,
+	highOp string,
+	cutoffFreq float64,
+	msm any,
+	explicitAnalyzer string,
+	zeroTermsQuery string,
+	boost float64,
+	scoring bool,
+	nctx *nestedCtx,
+	isCommonQuery bool,
+) (CompiledQuery, bool) {
+	cleanKey, fBoost := parseFieldBoost(origField, 1.0)
+	if strings.ContainsAny(cleanKey, "*?") {
+		return CompiledQuery{}, false
+	}
+	resolved, b := t.resolveFieldInNestedCtx(cleanKey, false, nctx)
+	if isExactKeywordField(resolved, b) || b.ESType == "wildcard" || schema.IsRangeFieldType(b.ESType) || b.ESType == "ip" {
+		return CompiledQuery{}, false
+	}
+	if !t.checkFieldSearchable(resolved, b) || t.isNonStandardQueryRestrictedField(cleanKey, b, "common") || b.Kind == schema.StoragePromotedVector {
+		return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}, true
+	}
+	effAn := t.effectiveQueryAnalyzerName(b, explicitAnalyzer)
+	effCfg := t.effectiveAnalysisConfig()
+	toks, err := analysis.AnalyzeTokens(qStr, effAn, effCfg, t.Opts.AnalysisOpts)
+	if err != nil {
+		if !t.inLenientQuery && t.searchErr == nil {
+			t.searchErr = esTranspilerError("illegal_argument_exception: " + err.Error())
+		}
+		return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}, true
+	}
+	effBoost := boost * fBoost
+	if len(toks) == 0 {
+		if strings.EqualFold(zeroTermsQuery, "all") {
+			return CompiledQuery{
+				WhereSQL:     "TRUE",
+				SafeWhereSQL: "TRUE",
+				ScoreSQL:     strconv.FormatFloat(effBoost, 'g', -1, 64),
+			}, true
+		}
+		return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}, true
+	}
+
+	effLowOp := strings.ToLower(strings.TrimSpace(lowOp))
+	if effLowOp == "" {
+		effLowOp = "or"
+	}
+	explicitHighOp := strings.ToLower(strings.TrimSpace(highOp))
+	effHighOp := explicitHighOp
+	if effHighOp == "" {
+		effHighOp = "or"
+	}
+
+	caseSensitive, isWhitespace := analyzerCaseAndWhitespaceFlagsR63(effAn, effCfg, t.Opts.AnalysisOpts)
+	var docCount int
+	var dfs map[string]int
+	hasCorpusStats := false
+	effCutoff := cutoffFreq
+	if effCutoff == 0 && isCommonQuery {
+		effCutoff = 0.1
+	}
+	if t.Opts.TermDocFreqFn != nil && effCutoff > 0 {
+		termSeen := make(map[string]bool, len(toks))
+		var distinctTerms []string
+		for _, tk := range toks {
+			termKey := tk.Term
+			if !caseSensitive {
+				termKey = strings.ToLower(termKey)
+			}
+			if !termSeen[termKey] {
+				termSeen[termKey] = true
+				distinctTerms = append(distinctTerms, termKey)
+			}
+		}
+		colExpr := t.bm25TextColExprR63(resolved, b, nctx)
+		docCount, dfs = t.Opts.TermDocFreqFn(colExpr, distinctTerms, caseSensitive)
+		hasCorpusStats = docCount > 0
+	}
+
+	var lowToks, highToks []analysis.Token
+	for _, tk := range toks {
+		isHigh := false
+		if hasCorpusStats {
+			termKey := tk.Term
+			if !caseSensitive {
+				termKey = strings.ToLower(termKey)
+			}
+			df := dfs[termKey]
+			if df > 0 {
+				if effCutoff >= 1.0 {
+					isHigh = float64(df) >= effCutoff
+				} else {
+					isHigh = float64(df) >= effCutoff*float64(docCount)
+				}
+			}
+		} else if cutoffFreq > 0 && defaultEnglishStopwords[strings.ToLower(tk.Term)] {
+			isHigh = true
+		}
+		if isHigh {
+			highToks = append(highToks, tk)
+		} else {
+			lowToks = append(lowToks, tk)
+		}
+	}
+
+	var lowMSM, highMSM any
+	scalarMSM := false
+	if msmMap, isMap := msm.(map[string]any); isMap {
+		lowMSM = msmMap["low_freq"]
+		highMSM = msmMap["high_freq"]
+	} else if msm != nil {
+		lowMSM = msm
+		scalarMSM = true
+	}
+
+	// Only high-frequency tokens matched.
+	if len(lowToks) == 0 {
+		if highMSM != nil {
+			var tokPreds, tokScores []string
+			for _, tk := range highToks {
+				cp := t.singleAnalyzedTokenWithFlagsR63(resolved, b, tk.Term, caseSensitive, isWhitespace, 1.0, scoring, nctx)
+				if cp.WhereSQL != "FALSE" {
+					tokPreds = append(tokPreds, cp.WhereSQL)
+					if scoring && cp.ScoreSQL != "0.0" {
+						tokScores = append(tokScores, cp.ScoreSQL)
+					}
+				}
+			}
+			if len(tokPreds) == 0 {
+				return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}, true
+			}
+			reqCount := parseMinShouldMatch(highMSM, len(tokPreds), true)
+			if reqCount > len(tokPreds) {
+				return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}, true
+			}
+			var whereSQL string
+			if reqCount <= 1 {
+				whereSQL = "(" + strings.Join(tokPreds, " OR ") + ")"
+			} else if reqCount == len(tokPreds) {
+				whereSQL = "(" + strings.Join(tokPreds, " AND ") + ")"
+			} else {
+				var casts []string
+				for _, tp := range tokPreds {
+					casts = append(casts, fmt.Sprintf("CAST(COALESCE(%s, FALSE) AS INT)", tp))
+				}
+				whereSQL = fmt.Sprintf("((%s) AND ((%s) >= %d))", strings.Join(tokPreds, " OR "), strings.Join(casts, " + "), reqCount)
+			}
+			scoreSQL := "0.0"
+			if scoring {
+				if len(tokScores) > 0 {
+					sumSc := tokScores[0]
+					if len(tokScores) > 1 {
+						sumSc = "(" + strings.Join(tokScores, " + ") + ")"
+					}
+					scoreSQL = fmt.Sprintf("(CASE WHEN %s THEN (%s * %s) ELSE 0.0 END)", whereSQL, strconv.FormatFloat(effBoost, 'g', -1, 64), sumSc)
+				} else {
+					scoreSQL = fmt.Sprintf("(CASE WHEN %s THEN %s ELSE 0.0 END)", whereSQL, strconv.FormatFloat(effBoost, 'g', -1, 64))
+				}
+			}
+			return CompiledQuery{WhereSQL: whereSQL, SafeWhereSQL: whereSQL, ScoreSQL: scoreSQL}, true
+		}
+		opForHigh := effHighOp
+		if explicitHighOp == "" && hasCorpusStats {
+			opForHigh = "and"
+		}
+		graph := analysis.BuildQueryTokenGraph(highToks)
+		return t.compileMatchGraphToSQLR64(resolved, b, effAn, effCfg, graph, opForHigh, nil, zeroTermsQuery, nil, 0, nil, nil, effBoost, scoring, nctx), true
+	}
+
+	lowGraph := analysis.BuildQueryTokenGraph(lowToks)
+	effLowMSM := lowMSM
+	if scalarMSM && !isCommonQuery && lowMSM != nil && len(lowGraph.Segments) > 0 {
+		if req := parseMinShouldMatch(lowMSM, len(lowGraph.Segments), true); req > len(lowGraph.Segments) {
+			effLowMSM = len(lowGraph.Segments)
+		}
+	}
+	lowCompiled := t.compileMatchGraphToSQLR64(resolved, b, effAn, effCfg, lowGraph, effLowOp, effLowMSM, zeroTermsQuery, nil, 0, nil, nil, 1.0, scoring, nctx)
+
+	if len(highToks) == 0 {
+		if effBoost == 1.0 {
+			return lowCompiled, true
+		}
+		sc := "0.0"
+		if scoring && lowCompiled.ScoreSQL != "" && lowCompiled.ScoreSQL != "0.0" {
+			sc = fmt.Sprintf("(CASE WHEN %s THEN (%s * %s) ELSE 0.0 END)", lowCompiled.WhereSQL, strconv.FormatFloat(effBoost, 'g', -1, 64), lowCompiled.ScoreSQL)
+		}
+		return CompiledQuery{WhereSQL: lowCompiled.WhereSQL, SafeWhereSQL: lowCompiled.SafeWhereSQL, ScoreSQL: sc}, true
+	}
+
+	// Both low-frequency and high-frequency groups are non-empty.
+	highGraph := analysis.BuildQueryTokenGraph(highToks)
+	highCompiled := t.compileMatchGraphToSQLR64(resolved, b, effAn, effCfg, highGraph, effHighOp, highMSM, "", nil, 0, nil, nil, 1.0, scoring, nctx)
+
+	lowRequired := effLowOp == "and" || effLowMSM != nil
+	highRequired := effHighOp == "and" || highMSM != nil
+
+	var whereSQL string
+	switch {
+	case lowRequired && highRequired:
+		if lowCompiled.WhereSQL == "FALSE" || highCompiled.WhereSQL == "FALSE" {
+			return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}, true
+		}
+		whereSQL = fmt.Sprintf("((%s) AND (%s))", lowCompiled.WhereSQL, highCompiled.WhereSQL)
+	case lowRequired:
+		whereSQL = lowCompiled.WhereSQL
+	case highRequired:
+		whereSQL = highCompiled.WhereSQL
+	default:
+		switch {
+		case lowCompiled.WhereSQL == "FALSE":
+			whereSQL = highCompiled.WhereSQL
+		case highCompiled.WhereSQL == "FALSE":
+			whereSQL = lowCompiled.WhereSQL
+		default:
+			whereSQL = fmt.Sprintf("((%s) OR (%s))", lowCompiled.WhereSQL, highCompiled.WhereSQL)
+		}
+	}
+	if whereSQL == "FALSE" {
+		return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}, true
+	}
+	scoreSQL := "0.0"
+	if scoring {
+		var parts []string
+		if lowCompiled.ScoreSQL != "" && lowCompiled.ScoreSQL != "0.0" {
+			parts = append(parts, lowCompiled.ScoreSQL)
+		}
+		if highCompiled.ScoreSQL != "" && highCompiled.ScoreSQL != "0.0" {
+			parts = append(parts, highCompiled.ScoreSQL)
+		}
+		if len(parts) > 0 {
+			sumSc := parts[0]
+			if len(parts) > 1 {
+				sumSc = "(" + strings.Join(parts, " + ") + ")"
 			}
 			scoreSQL = fmt.Sprintf("(CASE WHEN %s THEN (%s * %s) ELSE 0.0 END)", whereSQL, strconv.FormatFloat(effBoost, 'g', -1, 64), sumSc)
 		} else {
@@ -2299,13 +2638,15 @@ func (t *Transpiler) compileMatchPhraseWithAnalysisGraph(
 		return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}, true
 	}
 
-	graph, err := analysis.AnalyzeForQuery(queryStr, effAn, t.Opts.AnalysisConfig, t.Opts.AnalysisOpts)
+	effCfg := t.effectiveAnalysisConfig()
+	tokens, err := analysis.AnalyzeTokens(queryStr, effAn, effCfg, t.Opts.AnalysisOpts)
 	if err != nil {
 		if !t.inLenientQuery && t.searchErr == nil {
 			t.searchErr = esTranspilerError("illegal_argument_exception: " + err.Error())
 		}
 		return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}, true
 	}
+	graph := analysis.BuildQueryTokenGraph(tokens)
 	effBoost := boost * fBoost
 	if graph.IsEmpty() {
 		if strings.EqualFold(zeroTermsQuery, "all") {
@@ -2322,14 +2663,18 @@ func (t *Transpiler) compileMatchPhraseWithAnalysisGraph(
 	if len(paths) == 0 {
 		return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}, true
 	}
-	caseSensitive, isWhitespace := analyzerCaseAndWhitespaceFlagsR63(effAn, t.Opts.AnalysisConfig, t.Opts.AnalysisOpts)
+	caseSensitive, isWhitespace := analyzerCaseAndWhitespaceFlagsR63(effAn, effCfg, t.Opts.AnalysisOpts)
 	var disj, pathScores []string
 	for _, p := range paths {
+		clauseWeight := 1.0
+		if len(paths) > 1 && len(p) > 1 {
+			clauseWeight = 1.0 / float64(len(p))
+		}
 		var cp CompiledQuery
 		if len(p) == 1 && !isPrefix {
-			cp = t.singleAnalyzedTokenWithFlagsR63(resolved, b, p[0], caseSensitive, isWhitespace, 1.0, scoring, nctx)
+			cp = t.singleAnalyzedTokenWithFlagsR63(resolved, b, p[0], caseSensitive, isWhitespace, clauseWeight, scoring, nctx)
 		} else {
-			cp = t.multiTokenExactPhraseSQL(resolved, b, p, slop, isPrefix, caseSensitive, 1.0, scoring, nctx)
+			cp = t.multiTokenExactPhraseSQL(resolved, b, p, slop, isPrefix, caseSensitive, clauseWeight, scoring, nctx)
 		}
 		if cp.WhereSQL != "FALSE" {
 			disj = append(disj, cp.WhereSQL)
@@ -2366,6 +2711,10 @@ func (t *Transpiler) compileMatchPhraseWithAnalysisGraph(
 //   - Applies `fuzziness` ONLY to leading `0..len-2` term clauses, NEVER to the trailing prefix clause (`len-1`).
 //   - Honors `operator` (`or`/`and`) and `minimum_should_match` across all token clauses.
 func (t *Transpiler) compileMatchBoolPrefixRound62(rawField string, pe esast.PhraseEntry, scoring bool, nctx *nestedCtx) CompiledQuery {
+	return t.compileMatchBoolPrefixRound62Opts(rawField, pe, nil, scoring, nctx)
+}
+
+func (t *Transpiler) compileMatchBoolPrefixRound62Opts(rawField string, pe esast.PhraseEntry, autoSynPhrase *bool, scoring bool, nctx *nestedCtx) CompiledQuery {
 	cleanField, fBoost := parseFieldBoost(rawField, 1.0)
 	effBoost := pe.Boost * fBoost
 
@@ -2402,6 +2751,180 @@ func (t *Transpiler) compileMatchBoolPrefixRound62(rawField string, pe esast.Phr
 	effAn := t.effectiveQueryAnalyzerName(b, pe.Analyzer)
 	isWS := strings.EqualFold(effAn, "whitespace")
 
+	if !isExactKeywordField(resolved, b) && !b.IsVirtualSAYTSubfield && t.hasCustomQueryAnalysis(effAn) {
+		effCfg := t.effectiveAnalysisConfig()
+		toks, err := analysis.AnalyzeTokens(pe.Query, effAn, effCfg, t.Opts.AnalysisOpts)
+		if err != nil {
+			if !t.inLenientQuery && t.searchErr == nil {
+				t.searchErr = esTranspilerError("illegal_argument_exception: " + err.Error())
+			}
+			return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
+		}
+		graph := analysis.BuildQueryTokenGraph(toks)
+		if graph.IsEmpty() {
+			if strings.EqualFold(pe.ZeroTermsQuery, "all") {
+				return CompiledQuery{WhereSQL: "TRUE", SafeWhereSQL: "TRUE", ScoreSQL: strconv.FormatFloat(effBoost, 'g', -1, 64)}
+			}
+			return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
+		}
+		caseSens, isAnWS := analyzerCaseAndWhitespaceFlagsR63(effAn, effCfg, t.Opts.AnalysisOpts)
+		if autoSynPhrase == nil {
+			autoSynPhrase = t.autoGenSynPhraseQuery
+		}
+		autoPhrase := !t.Opts.DisableSynonymsPhraseQuery && graph.HasGraphSpans
+		if autoSynPhrase != nil {
+			autoPhrase = *autoSynPhrase && graph.HasGraphSpans
+		}
+		isAnd := strings.EqualFold(pe.Operator, "and")
+		var segPreds, segScores []string
+		for si, seg := range graph.Segments {
+			isLast := si == len(graph.Segments)-1
+			compilePrefixTok := func(ptk string) string {
+				if !isAnWS && b.Kind == schema.StoragePromotedScalar && !b.NotIndexed && nctx == nil && !strings.ContainsAny(ptk, " \t\r\n'\"\\") {
+					return t.compileMatchPhraseField(resolved, ptk, 0, 1.0, true, false, nctx).WhereSQL
+				}
+				return t.compileAnalyzedTokenOrPhrasePrefixRegex(resolved, b, ptk, !isAnWS, nctx)
+			}
+			var altPreds, altScores []string
+			if seg.IsSingleTermAlternatives() {
+				for _, tk := range seg.SingleTermAlternatives() {
+					var w, sc string
+					if isLast {
+						w = compilePrefixTok(tk)
+						if scoring {
+							sc = fmt.Sprintf("(CASE WHEN %s THEN 1.0 ELSE 0.0 END)", w)
+						}
+					} else if hasNonZeroFuzziness(pe.Fuzziness) {
+						cp := t.compileFuzzyFieldWithOpts(resolved, tk, "or", pe.Fuzziness, false, pe.PrefixLength, pe.FuzzyTranspositions, 1.0, scoring, nctx)
+						w, sc = cp.WhereSQL, cp.ScoreSQL
+					} else {
+						cp := t.singleAnalyzedTokenWithFlagsR63(resolved, b, tk, caseSens, isAnWS, 1.0, scoring, nctx)
+						w, sc = cp.WhereSQL, cp.ScoreSQL
+					}
+					if w != "FALSE" {
+						altPreds = append(altPreds, w)
+						if scoring && sc != "" && sc != "0.0" {
+							altScores = append(altScores, sc)
+						}
+					}
+				}
+			} else {
+				for _, alt := range seg.Alternatives {
+					if len(alt) == 0 {
+						continue
+					}
+					var w, sc string
+					if len(alt) == 1 {
+						if isLast {
+							w = compilePrefixTok(alt[0])
+							if scoring {
+								sc = fmt.Sprintf("(CASE WHEN %s THEN 1.0 ELSE 0.0 END)", w)
+							}
+						} else if hasNonZeroFuzziness(pe.Fuzziness) {
+							cp := t.compileFuzzyFieldWithOpts(resolved, alt[0], "or", pe.Fuzziness, false, pe.PrefixLength, pe.FuzzyTranspositions, 1.0, scoring, nctx)
+							w, sc = cp.WhereSQL, cp.ScoreSQL
+						} else {
+							cp := t.singleAnalyzedTokenWithFlagsR63(resolved, b, alt[0], caseSens, isAnWS, 1.0, scoring, nctx)
+							w, sc = cp.WhereSQL, cp.ScoreSQL
+						}
+					} else if autoPhrase {
+						cp := t.multiTokenExactPhraseSQL(resolved, b, alt, 0, isLast, caseSens, 1.0, scoring, nctx)
+						w, sc = cp.WhereSQL, cp.ScoreSQL
+					} else {
+						var subParts []string
+						for ai, tk := range alt {
+							if isLast && ai == len(alt)-1 {
+								subParts = append(subParts, compilePrefixTok(tk))
+							} else {
+								subParts = append(subParts, t.singleAnalyzedTokenWithFlagsR63(resolved, b, tk, caseSens, isAnWS, 1.0, false, nctx).WhereSQL)
+							}
+						}
+						joiner := " OR "
+						if isAnd {
+							joiner = " AND "
+						}
+						w = "(" + strings.Join(subParts, joiner) + ")"
+						if scoring {
+							sc = fmt.Sprintf("(CASE WHEN %s THEN 1.0 ELSE 0.0 END)", w)
+						}
+					}
+					if w != "FALSE" {
+						altPreds = append(altPreds, w)
+						if scoring && sc != "" && sc != "0.0" {
+							altScores = append(altScores, sc)
+						}
+					}
+				}
+			}
+			if len(altPreds) == 0 {
+				if isAnd {
+					return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
+				}
+				continue
+			}
+			segW := altPreds[0]
+			if len(altPreds) > 1 {
+				segW = "(" + strings.Join(altPreds, " OR ") + ")"
+			}
+			segPreds = append(segPreds, segW)
+			if scoring && len(altScores) > 0 {
+				if len(altScores) == 1 {
+					segScores = append(segScores, altScores[0])
+				} else {
+					segScores = append(segScores, fmt.Sprintf("GREATEST(%s)", strings.Join(altScores, ", ")))
+				}
+			}
+		}
+		if len(segPreds) == 0 {
+			return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
+		}
+		if pe.MinimumShouldMatch != nil && !isAnd {
+			if parseMinShouldMatch(pe.MinimumShouldMatch, len(segPreds), true) > len(segPreds) {
+				return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
+			}
+		}
+		var whereSQL string
+		if isAnd {
+			if len(segPreds) == 1 {
+				whereSQL = segPreds[0]
+			} else {
+				whereSQL = "(" + strings.Join(segPreds, " AND ") + ")"
+			}
+		} else if pe.MinimumShouldMatch != nil {
+			reqCount := parseMinShouldMatch(pe.MinimumShouldMatch, len(segPreds), true)
+			if reqCount <= 1 {
+				if len(segPreds) == 1 {
+					whereSQL = segPreds[0]
+				} else {
+					whereSQL = "(" + strings.Join(segPreds, " OR ") + ")"
+				}
+			} else if reqCount == len(segPreds) {
+				whereSQL = "(" + strings.Join(segPreds, " AND ") + ")"
+			} else {
+				var casts []string
+				for _, sp := range segPreds {
+					casts = append(casts, fmt.Sprintf("CAST(COALESCE(%s, FALSE) AS INT)", sp))
+				}
+				whereSQL = fmt.Sprintf("((%s) AND ((%s) >= %d))", strings.Join(segPreds, " OR "), strings.Join(casts, " + "), reqCount)
+			}
+		} else if len(segPreds) == 1 {
+			whereSQL = segPreds[0]
+		} else {
+			whereSQL = "(" + strings.Join(segPreds, " OR ") + ")"
+		}
+		scoreSQL := "0.0"
+		if scoring {
+			sumSc := "1.0"
+			if len(segScores) == 1 {
+				sumSc = segScores[0]
+			} else if len(segScores) > 1 {
+				sumSc = "(" + strings.Join(segScores, " + ") + ")"
+			}
+			scoreSQL = fmt.Sprintf("(CASE WHEN %s THEN (%s * %s) ELSE 0.0 END)", whereSQL, strconv.FormatFloat(effBoost, 'g', -1, 64), sumSc)
+		}
+		return CompiledQuery{WhereSQL: whereSQL, SafeWhereSQL: whereSQL, ScoreSQL: scoreSQL}
+	}
+
 	var tokens []string
 	if strings.EqualFold(effAn, "keyword") && !b.IsVirtualSAYTSubfield {
 		if pe.Query != "" {
@@ -2412,13 +2935,15 @@ func (t *Transpiler) compileMatchBoolPrefixRound62(rawField string, pe esast.Phr
 			tokens = []string{t.normalizeKeywordOrAnalyzerTerm(pe.Query, b, false)}
 		}
 	} else if t.hasCustomQueryAnalysis(effAn) {
-		graph, err := analysis.AnalyzeForQuery(pe.Query, effAn, t.Opts.AnalysisConfig, t.Opts.AnalysisOpts)
+		effCfg := t.effectiveAnalysisConfig()
+		toks, err := analysis.AnalyzeTokens(pe.Query, effAn, effCfg, t.Opts.AnalysisOpts)
 		if err != nil {
 			if !t.inLenientQuery && t.searchErr == nil {
 				t.searchErr = esTranspilerError("illegal_argument_exception: " + err.Error())
 			}
 			return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
 		}
+		graph := analysis.BuildQueryTokenGraph(toks)
 		for _, pos := range graph.Positions {
 			if len(pos.Terms) > 0 {
 				tokens = append(tokens, pos.Terms[0])

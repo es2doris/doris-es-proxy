@@ -242,6 +242,9 @@ func buildCharFilter(displayName string, typeName string, def map[string]any, op
 		}
 		flags, _ := def["flags"].(string)
 		repl, _ := def["replacement"].(string)
+		if len(repl) > MaxCharFilterOutputRunes*utf8.UTFMax {
+			return nil, newIllegalArgError(fmt.Sprintf("pattern_replace replacement length [%d] exceeds maximum allowed [%d]", len(repl), MaxCharFilterOutputRunes*utf8.UTFMax))
+		}
 		re, err := compileJavaRegex(pat, flags)
 		if err != nil {
 			return nil, err
@@ -825,8 +828,15 @@ func countConsecutiveCombiningMarks(s string) int {
 	return maxRun
 }
 
+const maxPatternReplaceScanBytes = 256 << 20
+
+var errReplacementTooLarge = newIllegalArgError("pattern_replace replacement output exceeds maximum allowed length")
+
 func applyPatternReplaceCharFilter(in charStream, re *regexp.Regexp, repl string) (charStream, error) {
 	if len(in.runes) > MaxCharFilterOutputRunes {
+		return charStream{}, newIllegalArgError(fmt.Sprintf("char_filter output exceeds maximum allowed length [%d]", MaxCharFilterOutputRunes))
+	}
+	if len(repl) > MaxCharFilterOutputRunes*utf8.UTFMax {
 		return charStream{}, newIllegalArgError(fmt.Sprintf("char_filter output exceeds maximum allowed length [%d]", MaxCharFilterOutputRunes))
 	}
 	s := in.String()
@@ -848,6 +858,11 @@ func applyPatternReplaceCharFilter(in charStream, re *regexp.Regexp, repl string
 
 	b := newCharStreamBuilder(in)
 	prevRune := 0
+	var hasEmptyExpansion bool
+	var emptyExpansion string
+	var emptyExpansionErr error
+	scanWork := 0
+
 	for _, loc := range matches {
 		mStartByte, mEndByte := loc[0], loc[1]
 		mStartRune := byteToRune[mStartByte]
@@ -859,7 +874,35 @@ func applyPatternReplaceCharFilter(in charStream, re *regexp.Regexp, repl string
 		if b.exceeded {
 			return b.build()
 		}
-		expanded := expandJavaReplacement(s, loc, repl)
+		remRunes := MaxCharFilterOutputRunes - len(b.runes)
+		if remRunes < 0 {
+			remRunes = 0
+		}
+		maxOutBytes := remRunes * utf8.UTFMax
+
+		var expanded string
+		var expErr error
+		if mStartByte == mEndByte {
+			if !hasEmptyExpansion {
+				hasEmptyExpansion = true
+				emptyExpansion, emptyExpansionErr = expandJavaReplacement(s, loc, repl, MaxCharFilterOutputRunes*utf8.UTFMax)
+			}
+			if emptyExpansionErr != nil || len(emptyExpansion) > maxOutBytes {
+				expErr = errReplacementTooLarge
+			} else {
+				expanded = emptyExpansion
+			}
+		} else {
+			scanWork += len(repl)
+			if scanWork > maxPatternReplaceScanBytes {
+				return charStream{}, newIllegalArgError("pattern_replace char_filter work limit exceeded")
+			}
+			expanded, expErr = expandJavaReplacement(s, loc, repl, maxOutBytes)
+		}
+		if expErr != nil {
+			return charStream{}, newIllegalArgError(fmt.Sprintf("char_filter output exceeds maximum allowed length [%d]", MaxCharFilterOutputRunes))
+		}
+
 		var origStart, origEnd int
 		if mStartRune < len(in.runes) {
 			origStart = in.starts[mStartRune]
@@ -893,12 +936,22 @@ func applyPatternReplaceCharFilter(in charStream, re *regexp.Regexp, repl string
 	return b.build()
 }
 
-func expandJavaReplacement(src string, loc []int, repl string) string {
+func expandJavaReplacement(src string, loc []int, repl string, maxOutBytes int) (string, error) {
+	if maxOutBytes < 0 {
+		return "", errReplacementTooLarge
+	}
 	var out strings.Builder
 	for i := 0; i < len(repl); {
 		r, sz := utf8.DecodeRuneInString(repl[i:])
 		if r == '\\' && i+sz < len(repl) {
 			nr, nsz := utf8.DecodeRuneInString(repl[i+sz:])
+			nLen := utf8.RuneLen(nr)
+			if nLen < 0 {
+				nLen = nsz
+			}
+			if out.Len()+nLen > maxOutBytes {
+				return "", errReplacementTooLarge
+			}
 			out.WriteRune(nr)
 			i += sz + nsz
 			continue
@@ -916,14 +969,25 @@ func expandJavaReplacement(src string, loc []int, repl string) string {
 					j++
 				}
 				if grp*2+1 < len(loc) && loc[grp*2] >= 0 && loc[grp*2+1] >= 0 {
-					out.WriteString(src[loc[grp*2]:loc[grp*2+1]])
+					sub := src[loc[grp*2]:loc[grp*2+1]]
+					if out.Len()+len(sub) > maxOutBytes {
+						return "", errReplacementTooLarge
+					}
+					out.WriteString(sub)
 				}
 				i = j
 				continue
 			}
 		}
+		rLen := utf8.RuneLen(r)
+		if rLen < 0 {
+			rLen = sz
+		}
+		if out.Len()+rLen > maxOutBytes {
+			return "", errReplacementTooLarge
+		}
 		out.WriteRune(r)
 		i += sz
 	}
-	return out.String()
+	return out.String(), nil
 }

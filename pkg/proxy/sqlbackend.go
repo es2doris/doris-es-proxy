@@ -431,7 +431,7 @@ func rewriteDorisArrayExists(q string) string {
 				out.WriteString(colPart)
 				out.WriteString(")")
 			} else {
-				emptyArrType := detectDorisArrayFallbackType(colPart)
+				emptyArrType := detectDorisArrayFallbackType(lambdaPart, colPart)
 				out.WriteString("array_contains(array_exists(")
 				out.WriteString(lambdaPart)
 				out.WriteString(", IFNULL(")
@@ -449,7 +449,7 @@ func rewriteDorisArrayExists(q string) string {
 	return out.String()
 }
 
-func detectDorisArrayFallbackType(colPart string) string {
+func detectDorisArrayFallbackType(lambdaPart, colPart string) string {
 	upper := strings.ToUpper(strings.TrimSpace(colPart))
 	switch {
 	case strings.HasSuffix(upper, " AS ARRAY<FLOAT>)"):
@@ -458,6 +458,8 @@ func detectDorisArrayFallbackType(colPart string) string {
 		return "ARRAY<BOOLEAN>"
 	case strings.HasSuffix(upper, " AS ARRAY<DATETIMEV2(3)>)"):
 		return "ARRAY<DATETIMEV2(3)>"
+	case strings.HasSuffix(upper, " AS ARRAY<DATETIMEV2(6)>)"):
+		return "ARRAY<DATETIMEV2(6)>"
 	case strings.HasSuffix(upper, " AS ARRAY<DATETIMEV2>)"):
 		return "ARRAY<DATETIMEV2>"
 	case strings.HasSuffix(upper, " AS ARRAY<DOUBLE>)"):
@@ -468,6 +470,8 @@ func detectDorisArrayFallbackType(colPart string) string {
 		return "ARRAY<LARGEINT>"
 	case strings.HasSuffix(upper, " AS ARRAY<INT>)"):
 		return "ARRAY<INT>"
+	case strings.HasSuffix(upper, " AS ARRAY<STRING>)"), strings.HasSuffix(upper, " AS ARRAY<VARCHAR>)"):
+		return "ARRAY<STRING>"
 	}
 	if strings.HasPrefix(upper, "ARRAY_MAP(") {
 		if arrowIdx := strings.Index(upper, "->"); arrowIdx > 0 {
@@ -479,6 +483,8 @@ func detectDorisArrayFallbackType(colPart string) string {
 				return "ARRAY<BOOLEAN>"
 			case strings.Contains(afterArrow, " AS DATETIMEV2(3)),"):
 				return "ARRAY<DATETIMEV2(3)>"
+			case strings.Contains(afterArrow, " AS DATETIMEV2(6)),"):
+				return "ARRAY<DATETIMEV2(6)>"
 			case strings.Contains(afterArrow, " AS DATETIMEV2),"):
 				return "ARRAY<DATETIMEV2>"
 			case strings.Contains(afterArrow, " AS DOUBLE),"):
@@ -489,10 +495,395 @@ func detectDorisArrayFallbackType(colPart string) string {
 				return "ARRAY<LARGEINT>"
 			case strings.Contains(afterArrow, " AS INT),"):
 				return "ARRAY<INT>"
+			case strings.Contains(afterArrow, " AS STRING),"), strings.Contains(afterArrow, " AS VARCHAR),"):
+				return "ARRAY<STRING>"
 			}
 		}
 	}
+	if strings.HasPrefix(upper, "CASE WHEN ") {
+		for _, arrType := range []string{
+			"ARRAY<FLOAT>",
+			"ARRAY<BOOLEAN>",
+			"ARRAY<DATETIMEV2(3)>",
+			"ARRAY<DATETIMEV2(6)>",
+			"ARRAY<DATETIMEV2>",
+			"ARRAY<DOUBLE>",
+			"ARRAY<BIGINT>",
+			"ARRAY<LARGEINT>",
+			"ARRAY<INT>",
+			"ARRAY<STRING>",
+		} {
+			if strings.Contains(upper, " AS "+arrType+")") {
+				return arrType
+			}
+		}
+	}
+	if inferred, ok := detectDorisLambdaCastArrayType(lambdaPart); ok {
+		return inferred
+	}
 	return "ARRAY<STRING>"
+}
+
+func isSQLIdentCharR64(c byte) bool {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'
+}
+
+func stripOuterSQLParensR64(s string) string {
+	s = strings.TrimSpace(s)
+	for len(s) >= 2 && s[0] == '(' && s[len(s)-1] == ')' {
+		depth := 0
+		inSingle := false
+		inDouble := false
+		inBacktick := false
+		balancedOuter := true
+		for i := 0; i < len(s); i++ {
+			c := s[i]
+			if inSingle {
+				if c == '\\' && i+1 < len(s) {
+					i++
+					continue
+				}
+				if c == '\'' {
+					if i+1 < len(s) && s[i+1] == '\'' {
+						i++
+						continue
+					}
+					inSingle = false
+				}
+				continue
+			}
+			if inDouble {
+				if c == '\\' && i+1 < len(s) {
+					i++
+					continue
+				}
+				if c == '"' {
+					inDouble = false
+				}
+				continue
+			}
+			if inBacktick {
+				if c == '`' {
+					if i+1 < len(s) && s[i+1] == '`' {
+						i++
+						continue
+					}
+					inBacktick = false
+				}
+				continue
+			}
+			switch c {
+			case '\'':
+				inSingle = true
+			case '"':
+				inDouble = true
+			case '`':
+				inBacktick = true
+			case '(':
+				depth++
+			case ')':
+				depth--
+				if depth == 0 && i < len(s)-1 {
+					balancedOuter = false
+				}
+			}
+			if !balancedOuter {
+				break
+			}
+		}
+		if !balancedOuter || depth != 0 {
+			break
+		}
+		s = strings.TrimSpace(s[1 : len(s)-1])
+	}
+	return s
+}
+
+func findTopLevelLambdaArrowR64(lambdaPart string) int {
+	depth := 0
+	inSingle := false
+	inDouble := false
+	inBacktick := false
+	for i := 0; i < len(lambdaPart); i++ {
+		c := lambdaPart[i]
+		if inSingle {
+			if c == '\\' && i+1 < len(lambdaPart) {
+				i++
+				continue
+			}
+			if c == '\'' {
+				if i+1 < len(lambdaPart) && lambdaPart[i+1] == '\'' {
+					i++
+					continue
+				}
+				inSingle = false
+			}
+			continue
+		}
+		if inDouble {
+			if c == '\\' && i+1 < len(lambdaPart) {
+				i++
+				continue
+			}
+			if c == '"' {
+				inDouble = false
+			}
+			continue
+		}
+		if inBacktick {
+			if c == '`' {
+				if i+1 < len(lambdaPart) && lambdaPart[i+1] == '`' {
+					i++
+					continue
+				}
+				inBacktick = false
+			}
+			continue
+		}
+		switch c {
+		case '\'':
+			inSingle = true
+		case '"':
+			inDouble = true
+		case '`':
+			inBacktick = true
+		case '(':
+			depth++
+		case ')':
+			if depth > 0 {
+				depth--
+			}
+		case '-':
+			if depth == 0 && i+1 < len(lambdaPart) && lambdaPart[i+1] == '>' {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
+func mapSQLScalarTypeToDorisArrayR64(rawType string) (string, bool) {
+	norm := strings.ToUpper(strings.Join(strings.Fields(rawType), ""))
+	switch norm {
+	case "FLOAT":
+		return "ARRAY<FLOAT>", true
+	case "DOUBLE":
+		return "ARRAY<DOUBLE>", true
+	case "BOOLEAN", "BOOL":
+		return "ARRAY<BOOLEAN>", true
+	case "DATETIMEV2(3)":
+		return "ARRAY<DATETIMEV2(3)>", true
+	case "DATETIMEV2(6)":
+		return "ARRAY<DATETIMEV2(6)>", true
+	case "DATETIMEV2":
+		return "ARRAY<DATETIMEV2>", true
+	case "DATETIME":
+		return "ARRAY<DATETIME>", true
+	case "DATE":
+		return "ARRAY<DATE>", true
+	case "LARGEINT":
+		return "ARRAY<LARGEINT>", true
+	case "BIGINT":
+		return "ARRAY<BIGINT>", true
+	case "INT", "INTEGER":
+		return "ARRAY<INT>", true
+	case "SMALLINT":
+		return "ARRAY<SMALLINT>", true
+	case "TINYINT":
+		return "ARRAY<TINYINT>", true
+	case "STRING", "VARCHAR":
+		return "ARRAY<STRING>", true
+	default:
+		return "", false
+	}
+}
+
+func hasASCIIPrefixFoldR64(s, prefix string) bool {
+	if len(s) < len(prefix) {
+		return false
+	}
+	for i := 0; i < len(prefix); i++ {
+		a := s[i]
+		b := prefix[i]
+		if a == b {
+			continue
+		}
+		if a >= 'a' && a <= 'z' {
+			a -= 'a' - 'A'
+		}
+		if b >= 'a' && b <= 'z' {
+			b -= 'a' - 'A'
+		}
+		if a != b {
+			return false
+		}
+	}
+	return true
+}
+
+func detectDorisLambdaCastArrayType(lambdaPart string) (string, bool) {
+	arrowIdx := findTopLevelLambdaArrowR64(lambdaPart)
+	if arrowIdx <= 0 {
+		return "", false
+	}
+	param := stripOuterSQLParensR64(lambdaPart[:arrowIdx])
+	if param == "" {
+		return "", false
+	}
+	for i := 0; i < len(param); i++ {
+		if !isSQLIdentCharR64(param[i]) {
+			return "", false
+		}
+	}
+
+	body := lambdaPart[arrowIdx+2:]
+	inSingle := false
+	inDouble := false
+	inBacktick := false
+	sawStringCast := false
+
+	for i := 0; i < len(body); {
+		c := body[i]
+		if inSingle {
+			if c == '\\' && i+1 < len(body) {
+				i += 2
+				continue
+			}
+			if c == '\'' {
+				if i+1 < len(body) && body[i+1] == '\'' {
+					i += 2
+					continue
+				}
+				inSingle = false
+			}
+			i++
+			continue
+		}
+		if inDouble {
+			if c == '\\' && i+1 < len(body) {
+				i += 2
+				continue
+			}
+			if c == '"' {
+				inDouble = false
+			}
+			i++
+			continue
+		}
+		if inBacktick {
+			if c == '`' {
+				if i+1 < len(body) && body[i+1] == '`' {
+					i += 2
+					continue
+				}
+				inBacktick = false
+			}
+			i++
+			continue
+		}
+		switch c {
+		case '\'':
+			inSingle = true
+			i++
+			continue
+		case '"':
+			inDouble = true
+			i++
+			continue
+		case '`':
+			inBacktick = true
+			i++
+			continue
+		}
+
+		openParen := -1
+		if i == 0 || !isSQLIdentCharR64(body[i-1]) {
+			if hasASCIIPrefixFoldR64(body[i:], "TRY_CAST(") {
+				openParen = i + len("TRY_CAST")
+			} else if hasASCIIPrefixFoldR64(body[i:], "CAST(") {
+				openParen = i + len("CAST")
+			}
+		}
+		if openParen < 0 {
+			i++
+			continue
+		}
+
+		depth := 1
+		qS, qD, qB := false, false, false
+		asIdx := -1
+		j := openParen + 1
+		for j < len(body) && depth > 0 {
+			ch := body[j]
+			if qS {
+				if ch == '\\' && j+1 < len(body) {
+					j += 2
+					continue
+				}
+				if ch == '\'' {
+					if j+1 < len(body) && body[j+1] == '\'' {
+						j += 2
+						continue
+					}
+					qS = false
+				}
+			} else if qD {
+				if ch == '\\' && j+1 < len(body) {
+					j += 2
+					continue
+				}
+				if ch == '"' {
+					qD = false
+				}
+			} else if qB {
+				if ch == '`' {
+					if j+1 < len(body) && body[j+1] == '`' {
+						j += 2
+						continue
+					}
+					qB = false
+				}
+			} else {
+				switch ch {
+				case '\'':
+					qS = true
+				case '"':
+					qD = true
+				case '`':
+					qB = true
+				case '(':
+					depth++
+				case ')':
+					depth--
+				default:
+					if depth == 1 && asIdx < 0 && hasASCIIPrefixFoldR64(body[j:], "AS") &&
+						j > openParen+1 && (body[j-1] == ' ' || body[j-1] == '\t' || body[j-1] == '\n' || body[j-1] == ')') &&
+						j+2 < len(body) && (body[j+2] == ' ' || body[j+2] == '\t' || body[j+2] == '\n') {
+						asIdx = j
+					}
+				}
+			}
+			j++
+		}
+
+		if depth == 0 && asIdx > openParen+1 {
+			argExpr := stripOuterSQLParensR64(body[openParen+1 : asIdx])
+			typeExpr := body[asIdx+2 : j-1]
+			if strings.EqualFold(argExpr, param) {
+				if arrType, ok := mapSQLScalarTypeToDorisArrayR64(typeExpr); ok {
+					if arrType != "ARRAY<STRING>" {
+						return arrType, true
+					}
+					sawStringCast = true
+				}
+			}
+		}
+		i = openParen + 1
+	}
+	if sawStringCast {
+		return "ARRAY<STRING>", true
+	}
+	return "", false
 }
 
 type traceMetaContextKey struct{}

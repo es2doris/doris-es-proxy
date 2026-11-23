@@ -886,8 +886,8 @@ func TestRound8_StreamLoadRedirectHostGuardAndMaxBodyEnforcement(t *testing.T) {
 		User:           "root",
 		Password:       "supersecret",
 	})
-	if err := slClient.LoadNDJSON(context.Background(), "tbl", []byte(`{"_id":"1"}`), true); err != nil {
-		t.Fatalf("unexpected LoadNDJSON error: %v", err)
+	if err := slClient.LoadNDJSON(context.Background(), "tbl", []byte(`{"_id":"1"}`), true); err == nil || !strings.Contains(err.Error(), "non-stream-load redirect path") {
+		t.Fatalf("expected non-stream-load redirect path rejection, got %v", err)
 	}
 	if leakedAuth != "" {
 		t.Fatalf("expected Authorization header not to be forwarded to non-_stream_load external path, got: %q", leakedAuth)

@@ -28,6 +28,7 @@ import (
 	"strconv"
 	"strings"
 	"unicode/utf16"
+	"unicode/utf8"
 )
 
 const maxFilterNestingDepth = 16
@@ -797,6 +798,9 @@ func buildTokenFilter(displayName string, typeName string, def map[string]any, i
 		}
 		flags, _ := def["flags"].(string)
 		repl, _ := def["replacement"].(string)
+		if len(repl) > MaxCharFilterOutputRunes*utf8.UTFMax {
+			return nil, newIllegalArgError(fmt.Sprintf("pattern_replace replacement length [%d] exceeds maximum allowed [%d]", len(repl), MaxCharFilterOutputRunes*utf8.UTFMax))
+		}
 		replaceAll := true
 		if raw, ok := def["all"]; ok {
 			b, valid := extractBool(raw)
@@ -813,17 +817,24 @@ func buildTokenFilter(displayName string, typeName string, def map[string]any, i
 			name: displayName,
 			typ:  normType,
 			apply: func(tokens []Token, budget *tokenStreamBudget) ([]Token, error) {
+				var hasEmptyExpansion bool
+				var emptyExpansion string
+				var emptyExpansionErr error
+				scanWork := 0
+
 				for i := range tokens {
 					s := tokens[i].Term
-					matches := re.FindAllStringSubmatchIndex(s, -1)
+					var matches [][]int
+					if replaceAll {
+						matches = re.FindAllStringSubmatchIndex(s, -1)
+					} else if first := re.FindStringSubmatchIndex(s); first != nil {
+						matches = [][]int{first}
+					}
 					if len(matches) == 0 {
 						if err := budget.addToken(tokens[i]); err != nil {
 							return nil, err
 						}
 						continue
-					}
-					if !replaceAll {
-						matches = matches[:1]
 					}
 					var sb strings.Builder
 					prev := 0
@@ -832,19 +843,45 @@ func buildTokenFilter(displayName string, typeName string, def map[string]any, i
 							continue
 						}
 						prefix := s[prev:loc[0]]
-						expanded := expandJavaReplacement(s, loc, repl)
-						if sb.Len()+len(prefix)+len(expanded) > MaxTokenTermBytes {
+						if sb.Len()+len(prefix) > MaxTokenTermBytes {
+							return nil, newIllegalArgError(fmt.Sprintf("token term length exceeds maximum allowed [%d] bytes", MaxTokenTermBytes))
+						}
+						rem := MaxTokenTermBytes - sb.Len() - len(prefix)
+						var expanded string
+						var expErr error
+						if loc[0] == loc[1] {
+							if !hasEmptyExpansion {
+								hasEmptyExpansion = true
+								emptyExpansion, emptyExpansionErr = expandJavaReplacement(s, loc, repl, MaxTokenTermBytes)
+							}
+							if emptyExpansionErr != nil || len(emptyExpansion) > rem {
+								expErr = errReplacementTooLarge
+							} else {
+								expanded = emptyExpansion
+							}
+						} else {
+							scanWork += len(repl)
+							if scanWork > maxPatternReplaceScanBytes {
+								return nil, newIllegalArgError("pattern_replace token filter work limit exceeded")
+							}
+							expanded, expErr = expandJavaReplacement(s, loc, repl, rem)
+						}
+						if expErr != nil {
 							return nil, newIllegalArgError(fmt.Sprintf("token term length exceeds maximum allowed [%d] bytes", MaxTokenTermBytes))
 						}
 						sb.WriteString(prefix)
 						sb.WriteString(expanded)
 						if loc[1] == loc[0] {
 							if loc[0] < len(s) {
-								if sb.Len()+1 > MaxTokenTermBytes {
+								_, rLen := utf8.DecodeRuneInString(s[loc[0]:])
+								if rLen < 1 {
+									rLen = 1
+								}
+								if sb.Len()+rLen > MaxTokenTermBytes {
 									return nil, newIllegalArgError(fmt.Sprintf("token term length exceeds maximum allowed [%d] bytes", MaxTokenTermBytes))
 								}
-								sb.WriteByte(s[loc[0]])
-								prev = loc[0] + 1
+								sb.WriteString(s[loc[0] : loc[0]+rLen])
+								prev = loc[0] + rLen
 							}
 						} else {
 							prev = loc[1]

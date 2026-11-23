@@ -677,8 +677,8 @@ func TestRound17_TranspilerLuceneDateNanosVariantAndNestedKeyword(t *testing.T) 
 	if strings.Contains(planVarArr.HitsSQL, "MATCH_REGEXP") || !strings.Contains(planVarArr.HitsSQL, "REGEXP") {
 		t.Fatalf("expected REGEXP instead of MATCH_REGEXP on dynamic variant, got: %s", planVarArr.HitsSQL)
 	}
-	if strings.Contains(planVarArr.HitsSQL, "`f__tags` MATCH_") || !strings.Contains(planVarArr.HitsSQL, "array_exists") {
-		t.Fatalf("expected array_exists instead of MATCH_ANY on promoted array column, got: %s", planVarArr.HitsSQL)
+	if strings.Contains(planVarArr.HitsSQL, "MATCH_") || (!strings.Contains(planVarArr.HitsSQL, "array_contains") && !strings.Contains(planVarArr.HitsSQL, "array_exists")) {
+		t.Fatalf("expected array_contains/array_exists instead of MATCH_ANY on promoted array column, got: %s", planVarArr.HitsSQL)
 	}
 }
 

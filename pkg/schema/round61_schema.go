@@ -680,7 +680,7 @@ func validateSingleSyntheticSourceProp(fullPath string, prop esast.FieldProperty
 			return fmt.Errorf("illegal_argument_exception: field [%s] of type [flattened] doesn't support synthetic source because it doesn't have doc values", fullPath)
 		}
 		return nil
-	case "text":
+	case "text", "match_only_text":
 		if prop.Store != nil && *prop.Store {
 			return nil
 		}
@@ -688,9 +688,24 @@ func validateSingleSyntheticSourceProp(fullPath string, prop esast.FieldProperty
 			if hasSyntheticCapableSubfield(prop.Fields) {
 				return nil
 			}
-			return fmt.Errorf("illegal_argument_exception: Field [%s] of type [text] doesn't support synthetic source unless [synthetic_source_keep] or [store] is enabled", fullPath)
+			return fmt.Errorf("illegal_argument_exception: Field [%s] of type [%s] doesn't support synthetic source unless [synthetic_source_keep] or [store] is enabled", fullPath, prop.Type)
 		}
 		// In ES 8.14+, `text` fields in an index created with `_source.mode: synthetic` default `synthetic_source_keep` to `"arrays"`.
+		return nil
+	case "keyword", "constant_keyword", "wildcard", "version", "ip", "date", "date_nanos",
+		"boolean", "byte", "short", "integer", "long", "unsigned_long",
+		"half_float", "float", "double", "scaled_float",
+		"geo_point", "point", "geo_shape", "shape", "binary",
+		"integer_range", "float_range", "long_range", "double_range", "date_range", "ip_range", "histogram":
+		if prop.DocValues != nil && !*prop.DocValues {
+			if prop.Store != nil && *prop.Store {
+				return nil
+			}
+			if hasSyntheticCapableSubfield(prop.Fields) {
+				return nil
+			}
+			return fmt.Errorf("illegal_argument_exception: field [%s] of type [%s] doesn't support synthetic source because it doesn't have doc values", fullPath, prop.Type)
+		}
 		return nil
 	}
 	return nil
@@ -1800,6 +1815,10 @@ func ComputeTSDBIdentityWithRoutingHash(idx *IndexSchema, doc map[string]any, se
 }
 
 func parseTSDBTimestampMillis(raw any, tsType, format string) (int64, bool) {
+	return parseTSDBTimestampMillisWithLocale(raw, tsType, format, "")
+}
+
+func parseTSDBTimestampMillisWithLocale(raw any, tsType, format, locale string) (int64, bool) {
 	switch v := raw.(type) {
 	case int:
 		return int64(v), true
@@ -1824,11 +1843,11 @@ func parseTSDBTimestampMillis(raw any, tsType, format string) (int64, bool) {
 		}
 	case string:
 		if tsType == "date_nanos" {
-			if ns, ok := ParseESDateWithFormatToEpochNanos(v, format, time.Now().UTC()); ok {
+			if ns, ok := ParseESDateWithFormatAndLocaleToEpochNanos(v, format, locale, time.Now().UTC()); ok {
 				return ns / 1_000_000, true
 			}
 		}
-		return ParseESDateWithFormatToEpochMillis(v, format, time.Now().UTC())
+		return ParseESDateWithFormatAndLocaleToEpochMillis(v, format, locale, time.Now().UTC())
 	}
 	return 0, false
 }
@@ -1942,8 +1961,8 @@ func canonicalizeTSDBDimensionScalar(fieldName string, b FieldBinding, raw any) 
 		return strconv.FormatInt(ms, 10), nil
 	default:
 		s := fmt.Sprintf("%v", raw)
-		if b.LowercaseNormalizer {
-			s = strings.ToLower(s)
+		if b.NormalizerName != "" || b.LowercaseNormalizer {
+			s = normalizeValueForBinding(s, b, nil)
 		}
 		return s, nil
 	}

@@ -65,14 +65,51 @@ var supportedRunnerFeatures = map[string]bool{
 }
 
 var defaultSupportedClusterFeatures = map[string]bool{
-	"mapper.boolean_simpler_mapping":             true,
-	"mapper.keyword_normalizer_synthetic_source": true,
-	"mapper.source.synthetic":                    true,
-	"mapper.source.synthetic_source_fallback":    true,
-	"mapper.subobjects":                          true,
-	"mapper.track_ignored_source":                true,
-	"scripting.emit_api":                         true,
-	"ingest.processors.script_fields":            true,
+	"mapper.boolean_simpler_mapping":                           true,
+	"mapper.keyword_normalizer_synthetic_source":               true,
+	"mapper.source.synthetic":                                  true,
+	"mapper.source.synthetic_source_fallback":                  true,
+	"mapper.subobjects":                                        true,
+	"mapper.track_ignored_source":                              true,
+	"scripting.emit_api":                                       true,
+	"ingest.processors.script_fields":                          true,
+	"mapper.vectors.bit_vectors":                               true,
+	"mapper.vectors.int4_quantization":                         true,
+	"rrf_retriever_supported":                                  true,
+	"mapper.annotated_text.synthetic_source":                   true,
+	"search.vectors.k_param_supported":                         true,
+	"unified_highlighter_matched_fields":                       true,
+	"script.hamming":                                           true,
+	"geoip.downloader.database.configuration":                  true,
+	"esql.agg_values":                                          true,
+	"esql.metrics_counter_fields":                              true,
+	"mapper.pass_through_priority":                             true,
+	"mapper.index_sorting_on_nested":                           true,
+	"mapper.keyword_dimension_ignore_above":                    true,
+	"mapper.source.synthetic_source_stored_fields_advance_fix": true,
+	"stats.include_disk_thresholds":                            true,
+	"mapper.range.null_values_off_by_one_fix":                  true,
+	"esql.mv_ordering_sorted_ascending":                        true,
+}
+
+var es8OnlyClusterFeatures = map[string]bool{
+	"mapper.vectors.bit_vectors":                               true,
+	"mapper.vectors.int4_quantization":                         true,
+	"rrf_retriever_supported":                                  true,
+	"mapper.annotated_text.synthetic_source":                   true,
+	"search.vectors.k_param_supported":                         true,
+	"unified_highlighter_matched_fields":                       true,
+	"script.hamming":                                           true,
+	"geoip.downloader.database.configuration":                  true,
+	"esql.agg_values":                                          true,
+	"esql.metrics_counter_fields":                              true,
+	"mapper.pass_through_priority":                             true,
+	"mapper.index_sorting_on_nested":                           true,
+	"mapper.keyword_dimension_ignore_above":                    true,
+	"mapper.source.synthetic_source_stored_fields_advance_fix": true,
+	"stats.include_disk_thresholds":                            true,
+	"mapper.range.null_values_off_by_one_fix":                  true,
+	"esql.mv_ordering_sorted_ascending":                        true,
 }
 
 // DefaultSupportedTestRunnerFeatures returns a copy of the default test-runner feature set.
@@ -89,6 +126,26 @@ func DefaultSupportedClusterFeatures() map[string]bool {
 	out := make(map[string]bool, len(defaultSupportedClusterFeatures))
 	for k, v := range defaultSupportedClusterFeatures {
 		out[k] = v
+	}
+	return out
+}
+
+// DefaultSupportedClusterFeaturesForVersion returns default supported cluster capabilities gated for targetVersion.
+func DefaultSupportedClusterFeaturesForVersion(targetVersion string) map[string]bool {
+	ver := strings.TrimSpace(targetVersion)
+	if ver == "" {
+		ver = resolveRunnerTargetVersion("")
+	}
+	isES8OrLater := compareSemver(ver, "8.0.0") >= 0
+	out := make(map[string]bool, len(defaultSupportedClusterFeatures))
+	for k, v := range defaultSupportedClusterFeatures {
+		if !v {
+			continue
+		}
+		if es8OnlyClusterFeatures[k] && !isES8OrLater {
+			continue
+		}
+		out[k] = true
 	}
 	return out
 }
@@ -217,6 +274,7 @@ func runSpecDocumentWithVersion(t *testing.T, client *http.Client, baseURL, file
 	t.Run(fileName, func(t *testing.T) {
 		probeCtx := newRunnerContext(client, trimmedBase)
 		probeCtx.targetVersion = targetVersion
+		probeCtx.supportedClusterFeatures = DefaultSupportedClusterFeaturesForVersion(targetVersion)
 		if reason, skip := probeCtx.evalSkipSpec(specDoc.Skip, false); skip {
 			t.Skipf("file skipped: %s", reason)
 		}
@@ -245,6 +303,7 @@ func runSpecDocumentWithVersion(t *testing.T, client *http.Client, baseURL, file
 			t.Run(sec.Name, func(t *testing.T) {
 				ctx := newRunnerContext(client, trimmedBase)
 				ctx.targetVersion = targetVersion
+				ctx.supportedClusterFeatures = DefaultSupportedClusterFeaturesForVersion(targetVersion)
 				defer ctx.cleanupAll()
 
 				for i, step := range specDoc.Setup {
@@ -389,7 +448,7 @@ func newRunnerContext(client *http.Client, baseURL string) *runnerContext {
 		client:                       client,
 		baseURL:                      baseURL,
 		targetVersion:                targetVer,
-		supportedClusterFeatures:     DefaultSupportedClusterFeatures(),
+		supportedClusterFeatures:     DefaultSupportedClusterFeaturesForVersion(targetVer),
 		supportedTestRunnerFeatures:  DefaultSupportedTestRunnerFeatures(),
 		stash:                        make(map[string]any),
 		lastHeaders:                  make(map[string]any),
@@ -5068,6 +5127,10 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		method = http.MethodGet
 		reqPath = "/_license/trial_status"
 
+	case "license.get_feature_usage":
+		method = http.MethodGet
+		reqPath = "/_license/feature_usage"
+
 	case "xpack.info":
 		method = http.MethodGet
 		reqPath = "/_xpack"
@@ -6788,7 +6851,13 @@ func (c *runnerContext) hasClusterFeature(feat string) bool {
 	if c != nil && c.supportedClusterFeatures != nil {
 		return c.supportedClusterFeatures[feat]
 	}
-	return defaultSupportedClusterFeatures[feat]
+	if !defaultSupportedClusterFeatures[feat] {
+		return false
+	}
+	if es8OnlyClusterFeatures[feat] && compareSemver(c.effectiveTargetVersion(), "8.0.0") < 0 {
+		return false
+	}
+	return true
 }
 
 func (c *runnerContext) evalClusterFeature(feat string) bool {
@@ -6858,6 +6927,21 @@ func (c *runnerContext) probeServerCapability(capReq CapabilityRequirement) bool
 	return payload.Supported
 }
 
+func (c *runnerContext) hasActiveKnownIssue(ki KnownIssue) bool {
+	if len(ki.ClusterFeatures) == 0 && ki.FixedBy == "" {
+		return false
+	}
+	for _, cf := range ki.ClusterFeatures {
+		if !c.evalClusterFeature(cf) {
+			return false
+		}
+	}
+	if ki.FixedBy != "" && c.evalClusterFeature(ki.FixedBy) {
+		return false
+	}
+	return true
+}
+
 func (c *runnerContext) evalSkipSpec(skip *SkipSpec, isRequires bool) (string, bool) {
 	if skip == nil {
 		return "", false
@@ -6868,8 +6952,12 @@ func (c *runnerContext) evalSkipSpec(skip *SkipSpec, isRequires bool) (string, b
 		}
 		return fallback
 	}
-	if skip.KnownIssues {
-		return reasonOr("known_issues"), true
+	if !isRequires {
+		for _, ki := range skip.KnownIssues {
+			if c.hasActiveKnownIssue(ki) {
+				return reasonOr("known_issues"), true
+			}
+		}
 	}
 	for _, feat := range skip.Features {
 		if !c.hasTestRunnerFeature(feat) {
@@ -6972,9 +7060,7 @@ func (c *runnerContext) parseRuntimeSkipSpec(op string, rawVal any) (*SkipSpec, 
 		case "capabilities":
 			out.Capabilities = append(out.Capabilities, parseCapabilityRequirements(c.expandStash(p.Value))...)
 		case "known_issues":
-			if p.Value != nil {
-				out.KnownIssues = true
-			}
+			out.KnownIssues = append(out.KnownIssues, parseKnownIssues(c.expandStash(p.Value))...)
 		}
 	}
 	return out, nil

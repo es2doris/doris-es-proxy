@@ -362,7 +362,7 @@ func scoreEntries(opts SuiteOptions, entries []scoredSpecEntry) *SuiteScorecard 
 	}
 	clusterFeats := opts.SupportedClusterFeatures
 	if clusterFeats == nil {
-		clusterFeats = DefaultSupportedClusterFeatures()
+		clusterFeats = DefaultSupportedClusterFeaturesForVersion(targetVer)
 	}
 	runnerFeats := opts.SupportedTestRunnerFeatures
 	if runnerFeats == nil {
@@ -484,13 +484,14 @@ func scoreEntries(opts SuiteOptions, entries []scoredSpecEntry) *SuiteScorecard 
 
 		for _, sec := range specDoc.Sections {
 			sc.SectionsTotal++
-			skipped, secErr := executeScoredSectionWithCleanupAndHook(
+			skipped, secErr := executeScoredSectionWithCategory(
 				opts.NewHandler,
 				opts.NewSectionHandler,
 				opts.ConfigureRemoteTransport,
 				targetVer,
 				clusterFeats,
 				runnerFeats,
+				entry.category,
 				specDoc,
 				sec,
 			)
@@ -648,6 +649,20 @@ func executeScoredSectionWithCleanupAndHook(
 	specDoc *SpecDocument,
 	sec SpecSection,
 ) (skipped bool, err error) {
+	return executeScoredSectionWithCategory(newHandler, newSectionHandler, remoteHook, targetVer, clusterFeats, runnerFeats, "", specDoc, sec)
+}
+
+func executeScoredSectionWithCategory(
+	newHandler func() http.Handler,
+	newSectionHandler func() (http.Handler, func()),
+	remoteHook func(handler http.Handler, transport http.RoundTripper),
+	targetVer string,
+	clusterFeats map[string]bool,
+	runnerFeats map[string]bool,
+	category string,
+	specDoc *SpecDocument,
+	sec SpecSection,
+) (skipped bool, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			skipped = false
@@ -676,6 +691,9 @@ func executeScoredSectionWithCleanupAndHook(
 	configureHandlerRemoteReindexWithHook(handler, transport, remoteHook)
 	client := &http.Client{
 		Transport: transport,
+	}
+	if repoCleanup := setupCategoryFixtureIfNeeded(category, client); repoCleanup != nil {
+		defer repoCleanup()
 	}
 	ctx := newConfiguredRunnerContext(client, "http://conformance.local", targetVer, clusterFeats, runnerFeats)
 	defer safeCleanupRunnerContext(ctx)
@@ -781,6 +799,81 @@ func isReadOnlySpecDocumentForSetupReuse(specDoc *SpecDocument) bool {
 	return true
 }
 
+func setupCategoryFixtureIfNeeded(category string, client *http.Client) func() {
+	if !strings.EqualFold(strings.TrimSpace(category), "repository_url") || client == nil {
+		return nil
+	}
+	tmpDir, err := os.MkdirTemp("", "conformance-repo-url-*")
+	if err != nil {
+		return nil
+	}
+	httpSrv := httptest.NewServer(http.FileServer(http.Dir(tmpDir)))
+
+	sendFixtureJSON := func(method, reqPath string, payload any) {
+		var bodyReader io.Reader
+		if payload != nil {
+			raw, mErr := json.Marshal(payload)
+			if mErr != nil {
+				return
+			}
+			bodyReader = strings.NewReader(string(raw))
+		}
+		req, rErr := http.NewRequest(method, "http://conformance.local"+reqPath, bodyReader)
+		if rErr != nil {
+			return
+		}
+		if payload != nil {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		resp, dErr := client.Do(req)
+		if dErr == nil && resp != nil {
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+		}
+	}
+
+	sendFixtureJSON(http.MethodPut, "/_cluster/settings", map[string]any{
+		"persistent": map[string]any{
+			"repositories.url.allowed_urls": "http://snapshot.test*,https://snapshot.test*,http://127.0.0.1:*,http://[::1]:*,file://*",
+		},
+	})
+	sendFixtureJSON(http.MethodPut, "/_snapshot/repository-fs?verify=false", map[string]any{
+		"type": "fs",
+		"settings": map[string]any{
+			"location": tmpDir,
+		},
+	})
+	sendFixtureJSON(http.MethodPut, "/_snapshot/repository-url?verify=false", map[string]any{
+		"type": "url",
+		"settings": map[string]any{
+			"url": strings.TrimRight(httpSrv.URL, "/") + "/",
+		},
+	})
+	fileURL := "file://" + filepath.ToSlash(tmpDir) + "/"
+	if !strings.HasPrefix(fileURL, "file:///") {
+		fileURL = "file:///" + strings.TrimPrefix(filepath.ToSlash(tmpDir), "/") + "/"
+	}
+	sendFixtureJSON(http.MethodPut, "/_snapshot/repository-file?verify=false", map[string]any{
+		"type": "url",
+		"settings": map[string]any{
+			"url": fileURL,
+		},
+	})
+
+	return func() {
+		sendFixtureJSON(http.MethodDelete, "/_snapshot/repository-url", nil)
+		sendFixtureJSON(http.MethodDelete, "/_snapshot/repository-file", nil)
+		sendFixtureJSON(http.MethodDelete, "/_snapshot/repository-fs", nil)
+		sendFixtureJSON(http.MethodPut, "/_cluster/settings", map[string]any{
+			"persistent": map[string]any{
+				"repositories.url.allowed_urls": nil,
+			},
+		})
+		httpSrv.Close()
+		_ = os.RemoveAll(tmpDir)
+	}
+}
+
 func executeReadOnlyFileWithSharedSetup(
 	newHandler func() http.Handler,
 	newSectionHandler func() (http.Handler, func()),
@@ -812,6 +905,9 @@ func executeReadOnlyFileWithSharedSetup(
 	transport := inProcessHandlerTransport{handler: handler}
 	configureHandlerRemoteReindexWithHook(handler, transport, remoteHook)
 	client := &http.Client{Transport: transport}
+	if repoCleanup := setupCategoryFixtureIfNeeded(category, client); repoCleanup != nil {
+		defer repoCleanup()
+	}
 	setupCtx := newConfiguredRunnerContext(client, "http://conformance.local", targetVer, clusterFeats, runnerFeats)
 	defer safeCleanupRunnerContext(setupCtx)
 

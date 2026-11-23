@@ -35,7 +35,7 @@ import (
 
 const (
 	expectedUpstreamV7YAMLCount          = 587
-	expectedUpstreamV8YAMLCount          = 893
+	expectedUpstreamV8YAMLCount          = 970
 	defaultRemoteReindexWhitelistForTest = "127.0.0.1:*,[::1]:*,localhost:*,conformance.local:*"
 )
 

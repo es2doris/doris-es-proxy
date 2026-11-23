@@ -376,7 +376,7 @@ func TestRound7_TopHitsScoreSortDoris4SearchGuardAndLuceneEdgeCases(t *testing.T
 	planParens, err := trStd.BuildSearchPlan(&esast.SearchRequest{
 		Query: &esast.Query{QueryString: &esast.QueryStringQuery{Query: "(service_a:alpha)OR(service_b:beta)"}},
 	})
-	if err != nil || !strings.Contains(planParens.HitsSQL, "`f__service_a` MATCH_ANY 'alpha'") || !strings.Contains(planParens.HitsSQL, "`f__service_b` MATCH_ANY 'beta'") {
+	if err != nil || !strings.Contains(planParens.HitsSQL, "`f__service_a` = 'alpha'") || !strings.Contains(planParens.HitsSQL, "`f__service_b` = 'beta'") {
 		t.Fatalf("expected (service_a:alpha)OR(service_b:beta) to parse both field clauses, got:\n%s", planParens.HitsSQL)
 	}
 

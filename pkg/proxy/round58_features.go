@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha1" // #nosec G505 -- deterministic non-cryptographic bucket ID hashing for ES transform/rollup
 	"encoding/base64"
+	"encoding/csv"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -36,12 +37,28 @@ func ensureESCompatHeaders(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("traceparent", tp)
 		}
 		if w.Header().Get("Content-Type") == "" {
-			accept := r.Header.Get("Accept")
-			reqCT := r.Header.Get("Content-Type")
+			accept := strings.ToLower(strings.Join(r.Header.Values("Accept"), ", "))
+			reqCT := strings.ToLower(strings.Join(r.Header.Values("Content-Type"), ", "))
 			switch {
-			case strings.Contains(accept, "compatible-with=8") || strings.Contains(reqCT, "compatible-with=8"):
+			case strings.Contains(accept, "application/vnd.opensearch+json"):
+				if cw, hasCW := extractCompatibleWithParam(accept); hasCW && cw != "" {
+					w.Header().Set("Content-Type", "application/vnd.opensearch+json; compatible-with="+cw)
+				} else {
+					w.Header().Set("Content-Type", "application/vnd.opensearch+json; charset=UTF-8")
+				}
+			case strings.Contains(accept, "compatible-with=8"):
 				w.Header().Set("Content-Type", "application/vnd.elasticsearch+json; compatible-with=8")
-			case strings.Contains(accept, "compatible-with=7") || strings.Contains(reqCT, "compatible-with=7"):
+			case strings.Contains(accept, "compatible-with=7"):
+				w.Header().Set("Content-Type", "application/vnd.elasticsearch+json; compatible-with=7")
+			case strings.Contains(reqCT, "application/vnd.opensearch+"):
+				if cw, hasCW := extractCompatibleWithParam(reqCT); hasCW && cw != "" {
+					w.Header().Set("Content-Type", "application/vnd.opensearch+json; compatible-with="+cw)
+				} else {
+					w.Header().Set("Content-Type", "application/vnd.opensearch+json; charset=UTF-8")
+				}
+			case strings.Contains(reqCT, "compatible-with=8"):
+				w.Header().Set("Content-Type", "application/vnd.elasticsearch+json; compatible-with=8")
+			case strings.Contains(reqCT, "compatible-with=7"):
 				w.Header().Set("Content-Type", "application/vnd.elasticsearch+json; compatible-with=7")
 			}
 		}
@@ -201,9 +218,43 @@ func parseESPositiveDuration(raw string) (time.Duration, error) {
 	return 0, fmt.Errorf("missing or unsupported time unit in [%s]", raw)
 }
 
+const (
+	maxPITEntriesR64           = 4096
+	maxScrollContextEntriesR64 = 4096
+)
+
 func (s *Server) ensurePITStoreLocked() {
 	if s.pits == nil {
 		s.pits = make(map[string]*pitContextEntry)
+	}
+}
+
+func (s *Server) sweepPITStoreLockedR64(now time.Time) {
+	for id, entry := range s.pits {
+		if entry == nil || now.After(entry.ExpiresAt) {
+			delete(s.pits, id)
+		}
+	}
+	if len(s.pits) < maxPITEntriesR64 {
+		return
+	}
+	type pitAge struct {
+		id  string
+		exp time.Time
+	}
+	all := make([]pitAge, 0, len(s.pits))
+	for id, entry := range s.pits {
+		all = append(all, pitAge{id: id, exp: entry.ExpiresAt})
+	}
+	sort.Slice(all, func(i, j int) bool {
+		if !all[i].exp.Equal(all[j].exp) {
+			return all[i].exp.Before(all[j].exp)
+		}
+		return all[i].id < all[j].id
+	})
+	excess := len(s.pits) - (maxPITEntriesR64 - 1)
+	for i := 0; i < excess && i < len(all); i++ {
+		delete(s.pits, all[i].id)
 	}
 }
 
@@ -431,8 +482,10 @@ func (s *Server) handlePITRound58(w http.ResponseWriter, r *http.Request) {
 	if len(aliasFilters) == 0 && len(targets) > 0 {
 		pitPattern = strings.Join(targets, ",")
 	}
+	now = time.Now()
 	s.mu.Lock()
 	s.ensurePITStoreLocked()
+	s.sweepPITStoreLockedR64(now)
 	snapDocs := make(map[string]map[string]struct{}, len(targets))
 	for _, t := range targets {
 		set := make(map[string]struct{})
@@ -450,7 +503,7 @@ func (s *Server) handlePITRound58(w http.ResponseWriter, r *http.Request) {
 		ID:             pitID,
 		Targets:        append([]string(nil), targets...),
 		RawIndex:       pitPattern,
-		ExpiresAt:      time.Now().Add(ttl),
+		ExpiresAt:      now.Add(ttl),
 		IndexFilter:    pitIndexFilter,
 		SnapshotDocIDs: snapDocs,
 	}
@@ -480,6 +533,7 @@ func (s *Server) validateAndResolvePITRequest(rawIndex string, req *esast.Search
 	now := time.Now()
 	s.mu.Lock()
 	s.ensurePITStoreLocked()
+	s.sweepPITStoreLockedR64(now)
 	entry, exists := s.pits[pitID]
 	if !exists || entry == nil || now.After(entry.ExpiresAt) {
 		if exists {
@@ -578,6 +632,26 @@ func (s *Server) sweepScrollStoreLockedR62Admin(now time.Time) {
 			delete(s.scrollContexts, tok)
 		}
 	}
+	if len(s.scrollContexts) >= maxScrollContextEntriesR64 {
+		type scrollAge struct {
+			tok string
+			exp time.Time
+		}
+		all := make([]scrollAge, 0, len(s.scrollContexts))
+		for tok, entry := range s.scrollContexts {
+			all = append(all, scrollAge{tok: tok, exp: entry.ExpiresAt})
+		}
+		sort.Slice(all, func(i, j int) bool {
+			if !all[i].exp.Equal(all[j].exp) {
+				return all[i].exp.Before(all[j].exp)
+			}
+			return all[i].tok < all[j].tok
+		})
+		excess := len(s.scrollContexts) - (maxScrollContextEntriesR64 - 1)
+		for i := 0; i < excess && i < len(all); i++ {
+			delete(s.scrollContexts, all[i].tok)
+		}
+	}
 	if len(s.invalidatedScrollSessions) > 512 {
 		activeSess := make(map[string]bool, len(s.scrollContexts))
 		for _, entry := range s.scrollContexts {
@@ -648,6 +722,7 @@ func (s *Server) validateAndAdvanceScrollToken(token, nextToken string, extendTT
 				delete(s.scrollContexts, evictTok)
 			}
 		}
+		s.sweepScrollStoreLockedR62Admin(now)
 		s.scrollContexts[nextToken] = &scrollContextEntry{
 			Token:     nextToken,
 			SessionID: entry.SessionID,
@@ -2443,11 +2518,17 @@ func negotiateCatFormat(r *http.Request) (string, error) {
 	rawFmt := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("format")))
 	switch rawFmt {
 	case "":
-		accept := strings.ToLower(r.Header.Get("Accept"))
-		if strings.Contains(accept, "application/yaml") || strings.Contains(accept, "text/yaml") || strings.Contains(accept, "application/vnd.elasticsearch+yaml") {
+		accept := strings.ToLower(strings.Join(r.Header.Values("Accept"), ", "))
+		if strings.Contains(accept, "application/yaml") || strings.Contains(accept, "text/yaml") || strings.Contains(accept, "application/vnd.elasticsearch+yaml") || strings.Contains(accept, "application/vnd.opensearch+yaml") {
 			return "yaml", nil
 		}
-		if strings.Contains(accept, "application/json") || strings.Contains(accept, "application/vnd.elasticsearch+json") {
+		if strings.Contains(accept, "text/csv") {
+			return "csv", nil
+		}
+		if strings.Contains(accept, "text/tab-separated-values") {
+			return "tsv", nil
+		}
+		if strings.Contains(accept, "application/json") || strings.Contains(accept, "application/vnd.elasticsearch+json") || strings.Contains(accept, "application/vnd.opensearch+json") {
 			return "json", nil
 		}
 		return "text", nil
@@ -2457,6 +2538,10 @@ func negotiateCatFormat(r *http.Request) (string, error) {
 		return "text", nil
 	case "yaml", "yml":
 		return "yaml", nil
+	case "csv":
+		return "csv", nil
+	case "tsv":
+		return "tsv", nil
 	default:
 		return "", fmt.Errorf("format [%s] is not supported", rawFmt)
 	}
@@ -2540,12 +2625,6 @@ func writeCatResponseWithHelpCols(w http.ResponseWriter, r *http.Request, header
 	allHelpCols = append(allHelpCols, extraHelpCols...)
 
 	if isTruthyBoolQueryParam(r, "help") {
-		w.Header().Set("Content-Type", "text/plain; charset=UTF-8")
-		w.Header().Set("X-Content-Type-Options", "nosniff")
-		w.WriteHeader(http.StatusOK)
-		if r != nil && r.Method == http.MethodHead {
-			return
-		}
 		maxColW := 0
 		maxShortW := 0
 		shortByCol := make(map[string]string, len(allHelpCols))
@@ -2577,10 +2656,21 @@ func writeCatResponseWithHelpCols(w http.ResponseWriter, r *http.Request, header
 				maxShortW = len(shortByCol[hdr])
 			}
 		}
+		var helpBuf bytes.Buffer
 		for _, hdr := range allHelpCols {
-			// #nosec G705 -- Content-Type is text/plain with X-Content-Type-Options: nosniff
-			_, _ = fmt.Fprintf(w, "%-*s | %-*s | %s\n", maxColW, hdr, maxShortW, shortByCol[hdr], hdr)
+			_, _ = fmt.Fprintf(&helpBuf, "%-*s | %-*s | %s\n", maxColW, hdr, maxShortW, shortByCol[hdr], hdr)
 		}
+		w.Header().Set("Content-Type", "text/plain; charset=UTF-8")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		if w.Header().Get("Content-Encoding") == "" {
+			w.Header().Set("Content-Length", strconv.Itoa(helpBuf.Len()))
+		}
+		w.WriteHeader(http.StatusOK)
+		if r != nil && r.Method == http.MethodHead {
+			return
+		}
+		// #nosec G705 -- Content-Type is text/plain with X-Content-Type-Options: nosniff
+		_, _ = w.Write(helpBuf.Bytes())
 		return
 	}
 
@@ -2704,82 +2794,135 @@ func writeCatResponseWithHelpCols(w http.ResponseWriter, r *http.Request, header
 
 	switch outFmt {
 	case "text":
+		verbose := isTruthyBoolQueryParam(r, "v")
+		var textBuf bytes.Buffer
+		if len(projectedRows) > 0 || verbose {
+			numCols := len(selectedHeaders)
+			widths := make([]int, numCols)
+			if verbose {
+				for ci := 0; ci < numCols; ci++ {
+					lbl := selectedHeaders[ci]
+					if ci < len(displayTextHeaders) {
+						lbl = displayTextHeaders[ci]
+					}
+					if len(lbl) > widths[ci] {
+						widths[ci] = len(lbl)
+					}
+				}
+			}
+			cellGrid := make([][]string, len(projectedRows))
+			for ri, row := range projectedRows {
+				vals := make([]string, numCols)
+				for ci, col := range selectedHeaders {
+					v, exists := row[col]
+					if !exists || v == nil {
+						vals[ci] = ""
+					} else {
+						vals[ci] = fmt.Sprintf("%v", v)
+					}
+					if len(vals[ci]) > widths[ci] {
+						widths[ci] = len(vals[ci])
+					}
+				}
+				cellGrid[ri] = vals
+			}
+			writePaddedCatRow := func(cells []string) {
+				var line strings.Builder
+				for ci, cell := range cells {
+					if ci > 0 {
+						line.WriteByte(' ')
+					}
+					rightAlign := ci < len(selectedHeaders) && isRightAlignedCatColumnR62Admin(selectedHeaders[ci])
+					if rightAlign {
+						fmt.Fprintf(&line, "%*s", widths[ci], cell)
+					} else if ci == len(cells)-1 {
+						line.WriteString(cell)
+					} else {
+						fmt.Fprintf(&line, "%-*s", widths[ci], cell)
+					}
+				}
+				_, _ = fmt.Fprintln(&textBuf, line.String())
+			}
+			if verbose && numCols > 0 {
+				hdrCells := make([]string, numCols)
+				for ci := 0; ci < numCols; ci++ {
+					if ci < len(displayTextHeaders) {
+						hdrCells[ci] = displayTextHeaders[ci]
+					} else {
+						hdrCells[ci] = selectedHeaders[ci]
+					}
+				}
+				writePaddedCatRow(hdrCells)
+			}
+			for _, vals := range cellGrid {
+				writePaddedCatRow(vals)
+			}
+		}
 		w.Header().Set("Content-Type", "text/plain; charset=UTF-8")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
+		if w.Header().Get("Content-Encoding") == "" {
+			w.Header().Set("Content-Length", strconv.Itoa(textBuf.Len()))
+		}
 		w.WriteHeader(http.StatusOK)
 		if r != nil && r.Method == http.MethodHead {
 			return
 		}
-		verbose := isTruthyBoolQueryParam(r, "v")
-		if len(projectedRows) == 0 && !verbose {
-			return
-		}
-		numCols := len(selectedHeaders)
-		widths := make([]int, numCols)
-		if verbose {
-			for ci := 0; ci < numCols; ci++ {
-				lbl := selectedHeaders[ci]
-				if ci < len(displayTextHeaders) {
-					lbl = displayTextHeaders[ci]
-				}
-				if len(lbl) > widths[ci] {
-					widths[ci] = len(lbl)
-				}
-			}
-		}
-		cellGrid := make([][]string, len(projectedRows))
-		for ri, row := range projectedRows {
-			vals := make([]string, numCols)
-			for ci, col := range selectedHeaders {
-				v, exists := row[col]
-				if !exists || v == nil {
-					vals[ci] = ""
-				} else {
-					vals[ci] = fmt.Sprintf("%v", v)
-				}
-				if len(vals[ci]) > widths[ci] {
-					widths[ci] = len(vals[ci])
-				}
-			}
-			cellGrid[ri] = vals
-		}
-		writePaddedCatRow := func(cells []string) {
-			var line strings.Builder
-			for ci, cell := range cells {
-				if ci > 0 {
-					line.WriteByte(' ')
-				}
-				rightAlign := ci < len(selectedHeaders) && isRightAlignedCatColumnR62Admin(selectedHeaders[ci])
-				if rightAlign {
-					fmt.Fprintf(&line, "%*s", widths[ci], cell)
-				} else if ci == len(cells)-1 {
-					line.WriteString(cell)
-				} else {
-					fmt.Fprintf(&line, "%-*s", widths[ci], cell)
-				}
-			}
+		if textBuf.Len() > 0 {
 			// #nosec G705 -- Content-Type is text/plain with X-Content-Type-Options: nosniff
-			_, _ = fmt.Fprintln(w, line.String())
+			_, _ = w.Write(textBuf.Bytes())
 		}
-		if verbose && numCols > 0 {
-			hdrCells := make([]string, numCols)
-			for ci := 0; ci < numCols; ci++ {
+
+	case "csv", "tsv":
+		verbose := isTruthyBoolQueryParam(r, "v")
+		var sepBuf bytes.Buffer
+		cw := csv.NewWriter(&sepBuf)
+		if outFmt == "tsv" {
+			cw.Comma = '\t'
+			w.Header().Set("Content-Type", "text/tab-separated-values; charset=UTF-8")
+		} else {
+			w.Header().Set("Content-Type", "text/csv; charset=UTF-8")
+		}
+		if verbose && len(selectedHeaders) > 0 {
+			hdrCells := make([]string, len(selectedHeaders))
+			for ci, col := range selectedHeaders {
 				if ci < len(displayTextHeaders) {
 					hdrCells[ci] = displayTextHeaders[ci]
 				} else {
-					hdrCells[ci] = selectedHeaders[ci]
+					hdrCells[ci] = col
 				}
 			}
-			writePaddedCatRow(hdrCells)
+			_ = cw.Write(hdrCells)
 		}
-		for _, vals := range cellGrid {
-			writePaddedCatRow(vals)
+		for _, row := range projectedRows {
+			rec := make([]string, len(selectedHeaders))
+			for ci, col := range selectedHeaders {
+				if v, ok := row[col]; ok && v != nil {
+					rec[ci] = fmt.Sprintf("%v", v)
+				}
+			}
+			_ = cw.Write(rec)
+		}
+		cw.Flush()
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		if w.Header().Get("Content-Encoding") == "" {
+			w.Header().Set("Content-Length", strconv.Itoa(sepBuf.Len()))
+		}
+		w.WriteHeader(http.StatusOK)
+		if r != nil && r.Method == http.MethodHead {
+			return
+		}
+		if sepBuf.Len() > 0 {
+			// #nosec G705 -- Content-Type is text/csv or text/tab-separated-values with X-Content-Type-Options: nosniff
+			_, _ = w.Write(sepBuf.Bytes())
 		}
 
 	case "yaml":
 		body := marshalCatYAML(selectedHeaders, projectedRows)
 		w.Header().Set("Content-Type", "application/yaml; charset=UTF-8")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
+		if w.Header().Get("Content-Encoding") == "" {
+			w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+		}
 		w.WriteHeader(http.StatusOK)
 		if r != nil && r.Method == http.MethodHead {
 			return
@@ -2789,10 +2932,28 @@ func writeCatResponseWithHelpCols(w http.ResponseWriter, r *http.Request, header
 
 	default:
 		if r != nil && r.Method == http.MethodHead {
+			var payload any = projectedRows
+			pretty := false
+			if opts, hasOpts := extractESResponseFormatOptions(w); hasOpts {
+				if len(opts.filterPaths) > 0 {
+					payload = applyFilterPathRound61(payload, opts.filterPaths)
+				}
+				pretty = opts.pretty
+			}
+			var jsonBuf bytes.Buffer
+			enc := json.NewEncoder(&jsonBuf)
+			enc.SetEscapeHTML(false)
+			if pretty {
+				enc.SetIndent("", "  ")
+			}
+			_ = enc.Encode(payload)
 			if w.Header().Get("Content-Type") == "" {
 				w.Header().Set("Content-Type", "application/json; charset=UTF-8")
 			}
 			w.Header().Set("X-Content-Type-Options", "nosniff")
+			if w.Header().Get("Content-Encoding") == "" {
+				w.Header().Set("Content-Length", strconv.Itoa(jsonBuf.Len()))
+			}
 			w.WriteHeader(http.StatusOK)
 			return
 		}

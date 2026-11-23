@@ -1286,7 +1286,7 @@ func (s *Server) ingestProcessorTypes() []map[string]any {
 	names := []string{
 		"append", "attachment", "bytes", "circle", "community_id", "compact", "convert",
 		"copy", "csv", "date", "date_index_name", "dedup", "default", "dissect",
-		"dot_expander", "drop", "enrich", "fail", "fingerprint", "foreach", "geoip",
+		"dot_expander", "drop", "enrich", "fail", "fingerprint", "foreach", "geo_grid", "geoip",
 		"grok", "gsub", "html_strip", "inference", "join", "json", "kv", "lowercase",
 		"network_direction", "pipeline", "redact", "registered_domain", "remove",
 		"rename", "reroute", "script", "set", "set_security_user", "sort", "split",
@@ -1857,6 +1857,25 @@ func (s *Server) getRemoteReindexTransportRound61() http.RoundTripper {
 	return nil
 }
 
+func sanitizeWarningHeaderTokenRound64(s string, escapeQuotes bool) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c == '\r' || c == '\n' || c < 0x20 || c == 0x7f {
+			if c == '\t' {
+				b.WriteByte(' ')
+			}
+			continue
+		}
+		if escapeQuotes && (c == '\\' || c == '"') {
+			b.WriteByte('\\')
+		}
+		b.WriteByte(c)
+	}
+	return b.String()
+}
+
 func emitESDeprecationWarningRound61(w http.ResponseWriter, s *Server, r *http.Request, msg string) {
 	if w == nil || msg == "" {
 		return
@@ -1865,7 +1884,15 @@ func emitESDeprecationWarningRound61(w http.ResponseWriter, s *Server, r *http.R
 	if s != nil {
 		ver = s.effectiveClusterESVersionNumber(r)
 	}
-	hdrVal := fmt.Sprintf(`299 Elasticsearch-%s-doris4x "%s"`, ver, msg)
+	cleanVer := sanitizeWarningHeaderTokenRound64(ver, false)
+	if cleanVer == "" {
+		cleanVer = "8.15.5"
+	}
+	escapedMsg := sanitizeWarningHeaderTokenRound64(msg, true)
+	if escapedMsg == "" {
+		return
+	}
+	hdrVal := fmt.Sprintf(`299 Elasticsearch-%s-doris4x "%s"`, cleanVer, escapedMsg)
 	for _, existing := range w.Header().Values("Warning") {
 		if existing == hdrVal {
 			return

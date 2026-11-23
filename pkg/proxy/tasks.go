@@ -23,6 +23,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"math"
 	"net"
 	"net/http"
@@ -1322,6 +1323,20 @@ func (s *Server) launchAsyncTaskRound60(w http.ResponseWriter, r *http.Request, 
 
 	go func() {
 		defer cancel()
+		defer func() {
+			if recErr := recover(); recErr != nil {
+				cleanMsg := strings.NewReplacer("\r", " ", "\n", " ", "\t", " ").Replace(fmt.Sprintf("%v", recErr))
+				if len(cleanMsg) > 512 {
+					cleanMsg = cleanMsg[:512]
+				}
+				log.Printf("[async-task] recovered panic in task %q (%q): %s", entry.fullID, action, cleanMsg)
+				entry.markDone(nil, map[string]any{
+					"type":   "internal_server_error",
+					"reason": "async task failed unexpectedly: " + cleanMsg,
+				})
+				s.getTaskRegistry().pruneCompletedTasks()
+			}
+		}()
 		rec := &bufferResponseWriter{}
 		execSync(rec, clonedReq)
 

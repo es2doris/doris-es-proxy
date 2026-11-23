@@ -72,6 +72,8 @@ V7_EXTRA_MODULE_TEST_PATHS=(
 )
 
 ES8_EXTRA_MODULE_TEST_PATHS=(
+  "rest-api-spec/src/yamlRestTestV7Compat/resources/rest-api-spec/test"
+  "qa/smoke-test-ingest-with-all-dependencies/src/yamlRestTest"
   "modules/rest-root/src/yamlRestTest"
   "modules/aggregations/src/yamlRestTest"
   "modules/data-streams/src/yamlRestTest"
@@ -100,6 +102,7 @@ ES8_EXTRA_MODULE_TEST_PATHS=(
   "x-pack/plugin/mapper-version/src/yamlRestTest"
   "x-pack/plugin/wildcard/src/yamlRestTest"
   "x-pack/plugin/rank-rrf/src/yamlRestTest"
+  "x-pack/plugin/autoscaling/qa/rest/src/yamlRestTest"
   "x-pack/plugin/eql/qa/rest/src/yamlRestTest"
   "x-pack/plugin/ilm/qa/rest/src/yamlRestTest"
   "x-pack/plugin/slm/qa/rest/src/yamlRestTest"
@@ -120,6 +123,23 @@ ES8_EXTRA_MODULE_TEST_PATHS=(
   "x-pack/plugin/src/yamlRestTest/resources/rest-api-spec/test/wildcard"
   "x-pack/plugin/src/yamlRestTest/resources/rest-api-spec/test/data_streams"
   "x-pack/plugin/src/yamlRestTest/resources/rest-api-spec/test/snapshot"
+  "x-pack/plugin/src/yamlRestTest/resources/rest-api-spec/test/analytics"
+  "x-pack/plugin/src/yamlRestTest/resources/rest-api-spec/test/deprecation"
+  "x-pack/plugin/src/yamlRestTest/resources/rest-api-spec/test/dlm"
+  "x-pack/plugin/src/yamlRestTest/resources/rest-api-spec/test/health"
+  "x-pack/plugin/src/yamlRestTest/resources/rest-api-spec/test/license"
+  "x-pack/plugin/src/yamlRestTest/resources/rest-api-spec/test/monitoring"
+  "x-pack/plugin/src/yamlRestTest/resources/rest-api-spec/test/text_structure"
+  "x-pack/plugin/src/yamlRestTest/resources/rest-api-spec/test/xpack"
+  "x-pack/plugin/src/yamlRestTest/resources/rest-api-spec/test/search-business-rules"
+  "x-pack/plugin/src/yamlRestTest/resources/rest-api-spec/test/rollup"
+  "x-pack/plugin/src/yamlRestTest/resources/rest-api-spec/test/transform"
+  "x-pack/plugin/src/yamlRestTest/resources/rest-api-spec/test/searchable_snapshots"
+  "x-pack/plugin/src/yamlRestTest/resources/rest-api-spec/test/graph"
+  "x-pack/plugin/src/yamlRestTest/resources/rest-api-spec/test/voting_only_node"
+  "x-pack/plugin/src/yamlRestTest/resources/rest-api-spec/test/redact"
+  "x-pack/plugin/src/yamlRestTest/resources/rest-api-spec/test/profiling"
+  "x-pack/plugin/src/yamlRestTest/resources/rest-api-spec/test/inference"
 )
 
 sparse_clone_or_reuse() {

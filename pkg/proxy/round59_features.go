@@ -1914,7 +1914,15 @@ func isSupportedESContentTypeRound59(rawCT string) bool {
 		"application/vnd.elasticsearch+json",
 		"application/vnd.elasticsearch+ndjson",
 		"application/vnd.elasticsearch+x-ndjson",
+		"application/vnd.elasticsearch+yaml",
+		"application/vnd.elasticsearch+cbor",
+		"application/vnd.elasticsearch+smile",
+		"application/vnd.opensearch+json",
+		"application/vnd.opensearch+ndjson",
+		"application/vnd.opensearch+x-ndjson",
+		"application/vnd.opensearch+yaml",
 		"application/yaml",
+		"application/x-yaml",
 		"text/yaml",
 		"application/cbor",
 		"application/smile":
@@ -1944,11 +1952,19 @@ func (p *prependedBodyReadCloserRound59) Close() error {
 // validateRequestContentTypeRound59 enforces 406 Not Acceptable when a non-empty request sends
 // an explicit unsupported Content-Type header.
 func validateRequestContentTypeRound59(w http.ResponseWriter, r *http.Request) bool {
-	if r == nil {
+	if r == nil || isRawUploadEndpointRound59(r.URL.Path) {
 		return true
 	}
-	rawCT := strings.TrimSpace(r.Header.Get("Content-Type"))
-	if rawCT == "" || isSupportedESContentTypeRound59(rawCT) || isRawUploadEndpointRound59(r.URL.Path) {
+	ctVals := r.Header.Values("Content-Type")
+	var badCT string
+	for _, rawCT := range ctVals {
+		rawCT = strings.TrimSpace(rawCT)
+		if rawCT != "" && !isSupportedESContentTypeRound59(rawCT) {
+			badCT = rawCT
+			break
+		}
+	}
+	if badCT == "" {
 		return true
 	}
 	if r.Body == nil || r.Body == http.NoBody {
@@ -1969,7 +1985,7 @@ func validateRequestContentTypeRound59(w http.ResponseWriter, r *http.Request) b
 		return false
 	}
 	writeESError(w, http.StatusNotAcceptable, "status_exception",
-		fmt.Sprintf("Content-Type header [%s] is not supported", rawCT))
+		fmt.Sprintf("Content-Type header [%s] is not supported", badCT))
 	return false
 }
 

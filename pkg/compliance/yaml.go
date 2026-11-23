@@ -110,6 +110,12 @@ type CapabilityRequirement struct {
 	Capabilities []string
 }
 
+// KnownIssue represents a conditional upstream known_issues skip entry.
+type KnownIssue struct {
+	ClusterFeatures []string
+	FixedBy         string
+}
+
 // SkipSpec represents a rest-api-spec skip or requires directive (file-level or section-level).
 type SkipSpec struct {
 	Version            string
@@ -118,7 +124,7 @@ type SkipSpec struct {
 	TestRunnerFeatures []string
 	ClusterFeatures    []string
 	Capabilities       []CapabilityRequirement
-	KnownIssues        bool
+	KnownIssues        []KnownIssue
 }
 
 // SpecDocument represents a parsed multi-document rest-api-spec YAML file.
@@ -246,12 +252,70 @@ func parseSkipSpec(raw any) (*SkipSpec, error) {
 		case "capabilities":
 			out.Capabilities = append(out.Capabilities, parseCapabilityRequirements(f.Value)...)
 		case "known_issues":
-			if f.Value != nil {
-				out.KnownIssues = true
-			}
+			out.KnownIssues = append(out.KnownIssues, parseKnownIssues(f.Value)...)
 		}
 	}
 	return out, nil
+}
+
+func parseKnownIssues(raw any) []KnownIssue {
+	if raw == nil {
+		return nil
+	}
+	parseOne := func(item any) (KnownIssue, bool) {
+		var fields []YAMLField
+		switch val := item.(type) {
+		case *OrderedMap:
+			if val == nil {
+				return KnownIssue{}, false
+			}
+			fields = val.Fields
+		case OrderedMap:
+			fields = val.Fields
+		case map[string]any:
+			for k, v := range val {
+				fields = append(fields, YAMLField{Key: k, Value: v})
+			}
+		default:
+			return KnownIssue{}, false
+		}
+		var ki KnownIssue
+		for _, f := range fields {
+			switch f.Key {
+			case "cluster_feature", "cluster_features":
+				for _, s := range extractStringSlice(f.Value) {
+					for _, part := range strings.Split(s, ",") {
+						if trimmed := strings.TrimSpace(part); trimmed != "" {
+							ki.ClusterFeatures = append(ki.ClusterFeatures, trimmed)
+						}
+					}
+				}
+			case "fixed_by":
+				if f.Value != nil {
+					ki.FixedBy = strings.TrimSpace(fmt.Sprintf("%v", f.Value))
+				}
+			}
+		}
+		if len(ki.ClusterFeatures) == 0 && ki.FixedBy == "" {
+			return KnownIssue{}, false
+		}
+		return ki, true
+	}
+
+	var out []KnownIssue
+	switch val := raw.(type) {
+	case []any:
+		for _, item := range val {
+			if ki, ok := parseOne(item); ok {
+				out = append(out, ki)
+			}
+		}
+	case *OrderedMap, OrderedMap, map[string]any:
+		if ki, ok := parseOne(val); ok {
+			out = append(out, ki)
+		}
+	}
+	return out
 }
 
 func parseCapabilityRequirements(raw any) []CapabilityRequirement {

@@ -1206,6 +1206,106 @@ type painlessBigDecimal struct {
 	scale    int
 }
 
+const (
+	maxBigIntBits      = 65536
+	maxBigDecimalScale = 10000
+	maxBigDecimalPow   = 10000
+	maxBitSetBits      = 1 << 20
+)
+
+func checkBigIntBitsPainless(bi *big.Int) error {
+	if bi != nil && bi.BitLen() > maxBigIntBits {
+		return &painlessExceptionError{
+			exType:  "ArithmeticException",
+			message: fmt.Sprintf("BigInteger bit length %d exceeds maximum (%d)", bi.BitLen(), maxBigIntBits),
+		}
+	}
+	return nil
+}
+
+func checkBigDecimalScalePainless(scale int) error {
+	if scale < -maxBigDecimalScale || scale > maxBigDecimalScale {
+		return &painlessExceptionError{
+			exType:  "ArithmeticException",
+			message: fmt.Sprintf("BigDecimal scale %d exceeds bounds [-%d, %d]", scale, maxBigDecimalScale, maxBigDecimalScale),
+		}
+	}
+	return nil
+}
+
+func checkBigDecimalBoundsPainless(bd *painlessBigDecimal) error {
+	if bd == nil {
+		return nil
+	}
+	if err := checkBigDecimalScalePainless(bd.scale); err != nil {
+		return err
+	}
+	return checkBigIntBitsPainless(bd.unscaled)
+}
+
+func extractInt64BoundArgPainless(v any) (int64, error) {
+	switch tv := v.(type) {
+	case int:
+		return int64(tv), nil
+	case int64:
+		return tv, nil
+	case int32:
+		return int64(tv), nil
+	case int16:
+		return int64(tv), nil
+	case int8:
+		return int64(tv), nil
+	case uint:
+		if uint64(tv) > math.MaxInt64 {
+			return 0, &painlessExceptionError{exType: "ArithmeticException", message: "integer argument overflow"}
+		}
+		return int64(tv), nil // #nosec G115 -- checked <= math.MaxInt64
+	case uint64:
+		if tv > math.MaxInt64 {
+			return 0, &painlessExceptionError{exType: "ArithmeticException", message: "integer argument overflow"}
+		}
+		return int64(tv), nil // #nosec G115 -- checked <= math.MaxInt64
+	case uint32:
+		return int64(tv), nil
+	case *painlessBigInteger:
+		if tv == nil || tv.val == nil {
+			return 0, &painlessExceptionError{exType: "ArithmeticException", message: "invalid BigInteger argument"}
+		}
+		if !tv.val.IsInt64() {
+			return 0, &painlessExceptionError{exType: "ArithmeticException", message: "BigInteger argument out of int64 bounds"}
+		}
+		return tv.val.Int64(), nil
+	case json.Number:
+		s := strings.TrimSpace(tv.String())
+		iv, err := strconv.ParseInt(s, 10, 64)
+		if err != nil {
+			return 0, &painlessExceptionError{exType: "ArithmeticException", message: fmt.Sprintf("integer argument out of range: %s", s)}
+		}
+		return iv, nil
+	case float64:
+		if math.IsNaN(tv) || math.IsInf(tv, 0) || tv >= float64(math.MaxInt64) || tv < float64(math.MinInt64) {
+			return 0, &painlessExceptionError{exType: "ArithmeticException", message: "integer argument out of int64 bounds"}
+		}
+		return int64(tv), nil
+	case float32:
+		f64 := float64(tv)
+		if math.IsNaN(f64) || math.IsInf(f64, 0) || f64 >= float64(math.MaxInt64) || f64 < float64(math.MinInt64) {
+			return 0, &painlessExceptionError{exType: "ArithmeticException", message: "integer argument out of int64 bounds"}
+		}
+		return int64(f64), nil
+	}
+	if iv, ok := toInt64Painless(v); ok {
+		return iv, nil
+	}
+	if fv, ok := toFloat64(v); ok {
+		if math.IsNaN(fv) || math.IsInf(fv, 0) || fv >= float64(math.MaxInt64) || fv < float64(math.MinInt64) {
+			return 0, &painlessExceptionError{exType: "ArithmeticException", message: "integer argument out of int64 bounds"}
+		}
+		return int64(fv), nil
+	}
+	return 0, &painlessExceptionError{exType: "IllegalArgumentException", message: fmt.Sprintf("expected integer argument, got %T", v)}
+}
+
 func newPainlessBigDecimal(unscaled *big.Int, scale int) *painlessBigDecimal {
 	if unscaled == nil {
 		unscaled = big.NewInt(0)
@@ -1216,38 +1316,53 @@ func newPainlessBigDecimal(unscaled *big.Int, scale int) *painlessBigDecimal {
 }
 
 func parsePainlessBigDecimal(v any) (*painlessBigDecimal, bool) {
+	bd, err := parsePainlessBigDecimalChecked(v)
+	if err != nil || bd == nil {
+		return nil, false
+	}
+	return bd, true
+}
+
+func parsePainlessBigDecimalChecked(v any) (*painlessBigDecimal, error) {
 	switch tv := v.(type) {
 	case *painlessBigDecimal:
 		if tv == nil {
-			return nil, false
+			return nil, nil
 		}
-		return newPainlessBigDecimal(tv.unscaled, tv.scale), true
+		if err := checkBigDecimalBoundsPainless(tv); err != nil {
+			return nil, err
+		}
+		return newPainlessBigDecimal(tv.unscaled, tv.scale), nil
 	case *painlessBigInteger:
 		if tv == nil || tv.val == nil {
-			return nil, false
+			return nil, nil
 		}
-		return newPainlessBigDecimal(tv.val, 0), true
+		if err := checkBigIntBitsPainless(tv.val); err != nil {
+			return nil, err
+		}
+		return newPainlessBigDecimal(tv.val, 0), nil
 	case int:
-		return newPainlessBigDecimal(big.NewInt(int64(tv)), 0), true
+		return newPainlessBigDecimal(big.NewInt(int64(tv)), 0), nil
 	case int64:
-		return newPainlessBigDecimal(big.NewInt(tv), 0), true
+		return newPainlessBigDecimal(big.NewInt(tv), 0), nil
 	case float64:
 		if math.IsNaN(tv) || math.IsInf(tv, 0) {
-			return nil, false
+			return nil, nil
 		}
-		return parsePainlessBigDecimalString(strconv.FormatFloat(tv, 'f', -1, 64))
+		return parsePainlessBigDecimalStringChecked(strconv.FormatFloat(tv, 'f', -1, 64))
 	case json.Number:
-		return parsePainlessBigDecimalString(tv.String())
+		return parsePainlessBigDecimalStringChecked(tv.String())
 	case string:
-		return parsePainlessBigDecimalString(tv)
+		return parsePainlessBigDecimalStringChecked(tv)
 	}
-	return nil, false
+	return nil, nil
 }
 
-func parsePainlessBigDecimalString(s string) (*painlessBigDecimal, bool) {
+func parsePainlessBigDecimalStringChecked(s string) (*painlessBigDecimal, error) {
+	orig := s
 	s = strings.TrimSpace(s)
 	if s == "" {
-		return nil, false
+		return nil, nil
 	}
 	neg := false
 	switch s[0] {
@@ -1258,42 +1373,102 @@ func parsePainlessBigDecimalString(s string) (*painlessBigDecimal, bool) {
 		s = s[1:]
 	}
 	if s == "" {
-		return nil, false
+		return nil, nil
 	}
-	exp := 0
+	var exp int64
 	if eIdx := strings.IndexAny(s, "eE"); eIdx >= 0 {
-		ev, err := strconv.Atoi(s[eIdx+1:])
+		expStr := s[eIdx+1:]
+		ev, err := strconv.ParseInt(expStr, 10, 64)
 		if err != nil {
-			return nil, false
+			if errors.Is(err, strconv.ErrRange) {
+				return nil, &painlessExceptionError{
+					exType:  "ArithmeticException",
+					message: fmt.Sprintf("BigDecimal exponent out of bounds: %q", expStr),
+				}
+			}
+			return nil, nil
 		}
 		exp = ev
 		s = s[:eIdx]
 	}
-	scale := 0
+	fracLen := int64(0)
 	if dotIdx := strings.IndexByte(s, '.'); dotIdx >= 0 {
-		fracLen := len(s) - dotIdx - 1
-		scale = fracLen
+		fracLen = int64(len(s) - dotIdx - 1)
 		s = s[:dotIdx] + s[dotIdx+1:]
 	}
 	if s == "" {
-		return nil, false
+		return nil, nil
+	}
+	if fracLen > int64(maxBigDecimalScale)*2 && exp < fracLen-int64(maxBigDecimalScale) {
+		return nil, &painlessExceptionError{
+			exType:  "ArithmeticException",
+			message: fmt.Sprintf("BigDecimal scale %d exceeds bounds [-%d, %d]", fracLen-exp, maxBigDecimalScale, maxBigDecimalScale),
+		}
+	}
+	// Guard scale overflow before SetString on huge inputs.
+	var scale64 int64
+	if exp > 0 && fracLen < math.MinInt64+exp {
+		return nil, &painlessExceptionError{exType: "ArithmeticException", message: "BigDecimal scale overflow"}
+	}
+	if exp < 0 && fracLen > math.MaxInt64+exp {
+		return nil, &painlessExceptionError{exType: "ArithmeticException", message: "BigDecimal scale overflow"}
+	}
+	scale64 = fracLen - exp
+	if scale64 < -int64(maxBigDecimalScale) || scale64 > int64(maxBigDecimalScale) {
+		return nil, &painlessExceptionError{
+			exType:  "ArithmeticException",
+			message: fmt.Sprintf("BigDecimal scale %d exceeds bounds [-%d, %d]", scale64, maxBigDecimalScale, maxBigDecimalScale),
+		}
+	}
+	// Reject oversized digit strings before big.Int.SetString (2^65536 has 19729 decimal digits).
+	trimmedDigits := strings.TrimLeft(s, "0")
+	if len(trimmedDigits) > 20000 {
+		return nil, &painlessExceptionError{
+			exType:  "ArithmeticException",
+			message: fmt.Sprintf("BigDecimal precision exceeds maximum bit length (%d bits) in %q", maxBigIntBits, orig[:min(len(orig), 64)]),
+		}
 	}
 	bi, ok := new(big.Int).SetString(s, 10)
 	if !ok {
-		return nil, false
+		return nil, nil
+	}
+	if err := checkBigIntBitsPainless(bi); err != nil {
+		return nil, err
 	}
 	if neg && bi.Sign() != 0 {
 		bi.Neg(bi)
 	}
-	scale -= exp
-	return &painlessBigDecimal{unscaled: bi, scale: scale}, true
+	return &painlessBigDecimal{unscaled: bi, scale: int(scale64)}, nil
+}
+
+func bigTenPowPainlessChecked(n int) (*big.Int, error) {
+	if n <= 0 {
+		return big.NewInt(1), nil
+	}
+	if n > maxBigDecimalScale {
+		return nil, &painlessExceptionError{
+			exType:  "ArithmeticException",
+			message: fmt.Sprintf("BigDecimal power-of-ten scale %d exceeds maximum (%d)", n, maxBigDecimalScale),
+		}
+	}
+	return new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(n)), nil), nil
 }
 
 func bigTenPowPainless(n int) *big.Int {
 	if n <= 0 {
 		return big.NewInt(1)
 	}
+	if n > maxBigDecimalScale {
+		n = maxBigDecimalScale
+	}
 	return new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(n)), nil)
+}
+
+func (bd *painlessBigDecimal) toPlainStringChecked() (string, error) {
+	if err := checkBigDecimalBoundsPainless(bd); err != nil {
+		return "", err
+	}
+	return bd.toPlainString(), nil
 }
 
 func (bd *painlessBigDecimal) toPlainString() string {
@@ -1308,6 +1483,21 @@ func (bd *painlessBigDecimal) toPlainString() string {
 			return "-" + digits
 		}
 		return digits
+	}
+	if bd.scale < -maxBigDecimalScale || bd.scale > maxBigDecimalScale {
+		if absVal.Sign() == 0 {
+			return "0"
+		}
+		mant := digits
+		if len(digits) > 1 {
+			mant = digits[:1] + "." + digits[1:]
+		}
+		adj := -int64(bd.scale) + int64(len(digits)-1)
+		out := fmt.Sprintf("%sE%+d", mant, adj)
+		if neg {
+			return "-" + out
+		}
+		return out
 	}
 	if bd.scale < 0 {
 		if absVal.Sign() == 0 {
@@ -1340,7 +1530,11 @@ func (bd *painlessBigDecimal) MarshalJSON() ([]byte, error) {
 	if bd == nil {
 		return []byte("null"), nil
 	}
-	return []byte(bd.toPlainString()), nil
+	s, err := bd.toPlainStringChecked()
+	if err != nil {
+		return nil, err
+	}
+	return []byte(s), nil
 }
 
 func (bd *painlessBigDecimal) float64Value() float64 {
@@ -1382,33 +1576,83 @@ func int64ToInt8Painless(v int64) int64 {
 	return int64(int8(v)) // #nosec G115 -- Intentional Java 8-bit byte narrowing semantics
 }
 
-func (bd *painlessBigDecimal) toBigInt() *big.Int {
+func (bd *painlessBigDecimal) toBigIntChecked() (*big.Int, error) {
 	if bd == nil || bd.unscaled == nil {
-		return big.NewInt(0)
+		return big.NewInt(0), nil
+	}
+	if err := checkBigDecimalBoundsPainless(bd); err != nil {
+		return nil, err
 	}
 	val := new(big.Int).Set(bd.unscaled)
 	if bd.scale > 0 {
-		val.Quo(val, bigTenPowPainless(bd.scale))
+		tenPow, err := bigTenPowPainlessChecked(bd.scale)
+		if err != nil {
+			return nil, err
+		}
+		val.Quo(val, tenPow)
 	} else if bd.scale < 0 {
-		val.Mul(val, bigTenPowPainless(-bd.scale))
+		if val.Sign() != 0 {
+			if int64(val.BitLen()-1)+int64(float64(-bd.scale)*3.3219) > int64(maxBigIntBits) {
+				return nil, &painlessExceptionError{
+					exType:  "ArithmeticException",
+					message: fmt.Sprintf("BigDecimal toBigInteger exceeds maximum bit length (%d)", maxBigIntBits),
+				}
+			}
+			tenPow, err := bigTenPowPainlessChecked(-bd.scale)
+			if err != nil {
+				return nil, err
+			}
+			val.Mul(val, tenPow)
+		}
 	}
-	return val
+	if err := checkBigIntBitsPainless(val); err != nil {
+		return nil, err
+	}
+	return val, nil
+}
+
+func (bd *painlessBigDecimal) toBigInt() *big.Int {
+	bi, err := bd.toBigIntChecked()
+	if err != nil {
+		return big.NewInt(0)
+	}
+	return bi
 }
 
 func (bd *painlessBigDecimal) bigIntExact() (*big.Int, error) {
 	if bd == nil || bd.unscaled == nil {
 		return big.NewInt(0), nil
 	}
+	if err := checkBigDecimalBoundsPainless(bd); err != nil {
+		return nil, err
+	}
 	val := new(big.Int).Set(bd.unscaled)
 	if bd.scale > 0 {
-		q, r := new(big.Int).QuoRem(val, bigTenPowPainless(bd.scale), new(big.Int))
+		tenPow, err := bigTenPowPainlessChecked(bd.scale)
+		if err != nil {
+			return nil, err
+		}
+		q, r := new(big.Int).QuoRem(val, tenPow, new(big.Int))
 		if r.Sign() != 0 {
 			return nil, &painlessExceptionError{exType: "ArithmeticException", message: "Rounding necessary"}
 		}
 		return q, nil
 	}
-	if bd.scale < 0 {
-		val.Mul(val, bigTenPowPainless(-bd.scale))
+	if bd.scale < 0 && val.Sign() != 0 {
+		if int64(val.BitLen()-1)+int64(float64(-bd.scale)*3.3219) > int64(maxBigIntBits) {
+			return nil, &painlessExceptionError{
+				exType:  "ArithmeticException",
+				message: fmt.Sprintf("BigDecimal toBigIntegerExact exceeds maximum bit length (%d)", maxBigIntBits),
+			}
+		}
+		tenPow, err := bigTenPowPainlessChecked(-bd.scale)
+		if err != nil {
+			return nil, err
+		}
+		val.Mul(val, tenPow)
+	}
+	if err := checkBigIntBitsPainless(val); err != nil {
+		return nil, err
 	}
 	return val, nil
 }
@@ -1476,6 +1720,9 @@ func (bd *painlessBigDecimal) byteValueExact() (int64, error) {
 func (bd *painlessBigDecimal) toEngineeringString() string {
 	if bd == nil || bd.unscaled == nil {
 		return "0"
+	}
+	if err := checkBigDecimalBoundsPainless(bd); err != nil {
+		return bd.String()
 	}
 	neg := bd.unscaled.Sign() < 0
 	absVal := new(big.Int).Abs(bd.unscaled)
@@ -1604,38 +1851,104 @@ func roundBigIntQuotientPainless(num, den *big.Int, mode string) (*big.Int, erro
 }
 
 func (bd *painlessBigDecimal) setScale(targetScale int, mode string) (*painlessBigDecimal, error) {
+	if err := checkBigDecimalScalePainless(targetScale); err != nil {
+		return nil, err
+	}
 	if bd == nil || bd.unscaled == nil {
 		return newPainlessBigDecimal(big.NewInt(0), targetScale), nil
+	}
+	if err := checkBigDecimalBoundsPainless(bd); err != nil {
+		return nil, err
 	}
 	if targetScale == bd.scale {
 		return newPainlessBigDecimal(bd.unscaled, bd.scale), nil
 	}
 	if targetScale > bd.scale {
-		mul := bigTenPowPainless(targetScale - bd.scale)
-		return &painlessBigDecimal{unscaled: new(big.Int).Mul(bd.unscaled, mul), scale: targetScale}, nil
+		diff := targetScale - bd.scale
+		if bd.unscaled.Sign() != 0 && int64(bd.unscaled.BitLen()-1)+int64(float64(diff)*3.3219) > int64(maxBigIntBits) {
+			return nil, &painlessExceptionError{
+				exType:  "ArithmeticException",
+				message: fmt.Sprintf("BigDecimal setScale(%d) exceeds maximum bit length (%d)", targetScale, maxBigIntBits),
+			}
+		}
+		mul, err := bigTenPowPainlessChecked(diff)
+		if err != nil {
+			return nil, err
+		}
+		resUnscaled := new(big.Int).Mul(bd.unscaled, mul)
+		if err := checkBigIntBitsPainless(resUnscaled); err != nil {
+			return nil, err
+		}
+		return &painlessBigDecimal{unscaled: resUnscaled, scale: targetScale}, nil
 	}
-	div := bigTenPowPainless(bd.scale - targetScale)
+	div, err := bigTenPowPainlessChecked(bd.scale - targetScale)
+	if err != nil {
+		return nil, err
+	}
 	q, err := roundBigIntQuotientPainless(bd.unscaled, div, mode)
 	if err != nil {
+		return nil, err
+	}
+	if err := checkBigIntBitsPainless(q); err != nil {
 		return nil, err
 	}
 	return &painlessBigDecimal{unscaled: q, scale: targetScale}, nil
 }
 
-func alignBigDecimalsPainless(a, b *painlessBigDecimal) (*big.Int, *big.Int, int) {
+func alignBigDecimalsPainlessChecked(a, b *painlessBigDecimal) (*big.Int, *big.Int, int, error) {
+	if err := checkBigDecimalBoundsPainless(a); err != nil {
+		return nil, nil, 0, err
+	}
+	if err := checkBigDecimalBoundsPainless(b); err != nil {
+		return nil, nil, 0, err
+	}
 	if a.scale == b.scale {
-		return new(big.Int).Set(a.unscaled), new(big.Int).Set(b.unscaled), a.scale
+		return new(big.Int).Set(a.unscaled), new(big.Int).Set(b.unscaled), a.scale, nil
 	}
 	if a.scale > b.scale {
-		mul := bigTenPowPainless(a.scale - b.scale)
-		return new(big.Int).Set(a.unscaled), new(big.Int).Mul(b.unscaled, mul), a.scale
+		diff := a.scale - b.scale
+		if b.unscaled.Sign() != 0 && int64(b.unscaled.BitLen()-1)+int64(float64(diff)*3.3219) > int64(maxBigIntBits) {
+			return nil, nil, 0, &painlessExceptionError{exType: "ArithmeticException", message: "BigDecimal aligned precision exceeds maximum bit length"}
+		}
+		mul, err := bigTenPowPainlessChecked(diff)
+		if err != nil {
+			return nil, nil, 0, err
+		}
+		ub := new(big.Int).Mul(b.unscaled, mul)
+		if err := checkBigIntBitsPainless(ub); err != nil {
+			return nil, nil, 0, err
+		}
+		return new(big.Int).Set(a.unscaled), ub, a.scale, nil
 	}
-	mul := bigTenPowPainless(b.scale - a.scale)
-	return new(big.Int).Mul(a.unscaled, mul), new(big.Int).Set(b.unscaled), b.scale
+	diff := b.scale - a.scale
+	if a.unscaled.Sign() != 0 && int64(a.unscaled.BitLen()-1)+int64(float64(diff)*3.3219) > int64(maxBigIntBits) {
+		return nil, nil, 0, &painlessExceptionError{exType: "ArithmeticException", message: "BigDecimal aligned precision exceeds maximum bit length"}
+	}
+	mul, err := bigTenPowPainlessChecked(diff)
+	if err != nil {
+		return nil, nil, 0, err
+	}
+	ua := new(big.Int).Mul(a.unscaled, mul)
+	if err := checkBigIntBitsPainless(ua); err != nil {
+		return nil, nil, 0, err
+	}
+	return ua, new(big.Int).Set(b.unscaled), b.scale, nil
 }
 
 func compareBigDecimalPainless(a, b *painlessBigDecimal) int {
-	ua, ub, _ := alignBigDecimalsPainless(a, b)
+	ua, ub, _, err := alignBigDecimalsPainlessChecked(a, b)
+	if err != nil {
+		// Compare sign and approximate magnitude without huge power-of-10 allocation if misaligned beyond bounds
+		fa := a.float64Value()
+		fb := b.float64Value()
+		if fa < fb {
+			return -1
+		}
+		if fa > fb {
+			return 1
+		}
+		return 0
+	}
 	return ua.Cmp(ub)
 }
 
@@ -1643,32 +1956,112 @@ func (bd *painlessBigDecimal) cmp(other *painlessBigDecimal) int {
 	return compareBigDecimalPainless(bd, other)
 }
 
-func (bd *painlessBigDecimal) sub(other *painlessBigDecimal) *painlessBigDecimal {
-	ua, ub, sc := alignBigDecimalsPainless(bd, other)
-	return &painlessBigDecimal{unscaled: new(big.Int).Sub(ua, ub), scale: sc}
+func (bd *painlessBigDecimal) addChecked(other *painlessBigDecimal) (*painlessBigDecimal, error) {
+	ua, ub, sc, err := alignBigDecimalsPainlessChecked(bd, other)
+	if err != nil {
+		return nil, err
+	}
+	sum := new(big.Int).Add(ua, ub)
+	if err := checkBigIntBitsPainless(sum); err != nil {
+		return nil, err
+	}
+	return &painlessBigDecimal{unscaled: sum, scale: sc}, nil
 }
 
-func (bd *painlessBigDecimal) mul(other *painlessBigDecimal) *painlessBigDecimal {
-	return &painlessBigDecimal{
-		unscaled: new(big.Int).Mul(bd.unscaled, other.unscaled),
-		scale:    bd.scale + other.scale,
+func (bd *painlessBigDecimal) subChecked(other *painlessBigDecimal) (*painlessBigDecimal, error) {
+	ua, ub, sc, err := alignBigDecimalsPainlessChecked(bd, other)
+	if err != nil {
+		return nil, err
 	}
+	diff := new(big.Int).Sub(ua, ub)
+	if err := checkBigIntBitsPainless(diff); err != nil {
+		return nil, err
+	}
+	return &painlessBigDecimal{unscaled: diff, scale: sc}, nil
+}
+
+func (bd *painlessBigDecimal) mulChecked(other *painlessBigDecimal) (*painlessBigDecimal, error) {
+	if err := checkBigDecimalBoundsPainless(bd); err != nil {
+		return nil, err
+	}
+	if err := checkBigDecimalBoundsPainless(other); err != nil {
+		return nil, err
+	}
+	scale64 := int64(bd.scale) + int64(other.scale)
+	if scale64 < -int64(maxBigDecimalScale) || scale64 > int64(maxBigDecimalScale) {
+		return nil, &painlessExceptionError{
+			exType:  "ArithmeticException",
+			message: fmt.Sprintf("BigDecimal scale %d exceeds bounds [-%d, %d]", scale64, maxBigDecimalScale, maxBigDecimalScale),
+		}
+	}
+	if bd.unscaled.Sign() != 0 && other.unscaled.Sign() != 0 {
+		if int64(bd.unscaled.BitLen()-1)+int64(other.unscaled.BitLen()-1) >= int64(maxBigIntBits) {
+			return nil, &painlessExceptionError{
+				exType:  "ArithmeticException",
+				message: fmt.Sprintf("BigDecimal product exceeds maximum bit length (%d)", maxBigIntBits),
+			}
+		}
+	}
+	prod := new(big.Int).Mul(bd.unscaled, other.unscaled)
+	if err := checkBigIntBitsPainless(prod); err != nil {
+		return nil, err
+	}
+	return &painlessBigDecimal{unscaled: prod, scale: int(scale64)}, nil
 }
 
 func (bd *painlessBigDecimal) div(other *painlessBigDecimal, targetScale int, mode string) (*painlessBigDecimal, error) {
 	if other == nil || other.unscaled == nil || other.unscaled.Sign() == 0 {
 		return nil, &painlessExceptionError{exType: "ArithmeticException", message: "Division by zero"}
 	}
+	if err := checkBigDecimalBoundsPainless(bd); err != nil {
+		return nil, err
+	}
+	if err := checkBigDecimalBoundsPainless(other); err != nil {
+		return nil, err
+	}
+	if err := checkBigDecimalScalePainless(targetScale); err != nil {
+		return nil, err
+	}
 	num := new(big.Int).Set(bd.unscaled)
 	den := new(big.Int).Set(other.unscaled)
-	shift := targetScale - bd.scale + other.scale
+	shift64 := int64(targetScale) - int64(bd.scale) + int64(other.scale)
+	if shift64 > int64(maxBigDecimalScale) || shift64 < -int64(maxBigDecimalScale) {
+		return nil, &painlessExceptionError{
+			exType:  "ArithmeticException",
+			message: fmt.Sprintf("BigDecimal divide scale shift %d exceeds bounds [-%d, %d]", shift64, maxBigDecimalScale, maxBigDecimalScale),
+		}
+	}
+	shift := int(shift64)
 	if shift > 0 {
-		num.Mul(num, bigTenPowPainless(shift))
+		if num.Sign() != 0 && int64(num.BitLen()-1)+int64(float64(shift)*3.3219) > int64(maxBigIntBits) {
+			return nil, &painlessExceptionError{exType: "ArithmeticException", message: "BigDecimal divide numerator exceeds maximum bit length"}
+		}
+		tenPow, err := bigTenPowPainlessChecked(shift)
+		if err != nil {
+			return nil, err
+		}
+		num.Mul(num, tenPow)
+		if err := checkBigIntBitsPainless(num); err != nil {
+			return nil, err
+		}
 	} else if shift < 0 {
-		den.Mul(den, bigTenPowPainless(-shift))
+		if den.Sign() != 0 && int64(den.BitLen()-1)+int64(float64(-shift)*3.3219) > int64(maxBigIntBits) {
+			return nil, &painlessExceptionError{exType: "ArithmeticException", message: "BigDecimal divide denominator exceeds maximum bit length"}
+		}
+		tenPow, err := bigTenPowPainlessChecked(-shift)
+		if err != nil {
+			return nil, err
+		}
+		den.Mul(den, tenPow)
+		if err := checkBigIntBitsPainless(den); err != nil {
+			return nil, err
+		}
 	}
 	q, err := roundBigIntQuotientPainless(num, den, mode)
 	if err != nil {
+		return nil, err
+	}
+	if err := checkBigIntBitsPainless(q); err != nil {
 		return nil, err
 	}
 	return &painlessBigDecimal{unscaled: q, scale: targetScale}, nil
@@ -1678,13 +2071,34 @@ func (bd *painlessBigDecimal) divideAndRemainder(other *painlessBigDecimal) (*pa
 	if other == nil || other.unscaled == nil || other.unscaled.Sign() == 0 {
 		return nil, nil, &painlessExceptionError{exType: "ArithmeticException", message: "Division by zero"}
 	}
-	ua, ub, maxSc := alignBigDecimalsPainless(bd, other)
+	ua, ub, maxSc, err := alignBigDecimalsPainlessChecked(bd, other)
+	if err != nil {
+		return nil, nil, err
+	}
 	qInt, rInt := new(big.Int).QuoRem(ua, ub, new(big.Int))
-	prefScale := bd.scale - other.scale
+	prefScale64 := int64(bd.scale) - int64(other.scale)
+	if prefScale64 > int64(maxBigDecimalScale) || prefScale64 < -int64(maxBigDecimalScale) {
+		return nil, nil, &painlessExceptionError{
+			exType:  "ArithmeticException",
+			message: fmt.Sprintf("BigDecimal divideAndRemainder scale %d exceeds bounds [-%d, %d]", prefScale64, maxBigDecimalScale, maxBigDecimalScale),
+		}
+	}
+	prefScale := int(prefScale64)
 	qBD := &painlessBigDecimal{unscaled: qInt, scale: 0}
 	if prefScale > 0 {
+		if qInt.Sign() != 0 && int64(qInt.BitLen()-1)+int64(float64(prefScale)*3.3219) > int64(maxBigIntBits) {
+			return nil, nil, &painlessExceptionError{exType: "ArithmeticException", message: "BigDecimal divideAndRemainder quotient exceeds maximum bit length"}
+		}
+		tenPow, err := bigTenPowPainlessChecked(prefScale)
+		if err != nil {
+			return nil, nil, err
+		}
+		qScaled := new(big.Int).Mul(qInt, tenPow)
+		if err := checkBigIntBitsPainless(qScaled); err != nil {
+			return nil, nil, err
+		}
 		qBD = &painlessBigDecimal{
-			unscaled: new(big.Int).Mul(qInt, bigTenPowPainless(prefScale)),
+			unscaled: qScaled,
 			scale:    prefScale,
 		}
 	}
@@ -1735,8 +2149,17 @@ func normalizeRoundingModePainless(v any) string {
 }
 
 func applyMathContextPainless(bd *painlessBigDecimal, mc painlessMathContext) (*painlessBigDecimal, error) {
+	if mc.precision > maxBigDecimalScale {
+		return nil, &painlessExceptionError{
+			exType:  "ArithmeticException",
+			message: fmt.Sprintf("MathContext precision %d exceeds maximum (%d)", mc.precision, maxBigDecimalScale),
+		}
+	}
 	if bd == nil || bd.unscaled == nil {
 		return newPainlessBigDecimal(big.NewInt(0), 0), nil
+	}
+	if err := checkBigDecimalBoundsPainless(bd); err != nil {
+		return nil, err
 	}
 	if mc.precision <= 0 || bd.unscaled.Sign() == 0 {
 		return newPainlessBigDecimal(bd.unscaled, bd.scale), nil
@@ -1747,23 +2170,62 @@ func applyMathContextPainless(bd *painlessBigDecimal, mc painlessMathContext) (*
 		return newPainlessBigDecimal(bd.unscaled, bd.scale), nil
 	}
 	drop := curPrec - mc.precision
-	targetScale := bd.scale - drop
-	return bd.setScale(targetScale, mc.roundingMode)
+	targetScale64 := int64(bd.scale) - int64(drop)
+	if targetScale64 < -int64(maxBigDecimalScale) || targetScale64 > int64(maxBigDecimalScale) {
+		return nil, &painlessExceptionError{
+			exType:  "ArithmeticException",
+			message: fmt.Sprintf("BigDecimal scale %d exceeds bounds [-%d, %d]", targetScale64, maxBigDecimalScale, maxBigDecimalScale),
+		}
+	}
+	return bd.setScale(int(targetScale64), mc.roundingMode)
 }
 
 func divideBigDecimalWithMathContextPainless(a, b *painlessBigDecimal, mc painlessMathContext) (*painlessBigDecimal, error) {
 	if b == nil || b.unscaled == nil || b.unscaled.Sign() == 0 {
 		return nil, &painlessExceptionError{exType: "ArithmeticException", message: "Division by zero"}
 	}
+	if err := checkBigDecimalBoundsPainless(b); err != nil {
+		return nil, err
+	}
+	if a != nil {
+		if err := checkBigDecimalBoundsPainless(a); err != nil {
+			return nil, err
+		}
+	}
+	if mc.precision > maxBigDecimalScale {
+		return nil, &painlessExceptionError{
+			exType:  "ArithmeticException",
+			message: fmt.Sprintf("MathContext precision %d exceeds maximum (%d)", mc.precision, maxBigDecimalScale),
+		}
+	}
 	if mc.precision <= 0 {
-		return divideExactBigDecimalPainless(a, b)
+		if a != nil {
+			prefScale64 := int64(a.scale) - int64(b.scale)
+			if prefScale64 > int64(maxBigDecimalScale) || prefScale64 < -int64(maxBigDecimalScale) {
+				return nil, &painlessExceptionError{
+					exType:  "ArithmeticException",
+					message: fmt.Sprintf("BigDecimal scale %d exceeds bounds [-%d, %d]", prefScale64, maxBigDecimalScale, maxBigDecimalScale),
+				}
+			}
+		}
+		res, err := divideExactBigDecimalPainless(a, b)
+		if err != nil {
+			return nil, err
+		}
+		if err := checkBigDecimalBoundsPainless(res); err != nil {
+			return nil, err
+		}
+		return res, nil
 	}
 	if a == nil || a.unscaled == nil || a.unscaled.Sign() == 0 {
-		preferredScale := 0
+		preferredScale64 := -int64(b.scale)
 		if a != nil {
-			preferredScale = a.scale - b.scale
+			preferredScale64 = int64(a.scale) - int64(b.scale)
 		}
-		return newPainlessBigDecimal(big.NewInt(0), preferredScale), nil
+		if preferredScale64 > int64(maxBigDecimalScale) || preferredScale64 < -int64(maxBigDecimalScale) {
+			return nil, &painlessExceptionError{exType: "ArithmeticException", message: "BigDecimal divide scale exceeds bounds"}
+		}
+		return newPainlessBigDecimal(big.NewInt(0), int(preferredScale64)), nil
 	}
 	precA := len(new(big.Int).Abs(a.unscaled).String())
 	precB := len(new(big.Int).Abs(b.unscaled).String())
@@ -1771,11 +2233,28 @@ func divideBigDecimalWithMathContextPainless(a, b *painlessBigDecimal, mc painle
 	if extraScale < 0 {
 		extraScale = 0
 	}
-	targetScale := (a.scale - b.scale) + extraScale
+	targetScale64 := (int64(a.scale) - int64(b.scale)) + int64(extraScale)
+	if extraScale > maxBigDecimalScale || targetScale64 < -int64(maxBigDecimalScale) || targetScale64 > int64(maxBigDecimalScale) {
+		return nil, &painlessExceptionError{
+			exType:  "ArithmeticException",
+			message: fmt.Sprintf("BigDecimal divide target scale %d exceeds bounds [-%d, %d]", targetScale64, maxBigDecimalScale, maxBigDecimalScale),
+		}
+	}
+	targetScale := int(targetScale64)
 	num := new(big.Int).Set(a.unscaled)
 	den := new(big.Int).Set(b.unscaled)
 	if extraScale > 0 {
-		num.Mul(num, bigTenPowPainless(extraScale))
+		if num.Sign() != 0 && int64(num.BitLen()-1)+int64(float64(extraScale)*3.3219) > int64(maxBigIntBits) {
+			return nil, &painlessExceptionError{exType: "ArithmeticException", message: "BigDecimal divide precision exceeds maximum bit length"}
+		}
+		tenPow, err := bigTenPowPainlessChecked(extraScale)
+		if err != nil {
+			return nil, err
+		}
+		num.Mul(num, tenPow)
+		if err := checkBigIntBitsPainless(num); err != nil {
+			return nil, err
+		}
 	}
 	q, err := roundBigIntQuotientPainless(num, den, mc.roundingMode)
 	if err != nil {
@@ -1800,7 +2279,11 @@ func divideBigDecimalWithMathContextPainless(a, b *painlessBigDecimal, mc painle
 		u = qTen
 		sc--
 	}
-	return &painlessBigDecimal{unscaled: u, scale: sc}, nil
+	out := &painlessBigDecimal{unscaled: u, scale: sc}
+	if err := checkBigDecimalBoundsPainless(out); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // painlessBigInteger represents an arbitrary-precision java.math.BigInteger in Painless.
@@ -1815,51 +2298,89 @@ func newPainlessBigInteger(v *big.Int) *painlessBigInteger {
 	return &painlessBigInteger{val: new(big.Int).Set(v)}
 }
 
-func parsePainlessBigInteger(v any) (*painlessBigInteger, bool) {
+func parsePainlessBigIntegerChecked(v any) (*painlessBigInteger, error) {
 	switch tv := v.(type) {
 	case *painlessBigInteger:
 		if tv == nil || tv.val == nil {
-			return nil, false
+			return nil, nil
 		}
-		return newPainlessBigInteger(tv.val), true
+		if err := checkBigIntBitsPainless(tv.val); err != nil {
+			return nil, err
+		}
+		return newPainlessBigInteger(tv.val), nil
 	case *painlessBigDecimal:
 		if tv == nil || tv.unscaled == nil {
-			return nil, false
+			return nil, nil
 		}
-		return newPainlessBigInteger(tv.toBigInt()), true
+		bi, err := tv.toBigIntChecked()
+		if err != nil {
+			return nil, err
+		}
+		return newPainlessBigInteger(bi), nil
 	case int:
-		return newPainlessBigInteger(big.NewInt(int64(tv))), true
+		return newPainlessBigInteger(big.NewInt(int64(tv))), nil
 	case int64:
-		return newPainlessBigInteger(big.NewInt(tv)), true
+		return newPainlessBigInteger(big.NewInt(tv)), nil
 	case float64:
 		if math.IsNaN(tv) || math.IsInf(tv, 0) {
-			return nil, false
+			return nil, nil
 		}
-		return newPainlessBigInteger(big.NewInt(int64(tv))), true
+		return newPainlessBigInteger(big.NewInt(int64(tv))), nil
 	case json.Number:
-		if bi, ok := new(big.Int).SetString(strings.TrimSpace(tv.String()), 10); ok {
-			return newPainlessBigInteger(bi), true
+		s := strings.TrimSpace(tv.String())
+		if len(strings.TrimLeft(strings.TrimPrefix(strings.TrimPrefix(s, "-"), "+"), "0")) > 20000 {
+			return nil, &painlessExceptionError{exType: "ArithmeticException", message: fmt.Sprintf("BigInteger exceeds maximum bit length (%d)", maxBigIntBits)}
 		}
-		return nil, false
+		if bi, ok := new(big.Int).SetString(s, 10); ok {
+			if err := checkBigIntBitsPainless(bi); err != nil {
+				return nil, err
+			}
+			return newPainlessBigInteger(bi), nil
+		}
+		return nil, nil
 	case string:
-		if bi, ok := new(big.Int).SetString(strings.TrimSpace(tv), 10); ok {
-			return newPainlessBigInteger(bi), true
+		s := strings.TrimSpace(tv)
+		if len(strings.TrimLeft(strings.TrimPrefix(strings.TrimPrefix(s, "-"), "+"), "0")) > 20000 {
+			return nil, &painlessExceptionError{exType: "ArithmeticException", message: fmt.Sprintf("BigInteger exceeds maximum bit length (%d)", maxBigIntBits)}
 		}
-		return nil, false
+		if bi, ok := new(big.Int).SetString(s, 10); ok {
+			if err := checkBigIntBitsPainless(bi); err != nil {
+				return nil, err
+			}
+			return newPainlessBigInteger(bi), nil
+		}
+		return nil, nil
 	}
-	return nil, false
+	return nil, nil
 }
 
-func newPainlessBigIntegerFromBytes(raw []byte) *painlessBigInteger {
+func parsePainlessBigInteger(v any) (*painlessBigInteger, bool) {
+	bi, err := parsePainlessBigIntegerChecked(v)
+	if err != nil || bi == nil {
+		return nil, false
+	}
+	return bi, true
+}
+
+func newPainlessBigIntegerFromBytesChecked(raw []byte) (*painlessBigInteger, error) {
+	if len(raw)*8 > maxBigIntBits {
+		return nil, &painlessExceptionError{
+			exType:  "ArithmeticException",
+			message: fmt.Sprintf("BigInteger byte array (%d bits) exceeds maximum (%d bits)", len(raw)*8, maxBigIntBits),
+		}
+	}
 	if len(raw) == 0 {
-		return newPainlessBigInteger(big.NewInt(0))
+		return newPainlessBigInteger(big.NewInt(0)), nil
 	}
 	mag := new(big.Int).SetBytes(raw)
 	if raw[0]&0x80 != 0 {
 		twoPow := new(big.Int).Lsh(big.NewInt(1), uint(len(raw)*8)) // #nosec G115 -- len(raw) is non-negative
 		mag.Sub(mag, twoPow)
 	}
-	return newPainlessBigInteger(mag)
+	if err := checkBigIntBitsPainless(mag); err != nil {
+		return nil, err
+	}
+	return newPainlessBigInteger(mag), nil
 }
 
 func (bi *painlessBigInteger) String() string {
@@ -2085,11 +2606,17 @@ func newPainlessBitSet() *painlessBitSet {
 	return &painlessBitSet{}
 }
 
-func newPainlessBitSetFromValueOf(v any) *painlessBitSet {
+func newPainlessBitSetFromValueOfChecked(v any) (*painlessBitSet, error) {
 	bs := newPainlessBitSet()
 	arr, ok := v.([]any)
 	if !ok || len(arr) == 0 {
-		return bs
+		return bs, nil
+	}
+	if len(arr)*64 > maxBitSetBits {
+		return nil, &painlessExceptionError{
+			exType:  "IllegalArgumentException",
+			message: fmt.Sprintf("BitSet word count %d exceeds maximum (%d bits)", len(arr), maxBitSetBits),
+		}
 	}
 	// Heuristic: if any element exceeds byte bounds [-128, 255] or fits 64-bit words,
 	// determine whether caller passed a byte[] or long[]. In BitSet.valueOf(long[]) vs BitSet.valueOf(byte[]),
@@ -2105,7 +2632,7 @@ func newPainlessBitSetFromValueOf(v any) *painlessBitSet {
 	}
 	bs.words = words
 	bs.trimWords()
-	return bs
+	return bs, nil
 }
 
 func (bs *painlessBitSet) clone() *painlessBitSet {
@@ -2126,12 +2653,20 @@ func (bs *painlessBitSet) trimWords() {
 	}
 }
 
-func (bs *painlessBitSet) ensureWord(wordIdx int) {
+func (bs *painlessBitSet) ensureWord(wordIdx int) error {
+	maxWords := maxBitSetBits / 64
+	if wordIdx < 0 || wordIdx >= maxWords {
+		return &painlessExceptionError{
+			exType:  "IllegalArgumentException",
+			message: fmt.Sprintf("BitSet bit index exceeds maximum (%d bits)", maxBitSetBits),
+		}
+	}
 	if wordIdx >= len(bs.words) {
 		newWords := make([]uint64, wordIdx+1)
 		copy(newWords, bs.words)
 		bs.words = newWords
 	}
+	return nil
 }
 
 func (bs *painlessBitSet) set(bitIdx int) error {
@@ -2146,10 +2681,18 @@ func (bs *painlessBitSet) setBit(bitIdx int, val bool) error {
 	if bitIdx < 0 {
 		return &painlessExceptionError{exType: "IndexOutOfBoundsException", message: fmt.Sprintf("bitIndex < 0: %d", bitIdx)}
 	}
+	if bitIdx >= maxBitSetBits {
+		return &painlessExceptionError{
+			exType:  "IllegalArgumentException",
+			message: fmt.Sprintf("BitSet bitIndex %d exceeds maximum (%d)", bitIdx, maxBitSetBits),
+		}
+	}
 	wordIdx := bitIdx / 64
 	mask := uint64(1) << uint(bitIdx%64) // #nosec G115 -- bitIdx >= 0
 	if val {
-		bs.ensureWord(wordIdx)
+		if err := bs.ensureWord(wordIdx); err != nil {
+			return err
+		}
 		bs.words[wordIdx] |= mask
 	} else if wordIdx < len(bs.words) {
 		bs.words[wordIdx] &^= mask
@@ -2158,14 +2701,25 @@ func (bs *painlessBitSet) setBit(bitIdx int, val bool) error {
 	return nil
 }
 
-func (bs *painlessBitSet) setRange(fromIdx, toIdx int, val bool) error {
+func (bs *painlessBitSet) setRange(fromIdx, toIdx int, val bool, budget *evalBudget) error {
 	if fromIdx < 0 || toIdx < 0 || fromIdx > toIdx {
 		return &painlessExceptionError{exType: "IndexOutOfBoundsException", message: fmt.Sprintf("fromIndex: %d, toIndex: %d", fromIdx, toIdx)}
+	}
+	if toIdx > maxBitSetBits {
+		return &painlessExceptionError{
+			exType:  "IllegalArgumentException",
+			message: fmt.Sprintf("BitSet toIndex %d exceeds maximum (%d)", toIdx, maxBitSetBits),
+		}
 	}
 	if fromIdx == toIdx {
 		return nil
 	}
 	for i := fromIdx; i < toIdx; i++ {
+		if budget != nil {
+			if err := budget.step(); err != nil {
+				return err
+			}
+		}
 		if err := bs.setBit(i, val); err != nil {
 			return err
 		}
@@ -2181,18 +2735,37 @@ func (bs *painlessBitSet) flipBit(bitIdx int) error {
 	if bitIdx < 0 {
 		return &painlessExceptionError{exType: "IndexOutOfBoundsException", message: fmt.Sprintf("bitIndex < 0: %d", bitIdx)}
 	}
+	if bitIdx >= maxBitSetBits {
+		return &painlessExceptionError{
+			exType:  "IllegalArgumentException",
+			message: fmt.Sprintf("BitSet bitIndex %d exceeds maximum (%d)", bitIdx, maxBitSetBits),
+		}
+	}
 	wordIdx := bitIdx / 64
-	bs.ensureWord(wordIdx)
+	if err := bs.ensureWord(wordIdx); err != nil {
+		return err
+	}
 	bs.words[wordIdx] ^= uint64(1) << uint(bitIdx%64) // #nosec G115 -- bitIdx >= 0
 	bs.trimWords()
 	return nil
 }
 
-func (bs *painlessBitSet) flipRange(fromIdx, toIdx int) error {
+func (bs *painlessBitSet) flipRange(fromIdx, toIdx int, budget *evalBudget) error {
 	if fromIdx < 0 || toIdx < 0 || fromIdx > toIdx {
 		return &painlessExceptionError{exType: "IndexOutOfBoundsException", message: fmt.Sprintf("fromIndex: %d, toIndex: %d", fromIdx, toIdx)}
 	}
+	if toIdx > maxBitSetBits {
+		return &painlessExceptionError{
+			exType:  "IllegalArgumentException",
+			message: fmt.Sprintf("BitSet toIndex %d exceeds maximum (%d)", toIdx, maxBitSetBits),
+		}
+	}
 	for i := fromIdx; i < toIdx; i++ {
+		if budget != nil {
+			if err := budget.step(); err != nil {
+				return err
+			}
+		}
 		if err := bs.flipBit(i); err != nil {
 			return err
 		}
@@ -2219,8 +2792,18 @@ func (bs *painlessBitSet) getRange(fromIdx, toIdx int) (*painlessBitSet, error) 
 	if fromIdx < 0 || toIdx < 0 || fromIdx > toIdx {
 		return nil, &painlessExceptionError{exType: "IndexOutOfBoundsException", message: fmt.Sprintf("fromIndex: %d, toIndex: %d", fromIdx, toIdx)}
 	}
+	if toIdx > maxBitSetBits {
+		return nil, &painlessExceptionError{
+			exType:  "IllegalArgumentException",
+			message: fmt.Sprintf("BitSet toIndex %d exceeds maximum (%d)", toIdx, maxBitSetBits),
+		}
+	}
 	res := newPainlessBitSet()
-	for i := fromIdx; i < toIdx; i++ {
+	limit := len(bs.words) * 64
+	if toIdx < limit {
+		limit = toIdx
+	}
+	for i := fromIdx; i < limit; i++ {
 		if b, _ := bs.getBit(i); b {
 			_ = res.setBit(i-fromIdx, true)
 		}
@@ -2283,6 +2866,10 @@ func (bs *painlessBitSet) previousClearBit(fromIdx int) (int64, error) {
 			return -1, nil
 		}
 		return -1, &painlessExceptionError{exType: "IndexOutOfBoundsException", message: fmt.Sprintf("fromIndex < -1: %d", fromIdx)}
+	}
+	maxBit := len(bs.words) * 64
+	if fromIdx >= maxBit {
+		return int64(fromIdx), nil
 	}
 	for i := fromIdx; i >= 0; i-- {
 		if b, _ := bs.getBit(i); !b {
@@ -2363,34 +2950,40 @@ func (bs *painlessBitSet) and(other *painlessBitSet) {
 	bs.trimWords()
 }
 
-func (bs *painlessBitSet) or(other *painlessBitSet) {
+func (bs *painlessBitSet) or(other *painlessBitSet) error {
 	if bs == nil || other == nil || bs == other {
-		return
+		return nil
 	}
 	if len(other.words) > len(bs.words) {
-		bs.ensureWord(len(other.words) - 1)
+		if err := bs.ensureWord(len(other.words) - 1); err != nil {
+			return err
+		}
 	}
 	for i := range other.words {
 		bs.words[i] |= other.words[i]
 	}
 	bs.trimWords()
+	return nil
 }
 
-func (bs *painlessBitSet) xor(other *painlessBitSet) {
+func (bs *painlessBitSet) xor(other *painlessBitSet) error {
 	if bs == nil || other == nil {
-		return
+		return nil
 	}
 	if bs == other {
 		bs.words = nil
-		return
+		return nil
 	}
 	if len(other.words) > len(bs.words) {
-		bs.ensureWord(len(other.words) - 1)
+		if err := bs.ensureWord(len(other.words) - 1); err != nil {
+			return err
+		}
 	}
 	for i := range other.words {
 		bs.words[i] ^= other.words[i]
 	}
 	bs.trimWords()
+	return nil
 }
 
 func (bs *painlessBitSet) andNot(other *painlessBitSet) {
@@ -2620,10 +3213,10 @@ var (
 	reLocalArrayRemoveIf   = regexp.MustCompile(`^([a-zA-Z_$][a-zA-Z0-9_$]*(?:\.[a-zA-Z0-9_$_.@/:?\x00-\x08\x10-\x1f\x7f-]+)*)\.removeIf\(\s*\(?\s*(?:[a-zA-Z_$][a-zA-Z0-9_$<>[\]]*\s+)?([a-zA-Z0-9_$]+)\s*\)?\s*->\s*(.+)\s*\)$`)
 	reLocalCompoundAssign  = regexp.MustCompile(`(?s)^([a-zA-Z_$][a-zA-Z0-9_$]*\??(?:\.[a-zA-Z0-9_$_.@/:?\x00-\x08\x10-\x1f\x7f-]+)*)\s*(\+=|-=|\*=|/=|%=|&=|\|=|\^=|<<=|>>>=|>>=)\s*(.+)$`)
 	reLocalPropAssign      = regexp.MustCompile(`(?s)^([a-zA-Z_$][a-zA-Z0-9_$]*)\??\.([a-zA-Z0-9_$_.@/:?\x00-\x08\x10-\x1f\x7f-]+)\s*=\s*(.+)$`)
-	reLocalVarAssign       = regexp.MustCompile(`(?s)^(?:(?:def|boolean|Boolean|int|Integer|long|Long|double|Double|float|Float|Number|Short|short|Byte|byte|Character|char|String|CharSequence|Object|Map\.Entry|Map|HashMap|LinkedHashMap|TreeMap|NavigableMap|SortedMap|List|ArrayList|LinkedList|Set|HashSet|LinkedHashSet|TreeSet|NavigableSet|SortedSet|Deque|ArrayDeque|Queue|PriorityQueue|Collection|ZonedDateTime|OffsetDateTime|Instant|LocalDateTime|LocalDate|(?:java\.time\.)?LocalTime|(?:java\.time\.)?OffsetTime|(?:java\.time\.)?Clock|(?:java\.math\.)?BigDecimal|(?:java\.math\.)?BigInteger|(?:java\.math\.)?MathContext|(?:java\.math\.)?RoundingMode|YearMonth|(?:java\.time\.)?Year|(?:java\.time\.)?MonthDay|(?:java\.time\.temporal\.)?ChronoField|(?:java\.time\.temporal\.)?IsoFields|(?:java\.time\.temporal\.)?ValueRange|(?:java\.time\.temporal\.)?TemporalAdjuster|(?:java\.time\.temporal\.)?TemporalAdjusters|DayOfWeek|DayOfWeekEnum|Month|MonthEnum|DateTimeFormatter|TextStyle|Locale|Duration|Period|ChronoUnit|ZoneId|ZoneOffset|Pattern|Matcher|(?:java\.util\.regex\.)?MatchResult|(?:java\.util\.function\.)?(?:Predicate|BiPredicate|Supplier|IntSupplier|LongSupplier|DoubleSupplier|BooleanSupplier|Function|BiFunction|IntFunction|LongFunction|DoubleFunction|UnaryOperator|BinaryOperator|Consumer|BiConsumer)|Runnable|Metadata|UpdateMetadata|Version|GeoPoint|GeoBoundingBox|IPAddress|DenseVector|DenseVectorField|DenseVectorDocValue|Grok|Dissect|BytesRef|ByteBuffer|(?:java\.net\.)?URI|(?:java\.net\.)?URL|StringBuilder|StringBuffer|(?:java\.lang\.)?Class|(?:java\.util\.)?UUID|(?:java\.util\.)?HexFormat|(?:java\.util\.)?Comparator|(?:java\.util\.)?BitSet|(?:java\.util\.)?StringJoiner|Optional|OptionalInt|OptionalLong|OptionalDouble|Stream|IntStream|LongStream|DoubleStream|Charset|IntSummaryStatistics|LongSummaryStatistics|DoubleSummaryStatistics)(?:\s*<[^=;]*>)?(?:\s*\[\s*\])*\s+)?([a-zA-Z_$][a-zA-Z0-9_$]*)\s*=\s*(.+)$`)
-	reNullVarDecl          = regexp.MustCompile(`^(?:def|boolean|Boolean|int|Integer|long|Long|double|Double|float|Float|Number|Short|short|Byte|byte|Character|char|String|CharSequence|Object|Map\.Entry|Map|HashMap|LinkedHashMap|TreeMap|NavigableMap|SortedMap|List|ArrayList|LinkedList|Set|HashSet|LinkedHashSet|TreeSet|NavigableSet|SortedSet|Deque|ArrayDeque|Queue|PriorityQueue|Collection|ZonedDateTime|OffsetDateTime|Instant|LocalDateTime|LocalDate|(?:java\.time\.)?LocalTime|(?:java\.time\.)?OffsetTime|(?:java\.time\.)?Clock|(?:java\.math\.)?BigDecimal|(?:java\.math\.)?BigInteger|(?:java\.math\.)?MathContext|(?:java\.math\.)?RoundingMode|YearMonth|(?:java\.time\.)?Year|(?:java\.time\.)?MonthDay|(?:java\.time\.temporal\.)?ChronoField|(?:java\.time\.temporal\.)?IsoFields|(?:java\.time\.temporal\.)?ValueRange|(?:java\.time\.temporal\.)?TemporalAdjuster|(?:java\.time\.temporal\.)?TemporalAdjusters|DayOfWeek|DayOfWeekEnum|Month|MonthEnum|DateTimeFormatter|TextStyle|Locale|Duration|Period|ChronoUnit|ZoneId|ZoneOffset|Pattern|Matcher|(?:java\.util\.regex\.)?MatchResult|(?:java\.util\.function\.)?(?:Predicate|BiPredicate|Supplier|IntSupplier|LongSupplier|DoubleSupplier|BooleanSupplier|Function|BiFunction|IntFunction|LongFunction|DoubleFunction|UnaryOperator|BinaryOperator|Consumer|BiConsumer)|Runnable|Metadata|UpdateMetadata|Version|GeoPoint|GeoBoundingBox|IPAddress|DenseVector|DenseVectorField|DenseVectorDocValue|Grok|Dissect|BytesRef|ByteBuffer|(?:java\.net\.)?URI|(?:java\.net\.)?URL|StringBuilder|StringBuffer|(?:java\.lang\.)?Class|(?:java\.util\.)?UUID|(?:java\.util\.)?HexFormat|(?:java\.util\.)?Comparator|(?:java\.util\.)?BitSet|(?:java\.util\.)?StringJoiner|Optional|OptionalInt|OptionalLong|OptionalDouble|Stream|IntStream|LongStream|DoubleStream|Charset|IntSummaryStatistics|LongSummaryStatistics|DoubleSummaryStatistics)(?:\s*<[^=;]*>)?(?:\s*\[\s*\])*\s+([a-zA-Z_$][a-zA-Z0-9_$]*)$`)
-	reVarTypeDeclPrefix    = regexp.MustCompile(`(?s)^((?:def|boolean|Boolean|int|Integer|long|Long|double|Double|float|Float|Number|Short|short|Byte|byte|Character|char|String|CharSequence|Object|Map\.Entry|Map|HashMap|LinkedHashMap|TreeMap|NavigableMap|SortedMap|List|ArrayList|LinkedList|Set|HashSet|LinkedHashSet|TreeSet|NavigableSet|SortedSet|Deque|ArrayDeque|Queue|PriorityQueue|Collection|ZonedDateTime|OffsetDateTime|Instant|LocalDateTime|LocalDate|(?:java\.time\.)?LocalTime|(?:java\.time\.)?OffsetTime|(?:java\.time\.)?Clock|(?:java\.math\.)?BigDecimal|(?:java\.math\.)?BigInteger|(?:java\.math\.)?MathContext|(?:java\.math\.)?RoundingMode|YearMonth|(?:java\.time\.)?Year|(?:java\.time\.)?MonthDay|(?:java\.time\.temporal\.)?ChronoField|(?:java\.time\.temporal\.)?IsoFields|(?:java\.time\.temporal\.)?ValueRange|(?:java\.time\.temporal\.)?TemporalAdjuster|(?:java\.time\.temporal\.)?TemporalAdjusters|DayOfWeek|DayOfWeekEnum|Month|MonthEnum|DateTimeFormatter|TextStyle|Locale|Duration|Period|ChronoUnit|ZoneId|ZoneOffset|Pattern|Matcher|(?:java\.util\.regex\.)?MatchResult|(?:java\.util\.function\.)?(?:Predicate|BiPredicate|Supplier|IntSupplier|LongSupplier|DoubleSupplier|BooleanSupplier|Function|BiFunction|IntFunction|LongFunction|DoubleFunction|UnaryOperator|BinaryOperator|Consumer|BiConsumer)|Runnable|Metadata|UpdateMetadata|Version|GeoPoint|GeoBoundingBox|IPAddress|DenseVector|DenseVectorField|DenseVectorDocValue|Grok|Dissect|BytesRef|ByteBuffer|(?:java\.net\.)?URI|(?:java\.net\.)?URL|StringBuilder|StringBuffer|(?:java\.lang\.)?Class|(?:java\.util\.)?UUID|(?:java\.util\.)?HexFormat|(?:java\.util\.)?Comparator|(?:java\.util\.)?BitSet|(?:java\.util\.)?StringJoiner|Optional|OptionalInt|OptionalLong|OptionalDouble|Stream|IntStream|LongStream|DoubleStream|Charset|IntSummaryStatistics|LongSummaryStatistics|DoubleSummaryStatistics)(?:\s*<[^=;]*>)?(?:\s*\[\s*\])*)\s+(.+)$`)
-	reUserFuncHeaderPrefix = regexp.MustCompile(`^(void|def|boolean|Boolean|int|Integer|long|Long|double|Double|float|Float|Number|Short|short|Byte|byte|Character|char|String|CharSequence|Object|Map\.Entry|Map|HashMap|LinkedHashMap|TreeMap|NavigableMap|SortedMap|List|ArrayList|LinkedList|Set|HashSet|LinkedHashSet|TreeSet|NavigableSet|SortedSet|Deque|ArrayDeque|Queue|PriorityQueue|Collection|ZonedDateTime|OffsetDateTime|Instant|LocalDateTime|LocalDate|(?:java\.time\.)?LocalTime|(?:java\.time\.)?OffsetTime|(?:java\.time\.)?Clock|(?:java\.math\.)?BigDecimal|(?:java\.math\.)?BigInteger|(?:java\.math\.)?MathContext|(?:java\.math\.)?RoundingMode|YearMonth|(?:java\.time\.)?Year|(?:java\.time\.)?MonthDay|(?:java\.time\.temporal\.)?ChronoField|(?:java\.time\.temporal\.)?IsoFields|(?:java\.time\.temporal\.)?ValueRange|(?:java\.time\.temporal\.)?TemporalAdjuster|(?:java\.time\.temporal\.)?TemporalAdjusters|DayOfWeek|DayOfWeekEnum|Month|MonthEnum|DateTimeFormatter|TextStyle|Locale|Duration|Period|ChronoUnit|ZoneId|ZoneOffset|Pattern|Matcher|(?:java\.util\.regex\.)?MatchResult|(?:java\.util\.function\.)?(?:Predicate|BiPredicate|Supplier|IntSupplier|LongSupplier|DoubleSupplier|BooleanSupplier|Function|BiFunction|IntFunction|LongFunction|DoubleFunction|UnaryOperator|BinaryOperator|Consumer|BiConsumer)|Runnable|Metadata|UpdateMetadata|Version|GeoPoint|GeoBoundingBox|IPAddress|DenseVector|DenseVectorField|DenseVectorDocValue|Grok|Dissect|BytesRef|ByteBuffer|(?:java\.net\.)?URI|(?:java\.net\.)?URL|StringBuilder|StringBuffer|(?:java\.lang\.)?Class|(?:java\.util\.)?UUID|(?:java\.util\.)?HexFormat|(?:java\.util\.)?Comparator|(?:java\.util\.)?BitSet|(?:java\.util\.)?StringJoiner|Optional|OptionalInt|OptionalLong|OptionalDouble|Stream|IntStream|LongStream|DoubleStream|Charset|IntSummaryStatistics|LongSummaryStatistics|DoubleSummaryStatistics|[a-zA-Z_$][a-zA-Z0-9_$]*)(?:\s*<[^>]*>)?(?:\s*\[\s*\])*\s+([a-zA-Z_$][a-zA-Z0-9_$]*)$`)
+	reLocalVarAssign       = regexp.MustCompile(`(?s)^(?:(?:def|boolean|Boolean|int|Integer|long|Long|double|Double|float|Float|Number|Short|short|Byte|byte|Character|char|String|CharSequence|Object|Map\.Entry|Map|HashMap|LinkedHashMap|TreeMap|NavigableMap|SortedMap|List|ArrayList|LinkedList|Set|HashSet|LinkedHashSet|TreeSet|NavigableSet|SortedSet|Deque|ArrayDeque|Queue|PriorityQueue|Collection|ZonedDateTime|OffsetDateTime|Instant|LocalDateTime|LocalDate|(?:java\.time\.)?LocalTime|(?:java\.time\.)?OffsetTime|(?:java\.time\.)?Clock|(?:java\.math\.)?BigDecimal|(?:java\.math\.)?BigInteger|(?:java\.math\.)?MathContext|(?:java\.math\.)?RoundingMode|YearMonth|(?:java\.time\.)?Year|(?:java\.time\.)?MonthDay|(?:java\.time\.temporal\.)?ChronoField|(?:java\.time\.temporal\.)?IsoFields|(?:java\.time\.temporal\.)?ValueRange|(?:java\.time\.temporal\.)?TemporalAdjuster|(?:java\.time\.temporal\.)?TemporalAdjusters|DayOfWeek|DayOfWeekEnum|Month|MonthEnum|DateTimeFormatter|TextStyle|Locale|Duration|Period|ChronoUnit|ZoneId|ZoneOffset|Pattern|Matcher|(?:java\.util\.regex\.)?MatchResult|(?:java\.util\.function\.)?(?:Predicate|BiPredicate|Supplier|IntSupplier|LongSupplier|DoubleSupplier|BooleanSupplier|Function|BiFunction|IntFunction|LongFunction|DoubleFunction|UnaryOperator|BinaryOperator|Consumer|BiConsumer)|Runnable|Metadata|UpdateMetadata|Version|GeoPoint|GeoBoundingBox|GeoShapeDocValues|Geometry|GeoShape|IPAddress|DenseVector|DenseVectorField|DenseVectorDocValue|Grok|Dissect|BytesRef|ByteBuffer|(?:java\.net\.)?URI|(?:java\.net\.)?URL|StringBuilder|StringBuffer|(?:java\.lang\.)?Class|(?:java\.util\.)?UUID|(?:java\.util\.)?HexFormat|(?:java\.util\.)?Comparator|(?:java\.util\.)?BitSet|(?:java\.util\.)?StringJoiner|Optional|OptionalInt|OptionalLong|OptionalDouble|Stream|IntStream|LongStream|DoubleStream|Charset|IntSummaryStatistics|LongSummaryStatistics|DoubleSummaryStatistics)(?:\s*<[^=;]*>)?(?:\s*\[\s*\])*\s+)?([a-zA-Z_$][a-zA-Z0-9_$]*)\s*=\s*(.+)$`)
+	reNullVarDecl          = regexp.MustCompile(`^(?:def|boolean|Boolean|int|Integer|long|Long|double|Double|float|Float|Number|Short|short|Byte|byte|Character|char|String|CharSequence|Object|Map\.Entry|Map|HashMap|LinkedHashMap|TreeMap|NavigableMap|SortedMap|List|ArrayList|LinkedList|Set|HashSet|LinkedHashSet|TreeSet|NavigableSet|SortedSet|Deque|ArrayDeque|Queue|PriorityQueue|Collection|ZonedDateTime|OffsetDateTime|Instant|LocalDateTime|LocalDate|(?:java\.time\.)?LocalTime|(?:java\.time\.)?OffsetTime|(?:java\.time\.)?Clock|(?:java\.math\.)?BigDecimal|(?:java\.math\.)?BigInteger|(?:java\.math\.)?MathContext|(?:java\.math\.)?RoundingMode|YearMonth|(?:java\.time\.)?Year|(?:java\.time\.)?MonthDay|(?:java\.time\.temporal\.)?ChronoField|(?:java\.time\.temporal\.)?IsoFields|(?:java\.time\.temporal\.)?ValueRange|(?:java\.time\.temporal\.)?TemporalAdjuster|(?:java\.time\.temporal\.)?TemporalAdjusters|DayOfWeek|DayOfWeekEnum|Month|MonthEnum|DateTimeFormatter|TextStyle|Locale|Duration|Period|ChronoUnit|ZoneId|ZoneOffset|Pattern|Matcher|(?:java\.util\.regex\.)?MatchResult|(?:java\.util\.function\.)?(?:Predicate|BiPredicate|Supplier|IntSupplier|LongSupplier|DoubleSupplier|BooleanSupplier|Function|BiFunction|IntFunction|LongFunction|DoubleFunction|UnaryOperator|BinaryOperator|Consumer|BiConsumer)|Runnable|Metadata|UpdateMetadata|Version|GeoPoint|GeoBoundingBox|GeoShapeDocValues|Geometry|GeoShape|IPAddress|DenseVector|DenseVectorField|DenseVectorDocValue|Grok|Dissect|BytesRef|ByteBuffer|(?:java\.net\.)?URI|(?:java\.net\.)?URL|StringBuilder|StringBuffer|(?:java\.lang\.)?Class|(?:java\.util\.)?UUID|(?:java\.util\.)?HexFormat|(?:java\.util\.)?Comparator|(?:java\.util\.)?BitSet|(?:java\.util\.)?StringJoiner|Optional|OptionalInt|OptionalLong|OptionalDouble|Stream|IntStream|LongStream|DoubleStream|Charset|IntSummaryStatistics|LongSummaryStatistics|DoubleSummaryStatistics)(?:\s*<[^=;]*>)?(?:\s*\[\s*\])*\s+([a-zA-Z_$][a-zA-Z0-9_$]*)$`)
+	reVarTypeDeclPrefix    = regexp.MustCompile(`(?s)^((?:def|boolean|Boolean|int|Integer|long|Long|double|Double|float|Float|Number|Short|short|Byte|byte|Character|char|String|CharSequence|Object|Map\.Entry|Map|HashMap|LinkedHashMap|TreeMap|NavigableMap|SortedMap|List|ArrayList|LinkedList|Set|HashSet|LinkedHashSet|TreeSet|NavigableSet|SortedSet|Deque|ArrayDeque|Queue|PriorityQueue|Collection|ZonedDateTime|OffsetDateTime|Instant|LocalDateTime|LocalDate|(?:java\.time\.)?LocalTime|(?:java\.time\.)?OffsetTime|(?:java\.time\.)?Clock|(?:java\.math\.)?BigDecimal|(?:java\.math\.)?BigInteger|(?:java\.math\.)?MathContext|(?:java\.math\.)?RoundingMode|YearMonth|(?:java\.time\.)?Year|(?:java\.time\.)?MonthDay|(?:java\.time\.temporal\.)?ChronoField|(?:java\.time\.temporal\.)?IsoFields|(?:java\.time\.temporal\.)?ValueRange|(?:java\.time\.temporal\.)?TemporalAdjuster|(?:java\.time\.temporal\.)?TemporalAdjusters|DayOfWeek|DayOfWeekEnum|Month|MonthEnum|DateTimeFormatter|TextStyle|Locale|Duration|Period|ChronoUnit|ZoneId|ZoneOffset|Pattern|Matcher|(?:java\.util\.regex\.)?MatchResult|(?:java\.util\.function\.)?(?:Predicate|BiPredicate|Supplier|IntSupplier|LongSupplier|DoubleSupplier|BooleanSupplier|Function|BiFunction|IntFunction|LongFunction|DoubleFunction|UnaryOperator|BinaryOperator|Consumer|BiConsumer)|Runnable|Metadata|UpdateMetadata|Version|GeoPoint|GeoBoundingBox|GeoShapeDocValues|Geometry|GeoShape|IPAddress|DenseVector|DenseVectorField|DenseVectorDocValue|Grok|Dissect|BytesRef|ByteBuffer|(?:java\.net\.)?URI|(?:java\.net\.)?URL|StringBuilder|StringBuffer|(?:java\.lang\.)?Class|(?:java\.util\.)?UUID|(?:java\.util\.)?HexFormat|(?:java\.util\.)?Comparator|(?:java\.util\.)?BitSet|(?:java\.util\.)?StringJoiner|Optional|OptionalInt|OptionalLong|OptionalDouble|Stream|IntStream|LongStream|DoubleStream|Charset|IntSummaryStatistics|LongSummaryStatistics|DoubleSummaryStatistics)(?:\s*<[^=;]*>)?(?:\s*\[\s*\])*)\s+(.+)$`)
+	reUserFuncHeaderPrefix = regexp.MustCompile(`^(void|def|boolean|Boolean|int|Integer|long|Long|double|Double|float|Float|Number|Short|short|Byte|byte|Character|char|String|CharSequence|Object|Map\.Entry|Map|HashMap|LinkedHashMap|TreeMap|NavigableMap|SortedMap|List|ArrayList|LinkedList|Set|HashSet|LinkedHashSet|TreeSet|NavigableSet|SortedSet|Deque|ArrayDeque|Queue|PriorityQueue|Collection|ZonedDateTime|OffsetDateTime|Instant|LocalDateTime|LocalDate|(?:java\.time\.)?LocalTime|(?:java\.time\.)?OffsetTime|(?:java\.time\.)?Clock|(?:java\.math\.)?BigDecimal|(?:java\.math\.)?BigInteger|(?:java\.math\.)?MathContext|(?:java\.math\.)?RoundingMode|YearMonth|(?:java\.time\.)?Year|(?:java\.time\.)?MonthDay|(?:java\.time\.temporal\.)?ChronoField|(?:java\.time\.temporal\.)?IsoFields|(?:java\.time\.temporal\.)?ValueRange|(?:java\.time\.temporal\.)?TemporalAdjuster|(?:java\.time\.temporal\.)?TemporalAdjusters|DayOfWeek|DayOfWeekEnum|Month|MonthEnum|DateTimeFormatter|TextStyle|Locale|Duration|Period|ChronoUnit|ZoneId|ZoneOffset|Pattern|Matcher|(?:java\.util\.regex\.)?MatchResult|(?:java\.util\.function\.)?(?:Predicate|BiPredicate|Supplier|IntSupplier|LongSupplier|DoubleSupplier|BooleanSupplier|Function|BiFunction|IntFunction|LongFunction|DoubleFunction|UnaryOperator|BinaryOperator|Consumer|BiConsumer)|Runnable|Metadata|UpdateMetadata|Version|GeoPoint|GeoBoundingBox|GeoShapeDocValues|Geometry|GeoShape|IPAddress|DenseVector|DenseVectorField|DenseVectorDocValue|Grok|Dissect|BytesRef|ByteBuffer|(?:java\.net\.)?URI|(?:java\.net\.)?URL|StringBuilder|StringBuffer|(?:java\.lang\.)?Class|(?:java\.util\.)?UUID|(?:java\.util\.)?HexFormat|(?:java\.util\.)?Comparator|(?:java\.util\.)?BitSet|(?:java\.util\.)?StringJoiner|Optional|OptionalInt|OptionalLong|OptionalDouble|Stream|IntStream|LongStream|DoubleStream|Charset|IntSummaryStatistics|LongSummaryStatistics|DoubleSummaryStatistics|[a-zA-Z_$][a-zA-Z0-9_$]*)(?:\s*<[^>]*>)?(?:\s*\[\s*\])*\s+([a-zA-Z_$][a-zA-Z0-9_$]*)$`)
 	reIdentAssign          = regexp.MustCompile(`(?s)^([a-zA-Z_$][a-zA-Z0-9_$]*)\s*=\s*(.+)$`)
 	reIdentOnly            = regexp.MustCompile(`^[a-zA-Z_$][a-zA-Z0-9_$]*$`)
 	reSimpleFieldPath      = regexp.MustCompile(`^[a-zA-Z0-9_$_.@/:?\x00-\x08\x10-\x1f\x7f-]+$`)
@@ -7927,7 +8520,7 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 		".firstKey()", ".lastKey()", ".firstEntry()", ".lastEntry()", ".pollFirstEntry()", ".pollLastEntry()", ".descendingKeySet()", ".navigableKeySet()", ".descendingMap()",
 		".first()", ".last()", ".getFirst()", ".getLast()", ".peekFirst()", ".peekLast()", ".peek()", ".element()", ".pollFirst()", ".pollLast()", ".poll()", ".removeFirst()", ".removeLast()", ".pop()", ".descendingSet()",
 		".utf8ToString()", ".limit()", ".position()", ".remaining()", ".hasRemaining()",
-		".getLat()", ".getLon()", ".getCentroid()", ".getBoundingBox()", ".getLabelPosition()", ".getDimensionalType()", ".getMercatorWidth()", ".getMercatorHeight()", ".topLeft()", ".bottomRight()",
+		".getLat()", ".getLon()", ".getCentroid()", ".getBoundingBox()", ".getLabelPosition()", ".getDimensionalType()", ".getShapeType()", ".getMercatorWidth()", ".getMercatorHeight()", ".topLeft()", ".bottomRight()", ".getMinLat()", ".getMaxLat()", ".getMinLon()", ".getMaxLon()",
 		".getCenturyOfEra()", ".getEra()", ".getMillisOfDay()", ".getMillisOfSecond()", ".getMinuteOfDay()", ".getSecondOfDay()", ".getWeekOfWeekyear()", ".getWeekyear()", ".getYearOfCentury()", ".getYearOfEra()",
 		".l1Norm()", ".l2Norm()", ".l1norm()", ".l2norm()", ".getDims()", ".dims()", ".getVector()", ".vector()", ".vectorValue()", ".getMagnitude()", ".magnitude()",
 		".isIPv4()", ".isIPv6()", ".getHostAddress()", ".toCanonicalString()", ".getAddress()", ".isLoopbackAddress()", ".isMulticastAddress()", ".isSiteLocalAddress()", ".isLinkLocalAddress()",
@@ -7948,7 +8541,8 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 				return int64(len(dv)), nil
 			}
 			if (mSuffix == ".getCentroid()" || mSuffix == ".getBoundingBox()" || mSuffix == ".getLabelPosition()" ||
-				mSuffix == ".getDimensionalType()" || mSuffix == ".getMercatorWidth()" || mSuffix == ".getMercatorHeight()") &&
+				mSuffix == ".getDimensionalType()" || mSuffix == ".getShapeType()" || mSuffix == ".getMercatorWidth()" || mSuffix == ".getMercatorHeight()" ||
+				mSuffix == ".topLeft()" || mSuffix == ".bottomRight()") &&
 				(strings.HasPrefix(recExpr, "doc.") || strings.HasPrefix(recExpr, "doc?.")) &&
 				!strings.HasSuffix(recExpr, ".value") && !strings.Contains(recExpr, ".values.") {
 				docPath := strings.TrimSuffix(strings.TrimPrefix(strings.TrimPrefix(recExpr, "doc?."), "doc."), ".values")
@@ -8239,13 +8833,20 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 					case ".plus()":
 						return newPainlessBigDecimal(bd.unscaled, bd.scale), nil
 					case ".toPlainString()":
-						return bd.toPlainString(), nil
+						return bd.toPlainStringChecked()
 					case ".ulp()":
 						return newPainlessBigDecimal(big.NewInt(1), bd.scale), nil
 					case ".toEngineeringString()":
+						if err := checkBigDecimalBoundsPainless(bd); err != nil {
+							return nil, err
+						}
 						return bd.toEngineeringString(), nil
 					case ".toBigInteger()":
-						return newPainlessBigInteger(bd.toBigInt()), nil
+						bi, err := bd.toBigIntChecked()
+						if err != nil {
+							return nil, err
+						}
+						return newPainlessBigInteger(bi), nil
 					case ".toBigIntegerExact()":
 						bi, err := bd.bigIntExact()
 						if err != nil {
@@ -9460,7 +10061,16 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 						if err0 != nil {
 							return nil, err0
 						}
-						idx, _ := toInt64Painless(v0)
+						idx, errI := extractInt64BoundArgPainless(v0)
+						if errI != nil {
+							return nil, errI
+						}
+						if idx >= int64(maxBitSetBits) {
+							return nil, &painlessExceptionError{
+								exType:  "IllegalArgumentException",
+								message: fmt.Sprintf("BitSet bitIndex %d exceeds maximum (%d)", idx, maxBitSetBits),
+							}
+						}
 						return nil, bs.set(int(idx))
 					} else if len(setArgs) == 2 {
 						v0, err0 := evalRHSExprDepth(sourceMap, strings.TrimSpace(setArgs[0]), params, depth+1)
@@ -9471,15 +10081,33 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 						if err1 != nil {
 							return nil, err1
 						}
-						idx0, _ := toInt64Painless(v0)
+						idx0, errI0 := extractInt64BoundArgPainless(v0)
+						if errI0 != nil {
+							return nil, errI0
+						}
 						if bVal, isBool := v1.(bool); isBool {
+							if idx0 >= int64(maxBitSetBits) {
+								return nil, &painlessExceptionError{
+									exType:  "IllegalArgumentException",
+									message: fmt.Sprintf("BitSet bitIndex %d exceeds maximum (%d)", idx0, maxBitSetBits),
+								}
+							}
 							if bVal {
 								return nil, bs.set(int(idx0))
 							}
 							return nil, bs.clearBit(int(idx0))
 						}
-						idx1, _ := toInt64Painless(v1)
-						return nil, bs.setRange(int(idx0), int(idx1), true)
+						idx1, errI1 := extractInt64BoundArgPainless(v1)
+						if errI1 != nil {
+							return nil, errI1
+						}
+						if idx1 > int64(maxBitSetBits) {
+							return nil, &painlessExceptionError{
+								exType:  "IllegalArgumentException",
+								message: fmt.Sprintf("BitSet toIndex %d exceeds maximum (%d)", idx1, maxBitSetBits),
+							}
+						}
+						return nil, bs.setRange(int(idx0), int(idx1), true, budget)
 					} else if len(setArgs) >= 3 {
 						v0, err0 := evalRHSExprDepth(sourceMap, strings.TrimSpace(setArgs[0]), params, depth+1)
 						if err0 != nil {
@@ -9493,10 +10121,22 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 						if err2 != nil {
 							return nil, err2
 						}
-						idx0, _ := toInt64Painless(v0)
-						idx1, _ := toInt64Painless(v1)
+						idx0, errI0 := extractInt64BoundArgPainless(v0)
+						if errI0 != nil {
+							return nil, errI0
+						}
+						idx1, errI1 := extractInt64BoundArgPainless(v1)
+						if errI1 != nil {
+							return nil, errI1
+						}
+						if idx1 > int64(maxBitSetBits) {
+							return nil, &painlessExceptionError{
+								exType:  "IllegalArgumentException",
+								message: fmt.Sprintf("BitSet toIndex %d exceeds maximum (%d)", idx1, maxBitSetBits),
+							}
+						}
 						bVal, _ := v2.(bool)
-						return nil, bs.setRange(int(idx0), int(idx1), bVal)
+						return nil, bs.setRange(int(idx0), int(idx1), bVal, budget)
 					}
 					return nil, nil
 				}
@@ -9701,9 +10341,15 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 					if aErr != nil {
 						return nil, aErr
 					}
-					if bd2, ok2 := parsePainlessBigDecimal(augVal); ok2 {
-						ua, ub, sc := alignBigDecimalsPainless(bd, bd2)
-						resBD := &painlessBigDecimal{unscaled: new(big.Int).Add(ua, ub), scale: sc}
+					bd2, bdErr := parsePainlessBigDecimalChecked(augVal)
+					if bdErr != nil {
+						return nil, bdErr
+					}
+					if bd2 != nil {
+						resBD, addErr := bd.addChecked(bd2)
+						if addErr != nil {
+							return nil, addErr
+						}
 						if len(addArgs) >= 2 {
 							mcVal, mcErr := evalRHSExprDepth(sourceMap, strings.TrimSpace(addArgs[1]), params, depth+1)
 							if mcErr != nil {
@@ -9722,8 +10368,16 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 					if aErr != nil {
 						return nil, aErr
 					}
-					if bi2, ok2 := parsePainlessBigInteger(augVal); ok2 {
-						return newPainlessBigInteger(new(big.Int).Add(bi.val, bi2.val)), nil
+					bi2, biErr := parsePainlessBigIntegerChecked(augVal)
+					if biErr != nil {
+						return nil, biErr
+					}
+					if bi2 != nil {
+						sum := new(big.Int).Add(bi.val, bi2.val)
+						if err := checkBigIntBitsPainless(sum); err != nil {
+							return nil, err
+						}
+						return newPainlessBigInteger(sum), nil
 					}
 					return bi, nil
 				}
@@ -10931,7 +11585,9 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 						return nil, err
 					}
 					if otherBS, okO := otherVal.(*painlessBitSet); okO {
-						bs.or(otherBS)
+						if err := bs.or(otherBS); err != nil {
+							return nil, err
+						}
 					}
 					return nil, nil
 				}
@@ -10940,8 +11596,16 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 					if err != nil {
 						return nil, err
 					}
-					if bi2, ok2 := parsePainlessBigInteger(otherVal); ok2 {
-						return newPainlessBigInteger(new(big.Int).Or(bi.val, bi2.val)), nil
+					bi2, biErr := parsePainlessBigIntegerChecked(otherVal)
+					if biErr != nil {
+						return nil, biErr
+					}
+					if bi2 != nil {
+						orRes := new(big.Int).Or(bi.val, bi2.val)
+						if err := checkBigIntBitsPainless(orRes); err != nil {
+							return nil, err
+						}
+						return newPainlessBigInteger(orRes), nil
 					}
 					return bi, nil
 				}
@@ -11581,11 +12245,29 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 						if err1 != nil {
 							return nil, err1
 						}
-						i0, _ := toInt64Painless(v0)
-						i1, _ := toInt64Painless(v1)
+						i0, errI0 := extractInt64BoundArgPainless(v0)
+						if errI0 != nil {
+							return nil, errI0
+						}
+						i1, errI1 := extractInt64BoundArgPainless(v1)
+						if errI1 != nil {
+							return nil, errI1
+						}
+						if i1 > int64(maxBitSetBits) {
+							return nil, &painlessExceptionError{
+								exType:  "IllegalArgumentException",
+								message: fmt.Sprintf("BitSet toIndex %d exceeds maximum (%d)", i1, maxBitSetBits),
+							}
+						}
 						return tv.getRange(int(i0), int(i1))
 					}
-					idx, _ := toInt64Painless(argVal)
+					idx, errI := extractInt64BoundArgPainless(argVal)
+					if errI != nil {
+						return nil, errI
+					}
+					if idx > int64(math.MaxInt32) {
+						return false, nil
+					}
 					return tv.get(int(idx))
 				case map[string]any:
 					kStr := encodePainlessMapKeyRound57(argVal)
@@ -12432,7 +13114,7 @@ func evalRHSExprDepth(sourceMap map[string]any, rhs string, params map[string]an
 		}
 		return resolveParamPath(sourceMap, path), nil
 	}
-	for _, wProp := range []string{".lat", ".lon", ".top_left", ".bottom_right", ".topLeft", ".bottomRight", ".bytes", ".offset", ".zone", ".vector", ".vectorValue", ".dims", ".magnitude", ".value", ".values"} {
+	for _, wProp := range []string{".lat", ".lon", ".top_left", ".bottom_right", ".topLeft", ".bottomRight", ".minLat", ".maxLat", ".minLon", ".maxLon", ".centroid", ".boundingBox", ".dimensionalType", ".shapeType", ".mercatorHeight", ".mercatorWidth", ".labelPosition", ".bytes", ".offset", ".zone", ".vector", ".vectorValue", ".dims", ".magnitude", ".value", ".values"} {
 		if strings.HasSuffix(rhs, wProp) && shouldTryWrapperPropRound63(rhs, wProp) {
 			recExpr := strings.TrimSpace(strings.TrimSuffix(rhs[:len(rhs)-len(wProp)], "?"))
 			if recVal, err := evalRHSExprDepth(sourceMap, recExpr, params, depth+1); err == nil && recVal != nil {
@@ -13584,8 +14266,17 @@ func evalCollectionConstructorPainless(sourceMap map[string]any, rhs string, par
 						return nil, true, mcErr
 					}
 					ctorVal = bd
-				} else if sc, okSc := toInt64Painless(arg1Val); okSc {
-					bd := newPainlessBigDecimal(bi.val, int(sc))
+				} else if sc64, errSc := extractInt64BoundArgPainless(arg1Val); errSc == nil {
+					if err := checkBigIntBitsPainless(bi.val); err != nil {
+						return nil, true, err
+					}
+					if sc64 < -int64(maxBigDecimalScale) || sc64 > int64(maxBigDecimalScale) {
+						return nil, true, &painlessExceptionError{
+							exType:  "ArithmeticException",
+							message: fmt.Sprintf("BigDecimal scale %d exceeds bounds [-%d, %d]", sc64, maxBigDecimalScale, maxBigDecimalScale),
+						}
+					}
+					bd := newPainlessBigDecimal(bi.val, int(sc64))
 					if len(cArgs) >= 3 {
 						arg2Val, err2 := evalRHSExprDepth(sourceMap, strings.TrimSpace(cArgs[2]), params, depth+1)
 						if err2 != nil {
@@ -13600,11 +14291,16 @@ func evalCollectionConstructorPainless(sourceMap map[string]any, rhs string, par
 						}
 					}
 					ctorVal = bd
+				} else {
+					return nil, true, errSc
 				}
 			}
 			if ctorVal == nil {
-				bd, ok := parsePainlessBigDecimal(arg0Val)
-				if !ok {
+				bd, bdErr := parsePainlessBigDecimalChecked(arg0Val)
+				if bdErr != nil {
+					return nil, true, bdErr
+				}
+				if bd == nil {
 					return nil, true, &painlessExceptionError{
 						exType:  "NumberFormatException",
 						message: fmt.Sprintf("For input string: %q", fmt.Sprintf("%v", arg0Val)),
@@ -13639,7 +14335,11 @@ func evalCollectionConstructorPainless(sourceMap map[string]any, rhs string, par
 				if len(arr) == 0 {
 					return nil, true, &painlessExceptionError{exType: "NumberFormatException", message: "Zero length BigInteger"}
 				}
-				ctorVal = newPainlessBigIntegerFromBytes(toBytesPainless(arr))
+				bi, biErr := newPainlessBigIntegerFromBytesChecked(toBytesPainless(arr))
+				if biErr != nil {
+					return nil, true, biErr
+				}
+				ctorVal = bi
 			} else {
 				radix := 10
 				if len(cArgs) >= 2 {
@@ -13655,12 +14355,22 @@ func evalCollectionConstructorPainless(sourceMap map[string]any, rhs string, par
 					return nil, true, &painlessExceptionError{exType: "NumberFormatException", message: fmt.Sprintf("Radix out of range: %d", radix)}
 				}
 				s := strings.TrimSpace(fmt.Sprintf("%v", arg0Val))
-				bi := new(big.Int)
 				if s == "" {
 					return nil, true, &painlessExceptionError{exType: "NumberFormatException", message: "Zero length BigInteger"}
 				}
+				trimmedBI := strings.TrimLeft(strings.TrimPrefix(strings.TrimPrefix(s, "-"), "+"), "0")
+				if len(trimmedBI) > maxBigIntBits+2 {
+					return nil, true, &painlessExceptionError{
+						exType:  "ArithmeticException",
+						message: fmt.Sprintf("BigInteger precision exceeds maximum bit length (%d bits)", maxBigIntBits),
+					}
+				}
+				bi := new(big.Int)
 				if _, ok := bi.SetString(s, radix); !ok {
 					return nil, true, &painlessExceptionError{exType: "NumberFormatException", message: fmt.Sprintf("For input string: %q", s)}
+				}
+				if err := checkBigIntBitsPainless(bi); err != nil {
+					return nil, true, err
 				}
 				ctorVal = newPainlessBigInteger(bi)
 			}
@@ -13703,8 +14413,15 @@ func evalCollectionConstructorPainless(sourceMap map[string]any, rhs string, par
 			if err0 != nil {
 				return nil, true, err0
 			}
-			if nbits, okN := toInt64Painless(v0); okN && nbits < 0 {
+			nbits, errN := extractInt64BoundArgPainless(v0)
+			if errN != nil {
+				return nil, true, errN
+			}
+			if nbits < 0 {
 				return nil, true, &painlessExceptionError{exType: "NegativeArraySizeException", message: fmt.Sprintf("nbits < 0: %d", nbits)}
+			}
+			if nbits > int64(maxBitSetBits) {
+				return nil, true, &painlessExceptionError{exType: "IllegalArgumentException", message: fmt.Sprintf("BitSet size %d exceeds maximum (%d bits)", nbits, maxBitSetBits)}
 			}
 		}
 		ctorVal = &painlessBitSet{}
@@ -14145,11 +14862,11 @@ func applyArithmetic(a, b any, isAdd bool) any {
 		_, aIsStr := a.(string)
 		_, bIsStr := b.(string)
 		if aIsStr || bIsStr {
-			as := formatValueForStringPainless(a)
+			as := formatValueForStringConcatPainless(a)
 			if len(as) >= MaxPainlessStringBytes {
 				return as[:MaxPainlessStringBytes]
 			}
-			bs := formatValueForStringPainless(b)
+			bs := formatValueForStringConcatPainless(b)
 			if len(as)+len(bs) > MaxPainlessStringBytes {
 				bs = bs[:MaxPainlessStringBytes-len(as)]
 			}
@@ -14160,11 +14877,11 @@ func applyArithmetic(a, b any, isAdd bool) any {
 		return res
 	}
 	if isAdd {
-		as := formatValueForStringPainless(a)
+		as := formatValueForStringConcatPainless(a)
 		if len(as) >= MaxPainlessStringBytes {
 			return as[:MaxPainlessStringBytes]
 		}
-		bs := formatValueForStringPainless(b)
+		bs := formatValueForStringConcatPainless(b)
 		if len(as)+len(bs) > MaxPainlessStringBytes {
 			bs = bs[:MaxPainlessStringBytes-len(as)]
 		}
@@ -15884,7 +16601,11 @@ func evalStaticCallPainless(sourceMap map[string]any, rhs string, params map[str
 			if err0 != nil {
 				return nil, true, err0
 			}
-			return newPainlessBitSetFromValueOf(v0), true, nil
+			bs, bsErr := newPainlessBitSetFromValueOfChecked(v0)
+			if bsErr != nil {
+				return nil, true, bsErr
+			}
+			return bs, true, nil
 		}
 		return &painlessBitSet{}, true, nil
 	case "BigDecimal.valueOf":
@@ -15895,12 +16616,28 @@ func evalStaticCallPainless(sourceMap map[string]any, rhs string, params map[str
 			}
 			if len(args) >= 2 {
 				if iv, ok1 := toInt64Painless(v0); ok1 {
-					if sc, ok2 := evalInt64Arg(1); ok2 {
-						return newPainlessBigDecimal(big.NewInt(iv), int(sc)), true, nil
+					v1, err1 := evalRHSExprDepth(sourceMap, strings.TrimSpace(args[1]), params, depth+1)
+					if err1 != nil {
+						return nil, true, err1
 					}
+					sc64, errSc := extractInt64BoundArgPainless(v1)
+					if errSc != nil {
+						return nil, true, errSc
+					}
+					if sc64 < -int64(maxBigDecimalScale) || sc64 > int64(maxBigDecimalScale) {
+						return nil, true, &painlessExceptionError{
+							exType:  "ArithmeticException",
+							message: fmt.Sprintf("BigDecimal scale %d exceeds bounds [-%d, %d]", sc64, maxBigDecimalScale, maxBigDecimalScale),
+						}
+					}
+					return newPainlessBigDecimal(big.NewInt(iv), int(sc64)), true, nil
 				}
 			}
-			if bd, ok := parsePainlessBigDecimal(v0); ok {
+			bd, bdErr := parsePainlessBigDecimalChecked(v0)
+			if bdErr != nil {
+				return nil, true, bdErr
+			}
+			if bd != nil {
 				return bd, true, nil
 			}
 		}
@@ -22822,11 +23559,17 @@ func evalNumericBitSetJoinerComparatorMethodPainless(mName string, recVal any, a
 			if err != nil {
 				return nil, err
 			}
-			other, okO := parsePainlessBigDecimal(a0)
-			if !okO {
+			other, bdErr := parsePainlessBigDecimalChecked(a0)
+			if bdErr != nil {
+				return nil, bdErr
+			}
+			if other == nil {
 				return nil, nil
 			}
-			res := bd.sub(other)
+			res, subErr := bd.subChecked(other)
+			if subErr != nil {
+				return nil, subErr
+			}
 			if len(args) >= 2 {
 				a1, err1 := evalArg(1)
 				if err1 != nil {
@@ -22842,35 +23585,64 @@ func evalNumericBitSetJoinerComparatorMethodPainless(mName string, recVal any, a
 			if err != nil {
 				return nil, err
 			}
-			other, okO := parsePainlessBigDecimal(a0)
-			if !okO {
+			other, bdErr := parsePainlessBigDecimalChecked(a0)
+			if bdErr != nil {
+				return nil, bdErr
+			}
+			if other == nil {
 				return nil, nil
 			}
-			res := bd.mul(other)
 			if len(args) >= 2 {
 				a1, err1 := evalArg(1)
 				if err1 != nil {
 					return nil, err1
 				}
 				if mc, okMC := a1.(painlessMathContext); okMC {
+					res, mulErr := bd.mulChecked(other)
+					if mulErr != nil {
+						return nil, mulErr
+					}
 					return applyMathContextPainless(res, mc)
 				}
 			}
-			return res, nil
+			return bd.mulChecked(other)
 		case ".divide(":
 			a0, err := evalArg(0)
 			if err != nil {
 				return nil, err
 			}
-			other, okO := parsePainlessBigDecimal(a0)
-			if !okO {
+			other, bdErr := parsePainlessBigDecimalChecked(a0)
+			if bdErr != nil {
+				return nil, bdErr
+			}
+			if other == nil {
 				return nil, nil
 			}
 			if other.unscaled.Sign() == 0 {
 				return nil, &painlessExceptionError{exType: "ArithmeticException", message: "Division by zero"}
 			}
+			if err := checkBigDecimalBoundsPainless(bd); err != nil {
+				return nil, err
+			}
+			if err := checkBigDecimalBoundsPainless(other); err != nil {
+				return nil, err
+			}
 			if len(args) == 1 {
-				return divideExactBigDecimalPainless(bd, other)
+				prefScale64 := int64(bd.scale) - int64(other.scale)
+				if prefScale64 > int64(maxBigDecimalScale) || prefScale64 < -int64(maxBigDecimalScale) {
+					return nil, &painlessExceptionError{
+						exType:  "ArithmeticException",
+						message: fmt.Sprintf("BigDecimal divide scale %d exceeds bounds [-%d, %d]", prefScale64, maxBigDecimalScale, maxBigDecimalScale),
+					}
+				}
+				res, dErr := divideExactBigDecimalPainless(bd, other)
+				if dErr != nil {
+					return nil, dErr
+				}
+				if err := checkBigDecimalBoundsPainless(res); err != nil {
+					return nil, err
+				}
+				return res, nil
 			}
 			a1, err1 := evalArg(1)
 			if err1 != nil {
@@ -22883,18 +23655,34 @@ func evalNumericBitSetJoinerComparatorMethodPainless(mName string, recVal any, a
 				if modeStr, isStr := a1.(string); isStr {
 					return bd.div(other, bd.scale, normalizeRoundingModePainless(modeStr))
 				}
-				scF, okSc := toFloat64(a1)
-				if okSc {
-					return bd.div(other, int(scF), "HALF_UP")
+				sc64, scErr := extractInt64BoundArgPainless(a1)
+				if scErr != nil {
+					return nil, scErr
 				}
+				if sc64 < -int64(maxBigDecimalScale) || sc64 > int64(maxBigDecimalScale) {
+					return nil, &painlessExceptionError{
+						exType:  "ArithmeticException",
+						message: fmt.Sprintf("BigDecimal scale %d exceeds bounds [-%d, %d]", sc64, maxBigDecimalScale, maxBigDecimalScale),
+					}
+				}
+				return bd.div(other, int(sc64), "HALF_UP")
 			}
 			if len(args) >= 3 {
-				scF, _ := toFloat64(a1)
+				sc64, scErr := extractInt64BoundArgPainless(a1)
+				if scErr != nil {
+					return nil, scErr
+				}
+				if sc64 < -int64(maxBigDecimalScale) || sc64 > int64(maxBigDecimalScale) {
+					return nil, &painlessExceptionError{
+						exType:  "ArithmeticException",
+						message: fmt.Sprintf("BigDecimal scale %d exceeds bounds [-%d, %d]", sc64, maxBigDecimalScale, maxBigDecimalScale),
+					}
+				}
 				a2, err2 := evalArg(2)
 				if err2 != nil {
 					return nil, err2
 				}
-				return bd.div(other, int(scF), normalizeRoundingModePainless(a2))
+				return bd.div(other, int(sc64), normalizeRoundingModePainless(a2))
 			}
 			return bd.div(other, bd.scale, "HALF_UP")
 		case ".remainder(":
@@ -22902,8 +23690,11 @@ func evalNumericBitSetJoinerComparatorMethodPainless(mName string, recVal any, a
 			if err != nil {
 				return nil, err
 			}
-			other, okO := parsePainlessBigDecimal(a0)
-			if !okO {
+			other, bdErr := parsePainlessBigDecimalChecked(a0)
+			if bdErr != nil {
+				return nil, bdErr
+			}
+			if other == nil {
 				return nil, nil
 			}
 			if other.unscaled.Sign() == 0 {
@@ -22982,16 +23773,57 @@ func evalNumericBitSetJoinerComparatorMethodPainless(mName string, recVal any, a
 			if err != nil {
 				return nil, err
 			}
-			nf, okN := toFloat64(a0)
-			if !okN {
-				return nil, nil
+			n64, errN := extractInt64BoundArgPainless(a0)
+			if errN != nil {
+				return nil, errN
 			}
-			n := int(nf)
-			if n < 0 || n > 999999999 {
-				return nil, &painlessExceptionError{exType: "ArithmeticException", message: "Invalid operation"}
+			if n64 < 0 || n64 > int64(maxBigDecimalPow) {
+				return nil, &painlessExceptionError{
+					exType:  "ArithmeticException",
+					message: fmt.Sprintf("BigDecimal pow exponent %d exceeds bounds [0, %d]", n64, maxBigDecimalPow),
+				}
+			}
+			if err := checkBigDecimalBoundsPainless(bd); err != nil {
+				return nil, err
+			}
+			n := int(n64)
+			if bd.scale != 0 && n > 0 {
+				if int64(bd.scale) > int64(maxBigDecimalScale)/int64(n) || int64(bd.scale) < -int64(maxBigDecimalScale)/int64(n) {
+					return nil, &painlessExceptionError{
+						exType:  "ArithmeticException",
+						message: fmt.Sprintf("BigDecimal pow scale %d*%d exceeds bounds [-%d, %d]", bd.scale, n, maxBigDecimalScale, maxBigDecimalScale),
+					}
+				}
+			}
+			var resUnscaled *big.Int
+			if bd.unscaled.Sign() == 0 {
+				if n == 0 {
+					resUnscaled = big.NewInt(1)
+				} else {
+					resUnscaled = big.NewInt(0)
+				}
+			} else if bd.unscaled.Cmp(big.NewInt(1)) == 0 {
+				resUnscaled = big.NewInt(1)
+			} else if bd.unscaled.Cmp(big.NewInt(-1)) == 0 {
+				if n%2 == 1 {
+					resUnscaled = big.NewInt(-1)
+				} else {
+					resUnscaled = big.NewInt(1)
+				}
+			} else {
+				if bd.unscaled.BitLen() > 1 && int64(bd.unscaled.BitLen()-1)*n64 >= int64(maxBigIntBits) {
+					return nil, &painlessExceptionError{
+						exType:  "ArithmeticException",
+						message: fmt.Sprintf("BigDecimal pow result exceeds maximum bit length (%d)", maxBigIntBits),
+					}
+				}
+				resUnscaled = new(big.Int).Exp(bd.unscaled, big.NewInt(n64), nil)
+				if err := checkBigIntBitsPainless(resUnscaled); err != nil {
+					return nil, err
+				}
 			}
 			res := &painlessBigDecimal{
-				unscaled: new(big.Int).Exp(bd.unscaled, big.NewInt(int64(n)), nil),
+				unscaled: resUnscaled,
 				scale:    bd.scale * n,
 			}
 			if len(args) >= 2 {
@@ -23009,9 +23841,15 @@ func evalNumericBitSetJoinerComparatorMethodPainless(mName string, recVal any, a
 			if err != nil {
 				return nil, err
 			}
-			scF, okSc := toFloat64(a0)
-			if !okSc {
-				return nil, nil
+			sc64, errSc := extractInt64BoundArgPainless(a0)
+			if errSc != nil {
+				return nil, errSc
+			}
+			if sc64 < -int64(maxBigDecimalScale) || sc64 > int64(maxBigDecimalScale) {
+				return nil, &painlessExceptionError{
+					exType:  "ArithmeticException",
+					message: fmt.Sprintf("BigDecimal scale %d exceeds bounds [-%d, %d]", sc64, maxBigDecimalScale, maxBigDecimalScale),
+				}
 			}
 			mode := "UNNECESSARY"
 			if len(args) >= 2 {
@@ -23021,14 +23859,17 @@ func evalNumericBitSetJoinerComparatorMethodPainless(mName string, recVal any, a
 				}
 				mode = normalizeRoundingModePainless(a1)
 			}
-			return bd.setScale(int(scF), mode)
+			return bd.setScale(int(sc64), mode)
 		case ".min(":
 			a0, err := evalArg(0)
 			if err != nil {
 				return nil, err
 			}
-			other, okO := parsePainlessBigDecimal(a0)
-			if !okO {
+			other, bdErr := parsePainlessBigDecimalChecked(a0)
+			if bdErr != nil {
+				return nil, bdErr
+			}
+			if other == nil {
 				return nil, nil
 			}
 			if bd.cmp(other) <= 0 {
@@ -23040,8 +23881,11 @@ func evalNumericBitSetJoinerComparatorMethodPainless(mName string, recVal any, a
 			if err != nil {
 				return nil, err
 			}
-			other, okO := parsePainlessBigDecimal(a0)
-			if !okO {
+			other, bdErr := parsePainlessBigDecimalChecked(a0)
+			if bdErr != nil {
+				return nil, bdErr
+			}
+			if other == nil {
 				return nil, nil
 			}
 			if bd.cmp(other) >= 0 {
@@ -23053,39 +23897,78 @@ func evalNumericBitSetJoinerComparatorMethodPainless(mName string, recVal any, a
 			if err != nil {
 				return nil, err
 			}
-			nf, okN := toFloat64(a0)
-			if !okN {
-				return nil, nil
+			n64, errN := extractInt64BoundArgPainless(a0)
+			if errN != nil {
+				return nil, errN
+			}
+			if err := checkBigDecimalBoundsPainless(bd); err != nil {
+				return nil, err
+			}
+			if n64 < -int64(maxBigDecimalScale)*2 || n64 > int64(maxBigDecimalScale)*2 {
+				return nil, &painlessExceptionError{
+					exType:  "ArithmeticException",
+					message: fmt.Sprintf("BigDecimal movePointLeft(%d) exceeds scale bounds [-%d, %d]", n64, maxBigDecimalScale, maxBigDecimalScale),
+				}
+			}
+			newScale := int64(bd.scale) + n64
+			if err := checkBigDecimalScalePainless(int(newScale)); err != nil {
+				return nil, err
 			}
 			return &painlessBigDecimal{
 				unscaled: new(big.Int).Set(bd.unscaled),
-				scale:    bd.scale + int(nf),
+				scale:    int(newScale),
 			}, nil
 		case ".movePointRight(":
 			a0, err := evalArg(0)
 			if err != nil {
 				return nil, err
 			}
-			nf, okN := toFloat64(a0)
-			if !okN {
-				return nil, nil
+			n64, errN := extractInt64BoundArgPainless(a0)
+			if errN != nil {
+				return nil, errN
+			}
+			if err := checkBigDecimalBoundsPainless(bd); err != nil {
+				return nil, err
+			}
+			if n64 < -int64(maxBigDecimalScale)*2 || n64 > int64(maxBigDecimalScale)*2 {
+				return nil, &painlessExceptionError{
+					exType:  "ArithmeticException",
+					message: fmt.Sprintf("BigDecimal movePointRight(%d) exceeds scale bounds [-%d, %d]", n64, maxBigDecimalScale, maxBigDecimalScale),
+				}
+			}
+			newScale := int64(bd.scale) - n64
+			if err := checkBigDecimalScalePainless(int(newScale)); err != nil {
+				return nil, err
 			}
 			return &painlessBigDecimal{
 				unscaled: new(big.Int).Set(bd.unscaled),
-				scale:    bd.scale - int(nf),
+				scale:    int(newScale),
 			}, nil
 		case ".scaleByPowerOfTen(":
 			a0, err := evalArg(0)
 			if err != nil {
 				return nil, err
 			}
-			nf, okN := toFloat64(a0)
-			if !okN {
-				return nil, nil
+			n64, errN := extractInt64BoundArgPainless(a0)
+			if errN != nil {
+				return nil, errN
+			}
+			if err := checkBigDecimalBoundsPainless(bd); err != nil {
+				return nil, err
+			}
+			if n64 < -int64(maxBigDecimalScale)*2 || n64 > int64(maxBigDecimalScale)*2 {
+				return nil, &painlessExceptionError{
+					exType:  "ArithmeticException",
+					message: fmt.Sprintf("BigDecimal scaleByPowerOfTen(%d) exceeds scale bounds [-%d, %d]", n64, maxBigDecimalScale, maxBigDecimalScale),
+				}
+			}
+			newScale := int64(bd.scale) - n64
+			if err := checkBigDecimalScalePainless(int(newScale)); err != nil {
+				return nil, err
 			}
 			return &painlessBigDecimal{
 				unscaled: new(big.Int).Set(bd.unscaled),
-				scale:    bd.scale - int(nf),
+				scale:    int(newScale),
 			}, nil
 		case ".round(":
 			a0, err := evalArg(0)
@@ -23127,22 +24010,49 @@ func evalNumericBitSetJoinerComparatorMethodPainless(mName string, recVal any, a
 
 	// BigInteger methods
 	if bi, ok := recVal.(*painlessBigInteger); ok && bi != nil && bi.val != nil {
+		if err := checkBigIntBitsPainless(bi.val); err != nil {
+			return nil, err
+		}
 		switch mName {
 		case ".subtract(":
 			a0, err := evalArg(0)
 			if err != nil {
 				return nil, err
 			}
-			if other, okO := parsePainlessBigInteger(a0); okO {
-				return newPainlessBigInteger(new(big.Int).Sub(bi.val, other.val)), nil
+			other, biErr := parsePainlessBigIntegerChecked(a0)
+			if biErr != nil {
+				return nil, biErr
+			}
+			if other != nil {
+				res := new(big.Int).Sub(bi.val, other.val)
+				if err := checkBigIntBitsPainless(res); err != nil {
+					return nil, err
+				}
+				return newPainlessBigInteger(res), nil
 			}
 		case ".multiply(":
 			a0, err := evalArg(0)
 			if err != nil {
 				return nil, err
 			}
-			if other, okO := parsePainlessBigInteger(a0); okO {
-				return newPainlessBigInteger(new(big.Int).Mul(bi.val, other.val)), nil
+			other, biErr := parsePainlessBigIntegerChecked(a0)
+			if biErr != nil {
+				return nil, biErr
+			}
+			if other != nil {
+				if bi.val.Sign() != 0 && other.val.Sign() != 0 {
+					if int64(bi.val.BitLen()-1)+int64(other.val.BitLen()-1) >= int64(maxBigIntBits) {
+						return nil, &painlessExceptionError{
+							exType:  "ArithmeticException",
+							message: fmt.Sprintf("BigInteger product exceeds maximum bit length (%d)", maxBigIntBits),
+						}
+					}
+				}
+				res := new(big.Int).Mul(bi.val, other.val)
+				if err := checkBigIntBitsPainless(res); err != nil {
+					return nil, err
+				}
+				return newPainlessBigInteger(res), nil
 			}
 		case ".divide(":
 			a0, err := evalArg(0)
@@ -23260,13 +24170,39 @@ func evalNumericBitSetJoinerComparatorMethodPainless(mName string, recVal any, a
 			if err != nil {
 				return nil, err
 			}
-			if nf, okN := toFloat64(a0); okN {
-				exp := int64(nf)
-				if exp < 0 {
-					return nil, &painlessExceptionError{exType: "ArithmeticException", message: "Negative exponent"}
-				}
-				return newPainlessBigInteger(new(big.Int).Exp(bi.val, big.NewInt(exp), nil)), nil
+			exp, errE := extractInt64BoundArgPainless(a0)
+			if errE != nil {
+				return nil, errE
 			}
+			if exp < 0 {
+				return nil, &painlessExceptionError{exType: "ArithmeticException", message: "Negative exponent"}
+			}
+			if bi.val.Sign() == 0 {
+				if exp == 0 {
+					return newPainlessBigInteger(big.NewInt(1)), nil
+				}
+				return newPainlessBigInteger(big.NewInt(0)), nil
+			}
+			if bi.val.Cmp(big.NewInt(1)) == 0 {
+				return newPainlessBigInteger(big.NewInt(1)), nil
+			}
+			if bi.val.Cmp(big.NewInt(-1)) == 0 {
+				if exp&1 == 1 {
+					return newPainlessBigInteger(big.NewInt(-1)), nil
+				}
+				return newPainlessBigInteger(big.NewInt(1)), nil
+			}
+			if exp > int64(maxBigIntBits) || int64(bi.val.BitLen()-1)*exp >= int64(maxBigIntBits) {
+				return nil, &painlessExceptionError{
+					exType:  "ArithmeticException",
+					message: fmt.Sprintf("BigInteger pow(%d) exceeds maximum bit length (%d)", exp, maxBigIntBits),
+				}
+			}
+			res := new(big.Int).Exp(bi.val, big.NewInt(exp), nil)
+			if err := checkBigIntBitsPainless(res); err != nil {
+				return nil, err
+			}
+			return newPainlessBigInteger(res), nil
 		case ".min(":
 			a0, err := evalArg(0)
 			if err != nil {
@@ -23318,77 +24254,130 @@ func evalNumericBitSetJoinerComparatorMethodPainless(mName string, recVal any, a
 			if err != nil {
 				return nil, err
 			}
-			if nf, okN := toFloat64(a0); okN {
-				n := int(nf)
-				if n >= 0 {
-					return newPainlessBigInteger(new(big.Int).Lsh(bi.val, uint(n))), nil // #nosec G115 -- checked n >= 0
-				}
-				return newPainlessBigInteger(new(big.Int).Rsh(bi.val, uint(-n))), nil // #nosec G115 -- checked n < 0
+			n64, errN := extractInt64BoundArgPainless(a0)
+			if errN != nil {
+				return nil, errN
 			}
+			if n64 < -int64(maxBigIntBits) || n64 > int64(maxBigIntBits) {
+				return nil, &painlessExceptionError{
+					exType:  "ArithmeticException",
+					message: fmt.Sprintf("BigInteger shiftLeft(%d) exceeds maximum bit length (%d)", n64, maxBigIntBits),
+				}
+			}
+			if n64 >= 0 {
+				if bi.val.Sign() != 0 && int64(bi.val.BitLen())+n64 > int64(maxBigIntBits) {
+					return nil, &painlessExceptionError{
+						exType:  "ArithmeticException",
+						message: fmt.Sprintf("BigInteger shiftLeft result exceeds maximum bit length (%d)", maxBigIntBits),
+					}
+				}
+				return newPainlessBigInteger(new(big.Int).Lsh(bi.val, uint(n64))), nil // #nosec G115 -- checked 0 <= n64 <= maxBigIntBits
+			}
+			return newPainlessBigInteger(new(big.Int).Rsh(bi.val, uint(-n64))), nil // #nosec G115 -- checked -maxBigIntBits <= n64 < 0
 		case ".shiftRight(":
 			a0, err := evalArg(0)
 			if err != nil {
 				return nil, err
 			}
-			if nf, okN := toFloat64(a0); okN {
-				n := int(nf)
-				if n >= 0 {
-					return newPainlessBigInteger(new(big.Int).Rsh(bi.val, uint(n))), nil // #nosec G115 -- checked n >= 0
-				}
-				return newPainlessBigInteger(new(big.Int).Lsh(bi.val, uint(-n))), nil // #nosec G115 -- checked n < 0
+			n64, errN := extractInt64BoundArgPainless(a0)
+			if errN != nil {
+				return nil, errN
 			}
+			if n64 < -int64(maxBigIntBits) || n64 > int64(maxBigIntBits) {
+				return nil, &painlessExceptionError{
+					exType:  "ArithmeticException",
+					message: fmt.Sprintf("BigInteger shiftRight(%d) exceeds maximum bit length (%d)", n64, maxBigIntBits),
+				}
+			}
+			if n64 >= 0 {
+				return newPainlessBigInteger(new(big.Int).Rsh(bi.val, uint(n64))), nil // #nosec G115 -- checked 0 <= n64 <= maxBigIntBits
+			}
+			mag := -n64
+			if bi.val.Sign() != 0 && int64(bi.val.BitLen())+mag > int64(maxBigIntBits) {
+				return nil, &painlessExceptionError{
+					exType:  "ArithmeticException",
+					message: fmt.Sprintf("BigInteger shiftRight result exceeds maximum bit length (%d)", maxBigIntBits),
+				}
+			}
+			return newPainlessBigInteger(new(big.Int).Lsh(bi.val, uint(mag))), nil // #nosec G115 -- checked 0 < mag <= maxBigIntBits
 		case ".testBit(":
 			a0, err := evalArg(0)
 			if err != nil {
 				return nil, err
 			}
-			if nf, okN := toFloat64(a0); okN {
-				n := int(nf)
-				if n < 0 {
-					return nil, &painlessExceptionError{exType: "ArithmeticException", message: "Negative bit address"}
-				}
-				return bi.val.Bit(n) == 1, nil
+			n64, errN := extractInt64BoundArgPainless(a0)
+			if errN != nil {
+				return nil, errN
 			}
+			if n64 < 0 {
+				return nil, &painlessExceptionError{exType: "ArithmeticException", message: "Negative bit address"}
+			}
+			if n64 > int64(math.MaxInt32) {
+				return bi.val.Sign() < 0, nil
+			}
+			return bi.val.Bit(int(n64)) == 1, nil
 		case ".setBit(":
 			a0, err := evalArg(0)
 			if err != nil {
 				return nil, err
 			}
-			if nf, okN := toFloat64(a0); okN {
-				n := int(nf)
-				if n < 0 {
-					return nil, &painlessExceptionError{exType: "ArithmeticException", message: "Negative bit address"}
-				}
-				return newPainlessBigInteger(new(big.Int).SetBit(bi.val, n, 1)), nil
+			n64, errN := extractInt64BoundArgPainless(a0)
+			if errN != nil {
+				return nil, errN
 			}
+			if n64 < 0 {
+				return nil, &painlessExceptionError{exType: "ArithmeticException", message: "Negative bit address"}
+			}
+			if n64 >= int64(maxBigIntBits) {
+				return nil, &painlessExceptionError{
+					exType:  "ArithmeticException",
+					message: fmt.Sprintf("BigInteger setBit(%d) exceeds maximum bit length (%d)", n64, maxBigIntBits),
+				}
+			}
+			return newPainlessBigInteger(new(big.Int).SetBit(bi.val, int(n64), 1)), nil
 		case ".clearBit(":
 			a0, err := evalArg(0)
 			if err != nil {
 				return nil, err
 			}
-			if nf, okN := toFloat64(a0); okN {
-				n := int(nf)
-				if n < 0 {
-					return nil, &painlessExceptionError{exType: "ArithmeticException", message: "Negative bit address"}
-				}
-				return newPainlessBigInteger(new(big.Int).SetBit(bi.val, n, 0)), nil
+			n64, errN := extractInt64BoundArgPainless(a0)
+			if errN != nil {
+				return nil, errN
 			}
+			if n64 < 0 {
+				return nil, &painlessExceptionError{exType: "ArithmeticException", message: "Negative bit address"}
+			}
+			if n64 >= int64(maxBigIntBits) {
+				return nil, &painlessExceptionError{
+					exType:  "ArithmeticException",
+					message: fmt.Sprintf("BigInteger clearBit(%d) exceeds maximum bit length (%d)", n64, maxBigIntBits),
+				}
+			}
+			return newPainlessBigInteger(new(big.Int).SetBit(bi.val, int(n64), 0)), nil
 		case ".flipBit(":
 			a0, err := evalArg(0)
 			if err != nil {
 				return nil, err
 			}
-			if nf, okN := toFloat64(a0); okN {
-				n := int(nf)
-				if n < 0 {
-					return nil, &painlessExceptionError{exType: "ArithmeticException", message: "Negative bit address"}
-				}
-				b := uint(1)
-				if bi.val.Bit(n) == 1 {
-					b = 0
-				}
-				return newPainlessBigInteger(new(big.Int).SetBit(bi.val, n, b)), nil
+			n64, errN := extractInt64BoundArgPainless(a0)
+			if errN != nil {
+				return nil, errN
 			}
+			if n64 < 0 {
+				return nil, &painlessExceptionError{exType: "ArithmeticException", message: "Negative bit address"}
+			}
+			if n64 >= int64(maxBigIntBits) {
+				return nil, &painlessExceptionError{
+					exType:  "ArithmeticException",
+					message: fmt.Sprintf("BigInteger flipBit(%d) exceeds maximum bit length (%d)", n64, maxBigIntBits),
+				}
+			}
+			n := int(n64)
+			b := uint(1)
+			if bi.val.Bit(n) == 1 {
+				b = 0
+			}
+			return newPainlessBigInteger(new(big.Int).SetBit(bi.val, n, b)), nil
 		case ".isProbablePrime(":
 			a0, err := evalArg(0)
 			if err != nil {
@@ -23431,6 +24420,7 @@ func evalNumericBitSetJoinerComparatorMethodPainless(mName string, recVal any, a
 
 	// BitSet methods
 	if bs, ok := recVal.(*painlessBitSet); ok && bs != nil {
+		budget := getOrInitEvalBudget(params)
 		switch mName {
 		case ".and(":
 			a0, err := evalArg(0)
@@ -23447,7 +24437,9 @@ func evalNumericBitSetJoinerComparatorMethodPainless(mName string, recVal any, a
 				return nil, err
 			}
 			if other, okO := a0.(*painlessBitSet); okO {
-				bs.xor(other)
+				if err := bs.xor(other); err != nil {
+					return nil, err
+				}
 				return nil, nil
 			}
 		case ".andNot(":
@@ -23468,9 +24460,18 @@ func evalNumericBitSetJoinerComparatorMethodPainless(mName string, recVal any, a
 			if err0 != nil {
 				return nil, err0
 			}
-			f0, _ := toFloat64(a0)
+			i0, errI0 := extractInt64BoundArgPainless(a0)
+			if errI0 != nil {
+				return nil, errI0
+			}
 			if len(args) == 1 {
-				if err := bs.clearBit(int(f0)); err != nil {
+				if i0 >= int64(maxBitSetBits) {
+					return nil, &painlessExceptionError{
+						exType:  "IllegalArgumentException",
+						message: fmt.Sprintf("BitSet bitIndex %d exceeds maximum (%d)", i0, maxBitSetBits),
+					}
+				}
+				if err := bs.clearBit(int(i0)); err != nil {
 					return nil, err
 				}
 				return nil, nil
@@ -23479,8 +24480,17 @@ func evalNumericBitSetJoinerComparatorMethodPainless(mName string, recVal any, a
 			if err1 != nil {
 				return nil, err1
 			}
-			f1, _ := toFloat64(a1)
-			if err := bs.setRange(int(f0), int(f1), false); err != nil {
+			i1, errI1 := extractInt64BoundArgPainless(a1)
+			if errI1 != nil {
+				return nil, errI1
+			}
+			if i1 > int64(maxBitSetBits) {
+				return nil, &painlessExceptionError{
+					exType:  "IllegalArgumentException",
+					message: fmt.Sprintf("BitSet toIndex %d exceeds maximum (%d)", i1, maxBitSetBits),
+				}
+			}
+			if err := bs.setRange(int(i0), int(i1), false, budget); err != nil {
 				return nil, err
 			}
 			return nil, nil
@@ -23489,9 +24499,18 @@ func evalNumericBitSetJoinerComparatorMethodPainless(mName string, recVal any, a
 			if err0 != nil {
 				return nil, err0
 			}
-			f0, _ := toFloat64(a0)
+			i0, errI0 := extractInt64BoundArgPainless(a0)
+			if errI0 != nil {
+				return nil, errI0
+			}
 			if len(args) == 1 {
-				if err := bs.flip(int(f0)); err != nil {
+				if i0 >= int64(maxBitSetBits) {
+					return nil, &painlessExceptionError{
+						exType:  "IllegalArgumentException",
+						message: fmt.Sprintf("BitSet bitIndex %d exceeds maximum (%d)", i0, maxBitSetBits),
+					}
+				}
+				if err := bs.flip(int(i0)); err != nil {
 					return nil, err
 				}
 				return nil, nil
@@ -23500,8 +24519,17 @@ func evalNumericBitSetJoinerComparatorMethodPainless(mName string, recVal any, a
 			if err1 != nil {
 				return nil, err1
 			}
-			f1, _ := toFloat64(a1)
-			if err := bs.flipRange(int(f0), int(f1)); err != nil {
+			i1, errI1 := extractInt64BoundArgPainless(a1)
+			if errI1 != nil {
+				return nil, errI1
+			}
+			if i1 > int64(maxBitSetBits) {
+				return nil, &painlessExceptionError{
+					exType:  "IllegalArgumentException",
+					message: fmt.Sprintf("BitSet toIndex %d exceeds maximum (%d)", i1, maxBitSetBits),
+				}
+			}
+			if err := bs.flipRange(int(i0), int(i1), budget); err != nil {
 				return nil, err
 			}
 			return nil, nil

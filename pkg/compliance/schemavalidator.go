@@ -258,12 +258,26 @@ func (v *SpecSchemaValidator) HasEndpoint(endpoint string) bool {
 }
 
 func isSpecWildcardTargetSegment(seg string) bool {
-	switch seg {
-	case "_all", "_local", "_master":
-		return true
-	default:
+	if !strings.HasPrefix(seg, "_") {
 		return false
 	}
+	sawWildcard := false
+	for _, part := range strings.Split(seg, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			return false
+		}
+		if !strings.HasPrefix(part, "_") {
+			continue
+		}
+		switch part {
+		case "_all", "_local", "_master", "_nodes", "_primary", "_replica", "_only_nodes", "_data", "_ingest":
+			sawWildcard = true
+		default:
+			return false
+		}
+	}
+	return sawWildcard
 }
 
 func matchSpecURLTemplate(method, cleanPath string, tmpl specURLTemplate) (bool, int) {
@@ -411,11 +425,18 @@ func (v *SpecSchemaValidator) ValidateHTTPResponse(endpoint string, statusCode i
 			if err := v.validateNamedType("$", root, errBaseDef, nil, 0); err != nil {
 				return fmt.Errorf("endpoint %q (HTTP %d): %w", epName, statusCode, err)
 			}
-			if statusField, hasStatus := obj["status"]; hasStatus {
-				if sf, sOk := toNumericFloat64(statusField); sOk && int(sf) != statusCode {
-					return fmt.Errorf("endpoint %q ($): HTTP %d error payload status=%d mismatch", epName, statusCode, int(sf))
-				}
-			}
+		} else if _, hasStatus := obj["status"]; !hasStatus {
+			return fmt.Errorf("endpoint %q ($): expected \"status\" field in HTTP %d error response", epName, statusCode)
+		}
+	}
+	if statusField, hasStatus := obj["status"]; hasStatus {
+		integral, _ := isIntegralNumber(statusField)
+		sf, sOk := toNumericFloat64(statusField)
+		if !integral || !sOk {
+			return fmt.Errorf("endpoint %q ($.status): expected integral HTTP status code on HTTP %d response, got %s", epName, statusCode, describeJSONKind(statusField))
+		}
+		if int(sf) != statusCode {
+			return fmt.Errorf("endpoint %q ($): HTTP %d error payload status=%d mismatch", epName, statusCode, int(sf))
 		}
 	}
 	return nil
@@ -469,8 +490,9 @@ func (v *SpecSchemaValidator) ValidateEndpointResponse(endpoint string, payload 
 		return fmt.Errorf("endpoint %q ($): empty response payload for typed response %s", epName, respKey.String())
 	}
 
-	if acceptsNonJSONMedia(ep.ResponseMediaType) && (!acceptsJSONMedia(ep.ResponseMediaType) ||
-		((trimmedPayload[0] != '{' && trimmedPayload[0] != '[') && respDef.Body != nil && respDef.Body.Value != nil && respDef.Body.Value.Kind == "array_of")) {
+	if acceptsNonJSONMedia(ep.ResponseMediaType) && trimmedPayload[0] != '{' && trimmedPayload[0] != '[' &&
+		(!acceptsJSONMedia(ep.ResponseMediaType) ||
+			(respDef.Body != nil && respDef.Body.Value != nil && respDef.Body.Value.Kind == "array_of")) {
 		return nil
 	}
 
@@ -478,7 +500,7 @@ func (v *SpecSchemaValidator) ValidateEndpointResponse(endpoint string, payload 
 	if err != nil {
 		// Some endpoints (e.g. cat.*) support both text/plain and application/json;
 		// if payload is non-JSON and text media is permitted, validate as string when applicable.
-		if acceptsNonJSONMedia(ep.ResponseMediaType) {
+		if acceptsNonJSONMedia(ep.ResponseMediaType) && trimmedPayload[0] != '{' && trimmedPayload[0] != '[' {
 			bindings := unboundGenericBindings(respDef.Generics)
 			if textErr := v.validateNamedType("$", string(payload), respDef, bindings, 0); textErr == nil {
 				return nil

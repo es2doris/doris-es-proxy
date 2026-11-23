@@ -1185,9 +1185,13 @@ func computeExactESTSDBRoutingHashBytes(pairs []tsdbRoutingPair) [4]byte {
 }
 
 func parseTSDBTypedDimensionScalar(fieldName string, b FieldBinding, raw any) (tsdbTypedDimension, error) {
+	return parseTSDBTypedDimensionScalarWithSchema(nil, fieldName, b, raw)
+}
+
+func parseTSDBTypedDimensionScalarWithSchema(idx *IndexSchema, fieldName string, b FieldBinding, raw any) (tsdbTypedDimension, error) {
 	if arr, isArr := raw.([]any); isArr {
 		if len(arr) == 1 {
-			return parseTSDBTypedDimensionScalar(fieldName, b, arr[0])
+			return parseTSDBTypedDimensionScalarWithSchema(idx, fieldName, b, arr[0])
 		}
 		return tsdbTypedDimension{}, fmt.Errorf("mapper_parsing_exception: time_series_dimension field [%s] does not accept arrays with multiple values", fieldName)
 	}
@@ -1294,7 +1298,7 @@ func parseTSDBTypedDimensionScalar(fieldName string, b FieldBinding, raw any) (t
 		}, nil
 
 	case "date", "date_nanos":
-		ms, ok := parseTSDBTimestampMillis(raw, esType, b.Format)
+		ms, ok := parseTSDBTimestampMillisWithLocale(raw, esType, b.Format, b.Locale)
 		if !ok {
 			return tsdbTypedDimension{}, fmt.Errorf("mapper_parsing_exception: failed to parse date dimension field [%s]", fieldName)
 		}
@@ -1309,8 +1313,8 @@ func parseTSDBTypedDimensionScalar(fieldName string, b FieldBinding, raw any) (t
 
 	default:
 		s := fmt.Sprintf("%v", raw)
-		if b.LowercaseNormalizer {
-			s = strings.ToLower(s)
+		if b.NormalizerName != "" || b.LowercaseNormalizer {
+			s = normalizeValueForBinding(s, b, idx)
 		}
 		return tsdbTypedDimension{
 			name:     fieldName,
@@ -1406,6 +1410,7 @@ func extractTSDBTypedDimensionsFromDoc(idx *IndexSchema, doc map[string]any) ([]
 					IgnoreAbove:         b.IgnoreAbove,
 					IgnoreMalformed:     b.IgnoreMalformed,
 					LowercaseNormalizer: b.LowercaseNormalizer,
+					NormalizerName:      b.NormalizerName,
 				}
 				tds, err := flattenAndParseTSDBDimensionValues(idx, fullName, subB, subCandidates)
 				if err != nil {
@@ -1958,6 +1963,36 @@ func tokenizeSAYTAnalyzer(input, analyzer string) []string {
 
 // --- `date_nanos` Strict `[1970-01-01T00:00:00Z, 2262-04-11T23:47:16.854775807Z]` Bounds Validation ---
 
+// StructuredParseError carries Elasticsearch bulk/document parse error metadata
+// including `caused_by` type and reason (`80_date_nanos.yml`).
+type StructuredParseError struct {
+	ErrType        string
+	Reason         string
+	CausedByType   string
+	CausedByReason string
+}
+
+func (e *StructuredParseError) Error() string {
+	if e.CausedByReason != "" {
+		return fmt.Sprintf("%s: %s: %s", e.ErrType, e.Reason, e.CausedByReason)
+	}
+	return fmt.Sprintf("%s: %s", e.ErrType, e.Reason)
+}
+
+// CausedBy returns ES `caused_by` error metadata (`type`, `reason`) for bulk/index error envelopes.
+func (e *StructuredParseError) CausedBy() (errType, reason string) {
+	return e.CausedByType, e.CausedByReason
+}
+
+func newDateNanosStructuredError(fieldPath, causedReason string) error {
+	return &StructuredParseError{
+		ErrType:        "document_parsing_exception",
+		Reason:         fmt.Sprintf("failed to parse field [%s] of type [date_nanos]", fieldPath),
+		CausedByType:   "illegal_argument_exception",
+		CausedByReason: causedReason,
+	}
+}
+
 func diagnoseDateNanosOutOfRangeError(raw any, b FieldBinding) error {
 	if b.ESType != "date_nanos" || raw == nil {
 		return nil
@@ -1969,12 +2004,24 @@ func diagnoseDateNanosOutOfRangeError(raw any, b FieldBinding) error {
 	// Check integer epoch values directly
 	if iv, err := strconv.ParseInt(rawStr, 10, 64); err == nil {
 		if iv < 0 {
-			return esWireError(fmt.Sprintf(
-				"document_parsing_exception: failed to parse field [%s] of type [date_nanos]: date[%s] is before the epoch in 1970 and cannot be stored in nanosecond resolution",
-				b.ESFieldPath, rawStr,
-			))
+			return newDateNanosStructuredError(
+				b.ESFieldPath,
+				fmt.Sprintf("date[%s] is before the epoch in 1970 and cannot be stored in nanosecond resolution", rawStr),
+			)
+		}
+		if (strings.TrimSpace(b.Format) == "" || strings.Contains(b.Format, "epoch_millis")) && iv > 9223372036854 {
+			return newDateNanosStructuredError(
+				b.ESFieldPath,
+				fmt.Sprintf("date[%s] is after 2262-04-11T23:47:16.854775807 and cannot be stored in nanosecond resolution", rawStr),
+			)
 		}
 		return nil
+	}
+	if u, err := strconv.ParseUint(rawStr, 10, 64); err == nil && u > uint64(math.MaxInt64) {
+		return newDateNanosStructuredError(
+			b.ESFieldPath,
+			fmt.Sprintf("date[%s] is after 2262-04-11T23:47:16.854775807 and cannot be stored in nanosecond resolution", rawStr),
+		)
 	}
 	// Check parsed ISO / custom format date before 1970 or after 2262-04-11T23:47:16.854775807Z
 	checkTime := func(t time.Time) error {
@@ -1982,16 +2029,16 @@ func diagnoseDateNanosOutOfRangeError(raw any, b FieldBinding) error {
 		sec := ut.Unix()
 		nsec := int64(ut.Nanosecond())
 		if sec < 0 {
-			return esWireError(fmt.Sprintf(
-				"document_parsing_exception: failed to parse field [%s] of type [date_nanos]: date[%s] is before the epoch in 1970 and cannot be stored in nanosecond resolution",
-				b.ESFieldPath, rawStr,
-			))
+			return newDateNanosStructuredError(
+				b.ESFieldPath,
+				fmt.Sprintf("date[%s] is before the epoch in 1970 and cannot be stored in nanosecond resolution", rawStr),
+			)
 		}
 		if sec > 9223372036 || (sec == 9223372036 && nsec > 854775807) {
-			return esWireError(fmt.Sprintf(
-				"document_parsing_exception: failed to parse field [%s] of type [date_nanos]: date[%s] is after 2262-04-11T23:47:16.854775807 and cannot be stored in nanosecond resolution",
-				b.ESFieldPath, rawStr,
-			))
+			return newDateNanosStructuredError(
+				b.ESFieldPath,
+				fmt.Sprintf("date[%s] is after 2262-04-11T23:47:16.854775807 and cannot be stored in nanosecond resolution", rawStr),
+			)
 		}
 		return nil
 	}
@@ -2001,6 +2048,10 @@ func diagnoseDateNanosOutOfRangeError(raw any, b FieldBinding) error {
 		}
 	}
 	if strings.TrimSpace(b.Format) != "" {
+		candStr := rawStr
+		if strings.TrimSpace(b.Locale) != "" {
+			candStr = translateLocalizedDateInput(candStr, b.Locale)
+		}
 		for _, rawFmt := range strings.Split(b.Format, "||") {
 			fmtPart := strings.TrimSpace(rawFmt)
 			if fmtPart == "" {
@@ -2008,7 +2059,7 @@ func diagnoseDateNanosOutOfRangeError(raw any, b FieldBinding) error {
 			}
 			layout := ESDateFormatToGoLayout(fmtPart)
 			if layout != "" {
-				if t, err := time.Parse(layout, rawStr); err == nil {
+				if t, err := time.Parse(layout, candStr); err == nil {
 					if rErr := checkTime(t); rErr != nil {
 						return rErr
 					}

@@ -277,6 +277,31 @@ type QueryGraphSegment struct {
 	Alternatives  [][]string
 }
 
+// IsSingleTermAlternatives reports whether every alternative in the segment consists of a single term.
+func (s QueryGraphSegment) IsSingleTermAlternatives() bool {
+	if len(s.Alternatives) == 0 {
+		return false
+	}
+	for _, alt := range s.Alternatives {
+		if len(alt) != 1 {
+			return false
+		}
+	}
+	return true
+}
+
+// SingleTermAlternatives returns all single-term alternatives in the segment when IsSingleTermAlternatives is true.
+func (s QueryGraphSegment) SingleTermAlternatives() []string {
+	if !s.IsSingleTermAlternatives() {
+		return nil
+	}
+	terms := make([]string, 0, len(s.Alternatives))
+	for _, alt := range s.Alternatives {
+		terms = append(terms, alt[0])
+	}
+	return terms
+}
+
 // QueryTokenGraph represents the positioned token graph produced by AnalyzeForQuery.
 type QueryTokenGraph struct {
 	Tokens                   []QueryToken

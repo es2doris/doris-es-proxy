@@ -97,11 +97,10 @@ func BuildQuotedDorisJSONPaths(field string) (nestedPath string, dottedLiteralPa
 func sqlRuntimeSourceJSONTypeIsArrayExpr(field string) string {
 	nestedPath, dottedPath, hasDot := BuildQuotedDorisJSONPaths(field)
 	if !hasDot {
-		return fmt.Sprintf("JSON_TYPE(json_extract(`_source`, %s)) = 'ARRAY'", quoteStr(nestedPath))
+		return fmt.Sprintf("JSON_TYPE(TRY_CAST(`_source` AS JSON), %s) = 'ARRAY'", quoteStr(nestedPath))
 	}
-	jsonExpr := fmt.Sprintf("COALESCE(json_extract(`_source`, %s), json_extract(`_source`, %s))",
-		quoteStr(nestedPath), quoteStr(dottedPath))
-	return fmt.Sprintf("JSON_TYPE(%s) = 'ARRAY'", jsonExpr)
+	return fmt.Sprintf("(JSON_TYPE(TRY_CAST(`_source` AS JSON), %s) = 'ARRAY' OR (JSON_TYPE(TRY_CAST(`_source` AS JSON), %s) IS NULL AND JSON_TYPE(TRY_CAST(`_source` AS JSON), %s) = 'ARRAY'))",
+		quoteStr(nestedPath), quoteStr(nestedPath), quoteStr(dottedPath))
 }
 
 // sqlRuntimeSourceDateMillisExpr coerces a scalar runtime string expression `scalarStr` to
@@ -204,16 +203,86 @@ func coerceJSONNumberExactIntOrUintR63(num json.Number) any {
 	return raw
 }
 
+func hasTopLevelOrderByInUnionBranchR64(sqlStr string) bool {
+	trimmed := strings.TrimSpace(sqlStr)
+	if trimmed == "" {
+		return false
+	}
+	depth := 0
+	inS, inD, inB := false, false, false
+	for i := 0; i < len(trimmed); i++ {
+		c := trimmed[i]
+		if inS {
+			if c == '\\' && i+1 < len(trimmed) {
+				i++
+				continue
+			}
+			if c == '\'' {
+				if i+1 < len(trimmed) && trimmed[i+1] == '\'' {
+					i++
+					continue
+				}
+				inS = false
+			}
+			continue
+		}
+		if inD {
+			if c == '\\' && i+1 < len(trimmed) {
+				i++
+				continue
+			}
+			if c == '"' {
+				inD = false
+			}
+			continue
+		}
+		if inB {
+			if c == '`' {
+				if i+1 < len(trimmed) && trimmed[i+1] == '`' {
+					i++
+					continue
+				}
+				inB = false
+			}
+			continue
+		}
+		switch c {
+		case '\'':
+			inS = true
+		case '"':
+			inD = true
+		case '`':
+			inB = true
+		case '(':
+			depth++
+		case ')':
+			if depth > 0 {
+				depth--
+			}
+		default:
+			if depth == 0 && i+len("ORDER BY") <= len(trimmed) && strings.EqualFold(trimmed[i:i+len("ORDER BY")], "ORDER BY") {
+				prevOK := i == 0 || trimmed[i-1] == ' ' || trimmed[i-1] == ')' || trimmed[i-1] == '\n' || trimmed[i-1] == '\t'
+				nextPos := i + len("ORDER BY")
+				nextOK := nextPos == len(trimmed) || trimmed[nextPos] == ' ' || trimmed[nextPos] == '\n' || trimmed[nextPos] == '\t'
+				if prevOK && nextOK {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
 // wrapUnionBranchesWithOuterOrderByR63 parenthesizes individual `UNION ALL` branches that carry
-// a trailing `ORDER BY ... LIMIT ...` on `_agg_sub_<N>` when multiple branches are joined by
-// `UNION ALL` so MySQL / Apache Doris 4.1.3 parses each branch's `ORDER BY` unambiguously (`C-14`).
+// a trailing `ORDER BY ... LIMIT ...` when multiple branches are joined by `UNION ALL` so
+// MySQL / Apache Doris 4.1.3 parses each branch's `ORDER BY` unambiguously (`C-14`).
 func wrapUnionBranchesWithOuterOrderByR63(branches []string) string {
 	if len(branches) <= 1 {
 		return strings.Join(branches, "\nUNION ALL\n")
 	}
 	wrapped := make([]string, len(branches))
 	for i, b := range branches {
-		if strings.Contains(b, ") `_agg_sub_") && strings.Contains(b[strings.LastIndex(b, ") `_agg_sub_"):], " ORDER BY ") {
+		if (strings.Contains(b, ") `_agg_sub_") && strings.Contains(b[strings.LastIndex(b, ") `_agg_sub_"):], " ORDER BY ")) || hasTopLevelOrderByInUnionBranchR64(b) {
 			wrapped[i] = "(" + b + ")"
 		} else {
 			wrapped[i] = b
@@ -519,13 +588,14 @@ func (t *Transpiler) compileAnalyzedTextTermPredicateR63(
 	// If the field's index analyzer lowercases tokens (e.g. `standard`), an unanalyzed `term`
 	// query containing uppercase characters cannot match unless `case_insensitive: true`.
 	effAn := strings.TrimSpace(b.Analyzer)
-	if t.Opts.AnalysisConfig != nil {
-		effAn = t.Opts.AnalysisConfig.ResolveIndexAnalyzer(effAn)
+	effCfg := t.effectiveAnalysisConfig()
+	if effCfg != nil {
+		effAn = effCfg.ResolveIndexAnalyzer(effAn)
 	}
 	if effAn == "" {
 		effAn = "standard"
 	}
-	anCaseSens, isWS := analyzerCaseAndWhitespaceFlagsR63(effAn, t.Opts.AnalysisConfig, analysis.Options{})
+	anCaseSens, isWS := analyzerCaseAndWhitespaceFlagsR63(effAn, effCfg, analysis.Options{})
 	if !anCaseSens {
 		if !caseInsensitive && rawStr != strings.ToLower(rawStr) {
 			return "FALSE", "", false, true
@@ -838,9 +908,9 @@ func ConstantKeywordScalarExprR63(rawCol string, field string, b schema.FieldBin
 	nestedPath, dottedPath, hasDot := BuildQuotedDorisJSONPaths(pathField)
 	var absentCond string
 	if !hasDot {
-		absentCond = fmt.Sprintf("JSON_TYPE(json_extract(`_source`, %s)) IS NULL", quoteStr(nestedPath))
+		absentCond = fmt.Sprintf("JSON_TYPE(TRY_CAST(`_source` AS JSON), %s) IS NULL", quoteStr(nestedPath))
 	} else {
-		absentCond = fmt.Sprintf("(JSON_TYPE(json_extract(`_source`, %s)) IS NULL AND JSON_TYPE(json_extract(`_source`, %s)) IS NULL)",
+		absentCond = fmt.Sprintf("(JSON_TYPE(TRY_CAST(`_source` AS JSON), %s) IS NULL AND JSON_TYPE(TRY_CAST(`_source` AS JSON), %s) IS NULL)",
 			quoteStr(nestedPath), quoteStr(dottedPath))
 	}
 	constLit := quoteStr(fmt.Sprintf("%v", b.ConstantValue))
@@ -1193,6 +1263,17 @@ func (t *Transpiler) appendRound63GroupedSubAggBranch(
 			return true
 		}
 	}
+	if stSpec := subSpec.EffectiveStats(); stSpec != nil && stSpec.Script == nil && strings.TrimSpace(stSpec.Field) != "" {
+		_, b := t.resolveFieldInNestedCtx(stSpec.Field, false, nctx)
+		if b.ESType == "aggregate_metric_double" {
+			t.appendSubAggregateMetricDoubleR63(branches, subFull+"._stats_count", "COUNT", stSpec.Field, b, parentBucketExpr, fromClause, whereClause)
+			t.appendSubAggregateMetricDoubleR63(branches, subFull+"._stats_min", "MIN", stSpec.Field, b, parentBucketExpr, fromClause, whereClause)
+			t.appendSubAggregateMetricDoubleR63(branches, subFull+"._stats_max", "MAX", stSpec.Field, b, parentBucketExpr, fromClause, whereClause)
+			t.appendSubAggregateMetricDoubleR63(branches, subFull+"._stats_sum", "SUM", stSpec.Field, b, parentBucketExpr, fromClause, whereClause)
+			t.appendSubAggregateMetricDoubleR63(branches, subFull+"._stats_avg", "AVG", stSpec.Field, b, parentBucketExpr, fromClause, whereClause)
+			return true
+		}
+	}
 	if subSpec.CountedTerms == nil {
 		return false
 	}
@@ -1310,8 +1391,8 @@ func buildSingleGeoScalarLatLonSQLR63(rawStrExpr string) (latExpr, lonExpr strin
 	geoJSONLat := fmt.Sprintf("COALESCE(CAST(element_at(TRY_CAST(%s AS ARRAY<DOUBLE>), 2) AS DOUBLE), TRY_CAST(REGEXP_EXTRACT(%s, '^[[[:space:]]*([-+0-9.eE]+)[[:space:]]*,[[:space:]]*([-+0-9.eE]+)', 2) AS DOUBLE))", coordsJSON, coordsJSON)
 	objLat := fmt.Sprintf("TRY_CAST(json_extract_string(%s, '$.\"lat\"') AS DOUBLE)", rawStrExpr)
 	objLon := fmt.Sprintf("TRY_CAST(json_extract_string(%s, '$.\"lon\"') AS DOUBLE)", rawStrExpr)
-	arrLon := fmt.Sprintf("CASE WHEN JSON_TYPE(%s) = 'ARRAY' THEN CAST(element_at(TRY_CAST(%s AS ARRAY<DOUBLE>), 1) AS DOUBLE) ELSE NULL END", rawStrExpr, rawStrExpr)
-	arrLat := fmt.Sprintf("CASE WHEN JSON_TYPE(%s) = 'ARRAY' THEN CAST(element_at(TRY_CAST(%s AS ARRAY<DOUBLE>), 2) AS DOUBLE) ELSE NULL END", rawStrExpr, rawStrExpr)
+	arrLon := fmt.Sprintf("CASE WHEN JSON_TYPE(TRY_CAST(%s AS JSON), '$') = 'ARRAY' THEN TRY_CAST(element_at(TRY_CAST(%s AS ARRAY<DOUBLE>), 1) AS DOUBLE) ELSE NULL END", rawStrExpr, rawStrExpr)
+	arrLat := fmt.Sprintf("CASE WHEN JSON_TYPE(TRY_CAST(%s AS JSON), '$') = 'ARRAY' THEN TRY_CAST(element_at(TRY_CAST(%s AS ARRAY<DOUBLE>), 2) AS DOUBLE) ELSE NULL END", rawStrExpr, rawStrExpr)
 	csvLat := fmt.Sprintf("CASE WHEN %s NOT LIKE '[%%' AND %s NOT REGEXP '^[[:space:]]*[A-Za-z{]' AND LOCATE(',', %s) > 0 THEN TRY_CAST(SPLIT_PART(%s, ',', 1) AS DOUBLE) ELSE NULL END", rawStrExpr, rawStrExpr, rawStrExpr, rawStrExpr)
 	csvLon := fmt.Sprintf("CASE WHEN %s NOT LIKE '[%%' AND %s NOT REGEXP '^[[:space:]]*[A-Za-z{]' AND LOCATE(',', %s) > 0 THEN TRY_CAST(SPLIT_PART(%s, ',', 2) AS DOUBLE) ELSE NULL END", rawStrExpr, rawStrExpr, rawStrExpr, rawStrExpr)
 	wktAnyLon := fmt.Sprintf("TRY_CAST(REGEXP_EXTRACT(TRIM(%s), '(?i)^[A-Z]+[[:space:]]*[(]+[[:space:]]*([-+0-9.eE]+)[[:space:]]+([-+0-9.eE]+)', 1) AS DOUBLE)", rawStrExpr)
@@ -1527,7 +1608,7 @@ func buildVectorSourceFallbackColExprR63(resolvedField string, b schema.FieldBin
 	for _, seg := range segs {
 		_, _ = fmt.Fprintf(&pathBuilder, "[%s]", quoteStr(seg))
 	}
-	return fmt.Sprintf("COALESCE(CAST(`_doc`%s AS ARRAY<FLOAT>), %s)", pathBuilder.String(), srcVecExpr)
+	return fmt.Sprintf("COALESCE(TRY_CAST(`_doc`%s AS ARRAY<FLOAT>), %s)", pathBuilder.String(), srcVecExpr)
 }
 
 func extractNestedKNNAndPostFiltersR63(q *esast.Query) (kq *esast.KNNQuery, postClauses []esast.Query, postMustNot []esast.Query, ok bool) {

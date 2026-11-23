@@ -499,6 +499,11 @@ func TestRound63_WP2_MVT_SQL_EQL_Downsample_ESQL_SLM_ILM(t *testing.T) {
 		t.Fatalf("ValidateESQLIPStringRound63 unexpected result")
 	}
 
+	recESQLMeta := doRound63ModulesReq(t, h, http.MethodPost, "/_query", `{"query":"FROM esql_t METADATA _id | LIMIT 1"}`)
+	if recESQLMeta.Code != http.StatusOK || !strings.Contains(recESQLMeta.Body.String(), `"_id"`) {
+		t.Fatalf("ES|QL METADATA failed: %d %s", recESQLMeta.Code, recESQLMeta.Body.String())
+	}
+
 	// --- 6. SLM, ILM & XPack Usage ---
 	recUsage := doRound63ModulesReq(t, h, http.MethodGet, "/_xpack/usage", "")
 	if recUsage.Code != http.StatusOK || !strings.Contains(recUsage.Body.String(), `"meta":1`) {
