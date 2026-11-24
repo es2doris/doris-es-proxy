@@ -133,6 +133,16 @@ func (b *DorisSQLBackend) SetLogSQL(enabled bool) {
 	b.logSQL.Store(enabled)
 }
 
+func isDorisSchemaChangeRetryableError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "schema_change") ||
+		strings.Contains(msg, "is not normal") ||
+		strings.Contains(msg, "doing schema change")
+}
+
 func (b *DorisSQLBackend) ExecDDL(ctx context.Context, ddl string) error {
 	if b.logSQL.Load() {
 		log.Printf("[Doris DDL]\n%s", ddl)
@@ -140,8 +150,36 @@ func (b *DorisSQLBackend) ExecDDL(ctx context.Context, ddl string) error {
 	if b.db == nil {
 		return nil
 	}
-	_, err := b.db.ExecContext(ctx, ddl)
-	return err
+	var lastErr error
+	const maxAttempts = 8
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			if lastErr != nil {
+				return lastErr
+			}
+			return err
+		}
+		_, err := b.db.ExecContext(ctx, ddl)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if !isDorisSchemaChangeRetryableError(err) || attempt == maxAttempts-1 {
+			return err
+		}
+		backoff := time.Duration(50<<uint(attempt)) * time.Millisecond
+		if backoff > 500*time.Millisecond {
+			backoff = 500 * time.Millisecond
+		}
+		timer := time.NewTimer(backoff)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return lastErr
+		case <-timer.C:
+		}
+	}
+	return lastErr
 }
 
 // NormalizeDorisSQL rewrites internal transpiler markers (`__DORIS_DELETE_SIGN__`, `'\x1f'`,

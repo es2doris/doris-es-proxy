@@ -120,7 +120,10 @@ jobs:
         env:
           SCORECARD_JSON: "/tmp/live-doris-yaml-scorecard-shard-${{ matrix.shard }}.json"
         run: |
-          docker logs doris-fe-be --tail 200
+          docker logs doris-fe-be --tail 200 || true
+          docker exec doris-fe-be sh -c 'mysql -h 127.0.0.1 -P 9030 -u root -e "SHOW BACKENDS\G"' || mysql -h 127.0.0.1 -P 9030 -u root -e "SHOW BACKENDS\G" || true
+          docker exec doris-fe-be sh -c 'for f in /opt/apache-doris/be/log/be.out /opt/apache-doris/be/log/be.WARNING; do [ -f "$f" ] && echo "=== $f ===" && tail -n 120 "$f"; done' || true
+          dmesg -T | grep -iE 'oom|killed|segfault' | tail -n 20 || true
           if [ -f /tmp/doris-es-proxy.log ]; then
             echo "=== doris-es-proxy.log ==="
             tail -n 200 /tmp/doris-es-proxy.log

@@ -12339,8 +12339,14 @@ func (s *Server) executeSearchRequest(
 			emptyStatsAggs := make(map[string]bool)
 			emptySubStatsBuckets := make(map[string]bool)
 			statsCounts := make(map[string]int64)
+			avgWeights := make(map[string]int64)
 			for _, r := range aggRows {
-				if r.BucketKey == "_stats_count" || r.BucketKey == "_sstats_count" {
+				if r.BucketKey == "_avg_weight" {
+					avgWeights[r.AggName] = r.effectiveCount()
+				} else if strings.HasSuffix(r.AggName, "._avg_weight") {
+					baseAgg := strings.TrimSuffix(r.AggName, "._avg_weight")
+					avgWeights[baseAgg+"\x00"+r.BucketKey] = r.effectiveCount()
+				} else if r.BucketKey == "_stats_count" || r.BucketKey == "_sstats_count" {
 					statsCounts[r.AggName] = r.effectiveCount()
 					if r.effectiveCount() == 0 {
 						emptyStatsAggs[r.AggName] = true
@@ -12354,6 +12360,9 @@ func (s *Server) executeSearchRequest(
 				}
 			}
 			for _, r := range aggRows {
+				if r.BucketKey == "_avg_weight" || strings.HasSuffix(r.AggName, "._avg_weight") {
+					continue
+				}
 				if idxQueryTotal == 0 && r.AggName != "__meta_total" && r.AggName != "__meta_query_total" && req.PostFilter == nil && !isUnderGlobalAgg(effAggs, r.AggName) {
 					continue
 				}
@@ -12401,6 +12410,17 @@ func (s *Server) executeSearchRequest(
 						if metricField != "" && r.effectiveValue() == 0 && !metricAggHasMissing(spec) && !indexSchemaHasField(idxSchema, metricField) {
 							continue
 						}
+						if r.Weight == 0 && spec.Avg != nil {
+							var aw int64
+							if r.BucketKey == "_metric" {
+								aw = avgWeights[r.AggName]
+							} else {
+								aw = avgWeights[r.AggName+"\x00"+r.BucketKey]
+							}
+							if aw > 0 {
+								r.Weight = aw
+							}
+						}
 						parent := parentBucketAggPath(effAggs, r.AggName)
 						var w int64
 						if parent != "" {
@@ -12432,7 +12452,12 @@ func (s *Server) executeSearchRequest(
 				allAggRows = append(allAggRows, r)
 			}
 		} else {
-			allAggRows = append(allAggRows, aggRows...)
+			for _, r := range aggRows {
+				if r.BucketKey == "_avg_weight" || strings.HasSuffix(r.AggName, "._avg_weight") {
+					continue
+				}
+				allAggRows = append(allAggRows, r)
+			}
 		}
 
 		idxTookMs := time.Since(idxStart).Milliseconds()
@@ -14122,7 +14147,8 @@ func mergeMultiIndexAggRows(rows []AggRow, totalHits int64, totalQueryHits int64
 	}
 	var rawValueRows []AggRow
 	for _, r := range rows {
-		if r.AggName == "__meta_total" || r.AggName == "__meta_query_total" {
+		if r.AggName == "__meta_total" || r.AggName == "__meta_query_total" ||
+			r.BucketKey == "_avg_weight" || strings.HasSuffix(r.AggName, "._avg_weight") {
 			continue
 		}
 		if strings.HasPrefix(r.AggName, transpiler.RawValuesAggPrefix) {
@@ -29675,13 +29701,16 @@ func emitRuntimeMatrixStatsAggRowsWithServerWave3R63(srv *Server, fullAggName, m
 	for i := 0; i < n; i++ {
 		cov[i] = make([]float64, n)
 	}
+	m2 := make([]float64, n)
 	m3 := make([]float64, n)
 	m4 := make([]float64, n)
 	for _, r := range rows {
 		for i := 0; i < n; i++ {
 			di := r[i] - means[i]
-			m3[i] += di * di * di
-			m4[i] += di * di * di * di
+			di2 := di * di
+			m2[i] += di2
+			m3[i] += di2 * di
+			m4[i] += di2 * di2
 			for j := i; j < n; j++ {
 				dj := r[j] - means[j]
 				cov[i][j] += di * dj
@@ -29708,7 +29737,9 @@ func emitRuntimeMatrixStatsAggRowsWithServerWave3R63(srv *Server, fullAggName, m
 			popStd := math.Sqrt(math.Max(0, popVar))
 			if popStd > 0 {
 				skewness = (m3[i] / float64(docCount)) / (popStd * popStd * popStd)
-				kurtosis = (m4[i] / float64(docCount)) / (popVar * popVar)
+			}
+			if m2[i] > 0 {
+				kurtosis = (float64(docCount) * m4[i]) / (m2[i] * m2[i])
 			}
 		}
 		covMap := make(map[string]any, n)

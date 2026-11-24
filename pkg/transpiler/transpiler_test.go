@@ -2084,9 +2084,9 @@ func TestRound33TranspilerDateFormatsNestedNullsMultiTermsMsmAndLucene(t *testin
 	if !strings.Contains(plan.HitsSQL, "3.5000") || strings.Contains(plan.HitsSQL, "%e%x%a%c%t%") {
 		t.Fatalf("expected *^3.5 boost and exact~0 exact match in HitsSQL, got:\n%s", plan.HitsSQL)
 	}
-	// F10: nested sort mode median with filter uses array_median(array_map(..., array_filter(...)))
-	if !strings.Contains(plan.HitsSQL, "array_median(") || !strings.Contains(plan.HitsSQL, "array_filter(") {
-		t.Fatalf("expected array_median with array_filter for filtered nested sort in HitsSQL, got:\n%s", plan.HitsSQL)
+	// F10: nested sort mode median with filter uses flat array_median(array_map(_el -> IF(...)))
+	if !strings.Contains(plan.HitsSQL, "array_median(") || !strings.Contains(plan.HitsSQL, "TRY_CAST(NULL AS BIGINT)") {
+		t.Fatalf("expected flat array_median with filtered NULL guard for nested sort in HitsSQL, got:\n%s", plan.HitsSQL)
 	}
 }
 
@@ -2164,9 +2164,11 @@ func TestRound34NestedParentCorrelationTermsCaseInsensitiveLuceneEscapedRangeMus
 	if err != nil {
 		t.Fatalf("BuildSearchPlan failed: %v", err)
 	}
-	// F1: multi-level nested query parent correlation
-	if !strings.Contains(plan.HitsSQL, "json_extract_string(_el2, '$._parent_id') = json_extract_string(_el, '$._nested_id')") {
-		t.Fatalf("expected multi-level nested parent correlation in HitsSQL, got:\n%s", plan.HitsSQL)
+	// F1: multi-level nested query parent correlation via flat set intersection (no nested lambdas)
+	if !strings.Contains(plan.HitsSQL, "ARRAY_INTERSECT(") ||
+		!strings.Contains(plan.HitsSQL, "$._parent_id") ||
+		!strings.Contains(plan.HitsSQL, "$._nested_id") {
+		t.Fatalf("expected flat multi-level nested parent correlation in HitsSQL, got:\n%s", plan.HitsSQL)
 	}
 	// F4: case_insensitive terms on scalar and array columns
 	if !strings.Contains(plan.HitsSQL, "lower(`f__status`) IN ('active', 'pending')") ||

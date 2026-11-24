@@ -106,7 +106,7 @@ func buildRangeBucketExplodeSQL(
 		loIdxBig = fmt.Sprintf("TRY_CAST(FLOOR((%s) / %s) AS BIGINT)", effLoSQL, ivLit)
 		hiIdxBig = fmt.Sprintf("TRY_CAST(FLOOR((%s) / %s) AS BIGINT)", effHiSQL, ivLit)
 		countInt := fmt.Sprintf("CAST(LEAST(GREATEST((%s) - (%s) + 1, 0), 10001) AS INT)", hiIdxBig, loIdxBig)
-		fromClause = fmt.Sprintf("%s LATERAL VIEW EXPLODE(ARRAY_RANGE(0, %s)) `_rng_t` AS `_off`", baseTable, countInt)
+		fromClause = appendLateralViewToFromClause(baseTable, fmt.Sprintf("LATERAL VIEW EXPLODE(ARRAY_RANGE(0, %s)) `_rng_t` AS `_off`", countInt))
 		bucketValSQL = fmt.Sprintf("(TRY_CAST((%s) + TRY_CAST(`_off` AS BIGINT) AS DOUBLE) * %s)", loIdxBig, ivLit)
 		return fromClause, bucketValSQL
 	}
@@ -115,7 +115,7 @@ func buildRangeBucketExplodeSQL(
 	loIdxBig = fmt.Sprintf("TRY_CAST(FLOOR(((%s) - (%s)) / (%s)) AS BIGINT)", effLoSQL, offLit, ivLit)
 	hiIdxBig = fmt.Sprintf("TRY_CAST(FLOOR(((%s) - (%s)) / (%s)) AS BIGINT)", effHiSQL, offLit, ivLit)
 	countInt := fmt.Sprintf("CAST(LEAST(GREATEST((%s) - (%s) + 1, 0), 10001) AS INT)", hiIdxBig, loIdxBig)
-	fromClause = fmt.Sprintf("%s LATERAL VIEW EXPLODE(ARRAY_RANGE(0, %s)) `_rng_t` AS `_off`", baseTable, countInt)
+	fromClause = appendLateralViewToFromClause(baseTable, fmt.Sprintf("LATERAL VIEW EXPLODE(ARRAY_RANGE(0, %s)) `_rng_t` AS `_off`", countInt))
 	bucketValSQL = fmt.Sprintf("(TRY_CAST((%s) + TRY_CAST(`_off` AS BIGINT) AS DOUBLE) * (%s) + (%s))", loIdxBig, ivLit, offLit)
 	return fromClause, bucketValSQL
 }
@@ -968,7 +968,7 @@ func (t *Transpiler) appendRound62GroupedSubAggBranch(
 		if nctx == nil && (b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield) && b.EffectiveArrayColumn(true) != "" {
 			arrCol := b.EffectiveArrayColumn(true)
 			keySQL, sortHexSQL, validCond := buildIPPrefixBucketKeySQL(subElemAlias, ipSpec)
-			subFrom := fmt.Sprintf("%s LATERAL VIEW EXPLODE(`%s`) %s AS %s", fromClause, arrCol, subTableAlias, subElemAlias)
+			subFrom := appendLateralViewToFromClause(fromClause, fmt.Sprintf("LATERAL VIEW EXPLODE(`%s`) %s AS %s", arrCol, subTableAlias, subElemAlias))
 			subWhere := fmt.Sprintf("(%s) AND %s IS NOT NULL AND %s", whereClause, subElemAlias, validCond)
 			combKey := fmt.Sprintf("CONCAT(CAST(%s AS STRING), '\\x1f', CAST(%s AS STRING))", parentBucketExpr, keySQL)
 			*branches = append(*branches, fmt.Sprintf(

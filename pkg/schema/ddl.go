@@ -292,7 +292,26 @@ func GenerateAlterTableDDL(oldSchema, newSchema *IndexSchema) []string {
 		))
 	}
 
-	return stmts
+	return partitionAlterDDLColumnsBeforeIndexes(stmts)
+}
+
+// partitionAlterDDLColumnsBeforeIndexes orders DROP INDEX / MODIFY COLUMN / ADD COLUMN
+// statements ahead of ADD INDEX statements so batched ALTER TABLE execution in Doris 4.x
+// does not stall later column changes behind asynchronous index builds.
+func partitionAlterDDLColumnsBeforeIndexes(stmts []string) []string {
+	if len(stmts) <= 1 {
+		return stmts
+	}
+	nonIdx := make([]string, 0, len(stmts))
+	idx := make([]string, 0, len(stmts))
+	for _, stmt := range stmts {
+		if strings.Contains(strings.ToUpper(stmt), " ADD INDEX ") {
+			idx = append(idx, stmt)
+			continue
+		}
+		nonIdx = append(nonIdx, stmt)
+	}
+	return append(nonIdx, idx...)
 }
 
 func markRawMappingUpgradedArray(spec *esast.MappingSpec, esFieldPath string, sourceJSONPath []string) {
@@ -431,7 +450,7 @@ func GeneratePromoteVariantFieldDDL(s *IndexSchema, esFieldPath string, esType s
 			}
 		}
 	}
-	return stmts
+	return partitionAlterDDLColumnsBeforeIndexes(stmts)
 }
 
 func escapeDDLComment(s string) string {

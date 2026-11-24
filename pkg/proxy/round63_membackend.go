@@ -29,6 +29,7 @@ import (
 	"strings"
 	"time"
 	"unicode"
+	"unicode/utf8"
 )
 
 // ----------------------------------------------------------------------------
@@ -129,7 +130,227 @@ func checkStrictNereidsSQLTypesR63Mem(sqlStr string) error {
 	if err := checkStaticStrictCastLiteralsR65Mem(sqlStr); err != nil {
 		return err
 	}
+	// Reject nested higher-order lambda expressions (lambda `->` inside another lambda body), which
+	// trigger SIGSEGV in Apache Doris 4.1.3 BE `VLambdaFunctionExpr::execute_column`.
+	if hasNestedLambdaExprR66Mem(sqlStr) {
+		return fmt.Errorf("errCode = 2, detailMessage = Unexpected exception: nested lambda expressions are forbidden on Apache Doris 4.1.3 BE")
+	}
+	// Reject `LATERAL VIEW` appearing after a `JOIN` within the same `SELECT` scope (Doris Nereids syntax error).
+	if hasLateralViewAfterJoinR66Mem(sqlStr) {
+		return fmt.Errorf("errCode = 2, detailMessage = Syntax error: LATERAL VIEW cannot follow JOIN in Doris 4.1.3 Nereids")
+	}
 	return nil
+}
+
+func containsSQLArrowOutsideLiteralsR66Mem(s string) bool {
+	inSingle, inDouble, inBacktick := false, false, false
+	for i := 0; i < len(s)-1; i++ {
+		c := s[i]
+		if inSingle {
+			if c == '\\' && i+1 < len(s) {
+				i++
+				continue
+			}
+			if c == '\'' {
+				if i+1 < len(s) && s[i+1] == '\'' {
+					i++
+					continue
+				}
+				inSingle = false
+			}
+			continue
+		}
+		if inDouble {
+			if c == '\\' && i+1 < len(s) {
+				i++
+				continue
+			}
+			if c == '"' {
+				inDouble = false
+			}
+			continue
+		}
+		if inBacktick {
+			if c == '`' {
+				if i+1 < len(s) && s[i+1] == '`' {
+					i++
+					continue
+				}
+				inBacktick = false
+			}
+			continue
+		}
+		switch c {
+		case '\'':
+			inSingle = true
+		case '"':
+			inDouble = true
+		case '`':
+			inBacktick = true
+		case '-':
+			if s[i+1] == '>' {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func hasNestedLambdaExprR66Mem(sqlStr string) bool {
+	if !strings.Contains(sqlStr, "->") {
+		return false
+	}
+	upper := strings.ToUpper(sqlStr)
+	for _, kw := range []string{"ARRAY_EXISTS(", "ARRAY_MAP(", "ARRAY_FILTER(", "ARRAY_SORT(", "ARRAY_FIRST(", "ARRAY_LAST("} {
+		searchFrom := 0
+		for {
+			idx := strings.Index(upper[searchFrom:], kw)
+			if idx < 0 {
+				break
+			}
+			absIdx := searchFrom + idx
+			searchFrom = absIdx + len(kw)
+			if absIdx > 0 && isIdentByteR63Mem(upper[absIdx-1]) {
+				continue
+			}
+			if isOffsetInsideQuotesOrBackticksR63Mem(sqlStr, absIdx) {
+				continue
+			}
+			openParen := absIdx + len(kw) - 1
+			closeParen := memFindMatchingParen(sqlStr, openParen)
+			if closeParen <= openParen {
+				continue
+			}
+			callBody := sqlStr[openParen+1 : closeParen]
+			parts := splitTopLevelArgs(callBody)
+			if len(parts) == 0 {
+				continue
+			}
+			lambdaArg := parts[0]
+			if arrowIdx := findTopLevelLambdaArrowR66Mem(lambdaArg); arrowIdx > 0 {
+				lambdaBody := lambdaArg[arrowIdx+2:]
+				if containsSQLArrowOutsideLiteralsR66Mem(lambdaBody) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func findTopLevelLambdaArrowR66Mem(s string) int {
+	depth := 0
+	inSingle, inDouble, inBacktick := false, false, false
+	for i := 0; i < len(s)-1; i++ {
+		c := s[i]
+		if inSingle {
+			if c == '\\' && i+1 < len(s) {
+				i++
+				continue
+			}
+			if c == '\'' {
+				if i+1 < len(s) && s[i+1] == '\'' {
+					i++
+					continue
+				}
+				inSingle = false
+			}
+			continue
+		}
+		if inDouble {
+			if c == '\\' && i+1 < len(s) {
+				i++
+				continue
+			}
+			if c == '"' {
+				inDouble = false
+			}
+			continue
+		}
+		if inBacktick {
+			if c == '`' {
+				if i+1 < len(s) && s[i+1] == '`' {
+					i++
+					continue
+				}
+				inBacktick = false
+			}
+			continue
+		}
+		switch c {
+		case '\'':
+			inSingle = true
+		case '"':
+			inDouble = true
+		case '`':
+			inBacktick = true
+		case '(':
+			depth++
+		case ')':
+			if depth > 0 {
+				depth--
+			}
+		case '-':
+			if depth == 0 && s[i+1] == '>' {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
+var (
+	reLateralViewAfterJoinR66 = regexp.MustCompile(`(?is)\bJOIN\b.*\bLATERAL\s+VIEW\b`)
+	reUnionAllSplitR66        = regexp.MustCompile(`(?i)\bUNION\s+ALL\b`)
+)
+
+func hasLateralViewAfterJoinR66Mem(sqlStr string) bool {
+	if !strings.Contains(strings.ToUpper(sqlStr), "LATERAL VIEW") {
+		return false
+	}
+	cleaned := blankQuotedAndBacktickedR65Mem(sqlStr, false)
+	// Strip parenthesized subqueries iteratively from inside out so we only check JOIN ... LATERAL VIEW
+	// within the same SELECT FROM scope.
+	var checkScope func(seg string) bool
+	checkScope = func(seg string) bool {
+		var topLevel strings.Builder
+		depth := 0
+		subStart := -1
+		for i := 0; i < len(seg); i++ {
+			ch := seg[i]
+			if ch == '(' {
+				if depth == 0 {
+					subStart = i + 1
+					topLevel.WriteByte(' ')
+				}
+				depth++
+				continue
+			}
+			if ch == ')' {
+				if depth > 0 {
+					depth--
+					if depth == 0 && subStart >= 0 {
+						if checkScope(seg[subStart:i]) {
+							return true
+						}
+						subStart = -1
+					}
+				}
+				continue
+			}
+			if depth == 0 {
+				topLevel.WriteByte(ch)
+			}
+		}
+		topStr := topLevel.String()
+		for _, unionPart := range reUnionAllSplitR66.Split(topStr, -1) {
+			if reLateralViewAfterJoinR66.MatchString(unionPart) {
+				return true
+			}
+		}
+		return false
+	}
+	return checkScope(cleaned)
 }
 
 func blankQuotedAndBacktickedR65Mem(s string, keepBackticks bool) string {
@@ -1145,6 +1366,20 @@ func evalColumnFuncR63Mem(row map[string]any, colExpr string) (any, bool) {
 		return nil, true
 	}
 
+	// 8b. `SPLIT_BY_STRING(strExpr, sepLit)`
+	if strings.HasPrefix(upper, "SPLIT_BY_STRING(") && strings.HasSuffix(colExpr, ")") && hasMatchingOuterParens(colExpr, len("SPLIT_BY_STRING")) {
+		args := splitTopLevelArgs(colExpr[len("SPLIT_BY_STRING(") : len(colExpr)-1])
+		if len(args) >= 2 {
+			sv := resolveColumnValue(row, strings.TrimSpace(args[0]))
+			if sv == nil {
+				return nil, true
+			}
+			sep := unquoteSQLLiteral(strings.TrimSpace(args[1]))
+			return strings.Split(fmt.Sprintf("%v", sv), sep), true
+		}
+		return nil, true
+	}
+
 	// 9. `OCTET_LENGTH(strExpr)` (byte length for `_size` metadata mapper)
 	if strings.HasPrefix(upper, "OCTET_LENGTH(") && strings.HasSuffix(colExpr, ")") && hasMatchingOuterParens(colExpr, len("OCTET_LENGTH")) {
 		arg := strings.TrimSpace(colExpr[len("OCTET_LENGTH(") : len(colExpr)-1])
@@ -1178,6 +1413,193 @@ func evalColumnFuncR63Mem(row map[string]any, colExpr string) (any, bool) {
 			}
 			pow := math.Pow(10, float64(scale))
 			return math.Trunc(fv*pow) / pow, true
+		}
+		return nil, true
+	}
+
+	// 11. `IFNULL(expr, fallback)`
+	if strings.HasPrefix(upper, "IFNULL(") && strings.HasSuffix(colExpr, ")") && hasMatchingOuterParens(colExpr, len("IFNULL")) {
+		args := splitTopLevelArgs(colExpr[len("IFNULL(") : len(colExpr)-1])
+		if len(args) == 2 {
+			if v := resolveColumnValue(row, strings.TrimSpace(args[0])); v != nil {
+				return v, true
+			}
+			return resolveColumnValue(row, strings.TrimSpace(args[1])), true
+		}
+		return nil, true
+	}
+
+	// 12. `ARRAY_REMOVE(arrExpr, targetExpr)`
+	if strings.HasPrefix(upper, "ARRAY_REMOVE(") && strings.HasSuffix(colExpr, ")") && hasMatchingOuterParens(colExpr, len("ARRAY_REMOVE")) {
+		args := splitTopLevelArgs(colExpr[len("ARRAY_REMOVE(") : len(colExpr)-1])
+		if len(args) == 2 {
+			arrVal := resolveColumnValue(row, strings.TrimSpace(args[0]))
+			targetArg := strings.TrimSpace(args[1])
+			if arrVal == nil || strings.EqualFold(targetArg, "NULL") {
+				return nil, true
+			}
+			targetVal := resolveColumnValue(row, targetArg)
+			if targetVal == nil {
+				return nil, true
+			}
+			targetStr := fmt.Sprintf("%v", targetVal)
+			var elems []any
+			switch v := arrVal.(type) {
+			case []any:
+				elems = v
+			case []string:
+				elems = make([]any, len(v))
+				for i, s := range v {
+					elems[i] = s
+				}
+			default:
+				elems = asSliceOrSingle(arrVal)
+			}
+			out := make([]any, 0, len(elems))
+			for _, el := range elems {
+				if el == nil {
+					out = append(out, nil)
+					continue
+				}
+				if fmt.Sprintf("%v", el) != targetStr {
+					out = append(out, el)
+				}
+			}
+			return out, true
+		}
+		return nil, true
+	}
+
+	// 13. `ARRAY_INTERSECT(arr1, arr2, ...)`
+	if strings.HasPrefix(upper, "ARRAY_INTERSECT(") && strings.HasSuffix(colExpr, ")") && hasMatchingOuterParens(colExpr, len("ARRAY_INTERSECT")) {
+		args := splitTopLevelArgs(colExpr[len("ARRAY_INTERSECT(") : len(colExpr)-1])
+		if len(args) >= 2 {
+			sets := make([]map[string]bool, 0, len(args))
+			var firstElems []string
+			for idx, arg := range args {
+				av := resolveColumnValue(row, strings.TrimSpace(arg))
+				if av == nil {
+					return nil, true
+				}
+				ss := toStringSlice(av)
+				m := make(map[string]bool, len(ss))
+				for _, s := range ss {
+					m[s] = true
+				}
+				sets = append(sets, m)
+				if idx == 0 {
+					firstElems = ss
+				}
+			}
+			seen := make(map[string]bool)
+			out := make([]any, 0, len(firstElems))
+			for _, el := range firstElems {
+				if seen[el] {
+					continue
+				}
+				inAll := true
+				for _, m := range sets[1:] {
+					if !m[el] {
+						inAll = false
+						break
+					}
+				}
+				if inAll {
+					seen[el] = true
+					out = append(out, el)
+				}
+			}
+			return out, true
+		}
+		return nil, true
+	}
+
+	// 14. `ARRAY_UNION(arr1, arr2, ...)`
+	if strings.HasPrefix(upper, "ARRAY_UNION(") && strings.HasSuffix(colExpr, ")") && hasMatchingOuterParens(colExpr, len("ARRAY_UNION")) {
+		args := splitTopLevelArgs(colExpr[len("ARRAY_UNION(") : len(colExpr)-1])
+		if len(args) >= 2 {
+			seen := make(map[string]bool)
+			out := make([]any, 0)
+			for _, arg := range args {
+				av := resolveColumnValue(row, strings.TrimSpace(arg))
+				if av == nil {
+					return nil, true
+				}
+				for _, el := range toStringSlice(av) {
+					if !seen[el] {
+						seen[el] = true
+						out = append(out, el)
+					}
+				}
+			}
+			return out, true
+		}
+		return nil, true
+	}
+
+	// 15. `ARRAY_EXCEPT(arr1, arr2)`
+	if strings.HasPrefix(upper, "ARRAY_EXCEPT(") && strings.HasSuffix(colExpr, ")") && hasMatchingOuterParens(colExpr, len("ARRAY_EXCEPT")) {
+		args := splitTopLevelArgs(colExpr[len("ARRAY_EXCEPT(") : len(colExpr)-1])
+		if len(args) == 2 {
+			av1 := resolveColumnValue(row, strings.TrimSpace(args[0]))
+			av2 := resolveColumnValue(row, strings.TrimSpace(args[1]))
+			if av1 == nil || av2 == nil {
+				return nil, true
+			}
+			excl := make(map[string]bool)
+			for _, el := range toStringSlice(av2) {
+				excl[el] = true
+			}
+			seen := make(map[string]bool)
+			out := make([]any, 0)
+			for _, el := range toStringSlice(av1) {
+				if !excl[el] && !seen[el] {
+					seen[el] = true
+					out = append(out, el)
+				}
+			}
+			return out, true
+		}
+		return nil, true
+	}
+
+	// 16. `ARRAY_REPEAT(elemExpr, countExpr)`
+	if strings.HasPrefix(upper, "ARRAY_REPEAT(") && strings.HasSuffix(colExpr, ")") && hasMatchingOuterParens(colExpr, len("ARRAY_REPEAT")) {
+		args := splitTopLevelArgs(colExpr[len("ARRAY_REPEAT(") : len(colExpr)-1])
+		if len(args) == 2 {
+			elemVal := resolveColumnValue(row, strings.TrimSpace(args[0]))
+			cnt := int(evalNumericExpr(row, strings.TrimSpace(args[1])))
+			if cnt <= 0 {
+				return []any{}, true
+			}
+			if cnt > 100000 {
+				cnt = 100000
+			}
+			out := make([]any, cnt)
+			for i := 0; i < cnt; i++ {
+				out[i] = elemVal
+			}
+			return out, true
+		}
+		return nil, true
+	}
+
+	// 17. `INSTR(strExpr, subExpr)` (1-based UTF-8 character index, 0 when not found)
+	if strings.HasPrefix(upper, "INSTR(") && strings.HasSuffix(colExpr, ")") && hasMatchingOuterParens(colExpr, len("INSTR")) {
+		args := splitTopLevelArgs(colExpr[len("INSTR(") : len(colExpr)-1])
+		if len(args) == 2 {
+			sv := resolveColumnValue(row, strings.TrimSpace(args[0]))
+			subv := resolveColumnValue(row, strings.TrimSpace(args[1]))
+			if sv == nil || subv == nil {
+				return nil, true
+			}
+			strS := fmt.Sprintf("%v", sv)
+			subS := fmt.Sprintf("%v", subv)
+			byteIdx := strings.Index(strS, subS)
+			if byteIdx < 0 {
+				return int64(0), true
+			}
+			return int64(utf8.RuneCountInString(strS[:byteIdx]) + 1), true
 		}
 		return nil, true
 	}

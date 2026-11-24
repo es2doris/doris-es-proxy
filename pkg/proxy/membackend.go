@@ -824,7 +824,7 @@ var (
 	reAggScalarTermsMissing     = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, COALESCE\\(CAST\\((.+?) AS STRING\\), ('(?:''|[^'])*')\\) AS `_bucket_key`, CAST\\(" + docCountAggExprPatR62Mem + " AS DOUBLE\\) AS `_doc_count` FROM `base_matched`(?: WHERE (.+?))? GROUP BY `_bucket_key` ORDER BY `_doc_count` DESC, `_bucket_key` ASC LIMIT (\\d+)")
 	reAggNestedTerms            = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, (?:json_extract_string\\(`_nel`, '\\$\\.([^']+)'\\)|CAST\\((.+?) AS STRING\\)) AS `_bucket_key`, CAST\\(COUNT\\(\\*\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched` LATERAL VIEW EXPLODE\\(`([^`]+)`\\) `_nt` AS `_nel` WHERE (?:\\((.+)\\) AND )?(?:json_extract_string\\(`_nel`, '\\$\\.[^']+'\\)|CAST\\(.+? AS STRING\\)) IS NOT NULL GROUP BY `_bucket_key` ORDER BY `_doc_count` DESC, `_bucket_key` ASC LIMIT (\\d+)")
 	reAggNestedTermsMissing     = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, COALESCE\\((?:json_extract_string\\(`_nel`, '\\$\\.([^']+)'\\)|CAST\\((.+?) AS STRING\\)), ('(?:''|[^'])*')\\) AS `_bucket_key`, CAST\\(COUNT\\(\\*\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched` LATERAL VIEW EXPLODE\\((?:CASE WHEN )?`([^`]+)`(?: IS NULL.+?)?\\) `_nt` AS `_nel`(?: WHERE (.+?))? GROUP BY `_bucket_key` ORDER BY `_doc_count` DESC, `_bucket_key` ASC LIMIT (\\d+)")
-	reAggNestedMetric           = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, '(_metric|_nested_doc_count|_stats_[a-z_]+)' AS `_bucket_key`, CAST\\((?:COALESCE\\((AVG|SUM|MIN|MAX|COUNT|STDDEV_POP)\\((.+?)\\), 0\\)|(COUNT)\\((DISTINCT )?(.+?)\\)) AS DOUBLE\\) AS `_doc_count` FROM (`base_matched` LATERAL VIEW EXPLODE\\(.+?\\) `_(?:nt|t|ht)` AS `_(?:nel|elem|helem)`)(?: WHERE (.+))?$")
+	reAggNestedMetric           = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, '(_metric|_avg_weight|_nested_doc_count|_stats_[a-z_]+)' AS `_bucket_key`, CAST\\((?:COALESCE\\((AVG|SUM|MIN|MAX|COUNT|STDDEV_POP)\\((.+?)\\), 0\\)|(COUNT)\\((DISTINCT )?(.+?)\\)) AS DOUBLE\\) AS `_doc_count` FROM (`base_matched` LATERAL VIEW EXPLODE\\(.+?\\) `_(?:nt|t|ht)` AS `_(?:nel|elem|helem)`)(?: WHERE (.+))?$")
 	reAggWeightedAvg            = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, '(_metric|_stats_avg)' AS `_bucket_key`, CAST\\(COALESCE\\(SUM\\(\\((.+?)\\) \\* \\((.+?)\\)\\) / NULLIF\\(SUM\\((.+?)\\), 0\\), 0\\) AS DOUBLE\\) AS `_doc_count` FROM (`base_matched` LATERAL VIEW EXPLODE\\(.+?\\) `_ht` AS `_helem`)(?: WHERE (.+))?$")
 	reAggPercentileWeighted     = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, '([^']+)' AS `_bucket_key`, CAST\\(COALESCE\\(PERCENTILE_APPROX_WEIGHTED\\((.+?)\\), 0\\) AS DOUBLE\\) AS `_doc_count` FROM (`base_matched` LATERAL VIEW EXPLODE\\(.+?\\) `_ht` AS `_helem`)(?: WHERE (.+))?$")
 	reAggExactHistPercentile    = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, '([^']+)' AS `_bucket_key`, CAST\\(COALESCE\\(MIN\\(CASE WHEN `_cum_w` \\+ 0\\.000000001 >= ([0-9.]+) \\* `_tot_w` .+ FROM \\(SELECT (.+?) AS `_hv`, SUM\\((.+?)\\) AS `_hw` FROM (`base_matched` LATERAL VIEW EXPLODE\\(.+?\\) `_ht` AS `_helem`)(?: WHERE (.+?))? GROUP BY `_hv`\\) `_hbins`\\) `_hwcum`$")
@@ -839,7 +839,7 @@ var (
 	reAggCardScalar             = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, '_metric' AS `_bucket_key`, CAST\\(COUNT\\(DISTINCT (.+?)\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched`(?: WHERE (.+))?$")
 	reAggValueCountArray        = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, '_metric' AS `_bucket_key`, CAST\\(COUNT\\(`_elem`\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched` LATERAL VIEW EXPLODE\\(`([^`]+)`\\) `_t` AS `_elem` WHERE (?:\\((.+)\\) AND )?`_elem` IS NOT NULL$")
 	reAggValueCountScalar       = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, '_metric' AS `_bucket_key`, CAST\\(COUNT\\((.+?)\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched`(?: WHERE (.+))?$")
-	reAggMetric                 = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, '(_metric|_stats_[a-z_]+)' AS `_bucket_key`, CAST\\(COALESCE\\((AVG|SUM|MIN|MAX|COUNT|STDDEV_POP)\\((.+?)\\), 0\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched`(?: WHERE (.+))?$")
+	reAggMetric                 = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, '(_metric|_avg_weight|_stats_[a-z_]+)' AS `_bucket_key`, CAST\\(COALESCE\\((AVG|SUM|MIN|MAX|COUNT|STDDEV_POP)\\((.+?)\\), 0\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched`(?: WHERE (.+))?$")
 	reAggPercentile             = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, '([^']+)' AS `_bucket_key`, CAST\\(COALESCE\\(PERCENTILE_APPROX\\((.+?), ([0-9.]+)\\), 0\\) AS DOUBLE\\) AS `_doc_count` FROM (`base_matched`(?: LATERAL VIEW EXPLODE\\(.+?\\) `_(?:nt|t)` AS `_(?:nel|elem)`)?)(?: WHERE (.+))?$")
 	reAggPercentileRank         = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, '([^']+)' AS `_bucket_key`, CAST\\(COALESCE\\(AVG\\(CASE WHEN (.+?) <= ([0-9.eE+-]+) THEN 100\\.0 ELSE 0\\.0 END\\), 0\\) AS DOUBLE\\) AS `_doc_count` FROM (`base_matched`(?: LATERAL VIEW EXPLODE\\(.+?\\) `_(?:nt|t)` AS `_(?:nel|elem)`)?)(?: WHERE (.+))?$")
 	reAggDateHist               = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, CAST\\((?:TRY_)?CAST\\(FLOOR\\((?:\\((.+?) \\+ (-?\\d+)\\)|(.+?)) / (\\d+)\\) \\* \\d+(?: - -?\\d+)? AS BIGINT\\) AS STRING\\) AS `_bucket_key`, CAST\\((?:COUNT\\(\\*\\)|COUNT\\(DISTINCT `_id`\\)) AS DOUBLE\\) AS `_doc_count` FROM (`base_matched`(?: LATERAL VIEW EXPLODE\\((?:CASE WHEN .+ END|`[^`]+`)\\) `_(?:t|ht|rng_t)` AS `_(?:elem|helem|bidx|off)`)?) WHERE (?:(?:\\((.+)\\) AND )?(?:`[^`]+`|(?:TRY_CAST|CAST)\\([^)]+\\)|`_doc`\\[[^\\]]+\\]) IS NOT NULL|(.+?)) GROUP BY `_bucket_key` ORDER BY (?:TRY_)?CAST\\(`_bucket_key` AS BIGINT\\) ASC")
@@ -1626,8 +1626,8 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 			}
 		}
 		w := int64(len(nums))
-		if len(nums) == 0 && (fn == "AVG" || fn == "MIN" || fn == "MAX" || fn == "STDDEV_POP") {
-			if bKey == "_metric" {
+		if len(nums) == 0 && (fn == "AVG" || fn == "MIN" || fn == "MAX" || fn == "STDDEV_POP" || (hasHavingCountGtZero && bKey == "_avg_weight")) {
+			if bKey == "_metric" || (hasHavingCountGtZero && bKey == "_avg_weight") {
 				return nil
 			}
 			w = -1
@@ -2751,13 +2751,93 @@ func parseLateralViewExplodes(fromClause string) []parsedLateralExplode {
 	return out
 }
 
+func findLeadingBaseMatchedInnerJoin(fromClause string) (trimmed, prefixLateral string, openIdx int, ok bool) {
+	trimmed = strings.TrimSpace(fromClause)
+	const basePfx = "`base_matched`"
+	if !strings.HasPrefix(trimmed, basePfx) {
+		return "", "", 0, false
+	}
+	const joinMarker = " INNER JOIN ("
+	upper := strings.ToUpper(trimmed)
+	depth := 0
+	inSingle, inDouble, inBacktick := false, false, false
+	for i := len(basePfx); i <= len(trimmed)-len(joinMarker); i++ {
+		c := trimmed[i]
+		if inSingle {
+			if c == '\\' && i+1 < len(trimmed) {
+				i++
+				continue
+			}
+			if c == '\'' {
+				if i+1 < len(trimmed) && trimmed[i+1] == '\'' {
+					i++
+					continue
+				}
+				inSingle = false
+			}
+			continue
+		}
+		if inDouble {
+			if c == '\\' && i+1 < len(trimmed) {
+				i++
+				continue
+			}
+			if c == '"' {
+				inDouble = false
+			}
+			continue
+		}
+		if inBacktick {
+			if c == '`' {
+				if i+1 < len(trimmed) && trimmed[i+1] == '`' {
+					i++
+					continue
+				}
+				inBacktick = false
+			}
+			continue
+		}
+		switch c {
+		case '\'':
+			inSingle = true
+		case '"':
+			inDouble = true
+		case '`':
+			inBacktick = true
+		case '(':
+			depth++
+		case ')':
+			if depth > 0 {
+				depth--
+			}
+		default:
+			if depth == 0 && upper[i:i+len(joinMarker)] == joinMarker {
+				prefixLateral = strings.TrimSpace(trimmed[len(basePfx):i])
+				openIdx = i + len(joinMarker) - 1
+				return trimmed, prefixLateral, openIdx, true
+			}
+		}
+	}
+	return "", "", 0, false
+}
+
+func combineJoinLateralTails(prefixLateral, afterJoinTail string) string {
+	left := strings.TrimSpace(prefixLateral)
+	right := strings.TrimSpace(afterJoinTail)
+	if left == "" {
+		return right
+	}
+	if right == "" {
+		return " " + left
+	}
+	return " " + left + " " + right
+}
+
 func parseLeadingDedupJoin(fromClause string) (innerBucketExpr, bkeyAlias, innerFrom, innerWhere, tailFrom string, ok bool) {
-	const prefix = "`base_matched` INNER JOIN ("
-	trimmed := strings.TrimSpace(fromClause)
-	if !strings.HasPrefix(trimmed, prefix) {
+	trimmed, prefixLateral, openIdx, found := findLeadingBaseMatchedInnerJoin(fromClause)
+	if !found {
 		return "", "", "", "", "", false
 	}
-	openIdx := len(prefix) - 1
 	depth := 0
 	inSingleQuote := false
 	closeIdx := -1
@@ -2789,7 +2869,7 @@ func parseLeadingDedupJoin(fromClause string) (innerBucketExpr, bkeyAlias, inner
 	if tm == nil {
 		return "", "", "", "", "", false
 	}
-	tailFrom = tm[1]
+	tailFrom = combineJoinLateralTails(prefixLateral, tm[1])
 	sm := reDedupSelectInner.FindStringSubmatch(subquery)
 	if sm == nil {
 		return "", "", "", "", "", false
@@ -3420,18 +3500,25 @@ func evalWhereExpr(row map[string]any, expr string) bool {
 		}
 	}
 
-	if strings.HasPrefix(expr, "arrays_overlap(") && strings.HasSuffix(expr, ")") {
+	if strings.HasPrefix(strings.ToLower(expr), "arrays_overlap(") && strings.HasSuffix(expr, ")") {
 		inner := expr[len("arrays_overlap(") : len(expr)-1]
 		if args := splitTopLevelArgs(inner); len(args) == 2 {
 			colExpr := strings.TrimSpace(args[0])
 			listArg := strings.TrimSpace(args[1])
-			listStr := strings.TrimSuffix(strings.TrimPrefix(listArg, "["), "]")
 			targets := make(map[string]bool)
 			var targetVals []any
-			for _, part := range splitTopLevelArgs(listStr) {
-				tv := parseSQLLiteralValue(strings.TrimSpace(part))
-				targets[fmt.Sprintf("%v", tv)] = true
-				targetVals = append(targetVals, tv)
+			if strings.HasPrefix(listArg, "[") && strings.HasSuffix(listArg, "]") {
+				listStr := strings.TrimSuffix(strings.TrimPrefix(listArg, "["), "]")
+				for _, part := range splitTopLevelArgs(listStr) {
+					tv := parseSQLLiteralValue(strings.TrimSpace(part))
+					targets[fmt.Sprintf("%v", tv)] = true
+					targetVals = append(targetVals, tv)
+				}
+			} else if rhsVal := resolveColumnValue(row, listArg); rhsVal != nil {
+				for _, tv := range toStringSlice(rhsVal) {
+					targets[tv] = true
+					targetVals = append(targetVals, tv)
+				}
 			}
 			val := resolveColumnValue(row, colExpr)
 			for _, item := range toStringSlice(val) {
@@ -3448,7 +3535,7 @@ func evalWhereExpr(row map[string]any, expr string) bool {
 		}
 	}
 
-	if strings.HasPrefix(expr, "array_size(") && strings.HasSuffix(expr, ") > 0") {
+	if strings.HasPrefix(strings.ToLower(expr), "array_size(") && strings.HasSuffix(expr, ") > 0") {
 		colExpr := strings.TrimSpace(expr[len("array_size(") : len(expr)-len(") > 0")])
 		return len(toStringSlice(resolveColumnValue(row, colExpr))) > 0
 	}
@@ -4383,28 +4470,66 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 		}
 		return out
 	}
-	if strings.HasPrefix(colExpr, "array_map(") && strings.HasSuffix(colExpr, ")") {
+	if strings.HasPrefix(strings.ToLower(colExpr), "array_map(") && strings.HasSuffix(colExpr, ")") && hasMatchingOuterParens(colExpr, len("array_map")) {
 		args := splitTopLevelArgs(colExpr[len("array_map(") : len(colExpr)-1])
-		if len(args) == 2 {
+		if len(args) >= 2 {
 			lambda := strings.TrimSpace(args[0])
-			if arrowIdx := strings.Index(lambda, "->"); arrowIdx > 0 {
-				varName := strings.TrimSpace(lambda[:arrowIdx])
+			if arrowIdx := findTopLevelLambdaArrowR66Mem(lambda); arrowIdx > 0 {
+				paramPart := strings.TrimSpace(lambda[:arrowIdx])
 				bodyExpr := strings.TrimSpace(lambda[arrowIdx+2:])
-				var out []any
-				for _, elem := range toStringSlice(resolveColumnValue(row, strings.TrimSpace(args[1]))) {
-					cp := make(map[string]any, len(row)+1)
-					for k, v := range row {
-						cp[k] = v
+				var paramNames []string
+				if strings.HasPrefix(paramPart, "(") && strings.HasSuffix(paramPart, ")") {
+					for _, p := range strings.Split(paramPart[1:len(paramPart)-1], ",") {
+						paramNames = append(paramNames, strings.TrimSpace(p))
 					}
-					cp[varName] = elem
-					if mv := resolveColumnValue(cp, bodyExpr); mv != nil {
-						out = append(out, mv)
+				} else {
+					paramNames = []string{paramPart}
+				}
+				if len(paramNames) == len(args)-1 {
+					arrElems := make([][]any, len(paramNames))
+					minLen := -1
+					for k := range paramNames {
+						av := resolveColumnValue(row, strings.TrimSpace(args[1+k]))
+						if av == nil {
+							return nil
+						}
+						var elems []any
+						switch typed := av.(type) {
+						case []any:
+							elems = typed
+						case []string:
+							elems = make([]any, len(typed))
+							for i, s := range typed {
+								elems[i] = s
+							}
+						case []float64:
+							elems = make([]any, len(typed))
+							for i, f := range typed {
+								elems[i] = f
+							}
+						default:
+							elems = asSliceOrSingle(av)
+						}
+						arrElems[k] = elems
+						if minLen < 0 || len(elems) < minLen {
+							minLen = len(elems)
+						}
 					}
+					out := make([]any, 0, max(0, minLen))
+					for i := 0; i < minLen; i++ {
+						cp := make(map[string]any, len(row)+len(paramNames))
+						for k, v := range row {
+							cp[k] = v
+						}
+						for k, pName := range paramNames {
+							cp[pName] = arrElems[k][i]
+						}
+						if mv := resolveColumnValue(cp, bodyExpr); mv != nil {
+							out = append(out, mv)
+						}
+					}
+					return out
 				}
-				if len(out) == 0 {
-					return nil
-				}
-				return out
 			}
 		}
 	}
@@ -4503,10 +4628,10 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 			}
 			return bestF
 		}
-		isLargeIntMap := strings.HasPrefix(inner, "array_map(_x -> CAST(_x AS LARGEINT), ") || strings.HasPrefix(inner, "array_map(_x -> TRY_CAST(_x AS LARGEINT), ")
-		isBigIntMap := strings.HasPrefix(inner, "array_map(_x -> CAST(_x AS BIGINT), ") || strings.HasPrefix(inner, "array_map(_x -> TRY_CAST(_x AS BIGINT), ")
-		isDoubleMap := strings.HasPrefix(inner, "array_map(_x -> CAST(_x AS DOUBLE), ") || strings.HasPrefix(inner, "array_map(_x -> TRY_CAST(_x AS DOUBLE), ")
-		isNumericMap := isLargeIntMap || isBigIntMap || isDoubleMap
+		isNumericMap, mapCastType := memArrayMapCastType(inner)
+		isLargeIntMap := mapCastType == "LARGEINT"
+		isBigIntMap := mapCastType == "BIGINT" || mapCastType == "INT"
+		isDoubleMap := mapCastType == "DOUBLE"
 		if aSlice, okA := rawResolved.([]any); okA && len(aSlice) > 0 && !isNumericMap {
 			var bestAny any
 			hasAny := false
@@ -4846,7 +4971,7 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 			return res
 		}
 	}
-	if strings.HasPrefix(colExpr, "array_size(") && strings.HasSuffix(colExpr, ")") {
+	if strings.HasPrefix(strings.ToLower(colExpr), "array_size(") && strings.HasSuffix(colExpr, ")") && hasMatchingOuterParens(colExpr, len("array_size")) {
 		inner := colExpr[len("array_size(") : len(colExpr)-1]
 		val := resolveColumnValue(row, inner)
 		if val == nil {
@@ -5503,6 +5628,9 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 		}
 		if strings.HasSuffix(colExpr, " AS ARRAY<STRING>)") {
 			inner := strings.TrimSpace(colExpr[castPfxLen : len(colExpr)-len(" AS ARRAY<STRING>)")])
+			if inner == "[]" {
+				return []string{}
+			}
 			return coerceCastArrayOfStringR62Mem(resolveColumnValue(row, inner))
 		}
 		if strings.HasSuffix(colExpr, " AS ARRAY<LARGEINT>)") {
@@ -6238,6 +6366,59 @@ func toStringSlice(v any) []string {
 	default:
 		return nil
 	}
+}
+
+func memArrayMapCastType(expr string) (bool, string) {
+	trimmed := strings.TrimSpace(expr)
+	upper := strings.ToUpper(trimmed)
+	if strings.HasPrefix(upper, "ARRAY_REMOVE(") && strings.HasSuffix(trimmed, ")") && hasMatchingOuterParens(trimmed, len("ARRAY_REMOVE")) {
+		args := splitTopLevelArgs(trimmed[len("ARRAY_REMOVE(") : len(trimmed)-1])
+		if len(args) >= 1 {
+			trimmed = strings.TrimSpace(args[0])
+			upper = strings.ToUpper(trimmed)
+		}
+	}
+	if !strings.HasPrefix(upper, "ARRAY_MAP(") || !strings.HasSuffix(trimmed, ")") || !hasMatchingOuterParens(trimmed, len("ARRAY_MAP")) {
+		return false, ""
+	}
+	args := splitTopLevelArgs(trimmed[len("ARRAY_MAP(") : len(trimmed)-1])
+	if len(args) == 0 {
+		return false, ""
+	}
+	lambdaArg := strings.TrimSpace(args[0])
+	arrowIdx := findTopLevelLambdaArrowR66Mem(lambdaArg)
+	if arrowIdx < 0 {
+		return false, ""
+	}
+	body := strings.TrimSpace(lambdaArg[arrowIdx+2:])
+	for step := 0; step < 4; step++ {
+		ub := strings.ToUpper(body)
+		if strings.HasPrefix(ub, "IF(") && strings.HasSuffix(body, ")") && hasMatchingOuterParens(body, 2) {
+			ifArgs := splitTopLevelArgs(body[3 : len(body)-1])
+			if len(ifArgs) >= 2 {
+				body = strings.TrimSpace(ifArgs[1])
+				continue
+			}
+		}
+		break
+	}
+	ub := strings.ToUpper(body)
+	if strings.HasPrefix(ub, "ST_DISTANCE_SPHERE(") {
+		return true, "DOUBLE"
+	}
+	if strings.HasPrefix(ub, "CAST(") || strings.HasPrefix(ub, "TRY_CAST(") {
+		switch {
+		case strings.Contains(ub, " AS LARGEINT)"):
+			return true, "LARGEINT"
+		case strings.Contains(ub, " AS BIGINT)"):
+			return true, "BIGINT"
+		case strings.Contains(ub, " AS INT)"):
+			return true, "INT"
+		case strings.Contains(ub, " AS DOUBLE)"):
+			return true, "DOUBLE"
+		}
+	}
+	return false, ""
 }
 
 func resolveVectorValue(row map[string]any, expr string) []float64 {
@@ -7691,12 +7872,10 @@ func expandRound62LeadingJoinR62Mem(
 	currRows []map[string]any,
 	fromClause string,
 ) ([]map[string]any, string, bool) {
-	const prefix = "`base_matched` INNER JOIN ("
-	trimmed := strings.TrimSpace(fromClause)
-	if !strings.HasPrefix(trimmed, prefix) {
+	trimmed, prefixLateral, openIdx, found := findLeadingBaseMatchedInnerJoin(fromClause)
+	if !found {
 		return nil, "", false
 	}
-	openIdx := len(prefix) - 1
 	closeIdx := memFindMatchingParen(trimmed, openIdx)
 	if closeIdx <= openIdx {
 		return nil, "", false
@@ -7767,7 +7946,7 @@ func expandRound62LeadingJoinR62Mem(
 					joined = append(joined, cp)
 				}
 			}
-			return joined, tailFrom, true
+			return joined, combineJoinLateralTails(prefixLateral, tailFrom), true
 		}
 	}
 
@@ -7815,7 +7994,7 @@ func expandRound62LeadingJoinR62Mem(
 					}
 				}
 			}
-			return joined, tailFrom, true
+			return joined, combineJoinLateralTails(prefixLateral, tailFrom), true
 		}
 	}
 
@@ -7868,7 +8047,7 @@ func expandRound62LeadingJoinR62Mem(
 					joined = append(joined, cp)
 				}
 			}
-			return joined, tailFrom, true
+			return joined, combineJoinLateralTails(prefixLateral, tailFrom), true
 		}
 	}
 

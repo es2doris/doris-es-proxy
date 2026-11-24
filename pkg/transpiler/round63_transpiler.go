@@ -1202,6 +1202,12 @@ func (t *Transpiler) appendTopLevelAggregateMetricDoubleR63(
 			"SELECT %s AS `_agg_name`, %s AS `_bucket_key`, CAST(COALESCE(SUM(%s) / NULLIF(SUM(CAST(%s AS DOUBLE)), 0), 0) AS DOUBLE) AS `_doc_count` FROM `base_matched`%s HAVING SUM(%s) > 0",
 			quoteStr(aggName), quoteStr(bucketKey), sumCol, cntCol, wClause, cntCol,
 		))
+		if bucketKey == "_metric" {
+			*branches = append(*branches, fmt.Sprintf(
+				"SELECT %s AS `_agg_name`, '_avg_weight' AS `_bucket_key`, CAST(COALESCE(SUM(%s), 0) AS DOUBLE) AS `_doc_count` FROM `base_matched`%s HAVING SUM(%s) > 0",
+				quoteStr(aggName), cntCol, wClause, cntCol,
+			))
+		}
 		return true
 	}
 
@@ -1305,6 +1311,12 @@ func (t *Transpiler) appendSubAggregateMetricDoubleR63(
 			"SELECT %s AS `_agg_name`, %s AS `_bucket_key`, CAST(COALESCE(SUM(%s) / NULLIF(SUM(CAST(%s AS DOUBLE)), 0), 0) AS DOUBLE) AS `_doc_count` FROM %s WHERE %s GROUP BY `_bucket_key` HAVING SUM(%s) > 0",
 			quoteStr(subFull), parentBucketExpr, sumCol, cntCol, fromClause, whereClause, cntCol,
 		))
+		if !strings.HasSuffix(subFull, "._stats_avg") {
+			*branches = append(*branches, fmt.Sprintf(
+				"SELECT %s AS `_agg_name`, %s AS `_bucket_key`, CAST(COALESCE(SUM(%s), 0) AS DOUBLE) AS `_doc_count` FROM %s WHERE %s GROUP BY `_bucket_key` HAVING SUM(%s) > 0",
+				quoteStr(subFull+"._avg_weight"), parentBucketExpr, cntCol, fromClause, whereClause, cntCol,
+			))
+		}
 	}
 }
 
@@ -1431,7 +1443,7 @@ func (t *Transpiler) appendRound63GroupedSubAggBranch(
 		elemExpr = fmt.Sprintf("LOWER(CAST(%s AS STRING))", subElemAlias)
 	}
 	childKeyExpr := fmt.Sprintf("CONCAT_WS('\\x1f', CAST(%s AS STRING), CAST(%s AS STRING))", parentBucketExpr, elemExpr)
-	subFrom := fmt.Sprintf("%s LATERAL VIEW EXPLODE(%s) %s AS %s", fromClause, explodeTarget, subTableAlias, subElemAlias)
+	subFrom := appendLateralViewToFromClause(fromClause, fmt.Sprintf("LATERAL VIEW EXPLODE(%s) %s AS %s", explodeTarget, subTableAlias, subElemAlias))
 	subWhere := fmt.Sprintf("(%s) AND %s IS NOT NULL", whereClause, subElemAlias)
 	*subIdx++
 	*branches = append(*branches, fmt.Sprintf(
@@ -1961,8 +1973,7 @@ func (t *Transpiler) compileNestedKNNQueryR63(nq *esast.NestedQuery, scoring boo
 				simCond = fmt.Sprintf("(%s >= %s)", ipExpr, strconv.FormatFloat(*kq.Similarity, 'f', -1, 64))
 			}
 		default:
-			baseCond = fmt.Sprintf("(%s IS NOT NULL AND array_size(%s) = %d AND INNER_PRODUCT(%s, %s) > 0)", colExpr, colExpr, dim, colExpr, colExpr)
-			safeCol = fmt.Sprintf("IF(array_size(%s) = %d AND INNER_PRODUCT(%s, %s) > 0, %s, %s)", colExpr, dim, colExpr, colExpr, colExpr, vecLit)
+			baseCond, safeCol = buildCosineSafeExprsR61(colExpr, vecLit, dim)
 			cdExpr := fmt.Sprintf("COSINE_DISTANCE(%s, %s)", safeCol, vecLit)
 			rawScoreExpr = fmt.Sprintf("GREATEST((2.0 - (%s)) / 2.0, 0.0)", cdExpr)
 			if kq.Similarity != nil {
@@ -2051,14 +2062,21 @@ func (t *Transpiler) compileNestedKNNQueryR63(nq *esast.NestedQuery, scoring boo
 			}
 		}
 	}
-	if hasNestedPostFilter {
-		postChildConds = append(postChildConds, fmt.Sprintf("((%s) >= (%s) - 1e-12)", rawScoreExpr, knnBestChildExpr))
-	}
-
 	fullChildElemCond := strings.Join(postChildConds, " AND ")
 	existsFullChild := fmt.Sprintf("array_exists(_nel -> %s, `%s`)", fullChildElemCond, corrCol)
 	conds := []string{fmt.Sprintf("(`%s` IS NOT NULL AND %s)", corrCol, existsFullChild)}
 	safeConds := []string{fmt.Sprintf("(`%s` IS NOT NULL AND %s)", corrCol, existsFullChild)}
+	var postBestChildExpr string
+	if hasNestedPostFilter {
+		// Compare flat sibling `array_map` calls instead of embedding `knnBestChildExpr` inside an
+		// outer lambda; Apache Doris 4.1.3 BE segfaults on nested higher-order lambda expressions.
+		postBestChildExpr = fmt.Sprintf("ARRAY_MAX(array_map(_nel -> IF(%s, %s, NULL), `%s`))",
+			fullChildElemCond, rawScoreExpr, corrCol)
+		winningPostChildCond := fmt.Sprintf("(%s IS NOT NULL AND (%s) >= (%s) - 1e-12)",
+			postBestChildExpr, postBestChildExpr, knnBestChildExpr)
+		conds = append(conds, winningPostChildCond)
+		safeConds = append(safeConds, winningPostChildCond)
+	}
 	conds = append(conds, rootFilterConds...)
 	safeConds = append(safeConds, rootSafeFilterConds...)
 	conds = append(conds, postRootConds...)
@@ -2076,6 +2094,9 @@ func (t *Transpiler) compileNestedKNNQueryR63(nq *esast.NestedQuery, scoring boo
 	}
 	childScoreAggExpr := fmt.Sprintf("COALESCE(%s(array_map(_nel -> IF(%s, %s, NULL), `%s`)), 0.0)",
 		aggFn, fullChildElemCond, rawScoreExpr, corrCol)
+	if hasNestedPostFilter {
+		childScoreAggExpr = fmt.Sprintf("COALESCE(%s, 0.0)", postBestChildExpr)
+	}
 
 	if t.Schema != nil && t.Schema.DorisDB != "" && t.Schema.DorisTable != "" && topLimit > 0 {
 		topSubquery := fmt.Sprintf("`_id` IN (SELECT `_id` FROM (SELECT `_id`, ROW_NUMBER() OVER (ORDER BY %s DESC, `_id` ASC) AS `_rn` FROM `%s`.`%s` WHERE `__DORIS_DELETE_SIGN__` = 0 AND %s) `_knn_top` WHERE `_rn` <= %d)",
@@ -2441,7 +2462,7 @@ func buildDateRangeBucketExplodeSQLR63(fromTable, effLoSQL, effHiSQL string, ivM
 		"CAST(LEAST(GREATEST(TRY_CAST(FLOOR(((%s) - (%s)) / (%s)) AS BIGINT) + 2, 1), 2005) AS INT)",
 		effHiSQL, effLoSQL, stepExpr,
 	)
-	explodeFrom := fmt.Sprintf("%s LATERAL VIEW EXPLODE(ARRAY_RANGE(0, %s)) `_rng_t` AS `_off`", fromTable, countExpr)
+	explodeFrom := appendLateralViewToFromClause(fromTable, fmt.Sprintf("LATERAL VIEW EXPLODE(ARRAY_RANGE(0, %s)) `_rng_t` AS `_off`", countExpr))
 	valExpr := fmt.Sprintf("LEAST((%s) + TRY_CAST(`_off` AS DOUBLE) * (%s), (%s))", effLoSQL, stepExpr, effHiSQL)
 	return explodeFrom, valExpr
 }
