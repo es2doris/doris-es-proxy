@@ -7086,19 +7086,36 @@ func (s *Server) handleConnectorSyncJobClaimRound57(w http.ResponseWriter, r *ht
 	}
 
 	nowISO := time.Now().UTC().Format(time.RFC3339)
+	targetJobID := ""
+	pathParts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+	if len(pathParts) == 4 && pathParts[0] == "_connector" && pathParts[1] == "_sync_job" && pathParts[3] == "_claim" && pathParts[2] != "_claim" {
+		targetJobID = strings.TrimSpace(pathParts[2])
+	}
 	s.mu.Lock()
 	var pendingIDs []string
-	for id, job := range s.connectorSyncJobs {
-		if job == nil || job["status"] != "pending" {
-			continue
+	if targetJobID != "" {
+		job, exists := s.connectorSyncJobs[targetJobID]
+		if !exists {
+			s.mu.Unlock()
+			writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("Sync job [%s] not found", targetJobID))
+			return
 		}
-		if connFilter != "" && fmt.Sprintf("%v", job["connector_id"]) != connFilter {
-			continue
+		if job["status"] == "pending" {
+			pendingIDs = append(pendingIDs, targetJobID)
 		}
-		if len(allowedTypes) > 0 && !allowedTypes[fmt.Sprintf("%v", job["job_type"])] {
-			continue
+	} else {
+		for id, job := range s.connectorSyncJobs {
+			if job == nil || job["status"] != "pending" {
+				continue
+			}
+			if connFilter != "" && fmt.Sprintf("%v", job["connector_id"]) != connFilter {
+				continue
+			}
+			if len(allowedTypes) > 0 && !allowedTypes[fmt.Sprintf("%v", job["job_type"])] {
+				continue
+			}
+			pendingIDs = append(pendingIDs, id)
 		}
-		pendingIDs = append(pendingIDs, id)
 	}
 	sort.Slice(pendingIDs, func(i, j int) bool {
 		ci := fmt.Sprintf("%v", s.connectorSyncJobs[pendingIDs[i]]["created_at"])
@@ -7384,7 +7401,7 @@ func (s *Server) handleSecurityRound57(w http.ResponseWriter, r *http.Request, s
 		}
 
 		// PUT/POST /_security/api_key/{id}
-		if len(segs) == 3 && segs[2] != "_grant" {
+		if len(segs) == 3 && segs[2] != "_grant" && segs[2] != "grant" {
 			if r.Method != http.MethodPut && r.Method != http.MethodPost {
 				writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
 				return true
@@ -7484,7 +7501,7 @@ func (s *Server) handleSecurityQueryDSL(w http.ResponseWriter, r *http.Request, 
 		outKey = "api_keys"
 		for _, kObj := range s.securityAPIKeys {
 			if kObj != nil {
-				candidates = append(candidates, deepCloneDocMap(kObj))
+				candidates = append(candidates, cloneSanitizedSecurityAPIKeyR66(kObj))
 			}
 		}
 	case "user":
@@ -7501,7 +7518,7 @@ func (s *Server) handleSecurityQueryDSL(w http.ResponseWriter, r *http.Request, 
 		}
 		for uName, uObj := range s.securityUsers {
 			if uObj != nil {
-				cp := deepCloneDocMap(uObj)
+				cp := cloneSanitizedSecurityUserR66(uObj)
 				cp["username"] = uName
 				userMap[uName] = cp
 			}
@@ -8101,6 +8118,10 @@ func (s *Server) handleSecuritySAML(w http.ResponseWriter, r *http.Request, segs
 			return
 		}
 		xmlStr := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?><md:EntityDescriptor xmlns:md="urn:oasis:names:tc:SAML:2.0:metadata" entityID="https://doris-es-proxy/%s"/>`, html.EscapeString(realmName))
+		if r.Method == http.MethodGet {
+			writeJSON(w, http.StatusOK, map[string]any{"metadata": xmlStr})
+			return
+		}
 		w.Header().Set("Content-Type", "application/xml; charset=UTF-8")
 		w.WriteHeader(http.StatusOK)
 		// #nosec G705 -- SAML EntityDescriptor XML response with html.EscapeString-escaped entityID and application/xml Content-Type
@@ -8203,7 +8224,8 @@ func (s *Server) handleSecuritySAML(w http.ResponseWriter, r *http.Request, segs
 		})
 
 	case "complete_logout":
-		writeJSON(w, http.StatusOK, map[string]any{})
+		ensureESCompatHeaders(w, r)
+		w.WriteHeader(http.StatusOK)
 
 	default:
 		writeESError(w, http.StatusNotFound, "invalid_index_name_exception", "unknown endpoint: "+r.URL.Path)
@@ -8252,9 +8274,9 @@ func (s *Server) handleSecurityDelegatePKI(w http.ResponseWriter, r *http.Reques
 // /_scripts/{_context,_languages}, Rethrottle, Freeze/Unfreeze, Synced Flush & Migration
 // ============================================================================
 
-// handleFleetSecretsRound57 implements `POST /_fleet/secrets`, `GET /_fleet/secrets/{id}`, `DELETE /_fleet/secrets/{id}` (F9.1).
+// handleFleetSecretsRound57 implements `POST /_fleet/secret[s]`, `GET /_fleet/secret[s]/{id}`, `DELETE /_fleet/secret[s]/{id}` (F9.1).
 func (s *Server) handleFleetSecretsRound57(w http.ResponseWriter, r *http.Request, segs []string) {
-	// segs: ["_fleet", "secrets"] or ["_fleet", "secrets", "{id}"]
+	// segs: ["_fleet", "secret"|"secrets"] or ["_fleet", "secret"|"secrets", "{id}"]
 	if len(segs) == 2 {
 		if r.Method != http.MethodPost {
 			writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
@@ -8918,8 +8940,8 @@ func (s *Server) handleMigrationSystemFeaturesRound57(w http.ResponseWriter, r *
 			return
 		}
 		s.mu.RLock()
-		kibanaState := "NONE"
-		securityState := "NONE"
+		kibanaState := "NO_MIGRATION_NEEDED"
+		securityState := "NO_MIGRATION_NEEDED"
 		if len(s.migrationSystemFeatures) > 0 {
 			if migrated, hasKib := s.migrationSystemFeatures["kibana"]; hasKib && !migrated {
 				kibanaState = "MIGRATION_NEEDED"

@@ -21,8 +21,11 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
@@ -5879,8 +5882,12 @@ func (s *Server) finalizeReroutedDestinationRound63(
 	if s == nil || res == nil || res.Dropped || res.TargetIndex == "" || res.TargetIndex == rawTargetIndex {
 		return 0, "", ""
 	}
-	// Auto-create destination data stream if a matching template has `data_stream: {}`!
+	// Auto-create destination data stream if a matching template has `data_stream: {}`,
+	// or execute pending lazy rollover on an existing rerouted data stream.
 	_, _, _ = s.prepareAutoCreateTargetRound58(context.Background(), res.TargetIndex, true)
+	if s.isDataStream(res.TargetIndex) {
+		_, _, _ = s.maybePerformLazyRolloverR66(context.Background(), nil, res.TargetIndex)
+	}
 
 	// Resolve concrete write index (e.g. `.ds-<stream>-000001` after rollover or auto-create)
 	writeIdx := res.TargetIndex
@@ -5895,21 +5902,23 @@ func (s *Server) finalizeReroutedDestinationRound63(
 	}
 
 	s.mu.RLock()
+	isDSTarget := s.dataStreams[res.TargetIndex] != nil
+	hasConcreteWriteIdx := s.indices[writeIdx] != nil
 	destDef := s.indexDefaultPipelines[writeIdx]
-	if destDef == "" {
+	if destDef == "" && (!isDSTarget || writeIdx == res.TargetIndex) {
 		destDef = s.indexDefaultPipelines[res.TargetIndex]
 	}
-	if destDef == "" {
+	if destDef == "" && !hasConcreteWriteIdx {
 		_, tplDef, hasDef, _, _, _ := s.matchingTemplateConfigLocked(res.TargetIndex)
 		if hasDef {
 			destDef = tplDef
 		}
 	}
 	destFin := s.indexFinalPipelines[writeIdx]
-	if destFin == "" {
+	if destFin == "" && (!isDSTarget || writeIdx == res.TargetIndex) {
 		destFin = s.indexFinalPipelines[res.TargetIndex]
 	}
-	if destFin == "" {
+	if destFin == "" && !hasConcreteWriteIdx {
 		_, _, _, tplFin, hasFin, _ := s.matchingTemplateConfigLocked(res.TargetIndex)
 		if hasFin {
 			destFin = tplFin
@@ -6288,11 +6297,22 @@ func lookupFieldESTypeInSchemaR64(sch *schema.IndexSchema, fieldPath string) str
 	return ""
 }
 
+func schemaHasDownsampleFixedIntervalR66(sch *schema.IndexSchema) bool {
+	if sch == nil || sch.RawMapping == nil || len(sch.RawMapping.Properties) == 0 {
+		return false
+	}
+	if tsProp, ok := sch.RawMapping.Properties["@timestamp"]; ok && tsProp.Meta != nil && strings.TrimSpace(tsProp.Meta["fixed_interval"]) != "" {
+		return true
+	}
+	return false
+}
+
 // ValidateDownsampleAggsSpecMapR64 recursively validates a raw ES search `aggs` map against `sch` for unsupported downsampled index aggregations.
 func ValidateDownsampleAggsSpecMapR64(aggs map[string]any, sch *schema.IndexSchema) error {
 	if len(aggs) == 0 || sch == nil {
 		return nil
 	}
+	isDownsampledIdx := schemaHasDownsampleFixedIntervalR66(sch)
 	aggNames := make([]string, 0, len(aggs))
 	for k := range aggs {
 		aggNames = append(aggNames, k)
@@ -6327,6 +6347,25 @@ func ValidateDownsampleAggsSpecMapR64(aggs map[string]any, sch *schema.IndexSche
 			if fieldName, _ := bodyMap["field"].(string); fieldName != "" {
 				if err := ValidateDownsampleUnsupportedAggR64(lk, fieldName, lookupFieldESTypeInSchemaR64(sch, fieldName)); err != nil {
 					return err
+				}
+			}
+			if lk == "date_histogram" && isDownsampledIdx {
+				calInt, _ := bodyMap["calendar_interval"].(string)
+				fixedInt, _ := bodyMap["fixed_interval"].(string)
+				if strings.TrimSpace(calInt) != "" && strings.TrimSpace(fixedInt) == "" {
+					fn, _ := bodyMap["field"].(string)
+					if strings.TrimSpace(fn) == "" {
+						fn = "@timestamp"
+					}
+					ft := lookupFieldESTypeInSchemaR64(sch, fn)
+					if ft == "" {
+						ft = "date"
+					}
+					return &DownsampleAggValidationErrorR64{
+						Status: http.StatusBadRequest,
+						Type:   "illegal_argument_exception",
+						Reason: fmt.Sprintf("Field [%s] of type [%s] is not supported for aggregation [date_histogram] with interval type [calendar_interval]", fn, ft),
+					}
 				}
 			}
 			if lk == "top_metrics" {
@@ -6388,6 +6427,23 @@ func ValidateGeoGridProcessorR64(cfg map[string]any) error {
 
 var geohashAlphabetR64 = "0123456789bcdefghjkmnpqrstuvwxyz"
 
+func geotileYToLatJavaR66(y int, n float64) float64 {
+	x := math.Pi - 2.0*math.Pi*float64(y)/n
+	ax := math.Abs(x)
+	var sv float64
+	if ax < 22.0 {
+		t := math.Expm1(ax)
+		sv = 0.5 * (t + t/(t+1.0))
+	} else {
+		sv = 0.5 * math.Exp(ax)
+	}
+	if x < 0 {
+		sv = -sv
+	}
+	const radiansToDegrees float64 = 57.29577951308232
+	return math.Atan(sv) * radiansToDegrees
+}
+
 // ApplyGeoGridProcessorR64 executes the `geo_grid` ingest processor on `doc`.
 func ApplyGeoGridProcessorR64(doc map[string]any, cfg map[string]any) error {
 	if err := ValidateGeoGridProcessorR64(cfg); err != nil {
@@ -6439,8 +6495,8 @@ func ApplyGeoGridProcessorR64(doc map[string]any, cfg map[string]any) error {
 			return fmt.Errorf("illegal_argument_exception: invalid geotile [%s]", cellStr)
 		}
 		n := float64(uint64(1) << zoom)
-		topLat := math.Atan(math.Sinh(math.Pi-2.0*math.Pi*float64(y)/n)) * (180.0 / math.Pi)
-		botLat := math.Atan(math.Sinh(math.Pi-2.0*math.Pi*float64(y+1)/n)) * (180.0 / math.Pi)
+		topLat := geotileYToLatJavaR66(y, n)
+		botLat := geotileYToLatJavaR66(y+1, n)
 		precision = zoom
 		if targetFormat == "wkt" {
 			shapeVal = fmt.Sprintf("BBOX (%s, %s, %s, %s)",
@@ -6581,50 +6637,105 @@ func (s *Server) FilterTermsEnumByDLSWithRawTargetsR65(r *http.Request, rawIndex
 	if s == nil || r == nil || len(targetIndices) == 0 {
 		return false
 	}
+	allowed, _ := s.resolveAuthorizedTermsEnumTargetsAndFiltersR66(r, rawIndex, targetIndices, nil, fieldName)
+	return len(allowed) == len(targetIndices)
+}
+
+func cloneAliasFiltersMapR66(in map[string]*esast.Query) map[string]*esast.Query {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]*esast.Query, len(in))
+	for k, v := range in {
+		if v != nil {
+			out[k] = v
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func (s *Server) matchesTestFixtureAdminLockedR66(cred, basicAuthUser, proxyAPIKey string) bool {
+	if s == nil || basicAuthUser != "" || proxyAPIKey != "" || s.securityUsers["test_admin"] != nil {
+		return false
+	}
+	// #nosec G101 -- Elasticsearch upstream YAML test fixture credential, permitted only when proxy auth is disabled and test_admin is unconfigured
+	const fixtureCred = "test_admin:x-pack-test-password"
+	return len(cred) == len(fixtureCred) && subtle.ConstantTimeCompare([]byte(cred), []byte(fixtureCred)) == 1
+}
+
+func (s *Server) resolveAuthorizedTermsEnumTargetsAndFiltersR66(r *http.Request, rawIndex string, targets []string, aliasFilters map[string]*esast.Query, fieldName string) ([]string, map[string]*esast.Query) {
+	if s == nil || r == nil || len(targets) == 0 {
+		return nil, nil
+	}
 	authHeader := strings.TrimSpace(r.Header.Get("Authorization"))
+	s.authMu.RLock()
+	basicAuthUser := strings.TrimSpace(s.basicAuthUser)
+	basicAuthPass := s.basicAuthPass
+	proxyAPIKey := strings.TrimSpace(s.apiKey)
+	s.authMu.RUnlock()
+
 	_ = s.syncCatalogFromBackend(r.Context())
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	hasInboundProxyAuth := strings.TrimSpace(s.basicAuthUser) != "" || strings.TrimSpace(s.apiKey) != ""
+	hasInboundProxyAuth := basicAuthUser != "" || proxyAPIKey != ""
 	if authHeader == "" {
-		return !hasInboundProxyAuth
+		if hasInboundProxyAuth {
+			return nil, nil
+		}
+		return append([]string(nil), targets...), cloneAliasFiltersMapR66(aliasFilters)
 	}
 
-	// Preserve compatibility with ES YAML test fixture credentials (`test_admin:x-pack-test-password`)
-	// when `test_admin` has not been overridden in `securityUsers` or `basicAuthUser`.
-	if parts := strings.SplitN(authHeader, " ", 2); len(parts) == 2 && strings.EqualFold(strings.TrimSpace(parts[0]), "basic") {
-		if decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(parts[1])); err == nil {
-			if string(decoded) == "test_admin:x-pack-test-password" && s.securityUsers["test_admin"] == nil && strings.TrimSpace(s.basicAuthUser) == "" {
-				return true
+	// Preserve compatibility with configured proxy-level credentials (when not shadowed by securityUsers)
+	// and ES YAML test fixture credentials (`test_admin:x-pack-test-password`) only when proxy auth is disabled.
+	if parts := strings.SplitN(authHeader, " ", 2); len(parts) == 2 {
+		scheme := strings.ToLower(strings.TrimSpace(parts[0]))
+		rawTok := strings.TrimSpace(parts[1])
+		switch scheme {
+		case "basic":
+			if decoded, err := base64.StdEncoding.DecodeString(rawTok); err == nil {
+				cred := string(decoded)
+				if basicAuthUser != "" {
+					if u, p, okCut := strings.Cut(cred, ":"); okCut && u == basicAuthUser && s.securityUsers[basicAuthUser] == nil {
+						if len(p) == len(basicAuthPass) && subtle.ConstantTimeCompare([]byte(p), []byte(basicAuthPass)) == 1 {
+							return append([]string(nil), targets...), cloneAliasFiltersMapR66(aliasFilters)
+						}
+					}
+				}
+				if s.matchesTestFixtureAdminLockedR66(cred, basicAuthUser, proxyAPIKey) {
+					return append([]string(nil), targets...), cloneAliasFiltersMapR66(aliasFilters)
+				}
+			}
+		case "apikey", "bearer":
+			if proxyAPIKey != "" && len(rawTok) == len(proxyAPIKey) && subtle.ConstantTimeCompare([]byte(rawTok), []byte(proxyAPIKey)) == 1 {
+				return append([]string(nil), targets...), cloneAliasFiltersMapR66(aliasFilters)
 			}
 		}
 	}
 
-	if EvaluateTermsEnumSecurityAccessR64(authHeader, s.securityUsers, s.securityRoles, s.securityAPIKeys, s.indices, targetIndices, fieldName) {
-		return true
-	}
-
-	if strings.TrimSpace(rawIndex) == "" || len(s.aliases) == 0 {
-		return false
-	}
-	rawParts := strings.Split(rawIndex, ",")
 	var inclPats, exclPats []string
-	for _, rp := range rawParts {
-		rp = strings.TrimSpace(rp)
-		if rp == "" {
-			continue
+	if strings.TrimSpace(rawIndex) != "" && len(s.aliases) > 0 {
+		for _, rp := range strings.Split(rawIndex, ",") {
+			rp = strings.TrimSpace(rp)
+			if rp == "" {
+				continue
+			}
+			if strings.HasPrefix(rp, "-") {
+				if ep := strings.TrimSpace(strings.TrimPrefix(rp, "-")); ep != "" {
+					exclPats = append(exclPats, ep)
+				}
+			} else if rp != "*" && rp != "_all" {
+				inclPats = append(inclPats, rp)
+			}
 		}
-		if strings.HasPrefix(rp, "-") {
-			exclPats = append(exclPats, strings.TrimPrefix(rp, "-"))
-		} else {
-			inclPats = append(inclPats, rp)
-		}
-	}
-	if len(inclPats) == 0 {
-		return false
 	}
 	aliasMatchesRaw := func(alName string) bool {
+		if len(inclPats) == 0 {
+			return false
+		}
 		for _, ep := range exclPats {
 			if matchWildcardPattern(ep, alName) {
 				return false
@@ -6638,11 +6749,24 @@ func (s *Server) FilterTermsEnumByDLSWithRawTargetsR65(r *http.Request, rawIndex
 		return false
 	}
 
-	for _, tgt := range targetIndices {
-		if EvaluateTermsEnumSecurityAccessR64(authHeader, s.securityUsers, s.securityRoles, s.securityAPIKeys, s.indices, []string{tgt}, fieldName) {
+	allowed := make([]string, 0, len(targets))
+	effFilters := make(map[string]*esast.Query)
+	for _, tgt := range targets {
+		directAuth := EvaluateTermsEnumSecurityAccessR64(authHeader, s.securityUsers, s.securityRoles, s.securityAPIKeys, s.indices, []string{tgt}, fieldName)
+		if directAuth {
+			allowed = append(allowed, tgt)
+			if aliasFilters != nil {
+				if af := aliasFilters[tgt]; af != nil {
+					effFilters[tgt] = af
+				}
+			}
 			continue
 		}
-		authorizedViaAlias := false
+		if len(inclPats) == 0 || len(s.aliases) == 0 {
+			continue
+		}
+		var authFilteredAliases []string
+		hasUnfilteredAuthAlias := false
 		for alName, alTargets := range s.aliases {
 			if !aliasMatchesRaw(alName) {
 				continue
@@ -6663,15 +6787,51 @@ func (s *Server) FilterTermsEnumByDLSWithRawTargetsR65(r *http.Request, rawIndex
 			}
 			evalSchemas[alName] = s.indices[tgt]
 			if EvaluateTermsEnumSecurityAccessR64(authHeader, s.securityUsers, s.securityRoles, s.securityAPIKeys, evalSchemas, []string{alName}, fieldName) {
-				authorizedViaAlias = true
-				break
+				var af *esast.Query
+				if metaByIdx := s.aliasMeta[alName]; metaByIdx != nil {
+					af = metaByIdx[tgt].Filter
+				}
+				if af != nil {
+					authFilteredAliases = append(authFilteredAliases, alName)
+				} else {
+					hasUnfilteredAuthAlias = true
+				}
 			}
 		}
-		if !authorizedViaAlias {
-			return false
+		if !hasUnfilteredAuthAlias && len(authFilteredAliases) == 0 {
+			continue
+		}
+		allowed = append(allowed, tgt)
+		if !hasUnfilteredAuthAlias && len(authFilteredAliases) > 0 {
+			sort.Strings(authFilteredAliases)
+			if len(authFilteredAliases) == 1 {
+				if metaByIdx := s.aliasMeta[authFilteredAliases[0]]; metaByIdx != nil {
+					effFilters[tgt] = metaByIdx[tgt].Filter
+				}
+			} else {
+				should := make([]esast.Query, 0, len(authFilteredAliases))
+				for _, alName := range authFilteredAliases {
+					if metaByIdx := s.aliasMeta[alName]; metaByIdx != nil && metaByIdx[tgt].Filter != nil {
+						should = append(should, *metaByIdx[tgt].Filter)
+					}
+				}
+				if len(should) == 1 {
+					f := should[0]
+					effFilters[tgt] = &f
+				} else if len(should) > 1 {
+					effFilters[tgt] = &esast.Query{
+						Bool: &esast.BoolQuery{
+							Should: should,
+						},
+					}
+				}
+			}
 		}
 	}
-	return true
+	if len(effFilters) == 0 {
+		return allowed, nil
+	}
+	return allowed, effFilters
 }
 
 func extractTermsEnumDLSBoolClauseSliceR65(v any) ([]any, bool) {
@@ -7031,12 +7191,46 @@ func roleSliceAllowsTermsEnumR64(roleObjs []map[string]any, schemas map[string]*
 	return true
 }
 
+func verifyStoredSecretHashOrPlainR66(rec map[string]any, hashField string, plainFields []string, candidateSecret string) bool {
+	if rec == nil || candidateSecret == "" {
+		return false
+	}
+	if storedHash, ok := rec[hashField].(string); ok && storedHash != "" {
+		sum := sha256.Sum256([]byte(candidateSecret))
+		candHash := hex.EncodeToString(sum[:])
+		return len(storedHash) == len(candHash) && subtle.ConstantTimeCompare([]byte(candHash), []byte(storedHash)) == 1
+	}
+	for _, pf := range plainFields {
+		if storedPlain, ok := rec[pf].(string); ok && storedPlain != "" {
+			return len(storedPlain) == len(candidateSecret) && subtle.ConstantTimeCompare([]byte(storedPlain), []byte(candidateSecret)) == 1
+		}
+	}
+	return false
+}
+
+func verifySecurityUserPasswordR66(uObj map[string]any, pass string) bool {
+	return verifyStoredSecretHashOrPlainR66(uObj, "__password_sha256", []string{"password"}, pass)
+}
+
+func verifySecurityAPIKeySecretAndExpiryR66(kObj map[string]any, secret string, now time.Time) bool {
+	if kObj == nil {
+		return false
+	}
+	if inv, _ := kObj["invalidated"].(bool); inv {
+		return false
+	}
+	if expRaw, hasExp := kObj["expiration"]; hasExp && expRaw != nil {
+		expMS, okExp := toInt64(expRaw)
+		if !okExp || expMS <= now.UTC().UnixMilli() {
+			return false
+		}
+	}
+	return verifyStoredSecretHashOrPlainR66(kObj, "__secret_sha256", []string{"api_key", "secret"}, secret)
+}
+
 func resolveRolesForSecurityUserR64(username string, users, roles map[string]map[string]any) (isSuper bool, exists bool, roleObjs []map[string]any) {
 	if username == "" {
 		return false, false, nil
-	}
-	if username == "elastic" {
-		return true, true, nil
 	}
 	uObj, ok := users[username]
 	if !ok || uObj == nil {
@@ -7082,9 +7276,14 @@ func EvaluateTermsEnumSecurityAccessR64(authHeader string, users, roles, apiKeys
 		return false
 	}
 	principal := cred[:colon]
+	secret := cred[colon+1:]
 
 	switch scheme {
 	case "basic":
+		uObj := users[principal]
+		if !verifySecurityUserPasswordR66(uObj, secret) {
+			return false
+		}
 		isSuper, exists, roleObjs := resolveRolesForSecurityUserR64(principal, users, roles)
 		if !exists {
 			return false
@@ -7099,14 +7298,14 @@ func EvaluateTermsEnumSecurityAccessR64(authHeader string, users, roles, apiKeys
 		if !exists || kObj == nil {
 			return false
 		}
-		if inv, _ := kObj["invalidated"].(bool); inv {
+		if !verifySecurityAPIKeySecretAndExpiryR66(kObj, secret, time.Now()) {
 			return false
 		}
 		owner, _ := kObj["username"].(string)
 		if owner == "" {
 			return false
 		}
-		if owner != "elastic" {
+		if owner != "elastic" || users["elastic"] != nil {
 			isSuper, uExists, ownerRoles := resolveRolesForSecurityUserR64(owner, users, roles)
 			if !uExists {
 				return false

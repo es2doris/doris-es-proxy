@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.22.0] - 2026-11-24
+
+### Added
+- **Round-66 `100.00%` Upstream `v7.10.2` & `v8.15.5` Conformance (`4,616 / 4,616`), `512 / 518` Go SDK v8 Endpoints, `953`-File 3-Shard Live Doris `4.1.3` Matrix & `85.3%` Offline Statement Coverage:** Closed all `51` remaining `v8.15.5` upstream REST failures on the `970`-file corpus (`4,565 -> 4,616 / 4,616` unskipped = **`100.00%`**, `0` failed; CI ratcheted `4500 -> CONFORMANCE_MIN_V8_PASSED=4600`) while holding `v7.10.2` at **`1,985 / 1,985` (`100.00%`)**; expanded `e2e/sdkconformance` across all **`512 / 518` public `esapi` endpoints** (`730` HTTP responses across `53` named subtests including `Ml`, `Security`, `Connector`, `Ccr`, `Fleet`, `Transform`, `SearchableSnapshots`, `Features`, and `Nodes`, ratcheting `minValidatedEndpointsTarget` `265 -> 495`) plus `connector` (`_secret`, `_check_in`, `_update_features`, `_sync_job/{id}/_claim`) and route/schema completions; expanded `TestLiveDorisUpstreamYAMLConformance_E2E` from `316` to **`953` upstream `v8.15.5` YAML specs** (`4,602 / 4,602 = 100.00%` active precheck) partitioned by deterministic greedy LPT section weighting (`DORIS_LIVE_YAML_SHARD=1..3/3`, `318 / 318 / 317` files, balance ratio `1.0006`) across a **3-shard `.github/workflows/e2e-live-doris.yml` matrix** (`DORIS_LIVE_YAML_MIN_PASSED=1350`/shard); and lifted offline merged statement coverage (`CONFORMANCE_CACHE_DIR=/nonexistent`) from `83.51%` to **`85.32%` (`167,658 / 196,508`)** (CI gate ratcheted `82.0% -> 84.0%`) with hot-path benchmarks (`BenchmarkSearch_MatchAndAggs`, `BenchmarkBulkIndex_Coalescer`, `BenchmarkIngestPipeline_ExpandTemplate`) and `testing/quick` property invariants.
+
+### Fixed
+- **Live Apache Doris `4.1.3` BM25/VARIANT Parity & Final ES 8.15 Conformance Closures:** Wired live Doris `CorpusBM25Stats` (`QueryRows`) pre-query IDF/AvgDL computation (`(k1+1)` numerator & apostrophe-preserving regex) alongside `CollapseMaxScoreSQL`, `ImplicitTimestampSort`, and `NumberOfShards`-scaled `knn.num_candidates`; standardized 2-argument `JSON_TYPE` + `JSON_LENGTH(...) > 0` for dynamic `VARIANT`/empty-array `exists` predicates (paired with `MemoryBackend` `JSON_LENGTH` evaluation); aligned `date_histogram` DST `CONVERT_TZ` bucketing and positive-`offset` `extended_bounds` flooring; added exact `int64` `long_range` `term` precision and `MinInt64+1`/`MaxInt64-1` null-bound clamping; preserved Java `d`/`D`/`f`/`F` float suffixes, `geo_point` longitude wrapping, numeric duplicate synthetic `_source` values, English stemming in `match_phrase`, H3 `CellNonChildren` order, unmapped `nested` aggs, RRF shard tie-breaks, empty `boxplot` `NaN` formatting, TSDB data-stream `_settings` updates, and upstream compliance runner path/stash lookups (`..` & hyphenated keys).
+
+### Security & Fuzzing
+- **Static Snapshot Trust Boundary, RWMutex/CoW Concurrency, HDR Bounds, Fail-Closed Auth & `33` Fuzz Targets:** Removed dynamic `PUT /_cluster/settings` mutability for `path.repo*` and `repositories.url.allowed_urls*` in favor of static `--path-repo` (`DORIS_ES_PATH_REPO`) and `--repositories-url-allowed-urls` (`DORIS_ES_REPOSITORIES_URL_ALLOWED_URLS`) startup flags; added `maxVariantNormalizeDepth = 64` + O(1)-alloc nesting/dotted-key validation eliminating crafted VARIANT recursion DoS (`P0-5`); eliminated unlocked `s.mu` reads in `/_cluster/stats` (`getIndexShardAndReplicaCountsLocked`) and `RawMapping` concurrent writes in `handleRollup` (`CloneIndexSchema()`); guarded `hdrhistogram` negative width/underflow and enforced `maxTotalHDRSamplesR66 = 1,000,000`; added `s.authMu` locking, SHA-256 verification/expiry checks, `_terms_enum` filtered-alias enforcement, fail-closed `/_monitoring/bulk` auth/version checks, auth-scoped `QueryResultCache` keys, bounded Mustache `expandIngestTemplate` (`depth <= 32`, `4 MiB`), `s.lazyRolloverMu` double-checked locking, and elimination of global `map[*Server]` registries; tightened Doris 4.1.3 strict `TRY_CAST` / `LARGEINT` bounds (`[-2^127, 2^127-1]`); and expanded `Makefile` `fuzz` from `27` to **`33` `testing.F` targets** (adding `FuzzShredVariantAndHistogram`, `FuzzExpandIngestTemplate`, `FuzzStrictNereidsSQLGuards`, `FuzzHistogramBoundsAndSQL`, `FuzzMonitoringBulkNDJSON`, and `FuzzAutoscalingByteSize`).
+
 ## [0.21.0] - 2026-11-23
 
 ### Added
@@ -131,7 +142,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Round-5 Production Hardening:** Added `StreamLoadCoalescer` (`--bulk-coalesce-ms`), `QueryResultCache` (`--query-cache-ttl`) with automatic write invalidation and `now` date-math bypass, inbound HTTP `Basic` / `ApiKey` / `Bearer` authentication, native HTTPS/TLS (`--tls-cert` / `--tls-key`), and `migrate-schema --out-dir`.
 - **Packaging:** Added Helm chart (`deploy/helm/doris-es-proxy`), Prometheus `ServiceMonitor`, Grafana dashboard (`deploy/grafana/doris-es-proxy-dashboard.json`), and GitHub Actions release pipeline (`.github/workflows/release.yml`).
 
-[Unreleased]: https://github.com/es2doris/doris-es-proxy/compare/v0.21.0...HEAD
+[Unreleased]: https://github.com/es2doris/doris-es-proxy/compare/v0.22.0...HEAD
+[0.22.0]: https://github.com/es2doris/doris-es-proxy/compare/v0.21.0...v0.22.0
 [0.21.0]: https://github.com/es2doris/doris-es-proxy/compare/v0.20.0...v0.21.0
 [0.20.0]: https://github.com/es2doris/doris-es-proxy/compare/v0.19.0...v0.20.0
 [0.19.0]: https://github.com/es2doris/doris-es-proxy/compare/v0.18.0...v0.19.0

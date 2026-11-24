@@ -1558,6 +1558,12 @@ func ValidateIndexModeSettings(effectiveMode string, settings map[string]any) er
 	return validateIndexModeSettingsWithOpts(effectiveMode, settings, false)
 }
 
+// ValidateIndexModeSettingsUpdate validates `index.mode` on `PUT /_settings` updates while permitting
+// omitted `index.routing_path` on data-stream backing indices created in `time_series` mode.
+func ValidateIndexModeSettingsUpdate(effectiveMode string, settings map[string]any) error {
+	return validateIndexModeSettingsWithOpts(effectiveMode, settings, true)
+}
+
 func validateIndexModeSettingsWithOpts(effectiveMode string, settings map[string]any, allowOmittedRoutingPath bool) error {
 	mode := strings.ToLower(strings.TrimSpace(effectiveMode))
 	switch mode {

@@ -677,10 +677,9 @@ func esMurmur3Shard(routing string, numShards, routingNumShards int) int {
 	return esFloorMod(h, routingNumShards) / factor
 }
 
-func (s *Server) getIndexShardAndReplicaCounts(indexName string) (numShards, numReplicas, routingNumShards int) {
+func (s *Server) getIndexShardAndReplicaCountsLocked(indexName string) (numShards, numReplicas, routingNumShards int) {
 	numShards = 1
 	numReplicas = 0
-	s.mu.RLock()
 	cs := s.indexCustomSettings[indexName]
 	if cs != nil {
 		for _, k := range []string{"number_of_shards", "index.number_of_shards"} {
@@ -708,11 +707,16 @@ func (s *Server) getIndexShardAndReplicaCounts(indexName string) (numShards, num
 			}
 		}
 	}
-	s.mu.RUnlock()
 	if routingNumShards <= 0 {
 		routingNumShards = defaultESRoutingNumShards(numShards)
 	}
 	return numShards, numReplicas, routingNumShards
+}
+
+func (s *Server) getIndexShardAndReplicaCounts(indexName string) (numShards, numReplicas, routingNumShards int) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.getIndexShardAndReplicaCountsLocked(indexName)
 }
 
 func (s *Server) shardForDocRoutingRound60(indexName, docID, routing string) int {

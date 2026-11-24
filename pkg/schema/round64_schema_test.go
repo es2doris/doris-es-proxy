@@ -465,7 +465,7 @@ func TestRound64_P1_9_And_F5_SyntheticSourceGaps(t *testing.T) {
 		"gp": ["40.7,-74.0", [10.0, 20.0], "bad_geo", {"type":"Point","coordinates":[5.0,6.0]}],
 		"gs": "bad_shape",
 		"nums": [30, 10, "not_num", 10],
-		"ip_addr": ["10.0.0.2", "bad_ip", "10.0.0.1"],
+		"ip_addr": ["10.0.0.2", "bad_ip", "10.0.0.1", "10.0.0.2"],
 		"dyn_off_arr": [{"b": 2}, {"a": 1}],
 		"rf": {"cat1": 1.5, "cat2": 2},
 		"sv": {},
@@ -483,11 +483,11 @@ func TestRound64_P1_9_And_F5_SyntheticSourceGaps(t *testing.T) {
 	if err := dec.Decode(&got); err != nil {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(got["nums"], []any{json.Number("10"), json.Number("30"), "not_num"}) {
-		t.Fatalf("expected sorted dedup ints followed by malformed string, got %#v", got["nums"])
+	if !reflect.DeepEqual(got["nums"], []any{json.Number("10"), json.Number("10"), json.Number("30"), "not_num"}) {
+		t.Fatalf("expected sorted SortedNumericDocValues ints preserving duplicates followed by malformed string, got %#v", got["nums"])
 	}
 	if !reflect.DeepEqual(got["ip_addr"], []any{"10.0.0.1", "10.0.0.2", "bad_ip"}) {
-		t.Fatalf("expected sorted IPs followed by malformed IP, got %#v", got["ip_addr"])
+		t.Fatalf("expected sorted deduplicated IPs followed by malformed IP, got %#v", got["ip_addr"])
 	}
 	if got["gs"] != "bad_shape" {
 		t.Fatalf("expected malformed geo_shape kept with ignore_malformed, got %#v", got["gs"])

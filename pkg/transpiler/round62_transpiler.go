@@ -103,20 +103,20 @@ func buildRangeBucketExplodeSQL(
 		if !strings.Contains(ivLit, ".") {
 			ivLit += ".0"
 		}
-		loIdxBig = fmt.Sprintf("CAST(FLOOR((%s) / %s) AS BIGINT)", effLoSQL, ivLit)
-		hiIdxBig = fmt.Sprintf("CAST(FLOOR((%s) / %s) AS BIGINT)", effHiSQL, ivLit)
+		loIdxBig = fmt.Sprintf("TRY_CAST(FLOOR((%s) / %s) AS BIGINT)", effLoSQL, ivLit)
+		hiIdxBig = fmt.Sprintf("TRY_CAST(FLOOR((%s) / %s) AS BIGINT)", effHiSQL, ivLit)
 		countInt := fmt.Sprintf("CAST(LEAST(GREATEST((%s) - (%s) + 1, 0), 10001) AS INT)", hiIdxBig, loIdxBig)
 		fromClause = fmt.Sprintf("%s LATERAL VIEW EXPLODE(ARRAY_RANGE(0, %s)) `_rng_t` AS `_off`", baseTable, countInt)
-		bucketValSQL = fmt.Sprintf("(CAST((%s) + CAST(`_off` AS BIGINT) AS DOUBLE) * %s)", loIdxBig, ivLit)
+		bucketValSQL = fmt.Sprintf("(TRY_CAST((%s) + TRY_CAST(`_off` AS BIGINT) AS DOUBLE) * %s)", loIdxBig, ivLit)
 		return fromClause, bucketValSQL
 	}
 	offLit := FormatSQLFloatR63(offset)
 	ivLit := FormatSQLFloatR63(interval)
-	loIdxBig = fmt.Sprintf("CAST(FLOOR(((%s) - (%s)) / (%s)) AS BIGINT)", effLoSQL, offLit, ivLit)
-	hiIdxBig = fmt.Sprintf("CAST(FLOOR(((%s) - (%s)) / (%s)) AS BIGINT)", effHiSQL, offLit, ivLit)
+	loIdxBig = fmt.Sprintf("TRY_CAST(FLOOR(((%s) - (%s)) / (%s)) AS BIGINT)", effLoSQL, offLit, ivLit)
+	hiIdxBig = fmt.Sprintf("TRY_CAST(FLOOR(((%s) - (%s)) / (%s)) AS BIGINT)", effHiSQL, offLit, ivLit)
 	countInt := fmt.Sprintf("CAST(LEAST(GREATEST((%s) - (%s) + 1, 0), 10001) AS INT)", hiIdxBig, loIdxBig)
 	fromClause = fmt.Sprintf("%s LATERAL VIEW EXPLODE(ARRAY_RANGE(0, %s)) `_rng_t` AS `_off`", baseTable, countInt)
-	bucketValSQL = fmt.Sprintf("(CAST((%s) + CAST(`_off` AS BIGINT) AS DOUBLE) * (%s) + (%s))", loIdxBig, ivLit, offLit)
+	bucketValSQL = fmt.Sprintf("(TRY_CAST((%s) + TRY_CAST(`_off` AS BIGINT) AS DOUBLE) * (%s) + (%s))", loIdxBig, ivLit, offLit)
 	return fromClause, bucketValSQL
 }
 
@@ -2025,11 +2025,101 @@ func (t *Transpiler) normalizeKeywordOrAnalyzerTerm(raw string, b schema.FieldBi
 	return raw
 }
 
+func analyzerHasStemFilterR66(analyzerName string, cfg *analysis.IndexAnalysisConfig) bool {
+	an := strings.ToLower(strings.TrimSpace(analyzerName))
+	if an == "" {
+		return false
+	}
+	isStemLangOrFilter := func(s string) bool {
+		switch strings.ToLower(strings.TrimSpace(s)) {
+		case "english", "porter", "porter2", "lovins", "snowball", "possessive_english", "light_english", "minimal_english", "kstem", "porter_stem", "stemmer",
+			"arabic", "armenian", "basque", "bengali", "brazilian", "bulgarian", "catalan", "czech", "danish", "dutch", "estonian",
+			"finnish", "french", "galician", "german", "german2", "greek", "hindi", "hungarian", "indonesian", "irish", "italian",
+			"latvian", "lithuanian", "norwegian", "portuguese", "romanian", "russian", "serbian", "sorani", "spanish", "swedish", "turkish",
+			"polish", "ukrainian", "kuromoji":
+			return true
+		}
+		ls := strings.ToLower(s)
+		return strings.Contains(ls, "stem") || ls == "snowball"
+	}
+	if cfg != nil {
+		if def, ok := cfg.AnalyzerDefs[strings.TrimSpace(analyzerName)]; ok {
+			if typStr, _ := def["type"].(string); isStemLangOrFilter(typStr) {
+				return true
+			}
+			var filterNames []string
+			switch rawF := def["filter"].(type) {
+			case []any:
+				for _, el := range rawF {
+					if s, okS := el.(string); okS {
+						filterNames = append(filterNames, s)
+					}
+				}
+			case []string:
+				filterNames = rawF
+			case string:
+				filterNames = []string{rawF}
+			}
+			for _, fn := range filterNames {
+				if isStemLangOrFilter(fn) {
+					return true
+				}
+				if fDef, okF := cfg.FilterDefs[fn]; okF {
+					if ftStr, _ := fDef["type"].(string); isStemLangOrFilter(ftStr) {
+						return true
+					}
+				}
+			}
+			return false
+		}
+	}
+	return isStemLangOrFilter(an)
+}
+
+func isAllLetterStemCandidateR66(tok string) bool {
+	if utf8.RuneCountInString(tok) < 2 {
+		return false
+	}
+	for _, r := range tok {
+		if (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') {
+			return false
+		}
+	}
+	return true
+}
+
+func buildStemmedTokenRegexBodyR66(tok string) string {
+	if !isAllLetterStemCandidateR66(tok) {
+		return escapeSQLRegexMetaR63(tok)
+	}
+	lower := strings.ToLower(tok)
+	if len(lower) >= 3 && strings.HasSuffix(lower, "i") {
+		return escapeSQLRegexMetaR63(tok[:len(tok)-1]) + "[iyIY][[:alpha:]]*"
+	}
+	return escapeSQLRegexMetaR63(tok) + "[[:alpha:]]*"
+}
+
+func buildAnalyzedTokenRegexWithStemR66(tok string, caseSensitive, isWhitespace, stemmed bool) string {
+	if !stemmed || isWhitespace || !isAllLetterStemCandidateR66(tok) {
+		return buildAnalyzedTokenRegexExactR63(tok, caseSensitive, isWhitespace)
+	}
+	ci := "(?i)"
+	if caseSensitive {
+		ci = ""
+	}
+	return fmt.Sprintf("%s(^|[^[:alnum:]_])(%s)($|[^[:alnum:]_])", ci, buildStemmedTokenRegexBodyR66(tok))
+}
+
 func (t *Transpiler) singleAnalyzedTokenSQL(field string, b schema.FieldBinding, tok string, caseSensitive bool, boost float64, scoring bool, nctx *nestedCtx) CompiledQuery {
 	return t.singleAnalyzedTokenWithFlagsR63(field, b, tok, caseSensitive, caseSensitive, boost, scoring, nctx)
 }
 
 func (t *Transpiler) singleAnalyzedTokenWithFlagsR63(field string, b schema.FieldBinding, tok string, caseSensitive, isWhitespace bool, boost float64, scoring bool, nctx *nestedCtx) CompiledQuery {
+	stemmed := analyzerHasStemFilterR66(t.effectiveQueryAnalyzerName(b, ""), t.effectiveAnalysisConfig())
+	return t.singleAnalyzedTokenWithStemFlagsR66(field, b, tok, caseSensitive, isWhitespace, stemmed, boost, scoring, nctx)
+}
+
+func (t *Transpiler) singleAnalyzedTokenWithStemFlagsR66(field string, b schema.FieldBinding, tok string, caseSensitive, isWhitespace, stemmed bool, boost float64, scoring bool, nctx *nestedCtx) CompiledQuery {
 	if b.IsVirtualSAYTSubfield && b.EffectiveArrayColumn(false) != "" && nctx == nil {
 		arrCol := b.EffectiveArrayColumn(false)
 		var pred string
@@ -2044,7 +2134,7 @@ func (t *Transpiler) singleAnalyzedTokenWithFlagsR63(field string, b schema.Fiel
 		}
 		return CompiledQuery{WhereSQL: pred, SafeWhereSQL: pred, ScoreSQL: sc}
 	}
-	rePat := quoteStr(buildAnalyzedTokenRegexExactR63(tok, caseSensitive, isWhitespace))
+	rePat := quoteStr(buildAnalyzedTokenRegexWithStemR66(tok, caseSensitive, isWhitespace, stemmed))
 	var safePred string
 	if !t.isBoundToNestedCtx(field, b, nctx) && (b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield) {
 		arrCol := b.EffectiveArrayColumn(false)
@@ -2064,11 +2154,16 @@ func (t *Transpiler) singleAnalyzedTokenWithFlagsR63(field string, b schema.Fiel
 }
 
 func (t *Transpiler) multiTokenExactPhraseSQL(field string, b schema.FieldBinding, terms []string, slop int, trailingPrefix bool, caseSensitive bool, boost float64, scoring bool, nctx *nestedCtx) CompiledQuery {
+	stemmed := analyzerHasStemFilterR66(t.effectiveQueryAnalyzerName(b, ""), t.effectiveAnalysisConfig())
+	return t.multiTokenExactPhraseWithStemSQLR66(field, b, terms, nil, slop, trailingPrefix, caseSensitive, stemmed, boost, scoring, nctx)
+}
+
+func (t *Transpiler) multiTokenExactPhraseWithStemSQLR66(field string, b schema.FieldBinding, terms []string, posGaps []int, slop int, trailingPrefix bool, caseSensitive bool, stemmed bool, boost float64, scoring bool, nctx *nestedCtx) CompiledQuery {
 	if len(terms) == 0 {
 		return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}
 	}
 	if len(terms) == 1 && !trailingPrefix {
-		return t.singleAnalyzedTokenSQL(field, b, terms[0], caseSensitive, boost, scoring, nctx)
+		return t.singleAnalyzedTokenWithStemFlagsR66(field, b, terms[0], caseSensitive, caseSensitive, stemmed, boost, scoring, nctx)
 	}
 	if len(terms) == 1 && trailingPrefix {
 		pred := t.compileAnalyzedTokenOrPhrasePrefixRegex(field, b, terms[0], !caseSensitive, nctx)
@@ -2090,7 +2185,7 @@ func (t *Transpiler) multiTokenExactPhraseSQL(field string, b schema.FieldBindin
 			limit = len(terms) - 1
 		}
 		for i := 0; i < limit; i++ {
-			parts = append(parts, t.singleAnalyzedTokenSQL(field, b, terms[i], caseSensitive, 1.0, false, nctx).WhereSQL)
+			parts = append(parts, t.singleAnalyzedTokenWithStemFlagsR66(field, b, terms[i], caseSensitive, caseSensitive, stemmed, 1.0, false, nctx).WhereSQL)
 		}
 		if trailingPrefix {
 			parts = append(parts, t.compileAnalyzedTokenOrPhrasePrefixRegex(field, b, terms[len(terms)-1], !caseSensitive, nctx))
@@ -2112,13 +2207,32 @@ func (t *Transpiler) multiTokenExactPhraseSQL(field string, b schema.FieldBindin
 	}
 	escaped := make([]string, len(terms))
 	for i, tk := range terms {
-		escaped[i] = regexp.QuoteMeta(tk)
+		if stemmed && (!trailingPrefix || i < len(terms)-1 || isAllLetterStemCandidateR66(tk)) {
+			escaped[i] = buildStemmedTokenRegexBodyR66(tk)
+		} else {
+			escaped[i] = regexp.QuoteMeta(tk)
+		}
 	}
 	endBoundary := "($|[^[:alnum:]_])"
 	if trailingPrefix {
 		endBoundary = ""
 	}
-	rePat := fmt.Sprintf("%s(^|[^[:alnum:]_])(%s)%s", ciFlag, strings.Join(escaped, "[^[:alnum:]_]+"), endBoundary)
+	var phraseRegex strings.Builder
+	for i, part := range escaped {
+		if i > 0 {
+			gap := 0
+			if i-1 < len(posGaps) && posGaps[i-1] > 0 {
+				gap = posGaps[i-1]
+			}
+			if gap > 0 {
+				fmt.Fprintf(&phraseRegex, "[^[:alnum:]_]+(?:[[:alnum:]_]+[^[:alnum:]_]+){0,%d}", gap)
+			} else {
+				phraseRegex.WriteString("[^[:alnum:]_]+")
+			}
+		}
+		phraseRegex.WriteString(part)
+	}
+	rePat := fmt.Sprintf("%s(^|[^[:alnum:]_])(%s)%s", ciFlag, phraseRegex.String(), endBoundary)
 	qPat := quoteStr(rePat)
 
 	var pred string
@@ -2288,6 +2402,7 @@ func (t *Transpiler) compileMatchGraphToSQLR64(
 	}
 	isAnd := strings.EqualFold(operator, "and")
 	caseSensitive, isWhitespace := analyzerCaseAndWhitespaceFlagsR63(effAn, effCfg, t.Opts.AnalysisOpts)
+	isStemmed := analyzerHasStemFilterR66(effAn, effCfg) && !isWhitespace
 
 	var segPreds, segSafePreds, segScores []string
 	usesFT := false
@@ -2316,7 +2431,7 @@ func (t *Transpiler) compileMatchGraphToSQLR64(
 				if hasNonZeroFuzziness(fuzziness) {
 					cp = t.compileFuzzyFieldWithOpts(resolved, tk, "or", fuzziness, false, prefixLen, fuzzyTransp, 1.0, scoring, nctx)
 				} else {
-					cp = t.singleAnalyzedTokenWithFlagsR63(resolved, b, tk, caseSensitive, isWhitespace, 1.0, scoring, nctx)
+					cp = t.singleAnalyzedTokenWithStemFlagsR66(resolved, b, tk, caseSensitive, isWhitespace, isStemmed, 1.0, scoring, nctx)
 				}
 				appendAlt(cp)
 			}
@@ -2330,15 +2445,15 @@ func (t *Transpiler) compileMatchGraphToSQLR64(
 					if hasNonZeroFuzziness(fuzziness) {
 						cp = t.compileFuzzyFieldWithOpts(resolved, alt[0], "or", fuzziness, false, prefixLen, fuzzyTransp, 1.0, scoring, nctx)
 					} else {
-						cp = t.singleAnalyzedTokenWithFlagsR63(resolved, b, alt[0], caseSensitive, isWhitespace, 1.0, scoring, nctx)
+						cp = t.singleAnalyzedTokenWithStemFlagsR66(resolved, b, alt[0], caseSensitive, isWhitespace, isStemmed, 1.0, scoring, nctx)
 					}
 				} else if autoPhrase {
-					cp = t.multiTokenExactPhraseSQL(resolved, b, alt, 0, false, caseSensitive, 1.0, scoring, nctx)
+					cp = t.multiTokenExactPhraseWithStemSQLR66(resolved, b, alt, nil, 0, false, caseSensitive, isStemmed, 1.0, scoring, nctx)
 				} else {
 					var subParts, subSafeParts []string
 					subFT := false
 					for _, tk := range alt {
-						subCP := t.singleAnalyzedTokenWithFlagsR63(resolved, b, tk, caseSensitive, isWhitespace, 1.0, false, nctx)
+						subCP := t.singleAnalyzedTokenWithStemFlagsR66(resolved, b, tk, caseSensitive, isWhitespace, isStemmed, 1.0, false, nctx)
 						subParts = append(subParts, subCP.WhereSQL)
 						subSafeParts = append(subSafeParts, subCP.EffectiveSafeWhere())
 						if subCP.UsesFulltextMatch {
@@ -2717,6 +2832,16 @@ func (t *Transpiler) compileMatchPhraseWithAnalysisGraph(
 		return CompiledQuery{WhereSQL: "FALSE", SafeWhereSQL: "FALSE", ScoreSQL: "0.0"}, true
 	}
 	caseSensitive, isWhitespace := analyzerCaseAndWhitespaceFlagsR63(effAn, effCfg, t.Opts.AnalysisOpts)
+	isStemmed := analyzerHasStemFilterR66(effAn, effCfg) && !isWhitespace
+	var posGaps []int
+	if len(paths) == 1 && len(paths[0]) == len(tokens) && len(tokens) > 1 {
+		posGaps = make([]int, len(tokens)-1)
+		for i := 1; i < len(tokens); i++ {
+			if gap := tokens[i].Position - tokens[i-1].Position - 1; gap > 0 {
+				posGaps[i-1] = gap
+			}
+		}
+	}
 	var disj, pathScores []string
 	for _, p := range paths {
 		clauseWeight := 1.0
@@ -2725,9 +2850,9 @@ func (t *Transpiler) compileMatchPhraseWithAnalysisGraph(
 		}
 		var cp CompiledQuery
 		if len(p) == 1 && !isPrefix {
-			cp = t.singleAnalyzedTokenWithFlagsR63(resolved, b, p[0], caseSensitive, isWhitespace, clauseWeight, scoring, nctx)
+			cp = t.singleAnalyzedTokenWithStemFlagsR66(resolved, b, p[0], caseSensitive, isWhitespace, isStemmed, clauseWeight, scoring, nctx)
 		} else {
-			cp = t.multiTokenExactPhraseSQL(resolved, b, p, slop, isPrefix, caseSensitive, clauseWeight, scoring, nctx)
+			cp = t.multiTokenExactPhraseWithStemSQLR66(resolved, b, p, posGaps, slop, isPrefix, caseSensitive, isStemmed, clauseWeight, scoring, nctx)
 		}
 		if cp.WhereSQL != "FALSE" {
 			disj = append(disj, cp.WhereSQL)
@@ -2868,12 +2993,13 @@ func (t *Transpiler) compileMatchBoolPrefixRound62Opts(rawField string, pe esast
 						cp = t.compileFuzzyFieldWithOpts(resolved, tk, "or", pe.Fuzziness, false, pe.PrefixLength, pe.FuzzyTranspositions, 1.0, scoring, nctx)
 						w, sw, sc = cp.WhereSQL, cp.EffectiveSafeWhere(), cp.ScoreSQL
 					} else {
-						cp = t.singleAnalyzedTokenWithFlagsR63(resolved, b, tk, caseSens, isAnWS, 1.0, scoring, nctx)
+						cp = t.singleAnalyzedTokenWithStemFlagsR66(resolved, b, tk, caseSens, isAnWS, analyzerHasStemFilterR66(effAn, effCfg) && !isAnWS, 1.0, scoring, nctx)
 						w, sw, sc = cp.WhereSQL, cp.EffectiveSafeWhere(), cp.ScoreSQL
 					}
 					appendAlt(w, sw, sc, cp.UsesFulltextMatch)
 				}
 			} else {
+				isStemMBP := analyzerHasStemFilterR66(effAn, effCfg) && !isAnWS
 				for _, alt := range seg.Alternatives {
 					if len(alt) == 0 {
 						continue
@@ -2892,11 +3018,11 @@ func (t *Transpiler) compileMatchBoolPrefixRound62Opts(rawField string, pe esast
 							cp = t.compileFuzzyFieldWithOpts(resolved, alt[0], "or", pe.Fuzziness, false, pe.PrefixLength, pe.FuzzyTranspositions, 1.0, scoring, nctx)
 							w, sw, sc, ft = cp.WhereSQL, cp.EffectiveSafeWhere(), cp.ScoreSQL, cp.UsesFulltextMatch
 						} else {
-							cp = t.singleAnalyzedTokenWithFlagsR63(resolved, b, alt[0], caseSens, isAnWS, 1.0, scoring, nctx)
+							cp = t.singleAnalyzedTokenWithStemFlagsR66(resolved, b, alt[0], caseSens, isAnWS, isStemMBP, 1.0, scoring, nctx)
 							w, sw, sc, ft = cp.WhereSQL, cp.EffectiveSafeWhere(), cp.ScoreSQL, cp.UsesFulltextMatch
 						}
 					} else if autoPhrase {
-						cp = t.multiTokenExactPhraseSQL(resolved, b, alt, 0, isLast, caseSens, 1.0, scoring, nctx)
+						cp = t.multiTokenExactPhraseWithStemSQLR66(resolved, b, alt, nil, 0, isLast, caseSens, isStemMBP, 1.0, scoring, nctx)
 						w, sw, sc, ft = cp.WhereSQL, cp.EffectiveSafeWhere(), cp.ScoreSQL, cp.UsesFulltextMatch
 					} else {
 						var subParts, subSafeParts []string
@@ -2905,7 +3031,7 @@ func (t *Transpiler) compileMatchBoolPrefixRound62Opts(rawField string, pe esast
 							if isLast && ai == len(alt)-1 {
 								subCP = compilePrefixTok(tk)
 							} else {
-								subCP = t.singleAnalyzedTokenWithFlagsR63(resolved, b, tk, caseSens, isAnWS, 1.0, false, nctx)
+								subCP = t.singleAnalyzedTokenWithStemFlagsR66(resolved, b, tk, caseSens, isAnWS, isStemMBP, 1.0, false, nctx)
 							}
 							subParts = append(subParts, subCP.WhereSQL)
 							subSafeParts = append(subSafeParts, subCP.EffectiveSafeWhere())

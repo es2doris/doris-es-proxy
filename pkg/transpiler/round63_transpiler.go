@@ -424,6 +424,126 @@ func formatBM25BoostR63(boost float64) string {
 	return FormatSQLFloatR63(boost)
 }
 
+func (t *Transpiler) recordBM25RequirementR66(field, colExpr string, caseSensitive bool, terms []string) {
+	if t == nil || len(terms) == 0 {
+		return
+	}
+	var cleaned []string
+	for _, tk := range terms {
+		s := strings.TrimSpace(tk)
+		if !caseSensitive {
+			s = strings.ToLower(s)
+		}
+		if s != "" {
+			cleaned = append(cleaned, s)
+		}
+	}
+	if len(cleaned) == 0 {
+		return
+	}
+	t.collectedBM25Reqs = append(t.collectedBM25Reqs, BM25QueryRequirement{
+		Field:         field,
+		ColExpr:       colExpr,
+		CaseSensitive: caseSensitive,
+		Terms:         cleaned,
+	})
+}
+
+func (t *Transpiler) lookupBM25FieldStatsR66(colExpr, resolvedField, origField string) *BM25FieldTermStats {
+	if t == nil || len(t.Opts.CorpusBM25Stats) == 0 {
+		return nil
+	}
+	candidates := []string{
+		colExpr,
+		strings.Trim(colExpr, "`"),
+		resolvedField,
+		origField,
+	}
+	for _, k := range candidates {
+		if k == "" {
+			continue
+		}
+		if st, ok := t.Opts.CorpusBM25Stats[k]; ok && st != nil {
+			return st
+		}
+	}
+	return nil
+}
+
+func (t *Transpiler) buildBM25ClauseWithStatsR66(origField, resolvedField, colExpr, patInDblSpace string, caseSensitive bool, k1, bParam, boost float64, safePred string) string {
+	if safePred == "FALSE" || strings.TrimSpace(patInDblSpace) == "" {
+		return "0.0"
+	}
+	if boost == 0 {
+		return fmt.Sprintf("(CASE WHEN %s THEN 0.0000 ELSE 0.0 END)", safePred)
+	}
+	strCol := fmt.Sprintf("COALESCE(CAST(%s AS STRING), '')", colExpr)
+	pat := patInDblSpace
+	if !caseSensitive {
+		strCol = fmt.Sprintf("LOWER(%s)", strCol)
+		pat = strings.ToLower(pat)
+	}
+	// Preserve intra-word apostrophes (e.g. "Al's" as 1 token) while turning edge apostrophes and punctuation into delimiters.
+	stripEdgeApostrophes := fmt.Sprintf("REGEXP_REPLACE(%s, %s, ' ')", strCol, quoteStr(`(^|[^[:alnum:]_])'+|'+([^[:alnum:]_]|$)`))
+	trimOne := fmt.Sprintf("TRIM(REGEXP_REPLACE(%s, %s, ' '))", stripEdgeApostrophes, quoteStr(`[^[:alnum:]_']+`))
+	normDbl := fmt.Sprintf("CONCAT(' ', REPLACE(%s, ' ', '  '), ' ')", trimOne)
+	patLit := quoteStr(pat)
+	patRunes := utf8.RuneCountInString(pat)
+	if patRunes <= 0 {
+		patRunes = 1
+	}
+	tfExpr := fmt.Sprintf(
+		"GREATEST(CAST(CHAR_LENGTH(%s) - CHAR_LENGTH(REPLACE(%s, %s, '')) AS DOUBLE) / %.1f, 1.0)",
+		normDbl, normDbl, patLit, float64(patRunes),
+	)
+	dlExpr := fmt.Sprintf(
+		"GREATEST(CAST(1 + CHAR_LENGTH(%s) - CHAR_LENGTH(REPLACE(%s, ' ', '')) AS DOUBLE), 1.0)",
+		trimOne, trimOne,
+	)
+
+	terms := strings.Fields(pat)
+	st := t.lookupBM25FieldStatsR66(colExpr, resolvedField, origField)
+	avgdl := 2.0
+	idfSum := 1.0
+	if st != nil && st.TotalDocs > 0 {
+		if st.AvgDL > 0 {
+			avgdl = st.AvgDL
+		} else {
+			avgdl = 1.0
+		}
+		if len(terms) > 0 {
+			idfSum = 0.0
+			for _, term := range terms {
+				var df int64
+				if st.TermDocFreq != nil {
+					var ok bool
+					df, ok = st.TermDocFreq[term]
+					if !ok && !caseSensitive {
+						df = st.TermDocFreq[strings.ToLower(term)]
+					}
+				}
+				if df <= 0 {
+					df = 1
+				}
+				if df > st.TotalDocs {
+					df = st.TotalDocs
+				}
+				idfSum += math.Log(1.0 + (float64(st.TotalDocs)-float64(df)+0.5)/(float64(df)+0.5))
+			}
+		}
+	}
+
+	scaleStr := FormatSQLFloatR63(boost * idfSum * (k1 + 1.0))
+	denom := fmt.Sprintf(
+		"((%s) + %s * (%s + %s * (%s) / %s))",
+		tfExpr, FormatSQLFloatR63(k1), FormatSQLFloatR63(1.0-bParam), FormatSQLFloatR63(bParam), dlExpr, FormatSQLFloatR63(avgdl),
+	)
+	return fmt.Sprintf(
+		"(CASE WHEN %s THEN (%s * (%s) / %s) ELSE 0.0 END)",
+		safePred, scaleStr, tfExpr, denom,
+	)
+}
+
 // buildBM25ClauseFromColAndPatternR63 emits pure scalar Apache Doris 4.1.3 SQL computing
 // BM25 TF & field-length saturation for `patInDblSpace` (`" tok "` or `" t1  t2 "`).
 func buildBM25ClauseFromColAndPatternR63(colExpr, patInDblSpace string, caseSensitive bool, k1, bParam, boost float64, safePred string) string {
@@ -478,6 +598,10 @@ func (t *Transpiler) compileBM25SingleTermScoreR63(
 		return "", false
 	}
 	colExpr := t.bm25TextColExprR63(resolvedField, b, nctx)
+	t.recordBM25RequirementR66(resolvedField, colExpr, caseSensitive, []string{tok})
+	if t.Opts.CorpusBM25Stats != nil {
+		return t.buildBM25ClauseWithStatsR66(origField, resolvedField, colExpr, " "+tok+" ", caseSensitive, k1, bParam, boost, safePred), true
+	}
 	return buildBM25ClauseFromColAndPatternR63(colExpr, " "+tok+" ", caseSensitive, k1, bParam, boost, safePred), true
 }
 
@@ -497,10 +621,17 @@ func (t *Transpiler) compileBM25MultiTokenMatchScoreR63(
 	if overallSafePred == "FALSE" {
 		return "0.0", true
 	}
+	colExpr := t.bm25TextColExprR63(resolvedField, b, nctx)
+	t.recordBM25RequirementR66(resolvedField, colExpr, caseSensitive, tokens)
 	if boost == 0 {
 		return fmt.Sprintf("(CASE WHEN %s THEN 0.0000 ELSE 0.0 END)", overallSafePred), true
 	}
-	colExpr := t.bm25TextColExprR63(resolvedField, b, nctx)
+	emitClause := func(pat, pred string) string {
+		if t.Opts.CorpusBM25Stats != nil {
+			return t.buildBM25ClauseWithStatsR66(origField, resolvedField, colExpr, pat, caseSensitive, k1, bParam, boost, pred)
+		}
+		return buildBM25ClauseFromColAndPatternR63(colExpr, pat, caseSensitive, k1, bParam, boost, pred)
+	}
 	var termScores []string
 	for _, tok := range tokens {
 		tokTrim := strings.TrimSpace(tok)
@@ -508,14 +639,14 @@ func (t *Transpiler) compileBM25MultiTokenMatchScoreR63(
 			continue
 		}
 		tokPred := t.singleAnalyzedTokenWhereOnlyR63(resolvedField, b, tokTrim, caseSensitive, nctx)
-		termScores = append(termScores, buildBM25ClauseFromColAndPatternR63(colExpr, " "+tokTrim+" ", caseSensitive, k1, bParam, boost, tokPred))
+		termScores = append(termScores, emitClause(" "+tokTrim+" ", tokPred))
 	}
 	if len(termScores) == 0 {
 		return "", false
 	}
 	if len(termScores) == 1 {
 		// If `overallSafePred` matches broader/identical docs, gate on `overallSafePred`.
-		return buildBM25ClauseFromColAndPatternR63(colExpr, " "+strings.TrimSpace(tokens[0])+" ", caseSensitive, k1, bParam, boost, overallSafePred), true
+		return emitClause(" "+strings.TrimSpace(tokens[0])+" ", overallSafePred), true
 	}
 	return fmt.Sprintf("(CASE WHEN %s THEN (%s) ELSE 0.0 END)", overallSafePred, strings.Join(termScores, " + ")), true
 }
@@ -543,7 +674,11 @@ func (t *Transpiler) compileBM25PhraseScoreR63(
 		return "", false
 	}
 	colExpr := t.bm25TextColExprR63(resolvedField, b, nctx)
+	t.recordBM25RequirementR66(resolvedField, colExpr, caseSensitive, cleaned)
 	pat := " " + strings.Join(cleaned, "  ") + " "
+	if t.Opts.CorpusBM25Stats != nil {
+		return t.buildBM25ClauseWithStatsR66(origField, resolvedField, colExpr, pat, caseSensitive, k1, bParam, boost, safePred), true
+	}
 	return buildBM25ClauseFromColAndPatternR63(colExpr, pat, caseSensitive, k1, bParam, boost, safePred), true
 }
 
@@ -2303,11 +2438,11 @@ func buildDateRangeBucketExplodeSQLR63(fromTable, effLoSQL, effHiSQL string, ivM
 	stepExpr := fmt.Sprintf("GREATEST(%s, ((%s) - (%s)) / 2000.0)", minStepStr, effHiSQL, effLoSQL)
 	// Number of steps = floor((hi - lo) / step) + 2 so the final `_off` clamps cleanly onto `effHiSQL` via `LEAST(...)`.
 	countExpr := fmt.Sprintf(
-		"CAST(LEAST(GREATEST(CAST(FLOOR(((%s) - (%s)) / (%s)) AS BIGINT) + 2, 1), 2005) AS INT)",
+		"CAST(LEAST(GREATEST(TRY_CAST(FLOOR(((%s) - (%s)) / (%s)) AS BIGINT) + 2, 1), 2005) AS INT)",
 		effHiSQL, effLoSQL, stepExpr,
 	)
 	explodeFrom := fmt.Sprintf("%s LATERAL VIEW EXPLODE(ARRAY_RANGE(0, %s)) `_rng_t` AS `_off`", fromTable, countExpr)
-	valExpr := fmt.Sprintf("LEAST((%s) + CAST(`_off` AS DOUBLE) * (%s), (%s))", effLoSQL, stepExpr, effHiSQL)
+	valExpr := fmt.Sprintf("LEAST((%s) + TRY_CAST(`_off` AS DOUBLE) * (%s), (%s))", effLoSQL, stepExpr, effHiSQL)
 	return explodeFrom, valExpr
 }
 

@@ -3565,8 +3565,8 @@ func TestRound50TranspilerGeoPolygonRangeContainsNestedSpanSortAndTermsSet(t *te
 	var numTypeSortReq, badGeoSortReq, unmappedGeoSortReq, missingGeoSortReq esast.SearchRequest
 	_ = json.Unmarshal([]byte(`{"sort": [{"price": {"order": "asc", "numeric_type": "long"}}]}`), &numTypeSortReq)
 	planNT, err := tr.BuildSearchPlan(&numTypeSortReq)
-	if err != nil || !strings.Contains(planNT.HitsSQL, "CAST(`f__price` AS BIGINT)") {
-		t.Fatalf("F16 expected numeric_type=long on double field to emit CAST(`f__price` AS BIGINT), got plan=%+v err=%v", planNT, err)
+	if err != nil || !strings.Contains(planNT.HitsSQL, "TRY_CAST(`f__price` AS BIGINT)") {
+		t.Fatalf("F16 expected numeric_type=long on double field to emit TRY_CAST(`f__price` AS BIGINT), got plan=%+v err=%v", planNT, err)
 	}
 	_ = json.Unmarshal([]byte(`{"sort": [{"_geo_distance": {"status": [0, 0], "order": "asc"}}]}`), &badGeoSortReq)
 	if _, err := tr.BuildSearchPlan(&badGeoSortReq); err == nil || !strings.Contains(err.Error(), "failed to find mapper for [status] for geo distance based sort") {

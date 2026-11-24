@@ -493,9 +493,9 @@ func EncodeGeotileSQL(latExpr, lonExpr string, precision int) string {
 	}
 	n := int64(1) << zoom
 	nMinus1 := n - 1
-	clampedLat := fmt.Sprintf("LEAST(GREATEST(CAST(%s AS DOUBLE), -85.05112877980659), 85.05112877980659)", latExpr)
-	xExpr := fmt.Sprintf("LEAST(GREATEST(CAST(FLOOR(((CAST(%s AS DOUBLE) + 180.0) / 360.0) * %d.0) AS BIGINT), 0), %d)", lonExpr, n, nMinus1)
-	yExpr := fmt.Sprintf("LEAST(GREATEST(CAST(FLOOR((1.0 - LN(TAN(PI() / 4.0 + ((%s) * PI() / 360.0))) / PI()) / 2.0 * %d.0) AS BIGINT), 0), %d)", clampedLat, n, nMinus1)
+	clampedLat := fmt.Sprintf("LEAST(GREATEST(TRY_CAST(%s AS DOUBLE), -85.05112877980659), 85.05112877980659)", latExpr)
+	xExpr := fmt.Sprintf("LEAST(GREATEST(TRY_CAST(FLOOR(((TRY_CAST(%s AS DOUBLE) + 180.0) / 360.0) * %d.0) AS BIGINT), 0), %d)", lonExpr, n, nMinus1)
+	yExpr := fmt.Sprintf("LEAST(GREATEST(TRY_CAST(FLOOR((1.0 - LN(TAN(PI() / 4.0 + ((%s) * PI() / 360.0))) / PI()) / 2.0 * %d.0) AS BIGINT), 0), %d)", clampedLat, n, nMinus1)
 	return fmt.Sprintf("CASE WHEN %s IS NULL OR %s IS NULL THEN NULL ELSE CONCAT('%d/', CAST(%s AS STRING), '/', CAST(%s AS STRING)) END",
 		latExpr, lonExpr, zoom, xExpr, yExpr)
 }
@@ -864,6 +864,9 @@ func (t *Transpiler) compileKNNRound61(kq *esast.KNNQuery, scoring bool, nctx *n
 				effNumCand = min(10000, max(1, int(math.Ceil(1.5*float64(effSize)))))
 			}
 			topLimit = effNumCand
+			if t.Opts.NumberOfShards > 1 {
+				topLimit = effNumCand * t.Opts.NumberOfShards
+			}
 		}
 	}
 

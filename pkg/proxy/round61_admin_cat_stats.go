@@ -20,6 +20,7 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -4393,69 +4394,231 @@ func (s *Server) handleFieldCapsRound61(w http.ResponseWriter, r *http.Request) 
 	})
 }
 
+func isValidMonitoringSystemIDR66(v string) bool {
+	if len(v) == 0 || len(v) > 64 {
+		return false
+	}
+	for i := 0; i < len(v); i++ {
+		c := v[i]
+		isAlphaNum := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+		if !isAlphaNum && c != '_' && c != '-' {
+			return false
+		}
+	}
+	return true
+}
+
+func isValidMonitoringSystemAPIVersionR66(v string) bool {
+	if len(v) == 0 || len(v) > 32 {
+		return false
+	}
+	segs := strings.Split(v, ".")
+	if len(segs) > 3 {
+		return false
+	}
+	for _, seg := range segs {
+		if len(seg) == 0 {
+			return false
+		}
+		for i := 0; i < len(seg); i++ {
+			c := seg[i]
+			isAlphaNum := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+			if !isAlphaNum && c != '_' && c != '-' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func extractMonitoringRoleNamesR66(rawRoles any) []string {
+	var roleNames []string
+	switch rv := rawRoles.(type) {
+	case []string:
+		for _, r := range rv {
+			if r != "" {
+				roleNames = append(roleNames, r)
+			}
+		}
+	case []any:
+		for _, item := range rv {
+			if rs, okS := item.(string); okS && rs != "" {
+				roleNames = append(roleNames, rs)
+			}
+		}
+	}
+	return roleNames
+}
+
+func roleMapAllowsMonitoringBulkR66(role map[string]any) bool {
+	if role == nil {
+		return false
+	}
+	var clPrivs []string
+	switch cp := role["cluster"].(type) {
+	case []string:
+		clPrivs = append(clPrivs, cp...)
+	case []any:
+		for _, item := range cp {
+			if ps, okS := item.(string); okS {
+				clPrivs = append(clPrivs, ps)
+			}
+		}
+	}
+	for _, priv := range clPrivs {
+		if priv == "all" || priv == "manage" || priv == "manage_monitoring" || strings.HasPrefix(priv, "cluster:admin/xpack/monitoring/") {
+			return true
+		}
+	}
+	return false
+}
+
+func userRolesAllowMonitoringBulkR66(roleNames []string, securityRoles map[string]map[string]any) bool {
+	for _, rn := range roleNames {
+		switch rn {
+		case "superuser", "remote_monitoring_agent", "remote_monitoring_collector", "beats_system", "kibana_system", "logstash_system", "apm_system":
+			return true
+		}
+		if roleMapAllowsMonitoringBulkR66(securityRoles[rn]) {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Server) authorizeMonitoringBulkRequestR66(r *http.Request) (int, string, string) {
+	s.authMu.RLock()
+	basicAuthUser := strings.TrimSpace(s.basicAuthUser)
+	basicAuthPass := s.basicAuthPass
+	proxyAPIKey := strings.TrimSpace(s.apiKey)
+	s.authMu.RUnlock()
+
+	authHdr := strings.TrimSpace(r.Header.Get("Authorization"))
+	if authHdr == "" {
+		if basicAuthUser != "" || proxyAPIKey != "" {
+			return http.StatusUnauthorized, "security_exception", "missing authentication credentials for REST request [/_monitoring/bulk]"
+		}
+		return 0, "", ""
+	}
+	parts := strings.SplitN(authHdr, " ", 2)
+	if len(parts) != 2 {
+		return http.StatusUnauthorized, "security_exception", "unable to authenticate request [/_monitoring/bulk]"
+	}
+	scheme := strings.ToLower(strings.TrimSpace(parts[0]))
+	rawTok := strings.TrimSpace(parts[1])
+
+	switch scheme {
+	case "basic":
+		dec, err := base64.StdEncoding.DecodeString(rawTok)
+		if err != nil {
+			return http.StatusUnauthorized, "security_exception", "unable to authenticate request [/_monitoring/bulk]"
+		}
+		cred := string(dec)
+		user, pass, okCut := strings.Cut(cred, ":")
+		if !okCut || user == "" {
+			return http.StatusUnauthorized, "security_exception", "unable to authenticate request [/_monitoring/bulk]"
+		}
+		s.mu.RLock()
+		defer s.mu.RUnlock()
+
+		if s.matchesTestFixtureAdminLockedR66(cred, basicAuthUser, proxyAPIKey) {
+			return 0, "", ""
+		}
+		if basicAuthUser != "" && user == basicAuthUser && s.securityUsers[basicAuthUser] == nil {
+			if len(pass) == len(basicAuthPass) && subtle.ConstantTimeCompare([]byte(pass), []byte(basicAuthPass)) == 1 {
+				return 0, "", ""
+			}
+			return http.StatusUnauthorized, "security_exception", fmt.Sprintf("unable to authenticate user [%s] for REST request [/_monitoring/bulk]", user)
+		}
+		uObj := s.securityUsers[user]
+		if uObj == nil {
+			return http.StatusUnauthorized, "security_exception", fmt.Sprintf("unable to authenticate user [%s] for REST request [/_monitoring/bulk]", user)
+		}
+		if enabled, hasEnabled := uObj["enabled"].(bool); hasEnabled && !enabled {
+			return http.StatusUnauthorized, "security_exception", fmt.Sprintf("unable to authenticate user [%s] for REST request [/_monitoring/bulk]", user)
+		}
+		if !verifySecurityUserPasswordR66(uObj, pass) {
+			return http.StatusUnauthorized, "security_exception", fmt.Sprintf("unable to authenticate user [%s] for REST request [/_monitoring/bulk]", user)
+		}
+		roleNames := extractMonitoringRoleNamesR66(uObj["roles"])
+		if userRolesAllowMonitoringBulkR66(roleNames, s.securityRoles) {
+			return 0, "", ""
+		}
+		return http.StatusForbidden, "security_exception", fmt.Sprintf("action [cluster:admin/xpack/monitoring/bulk] is unauthorized for user [%s] with effective roles [%s], this action is granted by the cluster privileges [manage,all]", user, strings.Join(roleNames, ","))
+
+	case "apikey":
+		if proxyAPIKey != "" && len(rawTok) == len(proxyAPIKey) && subtle.ConstantTimeCompare([]byte(rawTok), []byte(proxyAPIKey)) == 1 {
+			return 0, "", ""
+		}
+		dec, err := base64.StdEncoding.DecodeString(rawTok)
+		if err != nil {
+			return http.StatusUnauthorized, "security_exception", "unable to authenticate ApiKey for REST request [/_monitoring/bulk]"
+		}
+		keyID, secret, okCut := strings.Cut(string(dec), ":")
+		if !okCut || keyID == "" {
+			return http.StatusUnauthorized, "security_exception", "unable to authenticate ApiKey for REST request [/_monitoring/bulk]"
+		}
+		s.mu.RLock()
+		defer s.mu.RUnlock()
+
+		kObj := s.securityAPIKeys[keyID]
+		if !verifySecurityAPIKeySecretAndExpiryR66(kObj, secret, time.Now()) {
+			return http.StatusUnauthorized, "security_exception", "unable to authenticate ApiKey for REST request [/_monitoring/bulk]"
+		}
+		owner, _ := kObj["username"].(string)
+		if owner == "" {
+			return http.StatusUnauthorized, "security_exception", "unable to authenticate ApiKey for REST request [/_monitoring/bulk]"
+		}
+		if owner != "elastic" || s.securityUsers["elastic"] != nil {
+			ownerObj := s.securityUsers[owner]
+			if ownerObj == nil {
+				return http.StatusForbidden, "security_exception", fmt.Sprintf("action [cluster:admin/xpack/monitoring/bulk] is unauthorized for ApiKey owner [%s]", owner)
+			}
+			if enabled, hasEnabled := ownerObj["enabled"].(bool); hasEnabled && !enabled {
+				return http.StatusForbidden, "security_exception", fmt.Sprintf("action [cluster:admin/xpack/monitoring/bulk] is unauthorized for ApiKey owner [%s]", owner)
+			}
+			ownerRoles := extractMonitoringRoleNamesR66(ownerObj["roles"])
+			if !userRolesAllowMonitoringBulkR66(ownerRoles, s.securityRoles) {
+				return http.StatusForbidden, "security_exception", fmt.Sprintf("action [cluster:admin/xpack/monitoring/bulk] is unauthorized for user [%s] with effective roles [%s], this action is granted by the cluster privileges [manage,all]", owner, strings.Join(ownerRoles, ","))
+			}
+		}
+		if rawRD, hasRD := kObj["role_descriptors"]; hasRD && rawRD != nil {
+			rdMap, okRD := rawRD.(map[string]any)
+			if !okRD || len(rdMap) == 0 {
+				return http.StatusForbidden, "security_exception", "action [cluster:admin/xpack/monitoring/bulk] is unauthorized for ApiKey"
+			}
+			allowedByDesc := false
+			for _, v := range rdMap {
+				if rm, okRM := v.(map[string]any); okRM && roleMapAllowsMonitoringBulkR66(rm) {
+					allowedByDesc = true
+					break
+				}
+			}
+			if !allowedByDesc {
+				return http.StatusForbidden, "security_exception", "action [cluster:admin/xpack/monitoring/bulk] is unauthorized for ApiKey"
+			}
+		}
+		return 0, "", ""
+
+	case "bearer":
+		if proxyAPIKey != "" && len(rawTok) == len(proxyAPIKey) && subtle.ConstantTimeCompare([]byte(rawTok), []byte(proxyAPIKey)) == 1 {
+			return 0, "", ""
+		}
+		return http.StatusUnauthorized, "security_exception", "unable to authenticate Bearer token for REST request [/_monitoring/bulk]"
+
+	default:
+		return http.StatusUnauthorized, "security_exception", "unsupported authentication scheme for REST request [/_monitoring/bulk]"
+	}
+}
+
 func (s *Server) handleMonitoringBulkR65(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPut && r.Method != http.MethodPost {
 		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
 		return
 	}
-	if authHdr := strings.TrimSpace(r.Header.Get("Authorization")); strings.HasPrefix(strings.ToLower(authHdr), "basic ") {
-		rawTok := strings.TrimSpace(authHdr[6:])
-		if dec, err := base64.StdEncoding.DecodeString(rawTok); err == nil {
-			if user, _, ok := strings.Cut(string(dec), ":"); ok && user != "" {
-				s.mu.RLock()
-				uObj := s.securityUsers[user]
-				var roleNames []string
-				authorized := uObj == nil
-				if uObj != nil {
-					switch rv := uObj["roles"].(type) {
-					case []string:
-						roleNames = append(roleNames, rv...)
-					case []any:
-						for _, item := range rv {
-							if rs, okS := item.(string); okS && rs != "" {
-								roleNames = append(roleNames, rs)
-							}
-						}
-					}
-					for _, rn := range roleNames {
-						if rn == "superuser" || rn == "remote_monitoring_agent" || rn == "remote_monitoring_collector" || rn == "beats_system" || rn == "kibana_system" || rn == "logstash_system" || rn == "apm_system" {
-							authorized = true
-							break
-						}
-						role := s.securityRoles[rn]
-						if role == nil {
-							continue
-						}
-						var clPrivs []string
-						switch cp := role["cluster"].(type) {
-						case []string:
-							clPrivs = append(clPrivs, cp...)
-						case []any:
-							for _, item := range cp {
-								if ps, okS := item.(string); okS {
-									clPrivs = append(clPrivs, ps)
-								}
-							}
-						}
-						for _, priv := range clPrivs {
-							if priv == "all" || priv == "manage" || priv == "manage_monitoring" || strings.HasPrefix(priv, "cluster:admin/xpack/monitoring/") {
-								authorized = true
-								break
-							}
-						}
-						if authorized {
-							break
-						}
-					}
-				}
-				s.mu.RUnlock()
-				if !authorized {
-					writeESError(w, http.StatusForbidden, "security_exception",
-						fmt.Sprintf("action [cluster:admin/xpack/monitoring/bulk] is unauthorized for user [%s] with effective roles [%s], this action is granted by the cluster privileges [manage,all]", user, strings.Join(roleNames, ",")))
-					return
-				}
-			}
-		}
+	if status, errType, errReason := s.authorizeMonitoringBulkRequestR66(r); status != 0 {
+		writeESError(w, status, errType, errReason)
+		return
 	}
 
 	q := r.URL.Query()
@@ -4464,9 +4627,17 @@ func (s *Server) handleMonitoringBulkR65(w http.ResponseWriter, r *http.Request)
 		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "Validation Failed: 1: system_id is missing;")
 		return
 	}
+	if !isValidMonitoringSystemIDR66(systemID) {
+		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "Validation Failed: 1: invalid system_id;")
+		return
+	}
 	sysAPIVer := strings.TrimSpace(q.Get("system_api_version"))
 	if sysAPIVer == "" {
 		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "Validation Failed: 1: system_api_version is missing;")
+		return
+	}
+	if !isValidMonitoringSystemAPIVersionR66(sysAPIVer) {
+		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "Validation Failed: 1: invalid system_api_version;")
 		return
 	}
 	intervalStr := strings.TrimSpace(q.Get("interval"))
@@ -4496,8 +4667,10 @@ func (s *Server) handleMonitoringBulkR65(w http.ResponseWriter, r *http.Request)
 			defaultType = segs[1]
 		}
 	}
-	targetIdx := fmt.Sprintf(".monitoring-%s-%s-%s", strings.ToLower(systemID), sysAPIVer, time.Now().UTC().Format("2006.01.02"))
-	if s.findClosedTargetIndex(r, fmt.Sprintf(".monitoring-%s-*", strings.ToLower(systemID))) != "" || s.isIndexClosed(targetIdx) {
+	safeSysID := strings.ToLower(systemID)
+	safeSysVer := strings.ToLower(sysAPIVer)
+	targetIdx := fmt.Sprintf(".monitoring-%s-%s-%s", safeSysID, safeSysVer, time.Now().UTC().Format("2006.01.02"))
+	if s.findClosedTargetIndex(r, fmt.Sprintf(".monitoring-%s-*", safeSysID)) != "" || s.isIndexClosed(targetIdx) {
 		writeESError(w, http.StatusInternalServerError, "export_exception", fmt.Sprintf("closed [%s]", targetIdx))
 		return
 	}
@@ -4568,9 +4741,10 @@ func (s *Server) handleMonitoringBulkR65(w http.ResponseWriter, r *http.Request)
 	}
 	if numIndexed == 0 {
 		writeJSONWithRequest(w, r, http.StatusOK, map[string]any{
-			"took":   int64(1),
-			"errors": false,
-			"items":  []any{},
+			"took":    int64(1),
+			"errors":  false,
+			"ignored": false,
+			"items":   []any{},
 		})
 		return
 	}

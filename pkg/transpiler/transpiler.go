@@ -23,6 +23,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"math/big"
 	"net"
 	"regexp"
 	"sort"
@@ -75,6 +76,25 @@ type ExecutionPlan struct {
 	// UnindexedVariantFields lists dynamic `_doc[...]` fields accessed by this query that are not yet
 	// promoted to physical `f__*` columns with `USING INVERTED` indexes.
 	UnindexedVariantFields []string
+	// CollapseMaxScoreSQL computes the pre-collapse `MAX(_score) AS _overall_max_score` without altering
+	// `HitsSQL`'s 5-column projection expected by backend row scanners.
+	CollapseMaxScoreSQL string
+}
+
+// BM25FieldTermStats provides corpus-wide field statistics (`TotalDocs`, `AvgDL`, and per-term `TermDocFreq`)
+// so live Doris BM25 scoring can compute exact Lucene IDF and average document length normalization.
+type BM25FieldTermStats struct {
+	TotalDocs   int64
+	AvgDL       float64
+	TermDocFreq map[string]int64
+}
+
+// BM25QueryRequirement identifies a field/column and analyzed query terms requiring corpus BM25 stats.
+type BM25QueryRequirement struct {
+	Field         string
+	ColExpr       string
+	CaseSensitive bool
+	Terms         []string
 }
 
 // RawHistParamStrings preserves unrounded JSON integer strings for `histogram`
@@ -104,11 +124,14 @@ type TranspilerOptions struct {
 	EnforceResultWindowError   bool
 	DisallowExpensiveQueries   bool
 	DisableSynonymsPhraseQuery bool
+	ImplicitTimestampSort      bool
+	NumberOfShards             int
 	RuntimeMappings            map[string]esast.FieldProperty
 	AnalysisConfig             *analysis.IndexAnalysisConfig
 	AnalysisOpts               analysis.Options
 	Similarities               map[string]SimilarityConfig
 	TermDocFreqFn              func(colExpr string, terms []string, caseSensitive bool) (int, map[string]int)
+	CorpusBM25Stats            map[string]*BM25FieldTermStats
 	RawHistBounds              map[string]RawHistParamStrings
 }
 
@@ -116,6 +139,7 @@ type Transpiler struct {
 	Schema                *schema.IndexSchema
 	Opts                  TranspilerOptions
 	unindexedFields       map[string]bool
+	collectedBM25Reqs     []BM25QueryRequirement
 	searchErr             error
 	inFilterAggQuery      bool
 	inLenientQuery        bool
@@ -137,6 +161,58 @@ func NewTranspiler(s *schema.IndexSchema, opts TranspilerOptions) *Transpiler {
 		Opts:            opts,
 		unindexedFields: make(map[string]bool),
 	}
+}
+
+// CollectBM25QueryRequirements dry-compiles a request's scoring queries and returns the deduplicated
+// set of fields, Doris SQL column expressions, and analyzed tokens needing corpus BM25 statistics.
+func CollectBM25QueryRequirements(req *esast.SearchRequest, sc *schema.IndexSchema, opts TranspilerOptions) []BM25QueryRequirement {
+	if req == nil {
+		return nil
+	}
+	collectOpts := opts
+	collectOpts.CorpusBM25Stats = nil
+	tr := NewTranspiler(sc, collectOpts)
+	if req.Query != nil {
+		_ = tr.CompileQuery(req.Query, true, nil)
+	}
+	for i := range req.Rescore {
+		if req.Rescore[i].Query.RescoreQuery != nil {
+			_ = tr.CompileQuery(req.Rescore[i].Query.RescoreQuery, true, nil)
+		}
+	}
+	if len(tr.collectedBM25Reqs) == 0 {
+		return nil
+	}
+	type reqKey struct {
+		field         string
+		colExpr       string
+		caseSensitive bool
+	}
+	idxByKey := make(map[reqKey]int, len(tr.collectedBM25Reqs))
+	seenTermsByIdx := make([]map[string]struct{}, 0, len(tr.collectedBM25Reqs))
+	out := make([]BM25QueryRequirement, 0, len(tr.collectedBM25Reqs))
+	for _, r := range tr.collectedBM25Reqs {
+		k := reqKey{field: r.Field, colExpr: r.ColExpr, caseSensitive: r.CaseSensitive}
+		idx, exists := idxByKey[k]
+		if !exists {
+			idx = len(out)
+			idxByKey[k] = idx
+			seenTermsByIdx = append(seenTermsByIdx, make(map[string]struct{}, len(r.Terms)))
+			out = append(out, BM25QueryRequirement{
+				Field:         r.Field,
+				ColExpr:       r.ColExpr,
+				CaseSensitive: r.CaseSensitive,
+			})
+		}
+		termSet := seenTermsByIdx[idx]
+		for _, tk := range r.Terms {
+			if _, ok := termSet[tk]; !ok {
+				termSet[tk] = struct{}{}
+				out[idx].Terms = append(out[idx].Terms, tk)
+			}
+		}
+	}
+	return out
 }
 
 func (t *Transpiler) isES8DocValuesSearchEnabled() bool {
@@ -856,7 +932,7 @@ func (t *Transpiler) BuildSearchPlan(req *esast.SearchRequest) (*ExecutionPlan, 
 			}
 		}
 	}
-	effSorts := EffectiveSortsForRequest(req)
+	effSorts := t.effectiveSortsForRequest(req)
 	orderBy := t.compileOrderByWithAfter(effSorts, req.SearchAfter)
 	if req.Collapse != nil && req.Collapse.Field != "" {
 		bCollapse := t.Schema.ResolveEffectiveField(req.Collapse.Field, true)
@@ -892,6 +968,13 @@ func (t *Transpiler) BuildSearchPlan(req *esast.SearchRequest) (*ExecutionPlan, 
 			if saPred != "" && saPred != "TRUE" {
 				outerCollapseWhere = fmt.Sprintf("(%s) AND (%s)", outerCollapseWhere, saPred)
 			}
+			plan.CollapseMaxScoreSQL = fmt.Sprintf(
+				"SELECT CAST(MAX(`_score`) AS DOUBLE) AS `_overall_max_score` FROM (SELECT CAST(%s AS DOUBLE) AS `_score` FROM `%s`.`%s` WHERE %s) `_scored`",
+				scoreExpr,
+				t.Schema.DorisDB,
+				t.Schema.DorisTable,
+				preCollapseWhere,
+			)
 			plan.HitsSQL = fmt.Sprintf(
 				"SELECT `_id`, `_version`, `_source`, `_score`, `_total_hits` "+
 					"FROM ("+
@@ -3331,6 +3414,23 @@ func (t *Transpiler) compileMatchPhraseField(
 		if len(filteredTokens) > 0 && len(filteredTokens) < len(strings.Fields(strings.TrimSpace(queryStr))) {
 			queryStr = strings.Join(filteredTokens, " ")
 		}
+		if strings.EqualFold(effectiveFieldSearchAnalyzer(b), "english") {
+			if engToks, okEng := analyzeTokensWithBuiltinGraphR63(queryStr, "english"); okEng && len(engToks) > 0 {
+				var terms []string
+				var posGaps []int
+				for i, tk := range engToks {
+					terms = append(terms, tk.Term)
+					if i > 0 {
+						gap := tk.Position - engToks[i-1].Position - 1
+						if gap < 0 {
+							gap = 0
+						}
+						posGaps = append(posGaps, gap)
+					}
+				}
+				return t.multiTokenExactPhraseWithStemSQLR66(field, b, terms, posGaps, slop, isPrefix, false, true, boost, scoring, nctx)
+			}
+		}
 	}
 	if isPrefix && !isExactKeywordField(field, b) {
 		effAn := t.effectiveQueryAnalyzerName(b, "")
@@ -5482,6 +5582,13 @@ func (t *Transpiler) compileTermPredicate(field string, val any, caseInsensitive
 		}
 		return fmt.Sprintf("array_contains(%s, %s)", arrExpr, qVal)
 	}
+	if b.ESType == "long_range" && nctx == nil {
+		return t.compileLongRangeOnRangeFieldR65(field, b, esast.RangeCond{
+			GTE:      val,
+			LTE:      val,
+			Relation: "INTERSECTS",
+		})
+	}
 	if schema.IsRangeFieldType(b.ESType) {
 		qf, ok := coerceRangeFieldQueryScalar(val, b, b.Format, 0, false, false)
 		if !ok {
@@ -5577,7 +5684,7 @@ func (t *Transpiler) compileTermPredicate(field string, val any, caseInsensitive
 		}
 	} else if b.ESType == "date" && b.Format != "" && !strings.Contains(strings.ToLower(b.Format), "epoch_millis") && val != nil {
 		if strVal, isStr := val.(string); isStr {
-			if ms, ok := schema.ParseESDateWithFormatToEpochMillis(strVal, b.Format, time.Now().UTC()); ok {
+			if ms, ok := schema.ParseESDateWithFormatAndLocaleToEpochMillis(strVal, b.Format, b.Locale, time.Now().UTC()); ok {
 				val = ms
 			} else if iv, err := strconv.ParseInt(strings.TrimSpace(strVal), 10, 64); err == nil {
 				val = iv
@@ -5599,7 +5706,7 @@ func (t *Transpiler) compileTermPredicate(field string, val any, caseInsensitive
 				numStr = nv.String()
 			}
 			if numStr != "" {
-				if ms, ok := schema.ParseESDateWithFormatToEpochMillis(numStr, b.Format, time.Now().UTC()); ok {
+				if ms, ok := schema.ParseESDateWithFormatAndLocaleToEpochMillis(numStr, b.Format, b.Locale, time.Now().UTC()); ok {
 					val = ms
 				}
 			}
@@ -5608,7 +5715,7 @@ func (t *Transpiler) compileTermPredicate(field string, val any, caseInsensitive
 		if effLower && effDT != schema.DorisBigInt && effDT != schema.DorisLargeInt && effDT != schema.DorisInt && effDT != schema.DorisDouble && b.ESType != "date" && b.ESType != "date_nanos" {
 			val = strings.ToLower(strVal)
 		} else if b.ESType == "date" || (b.ESType == "" && effDT == schema.DorisBigInt) {
-			if ms, ok := schema.ParseESDateWithFormatToEpochMillis(strVal, b.Format, time.Now().UTC()); ok {
+			if ms, ok := schema.ParseESDateWithFormatAndLocaleToEpochMillis(strVal, b.Format, b.Locale, time.Now().UTC()); ok {
 				val = ms
 			} else if iv, err := strconv.ParseInt(strings.TrimSpace(strVal), 10, 64); err == nil {
 				val = iv
@@ -6823,7 +6930,7 @@ func (t *Transpiler) compileRangeSingleField(field string, rc esast.RangeCond, n
 				if effFormat != "" && (b.ESType == "date" || rc.Format != "") && (!strings.Contains(strings.ToLower(effFormat), "epoch") || strings.Contains(strings.ToLower(effFormat), "basic_date")) {
 					switch iv := v.(type) {
 					case int, int64, json.Number:
-						if ms, ok := schema.ParseESDateBoundWithFormatToEpochMillis(fmt.Sprintf("%v", iv), effFormat, now, roundUp); ok {
+						if ms, ok := schema.ParseESDateBoundWithFormatAndLocaleToEpochMillis(fmt.Sprintf("%v", iv), effFormat, b.Locale, now, roundUp); ok {
 							if tzOffsetMs != 0 && !strings.Contains(strings.ToLower(effFormat), "epoch") {
 								ms -= tzOffsetMs
 							}
@@ -6831,7 +6938,7 @@ func (t *Transpiler) compileRangeSingleField(field string, rc esast.RangeCond, n
 						}
 					case float64:
 						if !math.IsNaN(iv) && !math.IsInf(iv, 0) && iv == math.Trunc(iv) && iv >= float64(math.MinInt64) && iv < 9223372036854775808.0 {
-							if ms, ok := schema.ParseESDateBoundWithFormatToEpochMillis(strconv.FormatInt(int64(iv), 10), effFormat, now, roundUp); ok {
+							if ms, ok := schema.ParseESDateBoundWithFormatAndLocaleToEpochMillis(strconv.FormatInt(int64(iv), 10), effFormat, b.Locale, now, roundUp); ok {
 								if tzOffsetMs != 0 && !strings.Contains(strings.ToLower(effFormat), "epoch") {
 									ms -= tzOffsetMs
 								}
@@ -6843,7 +6950,7 @@ func (t *Transpiler) compileRangeSingleField(field string, rc esast.RangeCond, n
 				if strVal, ok := v.(string); ok {
 					trimmed := strings.TrimSpace(strVal)
 					if effFormat != "" && (b.ESType == "date" || rc.Format != "") {
-						if ms, ok := schema.ParseESDateBoundWithFormatToEpochMillis(strVal, effFormat, now, roundUp); ok {
+						if ms, ok := schema.ParseESDateBoundWithFormatAndLocaleToEpochMillis(strVal, effFormat, b.Locale, now, roundUp); ok {
 							datePart := trimmed
 							if idx := strings.Index(datePart, "||"); idx >= 0 {
 								datePart = strings.TrimSpace(datePart[:idx])
@@ -6859,7 +6966,7 @@ func (t *Transpiler) compileRangeSingleField(field string, rc esast.RangeCond, n
 						}
 					}
 					if b.ESType == "date" || rc.Format != "" {
-						if ms, ok := schema.ParseESDateBoundWithFormatToEpochMillis(strVal, effFormat, now, roundUp); ok {
+						if ms, ok := schema.ParseESDateBoundWithFormatAndLocaleToEpochMillis(strVal, effFormat, b.Locale, now, roundUp); ok {
 							datePart := trimmed
 							if idx := strings.Index(datePart, "||"); idx >= 0 {
 								datePart = strings.TrimSpace(datePart[:idx])
@@ -6903,7 +7010,7 @@ func (t *Transpiler) compileRangeSingleField(field string, rc esast.RangeCond, n
 						return int64(rawSec)
 					}
 					if b.ESType == "" {
-						if ms, ok := schema.ParseESDateBoundWithFormatToEpochMillis(strVal, effFormat, now, roundUp); ok {
+						if ms, ok := schema.ParseESDateBoundWithFormatAndLocaleToEpochMillis(strVal, effFormat, b.Locale, now, roundUp); ok {
 							datePart := trimmed
 							if idx := strings.Index(datePart, "||"); idx >= 0 {
 								datePart = strings.TrimSpace(datePart[:idx])
@@ -7236,6 +7343,21 @@ func (t *Transpiler) compileExistsPredicate(field string, nctx *nestedCtx) strin
 	basePred := fmt.Sprintf("%s IS NOT NULL", col)
 	if b.ESType == "flattened" || b.ESType == "histogram" || schema.IsRangeFieldType(b.ESType) {
 		basePred = fmt.Sprintf("(%s IS NOT NULL AND %s != '{}' AND %s != 'null')", col, col, col)
+	} else if nctx == nil && b.Kind == schema.StorageDynamicVariant && !b.NotIndexed && b.ESType != "object" && b.ESType != "nested" && (t.Schema == nil || !t.Schema.SourceDisabled()) && field != "_all_text" && field != "*" {
+		pathField := field
+		if len(b.SourceJSONPath) > 0 {
+			pathField = strings.Join(b.SourceJSONPath, ".")
+		}
+		nestedPath, dottedPath, hasDot := BuildQuotedDorisJSONPaths(pathField)
+		jsonTypeExists := func(jp string) string {
+			ql := quoteStr(jp)
+			return fmt.Sprintf("(JSON_TYPE(TRY_CAST(`_source` AS JSON), %s) IS NOT NULL AND JSON_TYPE(TRY_CAST(`_source` AS JSON), %s) != 'NULL' AND (JSON_TYPE(TRY_CAST(`_source` AS JSON), %s) != 'ARRAY' OR JSON_LENGTH(TRY_CAST(`_source` AS JSON), %s) > 0))", ql, ql, ql, ql)
+		}
+		if !hasDot {
+			basePred = jsonTypeExists(nestedPath)
+		} else {
+			basePred = fmt.Sprintf("(%s OR %s)", jsonTypeExists(nestedPath), jsonTypeExists(dottedPath))
+		}
 	}
 	if b.Kind == schema.StorageDynamicVariant && t.Schema != nil && nctx == nil && !strings.ContainsAny(field, "*?") {
 		prefix := field + "."
@@ -7535,9 +7657,17 @@ func (t *Transpiler) appendAggBranches(
 			}
 			if !ok {
 				if t.Schema != nil && (len(t.Schema.Fields) > 0 || len(t.Schema.NestedRoots) > 0) {
-					if t.searchErr == nil {
-						t.searchErr = fmt.Errorf("[nested] failed to find nested object under path [%s]", spec.Nested.Path)
+					if schemaHasMappedNonNestedPathR66(t.Schema, spec.Nested.Path) {
+						if t.searchErr == nil {
+							t.searchErr = fmt.Errorf("[nested] failed to find nested object under path [%s]", spec.Nested.Path)
+						}
+						continue
 					}
+					*branches = append(*branches, fmt.Sprintf(
+						"SELECT %s AS `_agg_name`, '_nested_doc_count' AS `_bucket_key`, CAST(COUNT(*) AS DOUBLE) AS `_doc_count` "+
+							"FROM `base_matched` LATERAL VIEW EXPLODE(CAST([] AS ARRAY<STRING>)) `_nt` AS `_nel` WHERE %s`_nel` IS NOT NULL",
+						quoteStr(fullAggName), wherePrefix,
+					))
 					continue
 				}
 				corrCol = "n__" + schema.SanitizeDorisIdentifier(spec.Nested.Path)
@@ -8896,7 +9026,7 @@ func (t *Transpiler) appendAggBranches(
 					"SELECT %s AS `_agg_name`, %s AS `_bucket_key`, CAST(%s AS DOUBLE) AS `_doc_count` "+
 					"FROM %s "+
 					"WHERE %s "+
-					"GROUP BY `_bucket_key` ORDER BY CAST(`_bucket_key` AS BIGINT) ASC"+
+					"GROUP BY `_bucket_key` ORDER BY TRY_CAST(`_bucket_key` AS BIGINT) ASC"+
 					") `_agg_sub_%d`",
 				quoteStr(fullAggName), bucketExpr, dhCountExpr, fromClause, notNullCond, *subIdx,
 			))
@@ -9027,15 +9157,19 @@ func (t *Transpiler) appendAggBranches(
 					}
 				}
 			}
-			colDiv := ensureDoubleHistogramExprR64(col, b)
-			bucketExpr := t.formatHistogramBucketKeySQLWithRawR65(colDiv, fullAggName, offset, interval, b)
+			histKeyB := b
+			if spec.Histogram.Script != nil {
+				histKeyB = schema.FieldBinding{ESType: "double", DorisType: schema.DorisDouble}
+			}
+			colDiv := ensureDoubleHistogramExprR64(col, histKeyB)
+			bucketExpr := t.formatHistogramBucketKeySQLWithRawR65(colDiv, fullAggName, offset, interval, histKeyB)
 			*subIdx++
 			*branches = append(*branches, fmt.Sprintf(
 				"SELECT `_agg_name`, `_bucket_key`, `_doc_count` FROM ("+
 					"SELECT %s AS `_agg_name`, %s AS `_bucket_key`, CAST(%s AS DOUBLE) AS `_doc_count` "+
 					"FROM %s "+
 					"WHERE %s "+
-					"GROUP BY `_bucket_key` ORDER BY CAST(`_bucket_key` AS DOUBLE) ASC"+
+					"GROUP BY `_bucket_key` ORDER BY TRY_CAST(`_bucket_key` AS DOUBLE) ASC"+
 					") `_agg_sub_%d`",
 				quoteStr(fullAggName), bucketExpr, hCountExpr, fromClause, notNullCond, *subIdx,
 			))
@@ -9418,6 +9552,9 @@ func (t *Transpiler) appendAggBranches(
 							}
 						}
 						hB := t.Schema.ResolveEffectiveField(effHField, true)
+						if srcSpec.Histogram.Script != nil {
+							hB = schema.FieldBinding{ESType: "double", DorisType: schema.DorisDouble}
+						}
 						if srcSpec.Histogram.Missing != nil {
 							if missVal, ok := resolveHistogramMissingFloat(srcSpec.Histogram.Missing); ok {
 								col = fmt.Sprintf("COALESCE(%s, %s)", col, strconv.FormatFloat(missVal, 'f', -1, 64))
@@ -9728,7 +9865,7 @@ func (t *Transpiler) appendAggBranches(
 			if extraWhere != "" {
 				wCond = fmt.Sprintf("(%s) AND (%s)", extraWhere, wCond)
 			}
-			keyExpr := fmt.Sprintf("CAST(CAST(FLOOR(%s) AS BIGINT) AS STRING)", col)
+			keyExpr := fmt.Sprintf("CAST(TRY_CAST(FLOOR(%s) AS BIGINT) AS STRING)", col)
 			*subIdx++
 			*branches = append(*branches, fmt.Sprintf(
 				"SELECT `_agg_name`, `_bucket_key`, `_doc_count` FROM ("+
@@ -9765,7 +9902,7 @@ func (t *Transpiler) appendAggBranches(
 				"SELECT `_agg_name`, `_bucket_key`, `_doc_count` FROM ("+
 					"SELECT %s AS `_agg_name`, %s AS `_bucket_key`, CAST(COUNT(*) AS DOUBLE) AS `_doc_count` "+
 					"FROM `base_matched` WHERE %s "+
-					"GROUP BY `_bucket_key` ORDER BY CAST(`_bucket_key` AS DOUBLE) ASC, `_bucket_key` ASC LIMIT %d"+
+					"GROUP BY `_bucket_key` ORDER BY TRY_CAST(`_bucket_key` AS DOUBLE) ASC, `_bucket_key` ASC LIMIT %d"+
 					") `_agg_sub_%d`",
 				quoteStr(fullAggName), keyExpr, wCond, t.maxAggBuckets(), *subIdx,
 			))
@@ -11163,8 +11300,12 @@ func (t *Transpiler) appendGroupedBucketSubAggsWithNested(
 					hasMissing = true
 				}
 			}
-			colDiv := ensureDoubleHistogramExprR64(col, b)
-			childBucketExpr := t.formatHistogramBucketKeySQLWithRawR65(colDiv, subFull, offset, interval, b)
+			histKeyB := b
+			if subSpec.Histogram.Script != nil {
+				histKeyB = schema.FieldBinding{ESType: "double", DorisType: schema.DorisDouble}
+			}
+			colDiv := ensureDoubleHistogramExprR64(col, histKeyB)
+			childBucketExpr := t.formatHistogramBucketKeySQLWithRawR65(colDiv, subFull, offset, interval, histKeyB)
 			compKeyExpr := fmt.Sprintf("CONCAT(%s, '\\x1f', %s)", parentBucketExpr, childBucketExpr)
 			subWhere := fmt.Sprintf("(%s) AND %s IS NOT NULL", whereClause, notNullExpr)
 			if isHistType {
@@ -11487,9 +11628,17 @@ func (t *Transpiler) appendGroupedBucketSubAggsWithNested(
 			}
 			if !ok {
 				if t.Schema != nil && (len(t.Schema.Fields) > 0 || len(t.Schema.NestedRoots) > 0) {
-					if t.searchErr == nil {
-						t.searchErr = fmt.Errorf("[nested] failed to find nested object under path [%s]", subSpec.Nested.Path)
+					if schemaHasMappedNonNestedPathR66(t.Schema, subSpec.Nested.Path) {
+						if t.searchErr == nil {
+							t.searchErr = fmt.Errorf("[nested] failed to find nested object under path [%s]", subSpec.Nested.Path)
+						}
+						continue
 					}
+					*branches = append(*branches, fmt.Sprintf(
+						"SELECT %s AS `_agg_name`, %s AS `_bucket_key`, CAST(COUNT(CAST(NULL AS STRING)) AS DOUBLE) AS `_doc_count` "+
+							"FROM %s WHERE %s GROUP BY `_bucket_key`",
+						quoteStr(subFull), parentBucketExpr, fromClause, whereClause,
+					))
 					continue
 				}
 				corrCol = "n__" + schema.SanitizeDorisIdentifier(subSpec.Nested.Path)
@@ -11689,6 +11838,9 @@ func (t *Transpiler) appendGroupedBucketSubAggsWithNested(
 							}
 						}
 						hB := t.Schema.ResolveEffectiveField(effHField, true)
+						if srcSpec.Histogram.Script != nil {
+							hB = schema.FieldBinding{ESType: "double", DorisType: schema.DorisDouble}
+						}
 						if srcSpec.Histogram.Missing != nil {
 							if missVal, ok := resolveHistogramMissingFloat(srcSpec.Histogram.Missing); ok {
 								col = fmt.Sprintf("COALESCE(%s, %s)", col, strconv.FormatFloat(missVal, 'f', -1, 64))
@@ -11948,7 +12100,7 @@ func (t *Transpiler) appendGroupedBucketSubAggsWithNested(
 				}
 			}
 			subWhere := fmt.Sprintf("(%s) AND %s IS NOT NULL", whereClause, col)
-			childKeyExpr := fmt.Sprintf("CONCAT(%s, '\\x1f', CAST(CAST(FLOOR(%s / 3600000) * 3600000 AS BIGINT) AS STRING))", parentBucketExpr, col)
+			childKeyExpr := fmt.Sprintf("CONCAT(%s, '\\x1f', CAST(TRY_CAST(FLOOR(%s / 3600000) * 3600000 AS BIGINT) AS STRING))", parentBucketExpr, col)
 			*subIdx++
 			*branches = append(*branches, fmt.Sprintf(
 				"SELECT `_agg_name`, `_bucket_key`, `_doc_count` FROM ("+
@@ -13789,6 +13941,58 @@ func EffectiveSortsForRequest(req *esast.SearchRequest) []esast.SortSpec {
 	return out
 }
 
+func isConstantScoreQueryTreeR66(q *esast.Query) bool {
+	if q == nil || q.MatchAll != nil || q.MatchNone != nil || q.Exists != nil ||
+		len(q.Term) > 0 || q.Terms != nil || len(q.TermsSet) > 0 || len(q.Range) > 0 ||
+		len(q.Prefix) > 0 || len(q.Wildcard) > 0 || len(q.Regexp) > 0 || q.Ids != nil ||
+		q.GeoDistance != nil || q.GeoBoundingBox != nil || q.GeoPolygon != nil || q.GeoShape != nil || q.GeoGrid != nil ||
+		q.ConstantScore != nil {
+		return true
+	}
+	if q.Bool != nil {
+		return len(q.Bool.Must) == 0 && len(q.Bool.Should) == 0
+	}
+	return false
+}
+
+func (t *Transpiler) effectiveSortsForRequest(req *esast.SearchRequest) []esast.SortSpec {
+	base := EffectiveSortsForRequest(req)
+	if t == nil || !t.Opts.ImplicitTimestampSort || req == nil || len(req.Sort) > 0 || len(req.SearchAfter) > 0 || t.Schema == nil {
+		return base
+	}
+	tsB, ok := t.Schema.Fields["@timestamp"]
+	if !ok || tsB.Kind == schema.StorageDynamicVariant || tsB.EnabledFalse || tsB.DocValuesFalse {
+		return base
+	}
+	if tsB.ESType != "date" && tsB.ESType != "date_nanos" {
+		return base
+	}
+	trackScores := req.TrackScores != nil && *req.TrackScores
+	includeScore := trackScores || (req.Query != nil && !isConstantScoreQueryTreeR66(req.Query))
+	if req.PIT != nil {
+		if includeScore {
+			return []esast.SortSpec{
+				{Entry: esast.SortFieldSpec{Field: "_score", Order: "desc"}},
+				{Entry: esast.SortFieldSpec{Field: "@timestamp", Order: "desc"}},
+				{Entry: esast.SortFieldSpec{Field: "_id", Order: "asc"}},
+			}
+		}
+		return []esast.SortSpec{
+			{Entry: esast.SortFieldSpec{Field: "@timestamp", Order: "desc"}},
+			{Entry: esast.SortFieldSpec{Field: "_id", Order: "asc"}},
+		}
+	}
+	if includeScore {
+		return []esast.SortSpec{
+			{Entry: esast.SortFieldSpec{Field: "_score", Order: "desc"}},
+			{Entry: esast.SortFieldSpec{Field: "@timestamp", Order: "desc"}},
+		}
+	}
+	return []esast.SortSpec{
+		{Entry: esast.SortFieldSpec{Field: "@timestamp", Order: "desc"}},
+	}
+}
+
 func (t *Transpiler) compileGeoDistanceSortExpr(s esast.SortSpec) (string, bool) {
 	geoMap, ok := s.Entry.Script.(map[string]any)
 	if !ok || len(geoMap) == 0 {
@@ -14112,13 +14316,13 @@ func (t *Transpiler) compileOrderByWithAfter(sorts []esast.SortSpec, after []any
 				case "long", "date", "date_nanos":
 					if b.ESType != "unsigned_long" {
 						if strings.EqualFold(s.Entry.NumericType, "long") && b.ESType == "scaled_float" {
-							col = fmt.Sprintf("CAST(TRUNCATE(%s, 0) AS BIGINT)", col)
+							col = fmt.Sprintf("TRY_CAST(TRUNCATE(%s, 0) AS BIGINT)", col)
 						} else {
-							col = fmt.Sprintf("CAST(%s AS BIGINT)", col)
+							col = fmt.Sprintf("TRY_CAST(%s AS BIGINT)", col)
 						}
 					}
 				case "double":
-					col = fmt.Sprintf("CAST(%s AS DOUBLE)", col)
+					col = fmt.Sprintf("TRY_CAST(%s AS DOUBLE)", col)
 				}
 			}
 			if missingSQL != "" {
@@ -14381,13 +14585,13 @@ func (t *Transpiler) compileSearchAfterPredicate(sorts []esast.SortSpec, after [
 				case "long", "date", "date_nanos":
 					if b.ESType != "unsigned_long" {
 						if strings.EqualFold(effectiveSorts[idx].Entry.NumericType, "long") && b.ESType == "scaled_float" {
-							col = fmt.Sprintf("CAST(TRUNCATE(%s, 0) AS BIGINT)", col)
+							col = fmt.Sprintf("TRY_CAST(TRUNCATE(%s, 0) AS BIGINT)", col)
 						} else {
-							col = fmt.Sprintf("CAST(%s AS BIGINT)", col)
+							col = fmt.Sprintf("TRY_CAST(%s AS BIGINT)", col)
 						}
 					}
 				case "double":
-					col = fmt.Sprintf("CAST(%s AS DOUBLE)", col)
+					col = fmt.Sprintf("TRY_CAST(%s AS DOUBLE)", col)
 				}
 			}
 			if missingSQL != "" {
@@ -14551,9 +14755,9 @@ func (t *Transpiler) sqlSortColumnRefWithType(field string, sampleVal any, desc 
 		if deepestNestedPath == "" {
 			switch b.DorisType {
 			case schema.DorisBigInt, schema.DorisLargeInt, schema.DorisInt:
-				return "CAST(NULL AS BIGINT)"
+				return "TRY_CAST(NULL AS BIGINT)"
 			case schema.DorisDouble:
-				return "CAST(NULL AS DOUBLE)"
+				return "TRY_CAST(NULL AS DOUBLE)"
 			default:
 				return "CAST(NULL AS STRING)"
 			}
@@ -14853,7 +15057,7 @@ func (t *Transpiler) sqlTypedColumnRef(field string, sampleVal any, preferKeywor
 			break
 		}
 		if b.DorisType == schema.DorisLargeInt && castType == "DOUBLE" {
-			return fmt.Sprintf("CAST(`%s` AS DOUBLE)", b.ColumnName)
+			return fmt.Sprintf("TRY_CAST(`%s` AS DOUBLE)", b.ColumnName)
 		}
 		if preferKeyword && b.KeywordCompanion != "" && (b.ESType == "text" || b.ESType == "match_only_text" || b.ESType == "") {
 			return fmt.Sprintf("`%s`", b.KeywordCompanion)
@@ -15282,14 +15486,26 @@ func (t *Transpiler) buildDateHistogramBucketKeySQL(dh *esast.DateHistogramAggSp
 
 	if !isFixed {
 		const epoch0 = "CAST('1970-01-01 00:00:00' AS DATETIME)"
-		secExpr := fmt.Sprintf("CAST(FLOOR((%s) / 1000) AS BIGINT)", colMillisExpr)
+		secExpr := fmt.Sprintf("TRY_CAST(FLOOR((%s) / 1000) AS BIGINT)", colMillisExpr)
 		utcDt := fmt.Sprintf("SECONDS_ADD(%s, %s)", epoch0, secExpr)
 		dynOffMs := fmt.Sprintf("(TIMESTAMPDIFF(SECOND, %s, CONVERT_TZ(%s, '+00:00', %s)) * 1000)", utcDt, utcDt, quoteStr(tzRaw))
 		shiftExpr := dynOffMs
 		if offsetMs != 0 {
 			shiftExpr = fmt.Sprintf("(%s - %d)", dynOffMs, offsetMs)
 		}
-		return fmt.Sprintf("CAST(CAST(FLOOR(((%s) + %s) / %d) * %d - %s AS BIGINT) AS STRING)", colMillisExpr, shiftExpr, intervalMs, intervalMs, shiftExpr)
+		flooredLocalMs := fmt.Sprintf("(FLOOR(((%s) + %s) / %d) * %d)", colMillisExpr, shiftExpr, intervalMs, intervalMs)
+		if offsetMs != 0 {
+			flooredLocalMs = fmt.Sprintf("(FLOOR(((%s) + %s) / %d) * %d + %d)", colMillisExpr, shiftExpr, intervalMs, intervalMs, offsetMs)
+		}
+		flooredLocalSec := fmt.Sprintf("TRY_CAST(FLOOR(%s / 1000) AS BIGINT)", flooredLocalMs)
+		flooredLocalDt := fmt.Sprintf("SECONDS_ADD(%s, %s)", epoch0, flooredLocalSec)
+		backToUTC := fmt.Sprintf("CONVERT_TZ(%s, %s, '+00:00')", flooredLocalDt, quoteStr(tzRaw))
+		utcMsExpr := fmt.Sprintf("(TIMESTAMPDIFF(SECOND, %s, %s) * 1000)", epoch0, backToUTC)
+		if intervalMs%1000 != 0 || offsetMs%1000 != 0 {
+			subMsExpr := fmt.Sprintf("(TRY_CAST(%s AS BIGINT) - (%s * 1000))", flooredLocalMs, flooredLocalSec)
+			utcMsExpr = fmt.Sprintf("(%s + %s)", utcMsExpr, subMsExpr)
+		}
+		return fmt.Sprintf("CAST(TRY_CAST(%s AS BIGINT) AS STRING)", utcMsExpr)
 	}
 
 	tzShiftMs := fixedOffMs - offsetMs
@@ -15430,7 +15646,7 @@ func coerceRangeFieldQueryScalar(v any, b schema.FieldBinding, format string, tz
 		roundUp := isUpper != isExclusive
 		var ms int64
 		if s, isStr := v.(string); isStr {
-			parsedMs, ok := schema.ParseESDateBoundWithFormatToEpochMillis(s, format, now, roundUp)
+			parsedMs, ok := schema.ParseESDateBoundWithFormatAndLocaleToEpochMillis(s, format, b.Locale, now, roundUp)
 			if !ok {
 				return 0, false
 			}
@@ -15657,6 +15873,30 @@ func (t *Transpiler) compileRangeOnRangeField(field string, b schema.FieldBindin
 	return t.compileRangePredOnRangeField(field, b, nctx, buildConds)
 }
 
+func clampFloat64ToInt64RangeBoundR65(fv float64, isUpper bool) (int64, bool) {
+	if math.IsNaN(fv) || math.IsInf(fv, 0) {
+		return 0, false
+	}
+	if fv >= float64(math.MaxInt64) {
+		return math.MaxInt64, true
+	}
+	if fv <= float64(math.MinInt64) {
+		return math.MinInt64, true
+	}
+	if isUpper {
+		res := math.Floor(fv)
+		if res >= float64(math.MaxInt64) {
+			return math.MaxInt64, true
+		}
+		return int64(res), true
+	}
+	res := math.Ceil(fv)
+	if res <= float64(math.MinInt64) {
+		return math.MinInt64, true
+	}
+	return int64(res), true
+}
+
 func parseExactInt64RangeBoundR65(v any, isUpper bool) (int64, bool) {
 	switch nv := v.(type) {
 	case int:
@@ -15673,11 +15913,8 @@ func parseExactInt64RangeBoundR65(v any, isUpper bool) (int64, bool) {
 		if iv, err := strconv.ParseInt(s, 10, 64); err == nil {
 			return iv, true
 		}
-		if fv, err := strconv.ParseFloat(s, 64); err == nil && !math.IsNaN(fv) && !math.IsInf(fv, 0) {
-			if isUpper {
-				return int64(math.Floor(fv)), true
-			}
-			return int64(math.Ceil(fv)), true
+		if fv, err := strconv.ParseFloat(s, 64); err == nil {
+			return clampFloat64ToInt64RangeBoundR65(fv, isUpper)
 		}
 		return 0, false
 	case string:
@@ -15685,27 +15922,12 @@ func parseExactInt64RangeBoundR65(v any, isUpper bool) (int64, bool) {
 		if iv, err := strconv.ParseInt(s, 10, 64); err == nil {
 			return iv, true
 		}
-		if fv, err := strconv.ParseFloat(s, 64); err == nil && !math.IsNaN(fv) && !math.IsInf(fv, 0) {
-			if isUpper {
-				return int64(math.Floor(fv)), true
-			}
-			return int64(math.Ceil(fv)), true
+		if fv, err := strconv.ParseFloat(s, 64); err == nil {
+			return clampFloat64ToInt64RangeBoundR65(fv, isUpper)
 		}
 		return 0, false
 	case float64:
-		if math.IsNaN(nv) || math.IsInf(nv, 0) {
-			return 0, false
-		}
-		if isUpper {
-			if nv >= float64(math.MaxInt64) {
-				return math.MaxInt64, true
-			}
-			return int64(math.Floor(nv)), true
-		}
-		if nv <= float64(math.MinInt64) {
-			return math.MinInt64, true
-		}
-		return int64(math.Ceil(nv)), true
+		return clampFloat64ToInt64RangeBoundR65(nv, isUpper)
 	default:
 		return 0, false
 	}
@@ -16091,7 +16313,7 @@ func ensureDoubleHistogramExprR64(expr string, b schema.FieldBinding) string {
 		if (strings.HasPrefix(expr, "CAST(") || strings.HasPrefix(expr, "TRY_CAST(")) && strings.HasSuffix(expr, " AS DOUBLE)") {
 			return expr
 		}
-		return fmt.Sprintf("CAST(%s AS DOUBLE)", expr)
+		return fmt.Sprintf("TRY_CAST(%s AS DOUBLE)", expr)
 	}
 	return expr
 }
@@ -16104,12 +16326,23 @@ func formatHistogramBucketKeySQLR65(colDiv string, offset, interval float64, b s
 	return formatHistogramBucketKeySQLWithRawParamsR65(colDiv, offset, interval, RawHistParamStrings{}, b)
 }
 
+var (
+	dorisLargeIntMinR66 = func() *big.Int {
+		v, _ := new(big.Int).SetString("-170141183460469231731687303715884105728", 10)
+		return v
+	}()
+	dorisLargeIntMaxR66 = func() *big.Int {
+		v, _ := new(big.Int).SetString("170141183460469231731687303715884105727", 10)
+		return v
+	}()
+)
+
 func isExactSignedIntLiteralR65(s string) bool {
 	if s == "" {
 		return false
 	}
 	i := 0
-	if s[0] == '-' {
+	if s[0] == '-' || s[0] == '+' {
 		if len(s) == 1 {
 			return false
 		}
@@ -16120,7 +16353,19 @@ func isExactSignedIntLiteralR65(s string) bool {
 			return false
 		}
 	}
-	return true
+	bi, ok := new(big.Int).SetString(s, 10)
+	if !ok {
+		return false
+	}
+	return bi.Cmp(dorisLargeIntMinR66) >= 0 && bi.Cmp(dorisLargeIntMaxR66) <= 0
+}
+
+func isPositiveExactSignedIntLiteralR66(s string) bool {
+	if !isExactSignedIntLiteralR65(s) {
+		return false
+	}
+	bi, ok := new(big.Int).SetString(s, 10)
+	return ok && bi.Sign() > 0
 }
 
 func (t *Transpiler) formatHistogramBucketKeySQLWithRawR65(colDiv, aggPath string, offset, interval float64, b schema.FieldBinding) string {
@@ -16131,25 +16376,79 @@ func (t *Transpiler) formatHistogramBucketKeySQLWithRawR65(colDiv, aggPath strin
 	return formatHistogramBucketKeySQLWithRawParamsR65(colDiv, offset, interval, raw, b)
 }
 
+func isIntegralHistogramTypeR66(b schema.FieldBinding) bool {
+	switch b.ESType {
+	case "unsigned_long", "long", "integer", "short", "byte":
+		return true
+	}
+	switch b.DorisType {
+	case schema.DorisLargeInt, schema.DorisLargeIntArray,
+		schema.DorisBigInt, schema.DorisInt:
+		return true
+	}
+	return false
+}
+
 func formatHistogramBucketKeySQLWithRawParamsR65(colDiv string, offset, interval float64, raw RawHistParamStrings, b schema.FieldBinding) string {
+	if math.IsNaN(offset) || math.IsInf(offset, 0) {
+		offset = 0
+	}
+	if math.IsNaN(interval) || math.IsInf(interval, 0) || interval <= 0 {
+		interval = 1.0
+	}
 	offStr := FormatSQLFloatR63(offset)
 	intStr := FormatSQLFloatR63(interval)
-	isUL := b.ESType == "unsigned_long" || b.DorisType == schema.DorisLargeInt || b.DorisType == schema.DorisLargeIntArray
-	if isUL && isExactSignedIntLiteralR65(strings.TrimSpace(raw.Interval)) {
-		intStr = strings.TrimSpace(raw.Interval)
-		if isExactSignedIntLiteralR65(strings.TrimSpace(raw.Offset)) {
-			offStr = strings.TrimSpace(raw.Offset)
+	isIntHist := isIntegralHistogramTypeR66(b)
+	rawInt := strings.TrimSpace(raw.Interval)
+	if isIntHist && isPositiveExactSignedIntLiteralR66(rawInt) {
+		intStr = rawInt
+		rawOff := strings.TrimSpace(raw.Offset)
+		if isExactSignedIntLiteralR65(rawOff) {
+			offStr = rawOff
 		} else if offset == 0 {
 			offStr = "0"
 		}
-		return fmt.Sprintf("CAST((CAST(FLOOR((%s - %s) / %s) AS LARGEINT) * %s + %s) AS STRING)", colDiv, offStr, intStr, intStr, offStr)
+		return fmt.Sprintf("CAST((TRY_CAST(FLOOR((%s - %s) / %s) AS LARGEINT) * %s + %s) AS STRING)", colDiv, offStr, intStr, intStr, offStr)
 	}
-	if isUL && !math.IsNaN(offset) && !math.IsInf(offset, 0) && !math.IsNaN(interval) && !math.IsInf(interval, 0) &&
+	if isIntHist && interval > 0 && !math.IsNaN(offset) && !math.IsInf(offset, 0) && !math.IsNaN(interval) && !math.IsInf(interval, 0) &&
 		interval == math.Trunc(interval) && offset == math.Trunc(offset) &&
 		math.Abs(interval) <= 1e20 && math.Abs(offset) <= 1e20 {
-		return fmt.Sprintf("CAST((CAST(FLOOR((%s - %s) / %s) AS LARGEINT) * %s + %s) AS STRING)", colDiv, offStr, intStr, intStr, offStr)
+		return fmt.Sprintf("CAST((TRY_CAST(FLOOR((%s - %s) / %s) AS LARGEINT) * %s + %s) AS STRING)", colDiv, offStr, intStr, intStr, offStr)
 	}
 	return fmt.Sprintf("CAST(FLOOR((%s - %s) / %s) * %s + %s AS STRING)", colDiv, offStr, intStr, intStr, offStr)
+}
+
+func schemaHasMappedNonNestedPathR66(sc *schema.IndexSchema, targetPath string) bool {
+	if sc == nil || targetPath == "" {
+		return false
+	}
+	if _, ok := sc.Fields[targetPath]; ok {
+		return true
+	}
+	prefix := targetPath + "."
+	for fp, fb := range sc.Fields {
+		if strings.HasPrefix(fp, prefix) && fb.NestedPath != targetPath {
+			return true
+		}
+	}
+	if sc.RawMapping != nil && len(sc.RawMapping.Properties) > 0 {
+		segs := strings.Split(targetPath, ".")
+		props := sc.RawMapping.Properties
+		for i, seg := range segs {
+			prop, exists := props[seg]
+			if !exists {
+				return false
+			}
+			if i == len(segs)-1 {
+				return !strings.EqualFold(strings.TrimSpace(prop.Type), "nested")
+			}
+			props = prop.Properties
+			if len(props) == 0 {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func schemaHasNestedObjectPathR65(sc *schema.IndexSchema, nestedPath string) bool {

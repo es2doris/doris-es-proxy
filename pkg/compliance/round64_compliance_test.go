@@ -24,6 +24,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -825,5 +826,199 @@ func TestRound64_SchemaValidatorHardening(t *testing.T) {
 	}
 	if err := v.ValidateEndpointResponse("nodes.hot_threads", []byte(`{"unexpected":true}`)); err == nil {
 		t.Errorf("nodes.hot_threads JSON object root must fail string validation")
+	}
+}
+
+type mockStaticRepoServer struct {
+	mu               sync.Mutex
+	pathRepoHistory  [][]string
+	allowedHistory   [][]string
+	currentPathRepo  []string
+	currentAllowed   []string
+	clusterSettingsN int
+	events           []string
+}
+
+func (s *mockStaticRepoServer) SetStaticPathRepo(roots []string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var cp []string
+	if roots != nil {
+		cp = append([]string(nil), roots...)
+	}
+	s.currentPathRepo = cp
+	s.pathRepoHistory = append(s.pathRepoHistory, cp)
+	s.events = append(s.events, "static:path.repo")
+}
+
+func (s *mockStaticRepoServer) SetStaticRepositoriesURLAllowedURLs(patterns []string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var cp []string
+	if patterns != nil {
+		cp = append([]string(nil), patterns...)
+	}
+	s.currentAllowed = cp
+	s.allowedHistory = append(s.allowedHistory, cp)
+	s.events = append(s.events, "static:allowed_urls")
+}
+
+func (s *mockStaticRepoServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	s.events = append(s.events, r.Method+" "+r.URL.Path)
+	if r.URL.Path == "/_cluster/settings" {
+		s.clusterSettingsN++
+		s.mu.Unlock()
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":{"type":"illegal_argument_exception","reason":"static setting cannot be updated dynamically"},"status":400}`))
+		return
+	}
+	s.mu.Unlock()
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write([]byte(`{"acknowledged":true}`))
+}
+
+type mockServerWrapperHandler struct {
+	next http.Handler
+	srv  any
+}
+
+func (w mockServerWrapperHandler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
+	w.next.ServeHTTP(rw, r)
+}
+
+func (w mockServerWrapperHandler) Unwrap() http.Handler {
+	return w.next
+}
+
+func (w mockServerWrapperHandler) Server() any {
+	return w.srv
+}
+
+func TestRound66_SetupCategoryFixturePrefersStaticRepoSettingsSetter(t *testing.T) {
+	t.Parallel()
+
+	srv := &mockStaticRepoServer{}
+	// Wrap twice: Unwrap() -> inner handler whose Server() returns StaticRepoSettingsSetter
+	wrapped := mockServerWrapperHandler{
+		next: mockServerWrapperHandler{
+			next: srv,
+			srv:  srv,
+		},
+	}
+	client := &http.Client{
+		Transport: inProcessHandlerTransport{handler: wrapped},
+	}
+
+	cleanup := setupCategoryFixtureIfNeeded("repository_url", client)
+	if cleanup == nil {
+		t.Fatal("expected non-nil cleanup for repository_url with StaticRepoSettingsSetter")
+	}
+
+	srv.mu.Lock()
+	if srv.clusterSettingsN != 0 {
+		srv.mu.Unlock()
+		cleanup()
+		t.Fatalf("expected 0 PUT /_cluster/settings calls when StaticRepoSettingsSetter is present, got %d", srv.clusterSettingsN)
+	}
+	if len(srv.currentPathRepo) != 1 || srv.currentPathRepo[0] == "" {
+		srv.mu.Unlock()
+		cleanup()
+		t.Fatalf("expected non-empty static path.repo set, got %v", srv.currentPathRepo)
+	}
+	tmpDir := srv.currentPathRepo[0]
+	if len(srv.currentAllowed) != 4 {
+		srv.mu.Unlock()
+		cleanup()
+		t.Fatalf("expected 4 allowed_urls patterns, got %v", srv.currentAllowed)
+	}
+	if len(srv.events) < 5 || srv.events[0] != "static:path.repo" || srv.events[1] != "static:allowed_urls" || srv.events[2] != "PUT /_snapshot/repository-fs" {
+		gotEvents := append([]string(nil), srv.events...)
+		srv.mu.Unlock()
+		cleanup()
+		t.Fatalf("expected static setters called before PUT /_snapshot/*, got events %v", gotEvents)
+	}
+	srv.mu.Unlock()
+
+	cleanup()
+
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	if srv.clusterSettingsN != 0 {
+		t.Fatalf("expected 0 /_cluster/settings calls during cleanup, got %d", srv.clusterSettingsN)
+	}
+	if srv.currentPathRepo != nil || srv.currentAllowed != nil {
+		t.Fatalf("expected static settings reset to nil after cleanup, got pathRepo=%v allowed=%v", srv.currentPathRepo, srv.currentAllowed)
+	}
+	if _, err := os.Stat(tmpDir); !os.IsNotExist(err) {
+		t.Fatalf("expected tmpDir %q removed after cleanup, err=%v", tmpDir, err)
+	}
+	nEvents := len(srv.events)
+	if nEvents < 2 || srv.events[nEvents-2] != "static:path.repo" || srv.events[nEvents-1] != "static:allowed_urls" {
+		t.Fatalf("expected cleanup to reset static setters after repo deletions, got events %v", srv.events)
+	}
+	wantPrefixes := []string{"http://snapshot.test*", "https://snapshot.test*", "http://127.0.0.1:"}
+	if !reflect.DeepEqual(srv.pathRepoHistory[1], []string(nil)) || !strings.HasPrefix(srv.allowedHistory[0][2], wantPrefixes[2]) || srv.allowedHistory[0][0] != wantPrefixes[0] || srv.allowedHistory[0][1] != wantPrefixes[1] {
+		t.Fatalf("unexpected static history pathRepo=%v allowed=%v", srv.pathRepoHistory, srv.allowedHistory)
+	}
+}
+
+func TestRound66_HyphenStashVarAndTrailingDotPath(t *testing.T) {
+	t.Parallel()
+
+	// 1. reStashVar & expandStashPath allow hyphens in stashed variable names (`downsample/60_settings.yml`)
+	ctx := &runnerContext{
+		stash: map[string]any{
+			"datastream-backing-index": ".ds-test-datastream-downsampling-2026.01.01-000001",
+			"prefix":                   "logs",
+		},
+		lastResponse: map[string]any{
+			".ds-test-datastream-downsampling-2026.01.01-000001": map[string]any{
+				"settings": map[string]any{
+					"index": map[string]any{
+						"lifecycle": map[string]any{
+							"name": "dummy-lifecycle",
+						},
+					},
+				},
+			},
+			"aggregations": map[string]any{
+				"tsids": map[string]any{
+					"buckets": []any{
+						map[string]any{
+							"key": "sample_tsid_bucket_key_0001",
+						},
+					},
+				},
+			},
+		},
+	}
+
+	if got := ctx.expandStash("$datastream-backing-index"); got != ".ds-test-datastream-downsampling-2026.01.01-000001" {
+		t.Fatalf("expected direct hyphenated stash lookup, got %#v", got)
+	}
+	if got := ctx.expandStashString("$prefix-2026"); got != "logs-2026" {
+		t.Fatalf("expected hyphen-prefix fallback to resolve $prefix-2026, got %q", got)
+	}
+	expandedPath := ctx.expandStashPath(".$datastream-backing-index.settings.index.lifecycle.name")
+	gotLifecycle, ok := ctx.lookupResponsePath(expandedPath)
+	if !ok || gotLifecycle != "dummy-lifecycle" {
+		t.Fatalf("expected hyphenated stashed backing index match to resolve dummy-lifecycle via %q, got (%#v, %v)", expandedPath, gotLifecycle, ok)
+	}
+
+	// 2. lookupResponsePath ignores upstream typo trailing dot on non-empty key paths (`tsdb/70_dimension_types.yml:315`)
+	// while preserving trailing dot on `$idx.` stash string expansion (`runner_test.go:3975`).
+	ctx.stash["idx"] = "plain_idx"
+	if gotIdx := ctx.expandStash("$idx."); gotIdx != "plain_idx." {
+		t.Fatalf("expected $idx. to preserve trailing dot, got %#v", gotIdx)
+	}
+	if gotTSID, okTSID := ctx.lookupResponsePath("aggregations.tsids.buckets.0.key."); !okTSID || gotTSID != "sample_tsid_bucket_key_0001" {
+		t.Fatalf("lookupResponsePath trailing dot = (%#v, %v)", gotTSID, okTSID)
+	}
+	if gotDoubleDot, okDoubleDot := ctx.lookupResponsePath("aggregations.tsids.buckets.0..key"); !okDoubleDot || gotDoubleDot != "sample_tsid_bucket_key_0001" {
+		t.Fatalf("lookupResponsePath double dot = (%#v, %v)", gotDoubleDot, okDoubleDot)
+	}
+	if gotEsc, okEsc := ctx.lookupResponsePath(`aggregations.tsids.buckets.0.key\.`); okEsc || gotEsc != nil {
+		t.Fatalf("expected escaped trailing dot not to strip literal dot, got (%#v, %v)", gotEsc, okEsc)
 	}
 }

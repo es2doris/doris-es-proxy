@@ -214,15 +214,15 @@ func TestRound65_DLS_TermsEnumFailClosedAndFeatures(t *testing.T) {
 			"privileges": []any{"read"},
 		}},
 	}
-	srv.securityUsers["dls_all_user"] = map[string]any{"roles": []any{"dls_all_role"}, "enabled": true}
-	srv.securityUsers["dls_should_denied"] = map[string]any{"roles": []any{"dls_should_matchall"}, "enabled": true}
-	srv.securityUsers["dls_must_not_user"] = map[string]any{"roles": []any{"dls_must_not_role"}, "enabled": true}
-	srv.securityUsers["dls_nonslice_user"] = map[string]any{"roles": []any{"dls_nonslice_role"}, "enabled": true}
-	srv.securityUsers["cluster_only_user"] = map[string]any{"roles": []any{"cluster_only_role"}, "enabled": true}
-	srv.securityUsers["write_only_user"] = map[string]any{"roles": []any{"write_only_role"}, "enabled": true}
-	srv.securityUsers["fls_empty_grant_user"] = map[string]any{"roles": []any{"fls_empty_grant"}, "enabled": true}
-	srv.securityUsers["dls_alias_user"] = map[string]any{"roles": []any{"alias_role"}, "enabled": true}
-	srv.securityUsers["disabled_user"] = map[string]any{"roles": []any{"superuser"}, "enabled": false}
+	srv.securityUsers["dls_all_user"] = map[string]any{"password": "pw", "roles": []any{"dls_all_role"}, "enabled": true}
+	srv.securityUsers["dls_should_denied"] = map[string]any{"password": "pw", "roles": []any{"dls_should_matchall"}, "enabled": true}
+	srv.securityUsers["dls_must_not_user"] = map[string]any{"password": "pw", "roles": []any{"dls_must_not_role"}, "enabled": true}
+	srv.securityUsers["dls_nonslice_user"] = map[string]any{"password": "pw", "roles": []any{"dls_nonslice_role"}, "enabled": true}
+	srv.securityUsers["cluster_only_user"] = map[string]any{"password": "pw", "roles": []any{"cluster_only_role"}, "enabled": true}
+	srv.securityUsers["write_only_user"] = map[string]any{"password": "pw", "roles": []any{"write_only_role"}, "enabled": true}
+	srv.securityUsers["fls_empty_grant_user"] = map[string]any{"password": "pw", "roles": []any{"fls_empty_grant"}, "enabled": true}
+	srv.securityUsers["dls_alias_user"] = map[string]any{"password": "pw", "roles": []any{"alias_role"}, "enabled": true}
+	srv.securityUsers["disabled_user"] = map[string]any{"password": "pw", "roles": []any{"superuser"}, "enabled": false}
 	srv.mu.Unlock()
 
 	// Unauthenticated must fail closed when inbound proxy auth is enabled (even calling FilterTermsEnum directly).
@@ -484,11 +484,14 @@ func TestRound65_Modules_NodesClusterStatsDownsamplePercolateAndIngest(t *testin
 	}
 
 	// Mustache template expansions (#join, #toJson, #url)
-	expanded := expandIngestTemplate("{{#join delimiter=|}}tags{{/join}} {{#toJson}}obj{{/toJson}} {{#url}}{{q}}{{/url}}", map[string]any{
+	expanded, err := expandIngestTemplate("{{#join delimiter=|}}tags{{/join}} {{#toJson}}obj{{/toJson}} {{#url}}{{q}}{{/url}}", map[string]any{
 		"tags": []any{"x", "y"},
 		"obj":  map[string]any{"k": 1},
 		"q":    "hello world",
 	})
+	if err != nil {
+		t.Fatalf("unexpected expandIngestTemplate error: %v", err)
+	}
 	if expanded != `x|y {"k":1} hello+world` {
 		t.Fatalf("unexpected expandIngestTemplate output: %q", expanded)
 	}

@@ -752,8 +752,8 @@ func TestRound62_F17_MapperExtrasAndF22RuntimeFields(t *testing.T) {
 		"sort": [{"sf": {"order": "asc", "numeric_type": "long"}}],
 		"search_after": [-2]
 	}`))
-	if err != nil || strings.Count(sfPlan.HitsSQL, "CAST(TRUNCATE(`f__sf`, 0) AS BIGINT)") < 2 {
-		t.Fatalf("expected CAST(TRUNCATE(`f__sf`, 0) AS BIGINT) in both ORDER BY and search_after, err=%v sql=%s", err, sfPlan.HitsSQL)
+	if err != nil || strings.Count(sfPlan.HitsSQL, "TRY_CAST(TRUNCATE(`f__sf`, 0) AS BIGINT)") < 2 {
+		t.Fatalf("expected TRY_CAST(TRUNCATE(`f__sf`, 0) AS BIGINT) in both ORDER BY and search_after, err=%v sql=%s", err, sfPlan.HitsSQL)
 	}
 
 	// 5. F22 Scriptless Runtime Fields (index-level & search-request runtime_mappings + composite subfields + dotted keys)

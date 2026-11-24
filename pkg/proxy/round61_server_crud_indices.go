@@ -159,12 +159,8 @@ func (s *Server) effectiveTranspileOptsR61CRUD(r *http.Request) transpiler.Trans
 
 var unsupportedEndpointCapabilitiesR61Admin = map[string]bool{
 	"lazy_rollover_failure_store":   true,
-	"failure_store":                 true,
-	"data_stream_failure_store":     true,
 	"project_routing":               true,
 	"serverless":                    true,
-	"esql_async":                    true,
-	"esql_enrich":                   true,
 	"esql_lookup_join":              true,
 	"retriever_text_similarity":     true,
 	"searchable_snapshots_shared":   true,
@@ -2403,6 +2399,8 @@ func (s *Server) handleDeleteIndexR61CRUD(w http.ResponseWriter, r *http.Request
 		delete(s.docExtTombstones, indexName)
 		delete(s.unrefreshedDocs, indexName)
 		delete(s.indexStats, indexName)
+		delete(s.implicitTimestampSortEligible, indexName)
+		delete(s.unmergedDeletedSources, indexName)
 		for alias := range s.aliases {
 			s.removeAliasTargetLocked(alias, indexName)
 			modifiedAliases[alias] = append([]string(nil), s.aliases[alias]...)
@@ -4064,6 +4062,7 @@ func (s *Server) ensureWritableIndexSchemaWithDocsErrR61CRUD(
 	s.mu.RUnlock()
 
 	effectiveMappings := tplMappings
+	hadExplicitTimestampBeforeSampleR66 := hasMappedTimestampPropR66(tplMappings)
 	if len(sampleDocs) > 0 {
 		if tplMappings != nil && tplMappings.Dynamic == "runtime" {
 			if nextMap, added := applyDynamicRuntimeInferenceRound59(sampleDocs, effectiveMappings); added {
@@ -4179,6 +4178,10 @@ func (s *Server) ensureWritableIndexSchemaWithDocsErrR61CRUD(
 	}
 	s.indices[indexName] = compiled
 	if existingEmptySchema == nil {
+		if s.implicitTimestampSortEligible == nil {
+			s.implicitTimestampSortEligible = make(map[string]bool)
+		}
+		s.implicitTimestampSortEligible[indexName] = hadExplicitTimestampBeforeSampleR66 && isTimestampImplicitSortSchemaR66(compiled)
 		if hasTplDefPipe && tplDefPipe != "" {
 			if _, hasCur := s.indexDefaultPipelines[indexName]; !hasCur {
 				s.indexDefaultPipelines[indexName] = tplDefPipe
@@ -4219,6 +4222,24 @@ func (s *Server) ensureWritableIndexSchemaWithDocsErrR61CRUD(
 	}
 	s.queryCache.InvalidateAll()
 	return compiled, nil
+}
+
+func hasMappedTimestampPropR66(m *esast.MappingSpec) bool {
+	if m == nil || m.Properties == nil {
+		return false
+	}
+	fp, ok := m.Properties["@timestamp"]
+	if !ok {
+		return false
+	}
+	if fp.Enabled != nil && !*fp.Enabled {
+		return false
+	}
+	if fp.DocValues != nil && !*fp.DocValues {
+		return false
+	}
+	t := strings.ToLower(strings.TrimSpace(fp.Type))
+	return t == "date" || t == "date_nanos"
 }
 
 func snapshotAutoDimsFieldsR61CRUD(idxSchema *schema.IndexSchema) map[string]bool {

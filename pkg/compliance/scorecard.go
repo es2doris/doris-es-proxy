@@ -799,6 +799,63 @@ func isReadOnlySpecDocumentForSetupReuse(specDoc *SpecDocument) bool {
 	return true
 }
 
+// StaticRepoSettingsSetter configures node-static snapshot repository settings
+// (`path.repo` and `repositories.url.allowed_urls`) directly on an in-process test
+// server instead of sending dynamic `PUT /_cluster/settings` requests.
+type StaticRepoSettingsSetter interface {
+	SetStaticPathRepo(roots []string)
+	SetStaticRepositoriesURLAllowedURLs(patterns []string)
+}
+
+func findStaticRepoSettingsSetter(client *http.Client) StaticRepoSettingsSetter {
+	if client == nil || client.Transport == nil {
+		return nil
+	}
+	cur := any(client.Transport)
+	for depth := 0; depth < 8 && cur != nil; depth++ {
+		if setter, ok := cur.(StaticRepoSettingsSetter); ok {
+			return setter
+		}
+		if srvProvider, ok := cur.(interface{ Server() any }); ok {
+			if setter, ok := srvProvider.Server().(StaticRepoSettingsSetter); ok {
+				return setter
+			}
+		}
+		if ipt, ok := cur.(inProcessHandlerTransport); ok {
+			if ipt.handler == nil {
+				break
+			}
+			cur = ipt.handler
+			continue
+		}
+		if iptPtr, ok := cur.(*inProcessHandlerTransport); ok && iptPtr != nil {
+			if iptPtr.handler == nil {
+				break
+			}
+			cur = iptPtr.handler
+			continue
+		}
+		if unwrapper, ok := cur.(interface{ Unwrap() http.Handler }); ok {
+			next := unwrapper.Unwrap()
+			if next == nil {
+				break
+			}
+			cur = next
+			continue
+		}
+		if rtUnwrapper, ok := cur.(interface{ Unwrap() http.RoundTripper }); ok {
+			next := rtUnwrapper.Unwrap()
+			if next == nil {
+				break
+			}
+			cur = next
+			continue
+		}
+		break
+	}
+	return nil
+}
+
 func setupCategoryFixtureIfNeeded(category string, client *http.Client) func() {
 	if !strings.EqualFold(strings.TrimSpace(category), "repository_url") || client == nil {
 		return nil
@@ -837,19 +894,26 @@ func setupCategoryFixtureIfNeeded(category string, client *http.Client) func() {
 	if !strings.HasPrefix(fileURL, "file:///") {
 		fileURL = "file:///" + strings.TrimPrefix(filepath.ToSlash(tmpDir), "/") + "/"
 	}
-	allowedURLs := strings.Join([]string{
+	allowedURLsSlice := []string{
 		"http://snapshot.test*",
 		"https://snapshot.test*",
 		httpURL + "*",
 		fileURL + "*",
-	}, ",")
+	}
+	allowedURLs := strings.Join(allowedURLsSlice, ",")
 
-	sendFixtureJSON(http.MethodPut, "/_cluster/settings", map[string]any{
-		"persistent": map[string]any{
-			"path.repo":                     []string{tmpDir},
-			"repositories.url.allowed_urls": allowedURLs,
-		},
-	})
+	staticSetter := findStaticRepoSettingsSetter(client)
+	if staticSetter != nil {
+		staticSetter.SetStaticPathRepo([]string{tmpDir})
+		staticSetter.SetStaticRepositoriesURLAllowedURLs(allowedURLsSlice)
+	} else {
+		sendFixtureJSON(http.MethodPut, "/_cluster/settings", map[string]any{
+			"persistent": map[string]any{
+				"path.repo":                     []string{tmpDir},
+				"repositories.url.allowed_urls": allowedURLs,
+			},
+		})
+	}
 	sendFixtureJSON(http.MethodPut, "/_snapshot/repository-fs?verify=false", map[string]any{
 		"type": "fs",
 		"settings": map[string]any{
@@ -873,12 +937,17 @@ func setupCategoryFixtureIfNeeded(category string, client *http.Client) func() {
 		sendFixtureJSON(http.MethodDelete, "/_snapshot/repository-url", nil)
 		sendFixtureJSON(http.MethodDelete, "/_snapshot/repository-file", nil)
 		sendFixtureJSON(http.MethodDelete, "/_snapshot/repository-fs", nil)
-		sendFixtureJSON(http.MethodPut, "/_cluster/settings", map[string]any{
-			"persistent": map[string]any{
-				"path.repo":                     nil,
-				"repositories.url.allowed_urls": nil,
-			},
-		})
+		if staticSetter != nil {
+			staticSetter.SetStaticPathRepo(nil)
+			staticSetter.SetStaticRepositoriesURLAllowedURLs(nil)
+		} else {
+			sendFixtureJSON(http.MethodPut, "/_cluster/settings", map[string]any{
+				"persistent": map[string]any{
+					"path.repo":                     nil,
+					"repositories.url.allowed_urls": nil,
+				},
+			})
+		}
 		httpSrv.Close()
 		_ = os.RemoveAll(tmpDir)
 	}

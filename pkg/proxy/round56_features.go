@@ -822,17 +822,27 @@ func (s *Server) handleMLDataFrame(w http.ResponseWriter, r *http.Request, segs 
 			}
 		}
 		previewDocs := []any{}
+		featureValues := []any{}
 		if srcIdx != "" {
 			sz := 10
 			if resp, _, errType, _ := s.executeSearchRequest(r.Context(), srcIdx, &esast.SearchRequest{Size: &sz}); errType == "" && resp != nil {
 				for _, hitItem := range extractSearchResponseHitItems(resp) {
 					if srcDoc := extractHitSourceMap(hitItem); srcDoc != nil {
-						previewDocs = append(previewDocs, enrichMLDataFrameSource(srcDoc, analysisType, resultsField))
+						enriched := enrichMLDataFrameSource(srcDoc, analysisType, resultsField)
+						previewDocs = append(previewDocs, enriched)
+						fv := make(map[string]any, len(enriched))
+						for k, v := range enriched {
+							fv[k] = fmt.Sprintf("%v", v)
+						}
+						featureValues = append(featureValues, fv)
 					}
 				}
 			}
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"preview": previewDocs})
+		writeJSON(w, http.StatusOK, map[string]any{
+			"preview":        previewDocs,
+			"feature_values": featureValues,
+		})
 		return
 	}
 
@@ -890,6 +900,12 @@ func (s *Server) handleMLDataFrame(w http.ResponseWriter, r *http.Request, segs 
 				if v, has := body[k]; has {
 					job[k] = v
 				}
+			}
+			if _, hasLazy := job["allow_lazy_start"]; !hasLazy {
+				job["allow_lazy_start"] = false
+			}
+			if _, hasThreads := job["max_num_threads"]; !hasThreads {
+				job["max_num_threads"] = 1
 			}
 			clean := stripInternalUnderscoreKeys(job)
 			s.mu.Unlock()
@@ -959,7 +975,7 @@ func (s *Server) handleMLDataFrame(w http.ResponseWriter, r *http.Request, segs 
 				curJob["_docs_count"] = copiedCount
 			}
 			s.mu.Unlock()
-			writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
+			writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true, "node": "doris-fe-1"})
 			return
 
 		case "_stop":
@@ -1030,6 +1046,12 @@ func (s *Server) handleMLDataFrame(w http.ResponseWriter, r *http.Request, segs 
 		entry["id"] = id
 		if _, hasMem := entry["model_memory_limit"]; !hasMem {
 			entry["model_memory_limit"] = "1gb"
+		}
+		if _, hasLazy := entry["allow_lazy_start"]; !hasLazy {
+			entry["allow_lazy_start"] = false
+		}
+		if _, hasThreads := entry["max_num_threads"]; !hasThreads {
+			entry["max_num_threads"] = 1
 		}
 		entry["create_time"] = time.Now().UTC().UnixMilli()
 		entry["version"] = "8.15.0"
@@ -1281,10 +1303,10 @@ func (s *Server) handleMLDataFrameEvaluate(w http.ResponseWriter, r *http.Reques
 		}
 		writeJSON(w, http.StatusOK, map[string]any{
 			"regression": map[string]any{
-				"mse":       mse,
-				"r_squared": r2,
-				"huber":     0.0,
-				"msle":      0.0,
+				"mse":       map[string]any{"value": mse},
+				"r_squared": map[string]any{"value": r2},
+				"huber":     map[string]any{"value": 0.0},
+				"msle":      map[string]any{"value": 0.0},
 			},
 		})
 	}
@@ -1316,6 +1338,12 @@ func (s *Server) formatTrainedModelConfigLocked(modelID string, m map[string]any
 	}
 	sort.Strings(aliases)
 	cp["model_aliases"] = aliases
+	if cp["tags"] == nil {
+		cp["tags"] = []string{}
+	}
+	if cp["input"] == nil {
+		cp["input"] = map[string]any{"field_names": []string{}}
+	}
 	return cp
 }
 
@@ -1341,6 +1369,7 @@ func buildDeploymentAssignment(modelID, depID string, allocs, threads, queueCap 
 			"model_id":               modelID,
 			"deployment_id":          depID,
 			"model_bytes":            int64(1024),
+			"cache_size":             "1mb",
 			"threads_per_allocation": threads,
 			"number_of_allocations":  allocs,
 			"queue_capacity":         queueCap,
@@ -1528,8 +1557,8 @@ func (s *Server) handleMLTrainedModelSubRoute(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	// POST /_ml/trained_models/{model_id}/deployment/_cache/_clear
-	if len(segs) == 6 && segs[3] == "deployment" && segs[4] == "_cache" && segs[5] == "_clear" {
+	// POST /_ml/trained_models/{model_id}/deployment/[_cache|cache]/_clear
+	if len(segs) == 6 && segs[3] == "deployment" && (segs[4] == "_cache" || segs[4] == "cache") && segs[5] == "_clear" {
 		if r.Method != http.MethodPost {
 			writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
 			return
@@ -1551,7 +1580,7 @@ func (s *Server) handleMLTrainedModelSubRoute(w http.ResponseWriter, r *http.Req
 			writeESError(w, http.StatusNotFound, "resource_not_found_exception", "No deployment matched ["+rawTarget+"]")
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
+		writeJSON(w, http.StatusOK, map[string]any{"cleared": true, "acknowledged": true})
 		return
 	}
 
@@ -1916,6 +1945,7 @@ func (s *Server) handleMLAnomalySubRoutes(w http.ResponseWriter, r *http.Request
 			newFields := prevFields + fieldCount
 			newBytes := prevBytes + int64(len(rawBytes))
 			newBuckets := prevBuckets
+			nowMS := time.Now().UTC().UnixMilli()
 			if len(records) > 0 {
 				if newBuckets == 0 {
 					newBuckets = 1
@@ -1929,6 +1959,9 @@ func (s *Server) handleMLAnomalySubRoutes(w http.ResponseWriter, r *http.Request
 					"anomaly_score":         0.0,
 					"initial_anomaly_score": 0.0,
 					"bucket_span":           3600,
+					"bucket_influencers":    []any{},
+					"event_count":           int64(len(records)),
+					"processing_time_ms":    int64(1),
 					"is_interim":            false,
 					"job_id":                jobID,
 					"result_type":           "bucket",
@@ -1940,11 +1973,13 @@ func (s *Server) handleMLAnomalySubRoutes(w http.ResponseWriter, r *http.Request
 				}
 				if _, hasSnap := snaps["1"]; !hasSnap {
 					snaps["1"] = map[string]any{
-						"snapshot_id": "1",
-						"job_id":      jobID,
-						"timestamp":   time.Now().UTC().UnixMilli(),
-						"description": "auto",
-						"retain":      false,
+						"snapshot_id":        "1",
+						"job_id":             jobID,
+						"timestamp":          nowMS,
+						"description":        "auto",
+						"retain":             false,
+						"min_version":        "8.0.0",
+						"snapshot_doc_count": int64(len(records)),
 					}
 				}
 				job["_snapshots"] = snaps
@@ -1959,6 +1994,7 @@ func (s *Server) handleMLAnomalySubRoutes(w http.ResponseWriter, r *http.Request
 				"processed_record_count":       len(records),
 				"processed_field_count":        fieldCount,
 				"input_bytes":                  len(rawBytes),
+				"input_record_count":           len(records),
 				"input_field_count":            fieldCount,
 				"invalid_date_count":           0,
 				"missing_field_count":          0,
@@ -1966,6 +2002,9 @@ func (s *Server) handleMLAnomalySubRoutes(w http.ResponseWriter, r *http.Request
 				"empty_bucket_count":           0,
 				"sparse_bucket_count":          0,
 				"bucket_count":                 newBuckets,
+				"earliest_record_timestamp":    int64(1700000000000),
+				"latest_record_timestamp":      int64(1700000000000),
+				"last_data_time":               nowMS,
 			})
 			return true
 
@@ -2157,13 +2196,17 @@ func (s *Server) handleMLAnomalySubRoutes(w http.ResponseWriter, r *http.Request
 				"count": 1,
 				"model_snapshot_upgrades": []any{
 					map[string]any{
-						"job_id":      jobID,
-						"snapshot_id": snapID,
+						"job_id":                 jobID,
+						"snapshot_id":            snapID,
+						"state":                  "stopped",
+						"assignment_explanation": "",
 						"node": map[string]any{
-							"id":   "doris-fe-1",
-							"name": "doris-fe-1",
+							"id":                "doris-fe-1",
+							"name":              "doris-fe-1",
+							"ephemeral_id":      "doris-ephemeral-1",
+							"transport_address": "127.0.0.1:9300",
+							"attributes":        map[string]any{},
 						},
-						"upgrade_state": "stopped",
 					},
 				},
 			})
@@ -2215,7 +2258,11 @@ func (s *Server) handleMLAnomalySubRoutes(w http.ResponseWriter, r *http.Request
 			case "_upgrade":
 				snap["upgraded"] = true
 				s.mu.Unlock()
-				writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
+				writeJSON(w, http.StatusOK, map[string]any{
+					"acknowledged": true,
+					"completed":    true,
+					"node":         "doris-fe-1",
+				})
 				return true
 			}
 			s.mu.Unlock()
@@ -2407,32 +2454,56 @@ func (s *Server) handleSecurityRound56(w http.ResponseWriter, r *http.Request, s
 				"email":      email,
 				"full_name":  fullName,
 			}
+			nowMS := time.Now().UTC().UnixMilli()
 			var prof map[string]any
 			if isNew || existing == nil {
 				prof = map[string]any{
-					"uid":     uid,
-					"enabled": true,
-					"user":    userMap,
-					"labels":  map[string]any{},
-					"data":    map[string]any{},
+					"uid":               uid,
+					"enabled":           true,
+					"user":              userMap,
+					"labels":            map[string]any{},
+					"data":              map[string]any{},
+					"last_synchronized": nowMS,
+					"_doc": map[string]any{
+						"_primary_term": int64(1),
+						"_seq_no":       int64(0),
+					},
 				}
 				s.securityProfiles[uid] = prof
 			} else {
 				existing["user"] = userMap
+				existing["last_synchronized"] = nowMS
+				if _, hasDoc := existing["_doc"]; !hasDoc {
+					existing["_doc"] = map[string]any{
+						"_primary_term": int64(1),
+						"_seq_no":       int64(0),
+					}
+				}
 				prof = existing
 			}
 			enabledBool, _ := prof["enabled"].(bool)
 			resp := map[string]any{
-				"uid":           uid,
-				"username":      username,
-				"enabled":       enabledBool,
-				"was_activated": isNew,
-				"user":          deepCloneDocMap(userMap),
-				"labels":        deepCloneIngestValue(prof["labels"]),
-				"data":          deepCloneIngestValue(prof["data"]),
+				"uid":               uid,
+				"username":          username,
+				"enabled":           enabledBool,
+				"was_activated":     isNew,
+				"user":              deepCloneDocMap(userMap),
+				"labels":            deepCloneIngestValue(prof["labels"]),
+				"data":              deepCloneIngestValue(prof["data"]),
+				"last_synchronized": nowMS,
+				"_doc":              deepCloneDocMap(prof["_doc"].(map[string]any)),
 			}
 			s.mu.Unlock()
 			writeJSON(w, http.StatusOK, resp)
+			return true
+		}
+
+		if len(segs) == 3 && segs[2] == "_has_privileges" {
+			s.handleSecurityHasPrivilegesUserProfilesR66(w, r)
+			return true
+		}
+		if len(segs) == 3 && segs[2] == "_suggest" {
+			s.handleSecuritySuggestUserProfilesR66(w, r)
 			return true
 		}
 
@@ -2452,7 +2523,7 @@ func (s *Server) handleSecurityRound56(w http.ResponseWriter, r *http.Request, s
 					continue
 				}
 				if p, exists := s.securityProfiles[u]; exists && p != nil {
-					profiles = append(profiles, deepCloneDocMap(p))
+					profiles = append(profiles, normalizeSecurityUserProfileR66(u, p))
 				} else {
 					detailsMap[u] = map[string]any{
 						"type":   "resource_not_found_exception",
@@ -2632,59 +2703,7 @@ func (s *Server) handleSecurityRound56(w http.ResponseWriter, r *http.Request, s
 		}
 
 	case "_suggest_profiles":
-		if r.Method != http.MethodPost && r.Method != http.MethodGet {
-			writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
-			return true
-		}
-		body, ok := parseJSONBody(w, r)
-		if !ok {
-			return true
-		}
-		needle := ""
-		if nStr, okN := body["name"].(string); okN {
-			needle = strings.ToLower(strings.TrimSpace(nStr))
-		} else if hStr, okH := body["hint"].(string); okH {
-			needle = strings.ToLower(strings.TrimSpace(hStr))
-		} else if hMap, okHM := body["hint"].(map[string]any); okHM {
-			if tStr, okT := hMap["text"].(string); okT {
-				needle = strings.ToLower(strings.TrimSpace(tStr))
-			}
-		}
-		maxSize := 10
-		if sz, okS := toInt64(body["size"]); okS && sz > 0 && sz <= 10000 {
-			maxSize = int(sz)
-		}
-		s.mu.RLock()
-		var uids []string
-		for u := range s.securityProfiles {
-			uids = append(uids, u)
-		}
-		sort.Strings(uids)
-		matches := []any{}
-		for _, u := range uids {
-			p := s.securityProfiles[u]
-			if en, _ := p["enabled"].(bool); !en {
-				continue
-			}
-			if needle != "" {
-				uMap, _ := p["user"].(map[string]any)
-				un := strings.ToLower(fmt.Sprintf("%v", uMap["username"]))
-				fn := strings.ToLower(fmt.Sprintf("%v", uMap["full_name"]))
-				em := strings.ToLower(fmt.Sprintf("%v", uMap["email"]))
-				if !strings.Contains(un, needle) && !strings.Contains(fn, needle) && !strings.Contains(em, needle) {
-					continue
-				}
-			}
-			matches = append(matches, deepCloneDocMap(p))
-			if len(matches) >= maxSize {
-				break
-			}
-		}
-		s.mu.RUnlock()
-		writeJSON(w, http.StatusOK, map[string]any{
-			"count":    len(matches),
-			"profiles": matches,
-		})
+		s.handleSecuritySuggestUserProfilesR66(w, r)
 		return true
 
 	case "settings":
@@ -2834,6 +2853,236 @@ func (s *Server) handleSecurityRound56(w http.ResponseWriter, r *http.Request, s
 		}
 	}
 	return false
+}
+
+func normalizeSecurityUserProfileR66(uid string, raw map[string]any) map[string]any {
+	cp := deepCloneDocMap(raw)
+	if cp == nil {
+		cp = make(map[string]any)
+	}
+	if _, hasUID := cp["uid"]; !hasUID || fmt.Sprintf("%v", cp["uid"]) == "" {
+		cp["uid"] = uid
+	}
+	if _, hasData := cp["data"]; !hasData || cp["data"] == nil {
+		cp["data"] = map[string]any{}
+	}
+	if _, hasLabels := cp["labels"]; !hasLabels || cp["labels"] == nil {
+		cp["labels"] = map[string]any{}
+	}
+	userMap, okU := cp["user"].(map[string]any)
+	if !okU || userMap == nil {
+		userMap = make(map[string]any)
+	}
+	if rn, _ := userMap["realm_name"].(string); strings.TrimSpace(rn) == "" {
+		userMap["realm_name"] = "default_native"
+	}
+	if _, hasRoles := userMap["roles"]; !hasRoles || userMap["roles"] == nil {
+		userMap["roles"] = []string{}
+	}
+	if un, _ := userMap["username"].(string); strings.TrimSpace(un) == "" {
+		userMap["username"] = "elastic"
+	}
+	cp["user"] = userMap
+	if _, hasSync := cp["last_synchronized"]; !hasSync || cp["last_synchronized"] == nil {
+		cp["last_synchronized"] = time.Now().UTC().UnixMilli()
+	}
+	if _, hasDoc := cp["_doc"]; !hasDoc || cp["_doc"] == nil {
+		cp["_doc"] = map[string]any{
+			"_primary_term": int64(1),
+			"_seq_no":       int64(0),
+		}
+	}
+	return cp
+}
+
+func (s *Server) handleSecurityHasPrivilegesUserProfilesR66(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodPost {
+		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+		return
+	}
+	body, ok := parseJSONBody(w, r)
+	if !ok {
+		return
+	}
+	if body == nil {
+		body = map[string]any{}
+	}
+	var uids []string
+	seen := make(map[string]bool)
+	addUID := func(u string) {
+		u = strings.TrimSpace(u)
+		if u != "" && !seen[u] {
+			seen[u] = true
+			uids = append(uids, u)
+		}
+	}
+	switch uv := body["uids"].(type) {
+	case []any:
+		for _, item := range uv {
+			addUID(fmt.Sprintf("%v", item))
+		}
+	case string:
+		for _, part := range strings.Split(uv, ",") {
+			addUID(part)
+		}
+	}
+	if len(uids) == 0 {
+		if uStr, ok := body["uid"].(string); ok {
+			addUID(uStr)
+		}
+	}
+	if len(uids) == 0 && r.URL != nil {
+		if qUIDs := strings.TrimSpace(r.URL.Query().Get("uids")); qUIDs != "" {
+			for _, part := range strings.Split(qUIDs, ",") {
+				addUID(part)
+			}
+		}
+	}
+
+	hasPrivUIDs := make([]string, 0, len(uids))
+	errDetails := make(map[string]any)
+	s.mu.RLock()
+	for _, u := range uids {
+		prof, exists := s.securityProfiles[u]
+		if !exists || prof == nil {
+			errDetails[u] = map[string]any{
+				"type":   "resource_not_found_exception",
+				"reason": fmt.Sprintf("profile [%s] not found", u),
+			}
+			continue
+		}
+		if en, _ := prof["enabled"].(bool); en {
+			hasPrivUIDs = append(hasPrivUIDs, u)
+		}
+	}
+	s.mu.RUnlock()
+
+	resp := map[string]any{
+		"has_privilege_uids": hasPrivUIDs,
+	}
+	if len(errDetails) > 0 {
+		resp["errors"] = map[string]any{
+			"count":   len(errDetails),
+			"details": errDetails,
+		}
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *Server) handleSecuritySuggestUserProfilesR66(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost && r.Method != http.MethodGet {
+		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+		return
+	}
+	body, ok := parseJSONBody(w, r)
+	if !ok {
+		return
+	}
+	if body == nil {
+		body = map[string]any{}
+	}
+	needle := ""
+	var hintUIDFilter map[string]bool
+	var hintLabelFilter map[string][]string
+	if nStr, okN := body["name"].(string); okN {
+		needle = strings.ToLower(strings.TrimSpace(nStr))
+	} else if hStr, okH := body["hint"].(string); okH {
+		needle = strings.ToLower(strings.TrimSpace(hStr))
+	} else if hMap, okHM := body["hint"].(map[string]any); okHM {
+		if tStr, okT := hMap["text"].(string); okT {
+			needle = strings.ToLower(strings.TrimSpace(tStr))
+		}
+		if rawUIDs, okU := hMap["uids"].([]any); okU && len(rawUIDs) > 0 {
+			hintUIDFilter = make(map[string]bool, len(rawUIDs))
+			for _, u := range rawUIDs {
+				if us := strings.TrimSpace(fmt.Sprintf("%v", u)); us != "" {
+					hintUIDFilter[us] = true
+				}
+			}
+		}
+		if rawLabels, okL := hMap["labels"].(map[string]any); okL && len(rawLabels) > 0 {
+			hintLabelFilter = make(map[string][]string, len(rawLabels))
+			for lk, lv := range rawLabels {
+				switch lvt := lv.(type) {
+				case []any:
+					for _, x := range lvt {
+						hintLabelFilter[lk] = append(hintLabelFilter[lk], fmt.Sprintf("%v", x))
+					}
+				default:
+					hintLabelFilter[lk] = []string{fmt.Sprintf("%v", lv)}
+				}
+			}
+		}
+	}
+	maxSize := 10
+	if sz, okS := toInt64(body["size"]); okS && sz > 0 && sz <= 10000 {
+		maxSize = int(sz)
+	}
+	s.mu.RLock()
+	var uids []string
+	for u := range s.securityProfiles {
+		uids = append(uids, u)
+	}
+	sort.Strings(uids)
+	matches := make([]any, 0)
+	for _, u := range uids {
+		p := s.securityProfiles[u]
+		if p == nil {
+			continue
+		}
+		if en, _ := p["enabled"].(bool); !en {
+			continue
+		}
+		if len(hintUIDFilter) > 0 && !hintUIDFilter[u] {
+			continue
+		}
+		if len(hintLabelFilter) > 0 {
+			pLabels, _ := p["labels"].(map[string]any)
+			labelMatch := true
+			for lk, allowedVals := range hintLabelFilter {
+				pv, hasL := pLabels[lk]
+				if !hasL {
+					labelMatch = false
+					break
+				}
+				foundVal := false
+				pvStr := fmt.Sprintf("%v", pv)
+				for _, av := range allowedVals {
+					if pvStr == av {
+						foundVal = true
+						break
+					}
+				}
+				if !foundVal {
+					labelMatch = false
+					break
+				}
+			}
+			if !labelMatch {
+				continue
+			}
+		}
+		if needle != "" {
+			uMap, _ := p["user"].(map[string]any)
+			un := strings.ToLower(fmt.Sprintf("%v", uMap["username"]))
+			fn := strings.ToLower(fmt.Sprintf("%v", uMap["full_name"]))
+			em := strings.ToLower(fmt.Sprintf("%v", uMap["email"]))
+			if !strings.Contains(un, needle) && !strings.Contains(fn, needle) && !strings.Contains(em, needle) {
+				continue
+			}
+		}
+		matches = append(matches, normalizeSecurityUserProfileR66(u, p))
+		if len(matches) >= maxSize {
+			break
+		}
+	}
+	s.mu.RUnlock()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"total":    map[string]any{"value": len(matches), "relation": "eq"},
+		"took":     1,
+		"count":    len(matches),
+		"profiles": matches,
+	})
 }
 
 // ============================================================================

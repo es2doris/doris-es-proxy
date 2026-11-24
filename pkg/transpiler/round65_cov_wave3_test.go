@@ -481,10 +481,14 @@ func TestRound65CovTranspiler_Wave3AggsAndSubAggs(t *testing.T) {
 	if fmtType := TypedAggKeyPrefix(&esast.AggSpec{MovingPercentiles: &esast.MovingPercentilesAggSpec{}}, sch); fmtType != "tdigest_percentiles" {
 		t.Fatalf("unexpected MovingPercentiles format: %s", fmtType)
 	}
-	var badNestedReq esast.SearchRequest
-	_ = json.Unmarshal([]byte(`{"size":0,"aggs":{"n":{"nested":{"path":"missing_path"}}}}`), &badNestedReq)
+	var unmappedNestedReq, badNestedReq esast.SearchRequest
+	_ = json.Unmarshal([]byte(`{"size":0,"aggs":{"n":{"nested":{"path":"missing_path"}}}}`), &unmappedNestedReq)
+	if pUnm, errU := tr.BuildSearchPlan(&unmappedNestedReq); errU != nil || !strings.Contains(pUnm.AggsSQL, "EXPLODE(CAST([] AS ARRAY<STRING>))") {
+		t.Fatalf("expected empty nested agg plan on unmapped path, err=%v sql=%v", errU, pUnm)
+	}
+	_ = json.Unmarshal([]byte(`{"size":0,"aggs":{"n":{"nested":{"path":"kw"}}}}`), &badNestedReq)
 	if _, errN := tr.BuildSearchPlan(&badNestedReq); errN == nil {
-		t.Fatal("expected error for missing nested path")
+		t.Fatal("expected error for mapped non-nested path")
 	}
 }
 

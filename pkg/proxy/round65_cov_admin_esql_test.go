@@ -281,12 +281,11 @@ func TestRound65CovAdminESQL_DataStreamModifyAndLazyRollover(t *testing.T) {
 		{"data_stream_options":{"data_stream":"r65_mod_ds","failure_store":{"enabled":true}}}
 	]}`, http.StatusOK)
 
-	// Error cases after ownership: already owned (normal & FS), cannot remove write index (normal & FS), not found in DS, options validation
+	// Error cases after ownership: already owned (normal & FS), cannot remove normal write index, not found in DS, options validation
 	for _, badBody := range []string{
 		`{"actions":[{"add_backing_index":{"data_stream":"other_ds","index":"r65_unm_1"}}]}`,
 		`{"actions":[{"add_backing_index":{"data_stream":"other_ds","index":"r65_unm_fs1"}}]}`,
 		`{"actions":[{"remove_backing_index":{"data_stream":"r65_mod_ds","index":"r65_unm_1"}}]}`,
-		`{"actions":[{"remove_backing_index":{"data_stream":"r65_mod_ds","index":"r65_unm_fs1","failure_store":true}}]}`,
 		`{"actions":[{"remove_backing_index":{"data_stream":"r65_mod_ds","index":"r65_aliased_idx"}}]}`,
 		`{"actions":[{"remove_backing_index":{"data_stream":"r65_mod_ds","index":"r65_aliased_idx","failure_store":true}}]}`,
 		`{"actions":[{"data_stream_options":{"data_stream":"r65_mod_ds","unknown_key":1}}]}`,
@@ -297,12 +296,12 @@ func TestRound65CovAdminESQL_DataStreamModifyAndLazyRollover(t *testing.T) {
 		r65CovBMustHTTP(t, h, http.MethodPost, "/_data_stream/_modify", badBody, http.StatusBadRequest)
 	}
 
-	// Remove older backing index + older FS index + disable FS to remove active FS write index in same atomic batch, then re-enable FS
+	// Remove older backing index + older FS index + active FS write index (allowed under ES 8.15), then toggle FS
 	r65CovBMustHTTP(t, h, http.MethodPost, "/_data_stream/_modify", `{"actions":[
 		{"remove_backing_index":{"data_stream":"r65_mod_ds","index":"r65_unm_2"}},
 		{"remove_backing_index":{"data_stream":"r65_mod_ds","index":"r65_unm_fs2","failure_store":true}},
-		{"data_stream_options":{"data_stream":"r65_mod_ds","failure_store":{"enabled":false}}},
-		{"remove_backing_index":{"data_stream":"r65_mod_ds","index":"r65_unm_fs1","failure_store":true}}
+		{"remove_backing_index":{"data_stream":"r65_mod_ds","index":"r65_unm_fs1","failure_store":true}},
+		{"data_stream_options":{"data_stream":"r65_mod_ds","failure_store":{"enabled":false}}}
 	]}`, http.StatusOK)
 	r65CovBMustHTTP(t, h, http.MethodPost, "/_data_stream/_modify", `{"actions":[
 		{"data_stream_options":{"data_stream":"r65_mod_ds","failure_store":true}}

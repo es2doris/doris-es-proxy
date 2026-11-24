@@ -3326,20 +3326,35 @@ func CellNonChildren(h uint64) ([]uint64, error) {
 	if len(parentVerts) < 3 {
 		return nil, nil
 	}
-	candSet := make(map[uint64]bool)
-	cands := make([]uint64, 0, 12)
-	for _, ch := range children {
-		for _, nbr := range GridDisk(ch, 1) {
-			if !childSet[nbr] && !candSet[nbr] {
-				candSet[nbr] = true
-				cands = append(cands, nbr)
+	candSet := make(map[uint64]bool, 12)
+	out := make([]uint64, 0, 6)
+	addCand := func(nbr uint64) {
+		if nbr == 0 || childSet[nbr] || candSet[nbr] {
+			return
+		}
+		candSet[nbr] = true
+		if cellBoundariesOverlapInterior(CellToBoundary(nbr), parentVerts) {
+			out = append(out, nbr)
+		}
+	}
+	// Visit each outer child digit (1..6) in child-iteration order stepping +60deg CW first
+	// so hexagon nonChildren match ES geo_grid ordering (`100_geo_grid_ingest.yml`).
+	if !isPentagonUnchecked(h) {
+		for _, ch := range children {
+			d := h3GetIndexDigit(ch, res+1)
+			if d <= centerDigit || d >= invalidDigit {
+				continue
+			}
+			rot := 0
+			if nbr, nErr := h3NeighborRotations(ch, rotate60cw(d), &rot); nErr == nil {
+				addCand(nbr)
 			}
 		}
 	}
-	out := make([]uint64, 0, 6)
-	for _, nbr := range cands {
-		if cellBoundariesOverlapInterior(CellToBoundary(nbr), parentVerts) {
-			out = append(out, nbr)
+	// Fallback 1-disk sweep covers pentagons and any distorted base-cell transitions.
+	for _, ch := range children {
+		for _, nbr := range GridDisk(ch, 1) {
+			addCand(nbr)
 		}
 	}
 	return out, nil

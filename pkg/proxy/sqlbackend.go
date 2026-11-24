@@ -1460,6 +1460,47 @@ func (b *DorisSQLBackend) QueryAggs(ctx context.Context, aggsSQL string) ([]AggR
 	return out, rows.Err()
 }
 
+// QueryRows executes a read-only SQL query and returns rows keyed by column name.
+func (b *DorisSQLBackend) QueryRows(ctx context.Context, querySQL string) ([]map[string]any, error) {
+	normSQL := prependSQLTraceComment(ctx, normalizeDorisSQL(querySQL))
+	if b.logSQL.Load() {
+		log.Printf("[Doris RowsSQL]\n%s", normSQL)
+	}
+	if b.db == nil {
+		return nil, nil
+	}
+	rows, err := b.db.QueryContext(ctx, normSQL)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	cols, err := rows.Columns()
+	if err != nil {
+		return nil, err
+	}
+	var out []map[string]any
+	for rows.Next() {
+		vals := make([]any, len(cols))
+		ptrs := make([]any, len(cols))
+		for i := range vals {
+			ptrs[i] = &vals[i]
+		}
+		if err := rows.Scan(ptrs...); err != nil {
+			return nil, err
+		}
+		row := make(map[string]any, len(cols))
+		for i, col := range cols {
+			if rawB, ok := vals[i].([]byte); ok {
+				row[col] = string(rawB)
+			} else {
+				row[col] = vals[i]
+			}
+		}
+		out = append(out, row)
+	}
+	return out, rows.Err()
+}
+
 type docPointRowScanLayout int
 
 const (

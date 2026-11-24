@@ -982,7 +982,7 @@ func dorisJSONTypeNameR63Mem(v any, exists bool) any {
 }
 
 // evalColumnFuncR63Mem evaluates Round-63 Doris 4.1.3 SQL scalar functions in `MemoryBackend`
-// (`TRY_CAST`, `CAST(... AS DATETIMEV2(...))`, `JSON_TYPE`, `MICROSECOND`, `TRANSLATE`,
+// (`TRY_CAST`, `CAST(... AS DATETIMEV2(...))`, `JSON_TYPE`, `JSON_LENGTH`, `MICROSECOND`, `TRANSLATE`,
 // `FROM_BASE64_BINARY`, `REGEXP_EXTRACT`).
 func evalColumnFuncR63Mem(row map[string]any, colExpr string) (any, bool) {
 	upper := strings.ToUpper(colExpr)
@@ -1010,6 +1010,19 @@ func evalColumnFuncR63Mem(row map[string]any, colExpr string) (any, bool) {
 			return nil, true
 		}
 		return evalDorisJSONTypeTwoArgR63Mem(row, args[0], args[1]), true
+	}
+
+	// 2b. `JSON_LENGTH(doc[, path])`
+	if strings.HasPrefix(upper, "JSON_LENGTH(") && strings.HasSuffix(colExpr, ")") && hasMatchingOuterParens(colExpr, len("JSON_LENGTH")) {
+		args := splitTopLevelArgs(colExpr[len("JSON_LENGTH(") : len(colExpr)-1])
+		switch len(args) {
+		case 1:
+			return evalDorisJSONLengthR66Mem(row, args[0], ""), true
+		case 2:
+			return evalDorisJSONLengthR66Mem(row, args[0], args[1]), true
+		default:
+			return nil, true
+		}
 	}
 
 	// 3. `MICROSECOND(dt)`
@@ -1510,43 +1523,72 @@ func evalCastDateTimeV2R63Mem(row map[string]any, srcExpr, targetType string) an
 	}
 }
 
-func evalDorisJSONTypeTwoArgR63Mem(row map[string]any, docArg, pathArg string) any {
-	pathTrim := strings.TrimSpace(pathArg)
-	var rawPath string
-	if strings.HasPrefix(pathTrim, "'") && strings.HasSuffix(pathTrim, "'") {
-		rawPath = unquoteSQLLiteral(pathTrim)
-	} else if pv := resolveColumnValue(row, pathTrim); pv != nil {
-		rawPath = fmt.Sprintf("%v", pv)
+func resolveDorisJSONArgValueR66Mem(row map[string]any, docArg, pathArg string) (any, bool) {
+	var segs []string
+	if strings.TrimSpace(pathArg) != "" {
+		pathTrim := strings.TrimSpace(pathArg)
+		var rawPath string
+		if strings.HasPrefix(pathTrim, "'") && strings.HasSuffix(pathTrim, "'") {
+			rawPath = unquoteSQLLiteral(pathTrim)
+		} else if pv := resolveColumnValue(row, pathTrim); pv != nil {
+			rawPath = fmt.Sprintf("%v", pv)
+		}
+		if rawPath == "" {
+			return nil, false
+		}
+		segs = parseDorisJSONPathSegmentsR63Mem(rawPath)
 	}
-	if rawPath == "" {
-		return nil
-	}
-	segs := parseDorisJSONPathSegmentsR63Mem(rawPath)
 	docTrim := trimOuterParens(strings.TrimSpace(docArg))
 	if docName := strings.Trim(docTrim, "`"); docName != "" {
 		if rawJSON := extractRowJSONStringR62Mem(row, docName); rawJSON != "" {
-			val, exists := extractJSONTypedValueFromStrR63Mem(rawJSON, segs)
-			return dorisJSONTypeNameR63Mem(val, exists)
+			return extractJSONTypedValueFromStrR63Mem(rawJSON, segs)
 		}
 	}
 	v := resolveColumnValue(row, docTrim)
 	if v == nil {
-		return nil
+		return nil, false
 	}
 	if s, ok := v.(string); ok {
 		trimmed := strings.TrimSpace(s)
 		if trimmed == "" {
-			return nil
+			return nil, false
 		}
-		val, exists := extractJSONTypedValueFromStrR63Mem(trimmed, segs)
-		return dorisJSONTypeNameR63Mem(val, exists)
+		return extractJSONTypedValueFromStrR63Mem(trimmed, segs)
 	}
 	jb, err := json.Marshal(v)
 	if err != nil {
+		return nil, false
+	}
+	return extractJSONTypedValueFromStrR63Mem(string(jb), segs)
+}
+
+func evalDorisJSONTypeTwoArgR63Mem(row map[string]any, docArg, pathArg string) any {
+	if strings.TrimSpace(pathArg) == "" {
 		return nil
 	}
-	val, exists := extractJSONTypedValueFromStrR63Mem(string(jb), segs)
+	val, exists := resolveDorisJSONArgValueR66Mem(row, docArg, pathArg)
 	return dorisJSONTypeNameR63Mem(val, exists)
+}
+
+// evalDorisJSONLengthR66Mem evaluates Doris 4.1.3 `JSON_LENGTH(doc[, path])`, returning element/key
+// counts for JSON arrays/objects, `1` for scalars/null literals, and `nil` when missing or invalid.
+func evalDorisJSONLengthR66Mem(row map[string]any, docArg, pathArg string) any {
+	val, exists := resolveDorisJSONArgValueR66Mem(row, docArg, pathArg)
+	if !exists {
+		return nil
+	}
+	switch tv := val.(type) {
+	case []any:
+		return int64(len(tv))
+	case []string:
+		return int64(len(tv))
+	case []float64:
+		return int64(len(tv))
+	case map[string]any:
+		return int64(len(tv))
+	default:
+		return int64(1)
+	}
 }
 
 // hasNullArithmeticOperandR63Mem ensures SQL `NULL` propagates through arithmetic (`+`, `-`, `*`, `/`)
@@ -1809,8 +1851,37 @@ func countBM25TermOrPhraseFreqR63Mem(docTokens, queryTerms []string) float64 {
 	return float64(cnt)
 }
 
+func isBM25ScoreExprR66Mem(s string) bool {
+	return strings.Contains(s, "'[^[:alnum:]_]+', '  '") || strings.Contains(s, "'[^[:alnum:]_\\']+', ' '")
+}
+
+func sumPureBM25PlaceholdersFloat32R66Mem(expr string, vals map[string]float32) (float64, bool) {
+	s := trimOuterParens(strings.TrimSpace(expr))
+	if s == "" {
+		return 0, false
+	}
+	parts := splitTopLevelBinaryMath(s, '+')
+	if len(parts) <= 1 {
+		return 0, false
+	}
+	var sum32 float32
+	for _, p := range parts {
+		pTrim := trimOuterParens(strings.TrimSpace(p))
+		if !strings.HasPrefix(pTrim, "`__bm25_") || !strings.HasSuffix(pTrim, "`") {
+			return 0, false
+		}
+		key := strings.Trim(pTrim, "`")
+		v, ok := vals[key]
+		if !ok {
+			return 0, false
+		}
+		sum32 += v
+	}
+	return float64(sum32), true
+}
+
 func extractBM25ClauseSpecR63Mem(clause string) (bm25ClauseSpecR63Mem, bool) {
-	if !strings.Contains(clause, "'[^[:alnum:]_]+', '  '") {
+	if !isBM25ScoreExprR66Mem(clause) {
 		return bm25ClauseSpecR63Mem{}, false
 	}
 	trimmed := strings.TrimSpace(clause)
@@ -1825,12 +1896,12 @@ func extractBM25ClauseSpecR63Mem(clause string) (bm25ClauseSpecR63Mem, bool) {
 	safePred := strings.TrimSpace(inner[:thenIdx])
 	thenBody := trimOuterParens(strings.TrimSpace(inner[thenIdx+len(" THEN "):]))
 
-	// Leading `<boost> * (...)`
-	mulIdx := strings.Index(thenBody, " * (GREATEST(CAST(CHAR_LENGTH(CONCAT(' ', REGEXP_REPLACE(")
+	// Leading `<boost> * (GREATEST(...))`
+	mulIdx := strings.Index(thenBody, " * (GREATEST(CAST(CHAR_LENGTH(")
 	if mulIdx <= 0 {
 		return bm25ClauseSpecR63Mem{}, false
 	}
-	boost, errB := strconv.ParseFloat(strings.TrimSpace(thenBody[:mulIdx]), 64)
+	scaleFloat, errB := strconv.ParseFloat(strings.TrimSpace(thenBody[:mulIdx]), 64)
 	if errB != nil {
 		return bm25ClauseSpecR63Mem{}, false
 	}
@@ -1850,19 +1921,30 @@ func extractBM25ClauseSpecR63Mem(clause string) (bm25ClauseSpecR63Mem, bool) {
 		return bm25ClauseSpecR63Mem{}, false
 	}
 	strCol := strings.TrimSpace(rrArgs[0])
+	// Handle nested REGEXP_REPLACE(REGEXP_REPLACE(strCol, ...), ...)
+	for strings.HasPrefix(strCol, "REGEXP_REPLACE(") && strings.HasSuffix(strCol, ")") {
+		innerRRArgs := splitTopLevelArgs(strCol[len("REGEXP_REPLACE(") : len(strCol)-1])
+		if len(innerRRArgs) != 3 {
+			break
+		}
+		strCol = strings.TrimSpace(innerRRArgs[0])
+	}
 	caseSensitive := true
 	if strings.HasPrefix(strCol, "LOWER(") && strings.HasSuffix(strCol, ")") && hasMatchingOuterParens(strCol, len("LOWER")) {
 		caseSensitive = false
 		strCol = strings.TrimSpace(strCol[len("LOWER(") : len(strCol)-1])
 	}
-	const coalPrefix = "COALESCE(CAST("
-	const coalSuffix = " AS STRING), '')"
-	if !strings.HasPrefix(strCol, coalPrefix) || !strings.HasSuffix(strCol, coalSuffix) {
+	var colExpr string
+	switch {
+	case strings.HasPrefix(strCol, "COALESCE(CAST(") && strings.HasSuffix(strCol, " AS STRING), '')"):
+		colExpr = strings.TrimSpace(strCol[len("COALESCE(CAST(") : len(strCol)-len(" AS STRING), '')")])
+	case strings.HasPrefix(strCol, "COALESCE(TRY_CAST(") && strings.HasSuffix(strCol, " AS STRING), '')"):
+		colExpr = strings.TrimSpace(strCol[len("COALESCE(TRY_CAST(") : len(strCol)-len(" AS STRING), '')")])
+	default:
 		return bm25ClauseSpecR63Mem{}, false
 	}
-	colExpr := strings.TrimSpace(strCol[len(coalPrefix) : len(strCol)-len(coalSuffix)])
 
-	// Extract `<patLit>` from `REPLACE(CONCAT(' ', REGEXP_REPLACE(...), ' '), <patLit>, '')`
+	// Extract `<patLit>` from `REPLACE(..., <patLit>, '')`
 	replMarker := "CHAR_LENGTH(REPLACE("
 	replIdx := strings.Index(thenBody[rrClose:], replMarker)
 	if replIdx < 0 {
@@ -1898,6 +1980,10 @@ func extractBM25ClauseSpecR63Mem(clause string) (bm25ClauseSpecR63Mem, bool) {
 			bParam = v
 		}
 	}
+	boost := scaleFloat
+	if strings.Contains(thenBody, "'[^[:alnum:]_\\']+', ' '") && k1 > -1.0 {
+		boost = scaleFloat / (k1 + 1.0)
+	}
 
 	return bm25ClauseSpecR63Mem{
 		safePred:      safePred,
@@ -1915,7 +2001,7 @@ type legacySimpleScoreCtxKeyR63 struct{}
 // prepareScoreEvaluatorR63Mem precomputes corpus-wide `(N, df, avgdl)` over `tbl` for all
 // BM25 text clauses inside `scoreExpr`, returning a fast per-row evaluator (`F12`).
 func prepareScoreEvaluatorR63Mem(ctx context.Context, tbl map[string]map[string]any, scoreExpr string) func(row map[string]any) float64 {
-	if (ctx != nil && ctx.Value(legacySimpleScoreCtxKeyR63{}) != nil) || !strings.Contains(scoreExpr, "'[^[:alnum:]_]+', '  '") || len(tbl) == 0 {
+	if (ctx != nil && ctx.Value(legacySimpleScoreCtxKeyR63{}) != nil) || !isBM25ScoreExprR66Mem(scoreExpr) || len(tbl) == 0 {
 		return func(row map[string]any) float64 {
 			return evalNumericExpr(row, scoreExpr)
 		}
@@ -2000,23 +2086,24 @@ func prepareScoreEvaluatorR63Mem(ctx context.Context, tbl map[string]map[string]
 
 		sp.docCount = docCount
 		if docCount > 0 {
-			sp.avgdl = float64(sumDL) / float64(docCount)
-			if sp.avgdl <= 0 {
-				sp.avgdl = 1.0
+			avgdl32 := float32(float64(sumDL) / float64(docCount))
+			if avgdl32 <= 0 {
+				avgdl32 = 1.0
 			}
-			var idfSum float64
+			sp.avgdl = float64(avgdl32)
+			var idfSum32 float32
 			for _, df := range dfs {
 				if df <= 0 {
 					df = 1
 				}
-				idfSum += math.Log(1.0 + (float64(docCount)-float64(df)+0.5)/(float64(df)+0.5))
+				idfSum32 += float32(math.Log(1.0 + (float64(docCount)-float64(df)+0.5)/(float64(df)+0.5)))
 			}
-			sp.idf = idfSum
+			sp.idf = float64(idfSum32)
 		}
 	}
 
 	singleDirect := len(specs) == 1 && strings.TrimSpace(rewritten) == "`"+specs[0].placeholder+"`"
-	evalClauseOnRow := func(sp *bm25ClauseSpecR63Mem, row map[string]any) float64 {
+	evalClauseOnRow32 := func(sp *bm25ClauseSpecR63Mem, row map[string]any) float32 {
 		if sp.docCount == 0 || sp.boost == 0 || !evalWhereExpr(row, sp.safePred) {
 			return 0.0
 		}
@@ -2029,32 +2116,46 @@ func prepareScoreEvaluatorR63Mem(ctx context.Context, tbl map[string]map[string]
 		if dl < 1 {
 			dl = 1
 		}
-		dlNorm := float64(luceneSmallFloatLengthR63Mem(dl))
-		tfNorm := (tf * (sp.k1 + 1.0)) / (tf + sp.k1*(1.0-sp.bParam+sp.bParam*(dlNorm/sp.avgdl)))
-		return sp.boost * sp.idf * tfNorm
+		dlNormF := float32(luceneSmallFloatLengthR63Mem(dl))
+		k1f := float32(sp.k1)
+		bf := float32(sp.bParam)
+		boostf := float32(sp.boost)
+		idf32 := float32(sp.idf)
+		avgdl32 := float32(sp.avgdl)
+		tff := float32(tf)
+		weight32 := boostf * idf32 * (k1f + float32(1.0))
+		norm32 := k1f * ((float32(1.0) - bf) + bf*(dlNormF/avgdl32))
+		return (weight32 * tff) / (tff + norm32)
 	}
 
 	if singleDirect {
 		sp0 := specs[0]
 		return func(row map[string]any) float64 {
-			return evalClauseOnRow(&sp0, row)
+			return float64(evalClauseOnRow32(&sp0, row))
 		}
 	}
 
 	return func(row map[string]any) float64 {
+		clauseVals := make(map[string]float32, len(specs))
+		for i := range specs {
+			clauseVals[specs[i].placeholder] = evalClauseOnRow32(&specs[i], row)
+		}
+		if sumVal, okSum := sumPureBM25PlaceholdersFloat32R66Mem(rewritten, clauseVals); okSum {
+			return sumVal
+		}
 		cp := make(map[string]any, len(row)+len(specs))
 		for k, v := range row {
 			cp[k] = v
 		}
-		for i := range specs {
-			cp[specs[i].placeholder] = evalClauseOnRow(&specs[i], row)
+		for k, v := range clauseVals {
+			cp[k] = float64(v)
 		}
 		return evalNumericExpr(cp, rewritten)
 	}
 }
 
 func prepareScoreEvaluatorFromRowSliceR63Mem(rows []map[string]any, scoreExpr string) func(row map[string]any) float64 {
-	if !strings.Contains(scoreExpr, "'[^[:alnum:]_]+', '  '") || len(rows) == 0 {
+	if !isBM25ScoreExprR66Mem(scoreExpr) || len(rows) == 0 {
 		return func(row map[string]any) float64 {
 			return evalNumericExpr(row, scoreExpr)
 		}

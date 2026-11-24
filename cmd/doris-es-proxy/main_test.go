@@ -22,6 +22,7 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -531,4 +532,88 @@ func TestRound65_ServerCLIAndSubcommandErrors(t *testing.T) {
 			t.Fatalf("expected error for %v", tc)
 		}
 	}
+}
+
+func TestRound66_StaticRepoCLIFlagsAndEnv(t *testing.T) {
+	if got := splitCommaTrimmedCLI(""); len(got) != 0 {
+		t.Fatalf("expected nil/empty for blank splitCommaTrimmedCLI, got %v", got)
+	}
+	if got := splitCommaTrimmedCLI(" /a , , /b/c , "); len(got) != 2 || got[0] != "/a" || got[1] != "/b/c" {
+		t.Fatalf("unexpected splitCommaTrimmedCLI output: %v", got)
+	}
+
+	repoA := t.TempDir()
+	repoB := t.TempDir()
+	assertStaticWiring := func(t *testing.T, args []string, expectedA, expectedURL string) {
+		t.Helper()
+		ctx, cancel := context.WithCancel(context.Background())
+		var errBuf bytes.Buffer
+		err := runServerErr(ctx, args, &errBuf, func(s *http.Server, certFile, keyFile string) error {
+			defer cancel()
+			// Dynamic PUT /_cluster/settings for path.repo / repositories.url.allowed_urls must reject with 400.
+			for _, payload := range []string{
+				`{"persistent":{"path.repo":["/tmp/evil"]}}`,
+				`{"transient":{"repositories.url.allowed_urls":["http://*"]}}`,
+			} {
+				req := httptest.NewRequest(http.MethodPut, "/_cluster/settings", strings.NewReader(payload))
+				req.Header.Set("Content-Type", "application/json")
+				rec := httptest.NewRecorder()
+				s.Handler.ServeHTTP(rec, req)
+				if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "illegal_argument_exception") {
+					return fmt.Errorf("expected 400 illegal_argument_exception for %s, got %d: %s", payload, rec.Code, rec.Body.String())
+				}
+			}
+
+			// GET /_cluster/settings?include_defaults=true must surface static defaults.
+			reqDef := httptest.NewRequest(http.MethodGet, "/_cluster/settings?include_defaults=true", nil)
+			recDef := httptest.NewRecorder()
+			s.Handler.ServeHTTP(recDef, reqDef)
+			if recDef.Code != http.StatusOK {
+				return fmt.Errorf("GET _cluster/settings failed: %d %s", recDef.Code, recDef.Body.String())
+			}
+			bodyDef := recDef.Body.String()
+			if !strings.Contains(bodyDef, expectedURL) {
+				return fmt.Errorf("expected defaults.repositories.url.allowed_urls %q in %s", expectedURL, bodyDef)
+			}
+
+			// PUT fs repo under configured --path-repo / env must succeed; outside must fail 500.
+			reqOK := httptest.NewRequest(http.MethodPut, "/_snapshot/fs_ok", strings.NewReader(fmt.Sprintf(`{"type":"fs","settings":{"location":%q}}`, expectedA)))
+			reqOK.Header.Set("Content-Type", "application/json")
+			recOK := httptest.NewRecorder()
+			s.Handler.ServeHTTP(recOK, reqOK)
+			if recOK.Code != http.StatusOK {
+				return fmt.Errorf("expected PUT fs repo in %q to succeed, got %d: %s", expectedA, recOK.Code, recOK.Body.String())
+			}
+
+			reqBad := httptest.NewRequest(http.MethodPut, "/_snapshot/fs_bad", strings.NewReader(`{"type":"fs","settings":{"location":"/etc"}}`))
+			reqBad.Header.Set("Content-Type", "application/json")
+			recBad := httptest.NewRecorder()
+			s.Handler.ServeHTTP(recBad, reqBad)
+			if recBad.Code == http.StatusOK {
+				return fmt.Errorf("expected PUT fs repo outside path.repo to be rejected")
+			}
+			return http.ErrServerClosed
+		})
+		if err != nil {
+			t.Fatalf("runServerErr failed: %v (stderr=%s)", err, errBuf.String())
+		}
+	}
+
+	// 1. CLI flags
+	assertStaticWiring(t, []string{
+		"--listen", "127.0.0.1:0",
+		"--doris-db", "r66_cli_db",
+		"--in-memory",
+		"--path-repo", filepath.ToSlash(repoA) + "," + filepath.ToSlash(repoB),
+		"--repositories-url-allowed-urls", "http://127.0.0.1:*,https://snap.example/*",
+	}, repoA, "https://snap.example/*")
+
+	// 2. Env var fallback
+	t.Setenv("DORIS_ES_PATH_REPO", filepath.ToSlash(repoB))
+	t.Setenv("DORIS_ES_REPOSITORIES_URL_ALLOWED_URLS", "http://env.snap.internal/*")
+	assertStaticWiring(t, []string{
+		"--listen", "127.0.0.1:0",
+		"--doris-db", "r66_env_db",
+		"--in-memory",
+	}, repoB, "http://env.snap.internal/*")
 }

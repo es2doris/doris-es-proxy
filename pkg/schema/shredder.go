@@ -98,6 +98,9 @@ func ShredDocumentWithNow(
 		_ = decOrig.Decode(&origDocForSynthetic)
 	}
 	prunedDynamic := false
+	if err := validateDocumentNestingDepth(parsedDoc, 1, maxVariantNormalizeDepth); err != nil {
+		return nil, err
+	}
 	if s.MaxDepth > 0 || s.MaxFieldNameLength > 0 {
 		if err := validateDocumentLimits(parsedDoc, 1, s.MaxDepth, s.MaxFieldNameLength); err != nil {
 			return nil, err
@@ -1256,7 +1259,11 @@ func ShredDocumentWithNow(
 			prunedDynamic = true
 		}
 	}
-	row["_doc"] = buildVariantDocPayload(trimmed, parsedDoc, prunedDynamic, s)
+	variantDoc, err := buildVariantDocPayloadWithError(trimmed, parsedDoc, prunedDynamic, s)
+	if err != nil {
+		return nil, err
+	}
+	row["_doc"] = variantDoc
 	if (s.SyntheticSource || isImplicitSynthMode) && !s.SourceDisabled() && !strings.EqualFold(s.SourceMode, "stored") {
 		srcInput := origDocForSynthetic
 		if srcInput == nil {
@@ -1283,13 +1290,71 @@ func isTypedNonStringBinding(b FieldBinding) bool {
 	return false
 }
 
-func isGeoNumericElem(v any) bool {
-	switch v.(type) {
-	case float64, int, int64, json.Number:
+func parseGeoStringFloat(s string) (float64, bool) {
+	trimmed := strings.TrimSpace(s)
+	if trimmed == "" || strings.ContainsRune(trimmed, '_') {
+		return 0, false
+	}
+	if strings.ContainsAny(trimmed, "xX") {
+		return 0, false
+	}
+	f, err := strconv.ParseFloat(trimmed, 64)
+	if err != nil || math.IsNaN(f) || math.IsInf(f, 0) {
+		return 0, false
+	}
+	return f, true
+}
+
+func isGeoJSONNumberElem(v any) bool {
+	switch tv := v.(type) {
+	case float64:
+		return !math.IsNaN(tv) && !math.IsInf(tv, 0)
+	case int, int64:
 		return true
+	case json.Number:
+		f, err := tv.Float64()
+		return err == nil && !math.IsNaN(f) && !math.IsInf(f, 0)
 	default:
 		return false
 	}
+}
+
+func isGeoNumericElem(v any) bool {
+	if isGeoJSONNumberElem(v) {
+		return true
+	}
+	if s, ok := v.(string); ok {
+		_, valid := parseGeoStringFloat(s)
+		return valid
+	}
+	return false
+}
+
+func isGeoLonLatPair(arr []any) bool {
+	return len(arr) == 2 && isGeoJSONNumberElem(arr[0]) && isGeoNumericElem(arr[1])
+}
+
+func normalizeGeoLon(lo float64) float64 {
+	if lo >= -180.0 && lo <= 180.0 {
+		if lo == 0 {
+			return 0
+		}
+		return lo
+	}
+	if math.Abs(lo) < 1e9 {
+		lo -= math.Round(lo/360.0) * 360.0
+	} else {
+		lo = math.Mod(lo, 360.0)
+	}
+	if lo > 180.0 {
+		lo -= 360.0
+	} else if lo < -180.0 {
+		lo += 360.0
+	}
+	if lo == 0 {
+		return 0
+	}
+	return lo
 }
 
 func extractGeoPointCandidatesWithNull(node any, path []string, nullVal any) []any {
@@ -1307,7 +1372,7 @@ func collectGeoPointCandidatesWithNull(node any, path []string, nullVal any, out
 			return
 		}
 		if arr, ok := node.([]any); ok {
-			if len(arr) == 2 && isGeoNumericElem(arr[0]) && isGeoNumericElem(arr[1]) {
+			if isGeoLonLatPair(arr) {
 				*out = append(*out, arr)
 				return
 			}
@@ -1351,8 +1416,7 @@ func parseGeoFloatElem(x any) (float64, bool) {
 		f, err := nv.Float64()
 		return f, err == nil && !math.IsNaN(f) && !math.IsInf(f, 0)
 	case string:
-		f, err := strconv.ParseFloat(strings.TrimSpace(nv), 64)
-		return f, err == nil && !math.IsNaN(f) && !math.IsInf(f, 0)
+		return parseGeoStringFloat(nv)
 	default:
 		return 0, false
 	}
@@ -1406,9 +1470,10 @@ func decodeGeohashLatLon(hash string) (lat, lon float64, ok bool) {
 func parseAndFormatGeoPointValue(val any) (formatted string, lat, lon float64, ok bool) {
 	checkBounds := func(la, lo float64) (string, float64, float64, bool) {
 		if math.IsNaN(la) || math.IsInf(la, 0) || la < -90.0 || la > 90.0 ||
-			math.IsNaN(lo) || math.IsInf(lo, 0) || lo < -180.0 || lo > 180.0 {
+			math.IsNaN(lo) || math.IsInf(lo, 0) {
 			return "", 0, 0, false
 		}
+		lo = normalizeGeoLon(lo)
 		return fmt.Sprintf("%s,%s", strconv.FormatFloat(la, 'f', -1, 64), strconv.FormatFloat(lo, 'f', -1, 64)), la, lo, true
 	}
 	switch tv := val.(type) {
@@ -1442,7 +1507,7 @@ func parseAndFormatGeoPointValue(val any) (formatted string, lat, lon float64, o
 		}
 		return checkBounds(la, lo)
 	case []any:
-		if len(tv) != 2 || !isGeoNumericElem(tv[0]) || !isGeoNumericElem(tv[1]) {
+		if !isGeoLonLatPair(tv) {
 			return "", 0, 0, false
 		}
 		lo, okLon := parseGeoFloatElem(tv[0])
@@ -1639,6 +1704,103 @@ func countTokensForBinding(sv string, b FieldBinding) int64 {
 	return cnt
 }
 
+const maxVariantNormalizeDepth = 64
+
+func countKeyDotDepthBounded(k string, depth, maxDepth int) (int, bool) {
+	if maxDepth <= 0 {
+		return depth + strings.Count(k, "."), true
+	}
+	if depth > maxDepth {
+		return 0, false
+	}
+	rem := maxDepth - depth
+	dots := 0
+	for i := 0; i < len(k); i++ {
+		if k[i] == '.' {
+			dots++
+			if dots > rem {
+				return 0, false
+			}
+		}
+	}
+	return depth + dots, true
+}
+
+func validateSliceNestingDepth(items []any, sliceDepth, maxDepth int) error {
+	if maxDepth <= 0 {
+		return nil
+	}
+	if sliceDepth > maxDepth {
+		return fmt.Errorf("illegal_argument_exception: Document nesting depth exceeds limit [%d]", maxDepth)
+	}
+	for _, elem := range items {
+		switch tv := elem.(type) {
+		case map[string]any:
+			if err := validateDocumentNestingDepth(tv, sliceDepth+1, maxDepth); err != nil {
+				return err
+			}
+		case []any:
+			if err := validateSliceNestingDepth(tv, sliceDepth+1, maxDepth); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func validateDocumentNestingDepth(obj any, depth, maxDepth int) error {
+	if obj == nil || maxDepth <= 0 {
+		return nil
+	}
+	switch typed := obj.(type) {
+	case map[string]any:
+		if depth > maxDepth {
+			return fmt.Errorf("illegal_argument_exception: Document nesting depth exceeds limit [%d]", maxDepth)
+		}
+		for k, v := range typed {
+			effDepth, ok := countKeyDotDepthBounded(k, depth, maxDepth)
+			if !ok {
+				return fmt.Errorf("illegal_argument_exception: Document nesting depth exceeds limit [%d]", maxDepth)
+			}
+			switch tv := v.(type) {
+			case map[string]any:
+				if err := validateDocumentNestingDepth(tv, effDepth+1, maxDepth); err != nil {
+					return err
+				}
+			case []any:
+				if err := validateSliceNestingDepth(tv, effDepth, maxDepth); err != nil {
+					return err
+				}
+			}
+		}
+	case []any:
+		return validateSliceNestingDepth(typed, depth, maxDepth)
+	}
+	return nil
+}
+
+func validateDocumentSliceLimits(items []any, sliceDepth, maxDepth, maxFieldNameLength int) error {
+	if sliceDepth > maxVariantNormalizeDepth {
+		return fmt.Errorf("illegal_argument_exception: Document nesting depth exceeds limit [%d]", maxVariantNormalizeDepth)
+	}
+	if maxDepth > 0 && sliceDepth > maxDepth {
+		return fmt.Errorf("illegal_argument_exception: Limit of mapping depth [%d] has been exceeded", maxDepth)
+	}
+	for _, elem := range items {
+		switch tv := elem.(type) {
+		case map[string]any:
+			if err := validateDocumentLimits(tv, sliceDepth+1, maxDepth, maxFieldNameLength); err != nil {
+				return err
+			}
+		case []any:
+			if err := validateDocumentSliceLimits(tv, sliceDepth+1, maxDepth, maxFieldNameLength); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 func validateDocumentLimits(obj map[string]any, depth, maxDepth, maxFieldNameLength int) error {
 	if obj == nil {
 		return nil
@@ -1657,8 +1819,8 @@ func validateDocumentLimits(obj map[string]any, depth, maxDepth, maxFieldNameLen
 				}
 			}
 		}
-		effDepth := depth + strings.Count(k, ".")
-		if maxDepth > 0 && effDepth > maxDepth {
+		effDepth, ok := countKeyDotDepthBounded(k, depth, maxDepth)
+		if !ok {
 			return fmt.Errorf("illegal_argument_exception: Limit of mapping depth [%d] has been exceeded", maxDepth)
 		}
 		switch tv := v.(type) {
@@ -1667,12 +1829,8 @@ func validateDocumentLimits(obj map[string]any, depth, maxDepth, maxFieldNameLen
 				return err
 			}
 		case []any:
-			for _, elem := range tv {
-				if em, ok := elem.(map[string]any); ok {
-					if err := validateDocumentLimits(em, effDepth+1, maxDepth, maxFieldNameLength); err != nil {
-						return err
-					}
-				}
+			if err := validateDocumentSliceLimits(tv, effDepth, maxDepth, maxFieldNameLength); err != nil {
+				return err
 			}
 		}
 	}
@@ -2178,6 +2336,27 @@ func coerceScalarBindingForDorisWithSchema(idx *IndexSchema, val any, b FieldBin
 	return coerced
 }
 
+func parseCoercedFloatString(s string) (float64, bool) {
+	trimmed := strings.TrimSpace(s)
+	if trimmed == "" || strings.ContainsRune(trimmed, '_') {
+		return 0, false
+	}
+	if strings.ContainsAny(trimmed, "xX") {
+		return 0, false
+	}
+	if len(trimmed) >= 2 {
+		switch trimmed[len(trimmed)-1] {
+		case 'd', 'D', 'f', 'F':
+			trimmed = trimmed[:len(trimmed)-1]
+		}
+	}
+	f, err := strconv.ParseFloat(trimmed, 64)
+	if err != nil || math.IsNaN(f) || math.IsInf(f, 0) {
+		return 0, false
+	}
+	return f, true
+}
+
 func coerceScalarForDoris(val any, dorisType DorisScalarType, lowercase bool, now time.Time) any {
 	if val == nil {
 		return nil
@@ -2354,7 +2533,7 @@ func coerceScalarForDoris(val any, dorisType DorisScalarType, lowercase bool, no
 			}
 			return nil
 		case string:
-			if f, err := strconv.ParseFloat(strings.TrimSpace(v), 64); err == nil && !math.IsNaN(f) && !math.IsInf(f, 0) {
+			if f, ok := parseCoercedFloatString(v); ok {
 				return f
 			}
 			return nil
@@ -4278,7 +4457,10 @@ func propagateCopyToCustomMultiFields(s *IndexSchema, row map[string]any, target
 	return nil
 }
 
-func buildVariantDocPayload(trimmed []byte, parsedDoc map[string]any, prunedDynamic bool, s *IndexSchema) json.RawMessage {
+func buildVariantDocPayloadWithError(trimmed []byte, parsedDoc map[string]any, prunedDynamic bool, s *IndexSchema) (json.RawMessage, error) {
+	if err := validateDocumentNestingDepth(parsedDoc, 1, maxVariantNormalizeDepth); err != nil {
+		return nil, err
+	}
 	var enabledFalsePaths [][]string
 	if s != nil {
 		for _, b := range s.Fields {
@@ -4289,26 +4471,33 @@ func buildVariantDocPayload(trimmed []byte, parsedDoc map[string]any, prunedDyna
 	}
 	hasDotted := hasAnyDottedKeyInMap(parsedDoc)
 	if !prunedDynamic && len(enabledFalsePaths) == 0 && !hasDotted {
-		return json.RawMessage(trimmed)
+		return json.RawMessage(trimmed), nil
 	}
 	if prunedDynamic && parsedDoc != nil {
 		for _, p := range enabledFalsePaths {
 			deletePathInMap(parsedDoc, p)
 		}
-		if normDoc, _ := normalizeVariantDocMap(parsedDoc, s, ""); normDoc != nil {
+		normDoc, _, err := normalizeVariantDocMapWithDepth(parsedDoc, s, "", 1, maxVariantNormalizeDepth)
+		if err != nil {
+			return nil, err
+		}
+		if normDoc != nil {
 			parsedDoc = normDoc
 		}
 		b, err := json.Marshal(parsedDoc)
 		if err != nil {
-			return json.RawMessage(trimmed)
+			return json.RawMessage(trimmed), nil
 		}
-		return json.RawMessage(b)
+		return json.RawMessage(b), nil
 	}
 	var docMap map[string]any
 	dec := json.NewDecoder(bytes.NewReader(trimmed))
 	dec.UseNumber()
 	if err := dec.Decode(&docMap); err != nil || docMap == nil {
-		return json.RawMessage(trimmed)
+		return json.RawMessage(trimmed), nil
+	}
+	if err := validateDocumentNestingDepth(docMap, 1, maxVariantNormalizeDepth); err != nil {
+		return nil, err
 	}
 	modified := false
 	for _, p := range enabledFalsePaths {
@@ -4316,34 +4505,45 @@ func buildVariantDocPayload(trimmed []byte, parsedDoc map[string]any, prunedDyna
 			modified = true
 		}
 	}
-	if normDoc, normMod := normalizeVariantDocMap(docMap, s, ""); normMod {
+	normDoc, normMod, err := normalizeVariantDocMapWithDepth(docMap, s, "", 1, maxVariantNormalizeDepth)
+	if err != nil {
+		return nil, err
+	}
+	if normMod {
 		docMap = normDoc
 		modified = true
 	}
 	if !modified {
-		return json.RawMessage(trimmed)
+		return json.RawMessage(trimmed), nil
 	}
 	b, err := json.Marshal(docMap)
 	if err != nil {
-		return json.RawMessage(trimmed)
+		return json.RawMessage(trimmed), nil
 	}
-	return json.RawMessage(b)
+	return json.RawMessage(b), nil
 }
 
 func hasAnyDottedKeyInMap(v any) bool {
+	return hasAnyDottedKeyInMapDepth(v, 1, maxVariantNormalizeDepth)
+}
+
+func hasAnyDottedKeyInMapDepth(v any, depth, maxDepth int) bool {
+	if depth > maxDepth {
+		return true
+	}
 	switch tv := v.(type) {
 	case map[string]any:
 		for k, val := range tv {
 			if strings.IndexByte(k, '.') >= 0 {
 				return true
 			}
-			if hasAnyDottedKeyInMap(val) {
+			if hasAnyDottedKeyInMapDepth(val, depth+1, maxDepth) {
 				return true
 			}
 		}
 	case []any:
 		for _, elem := range tv {
-			if hasAnyDottedKeyInMap(elem) {
+			if hasAnyDottedKeyInMapDepth(elem, depth+1, maxDepth) {
 				return true
 			}
 		}
@@ -4352,11 +4552,22 @@ func hasAnyDottedKeyInMap(v any) bool {
 }
 
 func mergeVariantValue(dst, src any) any {
+	merged, err := mergeVariantValueWithDepth(dst, src, 1, maxVariantNormalizeDepth)
+	if err != nil {
+		return dst
+	}
+	return merged
+}
+
+func mergeVariantValueWithDepth(dst, src any, depth, maxDepth int) (any, error) {
+	if depth > maxDepth {
+		return nil, fmt.Errorf("illegal_argument_exception: Document nesting depth exceeds limit [%d]", maxDepth)
+	}
 	if dst == nil {
-		return src
+		return src, nil
 	}
 	if src == nil {
-		return dst
+		return dst, nil
 	}
 	if dm, dIsMap := dst.(map[string]any); dIsMap {
 		if sm, sIsMap := src.(map[string]any); sIsMap {
@@ -4366,17 +4577,21 @@ func mergeVariantValue(dst, src any) any {
 			}
 			for k, v := range sm {
 				if prev, exists := merged[k]; exists {
-					merged[k] = mergeVariantValue(prev, v)
+					mv, err := mergeVariantValueWithDepth(prev, v, depth+1, maxDepth)
+					if err != nil {
+						return nil, err
+					}
+					merged[k] = mv
 				} else {
 					merged[k] = v
 				}
 			}
-			return merged
+			return merged, nil
 		}
-		return dst
+		return dst, nil
 	}
 	if _, sIsMap := src.(map[string]any); sIsMap {
-		return src
+		return src, nil
 	}
 	var out []any
 	if ds, ok := dst.([]any); ok {
@@ -4389,12 +4604,23 @@ func mergeVariantValue(dst, src any) any {
 	} else {
 		out = append(out, src)
 	}
-	return out
+	return out, nil
 }
 
 func normalizeVariantDocSlice(arr []any, s *IndexSchema, prefix string) ([]any, bool) {
-	if len(arr) == 0 {
+	out, modified, err := normalizeVariantDocSliceWithDepth(arr, s, prefix, 1, maxVariantNormalizeDepth)
+	if err != nil {
 		return arr, false
+	}
+	return out, modified
+}
+
+func normalizeVariantDocSliceWithDepth(arr []any, s *IndexSchema, prefix string, depth, maxDepth int) ([]any, bool, error) {
+	if depth > maxDepth {
+		return nil, false, fmt.Errorf("illegal_argument_exception: Document nesting depth exceeds limit [%d]", maxDepth)
+	}
+	if len(arr) == 0 {
+		return arr, false, nil
 	}
 	modified := false
 	var out []any
@@ -4407,13 +4633,21 @@ func normalizeVariantDocSlice(arr []any, s *IndexSchema, prefix string) ([]any, 
 	for i, elem := range arr {
 		switch tv := elem.(type) {
 		case map[string]any:
-			if sub, subMod := normalizeVariantDocMap(tv, s, prefix); subMod {
+			sub, subMod, err := normalizeVariantDocMapWithDepth(tv, s, prefix, depth+1, maxDepth)
+			if err != nil {
+				return nil, false, err
+			}
+			if subMod {
 				ensureOut()
 				out[i] = sub
 				modified = true
 			}
 		case []any:
-			if sub, subMod := normalizeVariantDocSlice(tv, s, prefix); subMod {
+			sub, subMod, err := normalizeVariantDocSliceWithDepth(tv, s, prefix, depth+1, maxDepth)
+			if err != nil {
+				return nil, false, err
+			}
+			if subMod {
 				ensureOut()
 				out[i] = sub
 				modified = true
@@ -4421,20 +4655,26 @@ func normalizeVariantDocSlice(arr []any, s *IndexSchema, prefix string) ([]any, 
 		}
 	}
 	if !modified {
-		return arr, false
+		return arr, false, nil
 	}
-	return out, true
+	return out, true, nil
 }
 
-func normalizeVariantDocMap(m map[string]any, s *IndexSchema, prefix string) (map[string]any, bool) {
+func normalizeVariantDocMapWithDepth(m map[string]any, s *IndexSchema, prefix string, depth, maxDepth int) (map[string]any, bool, error) {
+	if depth > maxDepth {
+		return nil, false, fmt.Errorf("illegal_argument_exception: Document nesting depth exceeds limit [%d]", maxDepth)
+	}
 	if len(m) == 0 {
-		return m, false
+		return m, false, nil
 	}
 	subFalse := isSubobjectsFalseAtPrefix(s, prefix)
 	nonDotted := make([]string, 0, len(m))
 	dotted := make([]string, 0)
 	for k := range m {
 		if !subFalse && strings.IndexByte(k, '.') > 0 {
+			if _, ok := countKeyDotDepthBounded(k, depth, maxDepth); !ok {
+				return nil, false, fmt.Errorf("illegal_argument_exception: Document nesting depth exceeds limit [%d]", maxDepth)
+			}
 			dotted = append(dotted, k)
 		} else {
 			nonDotted = append(nonDotted, k)
@@ -4458,7 +4698,11 @@ func normalizeVariantDocMap(m map[string]any, s *IndexSchema, prefix string) (ma
 		}
 		nested := map[string]any{tail: m[k]}
 		if existing, exists := out[head]; exists {
-			out[head] = mergeVariantValue(existing, nested)
+			mv, err := mergeVariantValueWithDepth(existing, nested, depth+1, maxDepth)
+			if err != nil {
+				return nil, false, err
+			}
+			out[head] = mv
 		} else {
 			out[head] = nested
 		}
@@ -4475,21 +4719,29 @@ func normalizeVariantDocMap(m map[string]any, s *IndexSchema, prefix string) (ma
 		}
 		switch tv := out[k].(type) {
 		case map[string]any:
-			if sub, subMod := normalizeVariantDocMap(tv, s, childPrefix); subMod {
+			sub, subMod, err := normalizeVariantDocMapWithDepth(tv, s, childPrefix, depth+1, maxDepth)
+			if err != nil {
+				return nil, false, err
+			}
+			if subMod {
 				out[k] = sub
 				modified = true
 			}
 		case []any:
-			if sub, subMod := normalizeVariantDocSlice(tv, s, childPrefix); subMod {
+			sub, subMod, err := normalizeVariantDocSliceWithDepth(tv, s, childPrefix, depth, maxDepth)
+			if err != nil {
+				return nil, false, err
+			}
+			if subMod {
 				out[k] = sub
 				modified = true
 			}
 		}
 	}
 	if !modified {
-		return m, false
+		return m, false, nil
 	}
-	return out, true
+	return out, true, nil
 }
 
 func isPrimaryFieldBinding(b FieldBinding) bool {
@@ -4592,7 +4844,7 @@ func cleanMalformedNestedLeafValue(val any, b FieldBinding, now time.Time) (any,
 		return nil, true, false
 	}
 	if arr, isSlice := val.([]any); isSlice {
-		if b.ESType == "geo_point" && len(arr) == 2 && isGeoNumericElem(arr[0]) && isGeoNumericElem(arr[1]) {
+		if b.ESType == "geo_point" && isGeoLonLatPair(arr) {
 			if _, _, _, ok := parseAndFormatGeoPointValue(arr); !ok {
 				return nil, false, true
 			}
@@ -5718,7 +5970,7 @@ func normalizeNestedLeafValueWithSchema(idx *IndexSchema, val any, b FieldBindin
 		return norm
 	}
 	if arr, ok := val.([]any); ok {
-		if b.ESType == "geo_point" && len(arr) == 2 && isGeoNumericElem(arr[0]) && isGeoNumericElem(arr[1]) {
+		if b.ESType == "geo_point" && isGeoLonLatPair(arr) {
 			if formatted, _, _, okGeo := parseAndFormatGeoPointValue(arr); okGeo {
 				return formatted
 			}
@@ -6206,14 +6458,17 @@ func validateAndNormalizeHistogramFieldInDocWithIgnored(curr map[string]any, pat
 			var allCnts []any
 			var allPairs []any
 			hadMalformed := false
-			var walkSlice func(items []any) error
-			walkSlice = func(items []any) error {
+			var walkSlice func(items []any, depth int) error
+			walkSlice = func(items []any, depth int) error {
+				if depth > maxVariantNormalizeDepth {
+					return fmt.Errorf("illegal_argument_exception: Document nesting depth exceeds limit [%d]", maxVariantNormalizeDepth)
+				}
 				for _, item := range items {
 					if item == nil {
 						continue
 					}
 					if sub, okS := item.([]any); okS {
-						if err := walkSlice(sub); err != nil {
+						if err := walkSlice(sub, depth+1); err != nil {
 							return err
 						}
 						continue
@@ -6232,7 +6487,7 @@ func validateAndNormalizeHistogramFieldInDocWithIgnored(curr map[string]any, pat
 				}
 				return nil
 			}
-			if err := walkSlice(arr); err != nil {
+			if err := walkSlice(arr, 1); err != nil {
 				return false, err
 			}
 			if hadMalformed && recordIgnored != nil {
@@ -6807,6 +7062,8 @@ func parseRangeBoundValue(raw any, b FieldBinding, getNow func() time.Time, roun
 
 func validateAndPopulateSingleRangeMap(m map[string]any, b FieldBinding, getNow func() time.Time) error {
 	hasGt, hasGte, hasLt, hasLte := false, false, false, false
+	hasGtKey, hasGteKey, hasLtKey, hasLteKey := false, false, false, false
+	hasGtNull, hasLtNull := false, false
 	hasExistingR := false
 	var rawLower, rawUpper any
 	for k, v := range m {
@@ -6819,21 +7076,29 @@ func validateAndPopulateSingleRangeMap(m map[string]any, b FieldBinding, getNow 
 			}
 			continue
 		case "gt":
+			hasGtKey = true
 			if v != nil {
 				hasGt = true
 				rawLower = v
+			} else {
+				hasGtNull = true
 			}
 		case "gte":
+			hasGteKey = true
 			if v != nil {
 				hasGte = true
 				rawLower = v
 			}
 		case "lt":
+			hasLtKey = true
 			if v != nil {
 				hasLt = true
 				rawUpper = v
+			} else {
+				hasLtNull = true
 			}
 		case "lte":
+			hasLteKey = true
 			if v != nil {
 				hasLte = true
 				rawUpper = v
@@ -6842,57 +7107,81 @@ func validateAndPopulateSingleRangeMap(m map[string]any, b FieldBinding, getNow 
 			return fmt.Errorf("mapper_parsing_exception: range field [%s] unknown bound key [%s]", b.ESFieldPath, k)
 		}
 	}
+	esType := strings.ToLower(strings.TrimSpace(b.ESType))
+	isIntRange := esType == "integer_range" || esType == "long_range" || esType == "date_range"
+	if hasGtNull && isIntRange && !hasGte {
+		hasGt = true
+	}
+	if hasLtNull && isIntRange && !hasLte {
+		hasLt = true
+	}
 	if !hasGt && !hasGte && !hasLt && !hasLte && hasExistingR {
 		return nil
 	}
-	if (hasGt && hasGte) || (hasLt && hasLte) || (!hasGt && !hasGte && !hasLt && !hasLte) {
+	if (hasGtKey && hasGteKey) || (hasLtKey && hasLteKey) || (!hasGt && !hasGte && !hasLt && !hasLte) {
 		return fmt.Errorf("mapper_parsing_exception: invalid range bounds for field [%s]", b.ESFieldPath)
 	}
-	esType := strings.ToLower(strings.TrimSpace(b.ESType))
-	isIntRange := esType == "integer_range" || esType == "long_range" || esType == "date_range"
 	hasLower := hasGt || hasGte
 	hasUpper := hasLt || hasLte
 	var lowerFloat, upperFloat float64
 	var lowerInt, upperInt int64
 	if hasLower {
-		lf, li, ok := parseRangeBoundValue(rawLower, b, getNow, hasGt)
-		if !ok {
-			return fmt.Errorf("mapper_parsing_exception: failed to parse lower bound of range field [%s] of type [%s]", b.ESFieldPath, b.ESType)
-		}
-		if hasGt {
-			if isIntRange {
-				if (esType == "integer_range" && li == math.MaxInt32) || li == math.MaxInt64 {
-					return fmt.Errorf("mapper_parsing_exception: lower bound overflow in range field [%s]", b.ESFieldPath)
-				}
-				li++
-				lf = float64(li)
-			} else if esType == "ip_range" {
-				lf += 1.0
+		if hasGtNull && isIntRange && rawLower == nil {
+			if esType == "integer_range" {
+				lowerInt = math.MinInt32 + 1
 			} else {
-				lf = math.Nextafter(lf, math.Inf(1))
+				lowerInt = math.MinInt64 + 1
 			}
+			lowerFloat = float64(lowerInt)
+		} else {
+			lf, li, ok := parseRangeBoundValue(rawLower, b, getNow, hasGt)
+			if !ok {
+				return fmt.Errorf("mapper_parsing_exception: failed to parse lower bound of range field [%s] of type [%s]", b.ESFieldPath, b.ESType)
+			}
+			if hasGt {
+				if isIntRange {
+					if (esType == "integer_range" && li == math.MaxInt32) || li == math.MaxInt64 {
+						return fmt.Errorf("mapper_parsing_exception: lower bound overflow in range field [%s]", b.ESFieldPath)
+					}
+					li++
+					lf = float64(li)
+				} else if esType == "ip_range" {
+					lf += 1.0
+				} else {
+					lf = math.Nextafter(lf, math.Inf(1))
+				}
+			}
+			lowerFloat, lowerInt = lf, li
 		}
-		lowerFloat, lowerInt = lf, li
 	}
 	if hasUpper {
-		uf, ui, ok := parseRangeBoundValue(rawUpper, b, getNow, hasLte)
-		if !ok {
-			return fmt.Errorf("mapper_parsing_exception: failed to parse upper bound of range field [%s] of type [%s]", b.ESFieldPath, b.ESType)
-		}
-		if hasLt {
-			if isIntRange {
-				if (esType == "integer_range" && ui == math.MinInt32) || ui == math.MinInt64 {
-					return fmt.Errorf("mapper_parsing_exception: upper bound underflow in range field [%s]", b.ESFieldPath)
-				}
-				ui--
-				uf = float64(ui)
-			} else if esType == "ip_range" {
-				uf -= 1.0
+		if hasLtNull && isIntRange && rawUpper == nil {
+			if esType == "integer_range" {
+				upperInt = math.MaxInt32 - 1
 			} else {
-				uf = math.Nextafter(uf, math.Inf(-1))
+				upperInt = math.MaxInt64 - 1
 			}
+			upperFloat = float64(upperInt)
+		} else {
+			uf, ui, ok := parseRangeBoundValue(rawUpper, b, getNow, hasLte)
+			if !ok {
+				return fmt.Errorf("mapper_parsing_exception: failed to parse upper bound of range field [%s] of type [%s]", b.ESFieldPath, b.ESType)
+			}
+			if hasLt {
+				if isIntRange {
+					if (esType == "integer_range" && ui == math.MinInt32) || ui == math.MinInt64 {
+						return fmt.Errorf("mapper_parsing_exception: upper bound underflow in range field [%s]", b.ESFieldPath)
+					}
+					ui--
+					uf = float64(ui)
+				} else if esType == "ip_range" {
+					uf -= 1.0
+				} else {
+					uf = math.Nextafter(uf, math.Inf(-1))
+				}
+			}
+			upperFloat, upperInt = uf, ui
 		}
-		upperFloat, upperInt = uf, ui
 	}
 	if hasLower && hasUpper {
 		if isIntRange {

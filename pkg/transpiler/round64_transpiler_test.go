@@ -380,9 +380,13 @@ func TestRound64_F2_F4_F11_F16_F21_DownsampleTypesNestedAndSentinel(t *testing.T
 		t.Fatalf("F4 expected unsupported_aggregation_on_downsampled_index error, got: %v", err)
 	}
 
-	// F16 nested agg validation error on missing nested path
+	// F16 nested agg on completely unmapped nested path returns empty/no-match plan rather than 400
 	badNested := mustUnmarshalSearchReqR62(t, `{"size": 0, "aggs": {"bad_n": {"nested": {"path": "missing_nested"}, "aggs": {"c": {"value_count": {"field": "uid"}}}}}}`)
-	if _, err := NewTranspiler(sch, TranspilerOptions{}).BuildSearchPlan(badNested); err == nil || !strings.Contains(err.Error(), "failed to find nested object under path [missing_nested]") {
-		t.Fatalf("F16 expected missing nested path error, got: %v", err)
+	badNestedPlan, err := NewTranspiler(sch, TranspilerOptions{}).BuildSearchPlan(badNested)
+	if err != nil {
+		t.Fatalf("expected unmapped nested agg path to return empty plan, got err: %v", err)
+	}
+	if !strings.Contains(badNestedPlan.AggsSQL, "EXPLODE(CAST([] AS ARRAY<STRING>))") || strings.Contains(badNestedPlan.AggsSQL, "n__missing_nested") {
+		t.Fatalf("expected empty ARRAY<STRING> explode without n__missing_nested column, got:\n%s", badNestedPlan.AggsSQL)
 	}
 }
