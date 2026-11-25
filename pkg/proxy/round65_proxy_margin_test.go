@@ -656,9 +656,9 @@ func TestRound65_Track123_MonitoringRoutesHistogramULAndAdminCoverage(t *testing
 		"mon_writer":   {"cluster": []string{"cluster:admin/xpack/monitoring/bulk"}},
 	}
 	srv.securityUsers = map[string]map[string]any{
-		"reader": {"roles": []string{"monitor_only"}},
-		"writer": {"roles": []string{"mon_writer"}},
-		"agent":  {"roles": []string{"remote_monitoring_agent"}},
+		"reader": {"password": "pass", "roles": []string{"monitor_only"}},
+		"writer": {"password": "pass", "roles": []string{"mon_writer"}},
+		"agent":  {"password": "pass", "roles": []string{"remote_monitoring_agent"}},
 	}
 	srv.mu.Unlock()
 

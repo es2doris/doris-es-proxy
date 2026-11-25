@@ -299,25 +299,29 @@ func TestRound64_Modules_F9_EQL_C35_C36(t *testing.T) {
 		},
 	}
 	users := map[string]map[string]any{
-		"dls_all_user":  {"roles": []any{"dls_all_role"}},
-		"dls_some_user": {"roles": []any{"dls_some_role"}},
-		"fls_user":      {"roles": []any{"fls_role"}},
+		"elastic":       {"password": "pw", "roles": []any{"superuser"}},
+		"dls_all_user":  {"password": "pw", "roles": []any{"dls_all_role"}},
+		"dls_some_user": {"password": "pw", "roles": []any{"dls_some_role"}},
+		"fls_user":      {"password": "pw", "roles": []any{"fls_role"}},
 	}
 	apiKeys := map[string]map[string]any{
 		"good_key": {
 			"username": "dls_all_user",
+			"api_key":  "sec",
 			"role_descriptors": map[string]any{
 				"role-a": map[string]any{"index": []any{map[string]any{"names": []any{"test_security"}, "query": `{"term": {"ck": "const"}}`}}},
 			},
 		},
 		"bad_key": {
 			"username": "dls_all_user",
+			"api_key":  "sec",
 			"role_descriptors": map[string]any{
 				"role-a": map[string]any{"index": []any{map[string]any{"names": []any{"test_security"}, "query": `{"term": {"foo": "bar_dls"}}`}}},
 			},
 		},
 		"bounded_key": {
 			"username": "dls_some_user",
+			"api_key":  "sec",
 			"role_descriptors": map[string]any{
 				"role-a": map[string]any{"index": []any{map[string]any{"names": []any{"test_security"}, "query": `{"term": {"ck": "const"}}`}}},
 			},
@@ -331,6 +335,12 @@ func TestRound64_Modules_F9_EQL_C35_C36(t *testing.T) {
 	}
 	if !EvaluateTermsEnumSecurityAccessR64(basicHdr("elastic"), users, roles, apiKeys, schemas, []string{"test_security"}, "foo") {
 		t.Fatalf("expected elastic superuser access allowed")
+	}
+	if EvaluateTermsEnumSecurityAccessR64("Basic "+base64.StdEncoding.EncodeToString([]byte("elastic:wrong")), users, roles, apiKeys, schemas, []string{"test_security"}, "foo") {
+		t.Fatalf("expected wrong password for elastic to be denied")
+	}
+	if EvaluateTermsEnumSecurityAccessR64(basicHdr("elastic"), map[string]map[string]any{}, roles, apiKeys, schemas, []string{"test_security"}, "foo") {
+		t.Fatalf("expected unconfigured elastic to fail closed")
 	}
 	if !EvaluateTermsEnumSecurityAccessR64(basicHdr("dls_all_user"), users, roles, apiKeys, schemas, []string{"test_security"}, "foo") {
 		t.Fatalf("expected dls_all_user (constant_keyword) allowed")

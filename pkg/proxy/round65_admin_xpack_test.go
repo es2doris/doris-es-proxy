@@ -190,11 +190,8 @@ func TestRound65_SnapshotRepoURLSecurityAndFS(t *testing.T) {
 	defer redirectSrv.Close()
 
 	srv, handler := newRound61AdminTestServer(t, "8.15.5")
-	cSet, _, _, rawSet := doR65Req(t, handler, http.MethodPut, "/_cluster/settings",
-		`{"persistent":{"path.repo":["`+filepath.ToSlash(pathRepoDir)+`"],"repositories.url.allowed_urls":"`+redirectSrv.URL+`/*,`+filePrefix+`*"}}`)
-	if cSet != http.StatusOK {
-		t.Fatalf("cluster settings failed: %d %s", cSet, rawSet)
-	}
+	srv.SetStaticPathRepo([]string{filepath.ToSlash(pathRepoDir)})
+	srv.SetStaticRepositoriesURLAllowedURLs([]string{redirectSrv.URL + "/*", filePrefix + "*"})
 
 	// PUT valid HTTP URL repo + HEAD compat & Content-Length + _all/_verify
 	cPut, _, _, rawPut := doR65Req(t, handler, http.MethodPut, "/_snapshot/r_ok",
@@ -350,8 +347,7 @@ func TestRound65_CompatHeadersQZeroAndUnwrap(t *testing.T) {
 func TestRound65_SearchableSnapshotsLicenseProfilingText(t *testing.T) {
 	srv, handler := newRound61AdminTestServer(t, "8.15.5")
 	repoDir := t.TempDir()
-	_, _, _, _ = doR65Req(t, handler, http.MethodPut, "/_cluster/settings",
-		`{"persistent":{"path.repo":["`+filepath.ToSlash(repoDir)+`"]}}`)
+	srv.SetStaticPathRepo([]string{filepath.ToSlash(repoDir)})
 	if c, _, _, raw := doR65Req(t, handler, http.MethodPut, "/_snapshot/ss_repo",
 		`{"type":"fs","settings":{"location":"`+filepath.ToSlash(repoDir)+`"}}`); c != http.StatusOK {
 		t.Fatalf("PUT repo failed: %d %s", c, raw)

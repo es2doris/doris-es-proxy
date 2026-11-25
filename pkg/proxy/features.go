@@ -543,7 +543,7 @@ func setESCompatHeadersWireR64(w http.ResponseWriter, r *http.Request) {
 	}
 	reqCT := strings.ToLower(strings.Join(r.Header.Values("Content-Type"), ", "))
 	switch {
-	case bestAcceptCT != "" && bestAcceptCT != "application/json; charset=UTF-8":
+	case bestAcceptCT != "":
 		w.Header().Set("Content-Type", bestAcceptCT)
 	case strings.Contains(reqCT, "application/vnd.opensearch+"):
 		if cw, hasCW := extractCompatibleWithParam(reqCT); hasCW && cw != "" {
@@ -3294,6 +3294,9 @@ func (s *Server) applyEffectiveAndFinalPipelinesWithMetaRound61(indexName, docID
 		progressed := false
 		for defHop := 0; defHop < 16 && curIndex != evaledDefForIndex && !skipDefaultForExplicitNone; defHop++ {
 			evaledDefForIndex = curIndex
+			if s != nil && curIndex != "" && s.isDataStream(curIndex) {
+				_, _, _ = s.maybePerformLazyRolloverR66(context.Background(), nil, curIndex)
+			}
 			destDef := resolveDef(curIndex, "", "")
 			visitKey := curIndex + "\x00" + destDef
 			if destDef != "" && !visitedDefTargets[visitKey] {
@@ -3317,6 +3320,9 @@ func (s *Server) applyEffectiveAndFinalPipelinesWithMetaRound61(indexName, docID
 		}
 		if evaledFinalForIndex != curIndex {
 			evaledFinalForIndex = curIndex
+			if s != nil && curIndex != "" && s.isDataStream(curIndex) {
+				_, _, _ = s.maybePerformLazyRolloverR66(context.Background(), nil, curIndex)
+			}
 			finalPipeline := resolveFin(curIndex)
 			if finalPipeline != "" {
 				progressed = true
@@ -3815,24 +3821,254 @@ func validateIngestMustacheValueR65(val any) error {
 	return nil
 }
 
-func expandIngestTemplate(val any, doc map[string]any) any {
+const (
+	maxIngestTemplateDepthR66       = 32
+	maxIngestTemplateOutputBytesR66 = 4 << 20
+)
+
+func consumeIngestTemplateBudgetR66(remaining *int, n int) error {
+	if remaining == nil {
+		return nil
+	}
+	if n < 0 || n > *remaining {
+		return fmt.Errorf("ingest template expanded output exceeds maximum size (%d bytes)", maxIngestTemplateOutputBytesR66)
+	}
+	*remaining -= n
+	return nil
+}
+
+func estimateJSONMarshalBytesBoundedR66(v any, depth, limit int) (int, error) {
+	if depth > maxIngestTemplateDepthR66 {
+		return 0, fmt.Errorf("ingest template JSON depth limit (%d) exceeded", maxIngestTemplateDepthR66)
+	}
+	switch tv := v.(type) {
+	case nil:
+		return 4, nil
+	case bool:
+		return 5, nil
+	case string:
+		n := len(tv) + 2
+		if n > limit {
+			return 0, fmt.Errorf("ingest template expanded output exceeds maximum size (%d bytes)", maxIngestTemplateOutputBytesR66)
+		}
+		return n, nil
+	case []any:
+		total := 2
+		for i, el := range tv {
+			if i > 0 {
+				total++
+			}
+			sub, err := estimateJSONMarshalBytesBoundedR66(el, depth+1, limit-total)
+			if err != nil {
+				return 0, err
+			}
+			total += sub
+			if total > limit {
+				return 0, fmt.Errorf("ingest template expanded output exceeds maximum size (%d bytes)", maxIngestTemplateOutputBytesR66)
+			}
+		}
+		return total, nil
+	case map[string]any:
+		total := 2
+		first := true
+		for k, el := range tv {
+			if !first {
+				total++
+			}
+			first = false
+			total += len(k) + 3
+			if total > limit {
+				return 0, fmt.Errorf("ingest template expanded output exceeds maximum size (%d bytes)", maxIngestTemplateOutputBytesR66)
+			}
+			sub, err := estimateJSONMarshalBytesBoundedR66(el, depth+1, limit-total)
+			if err != nil {
+				return 0, err
+			}
+			total += sub
+			if total > limit {
+				return 0, fmt.Errorf("ingest template expanded output exceeds maximum size (%d bytes)", maxIngestTemplateOutputBytesR66)
+			}
+		}
+		return total, nil
+	default:
+		return 32, nil
+	}
+}
+
+func writeBoundedIngestTemplateValueR66(out *strings.Builder, v any, depth int, remaining *int) error {
+	if depth > maxIngestTemplateDepthR66 {
+		return fmt.Errorf("ingest template recursion depth limit (%d) exceeded", maxIngestTemplateDepthR66)
+	}
+	writeStr := func(s string) error {
+		if err := consumeIngestTemplateBudgetR66(remaining, len(s)); err != nil {
+			return err
+		}
+		out.WriteString(s)
+		return nil
+	}
+	switch tv := v.(type) {
+	case string:
+		return writeStr(tv)
+	case []any:
+		if err := writeStr("["); err != nil {
+			return err
+		}
+		for i, el := range tv {
+			if i > 0 {
+				if err := writeStr(" "); err != nil {
+					return err
+				}
+			}
+			if err := writeBoundedIngestTemplateValueR66(out, el, depth+1, remaining); err != nil {
+				return err
+			}
+		}
+		return writeStr("]")
+	case []string:
+		if err := writeStr("["); err != nil {
+			return err
+		}
+		for i, el := range tv {
+			if i > 0 {
+				if err := writeStr(" "); err != nil {
+					return err
+				}
+			}
+			if err := writeStr(el); err != nil {
+				return err
+			}
+		}
+		return writeStr("]")
+	case map[string]any:
+		keys := make([]string, 0, len(tv))
+		for k := range tv {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		if err := writeStr("map["); err != nil {
+			return err
+		}
+		for i, k := range keys {
+			if i > 0 {
+				if err := writeStr(" "); err != nil {
+					return err
+				}
+			}
+			if err := writeStr(k); err != nil {
+				return err
+			}
+			if err := writeStr(":"); err != nil {
+				return err
+			}
+			if err := writeBoundedIngestTemplateValueR66(out, tv[k], depth+1, remaining); err != nil {
+				return err
+			}
+		}
+		return writeStr("]")
+	default:
+		return writeStr(fmt.Sprintf("%v", v))
+	}
+}
+
+func isURLQueryUnescapedByteR66(b byte) bool {
+	if (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z') || (b >= '0' && b <= '9') {
+		return true
+	}
+	switch b {
+	case '-', '_', '.', '~', ' ':
+		return true
+	}
+	return false
+}
+
+func urlQueryEscapedExtraBytesR66(s string) int {
+	extra := 0
+	for i := 0; i < len(s); i++ {
+		if !isURLQueryUnescapedByteR66(s[i]) {
+			extra += 2
+		}
+	}
+	return extra
+}
+
+func findBalancedIngestSectionCloseR66(s string, from int, fnName string) int {
+	nested := 1
+	closeTag := "{{/" + fnName + "}}"
+	pos := from
+	for pos < len(s) {
+		nextOpen := strings.Index(s[pos:], "{{")
+		if nextOpen < 0 {
+			return -1
+		}
+		tagPos := pos + nextOpen
+		if strings.HasPrefix(s[tagPos:], closeTag) {
+			nested--
+			if nested == 0 {
+				return tagPos - from
+			}
+			pos = tagPos + len(closeTag)
+			continue
+		}
+		tagEnd := strings.Index(s[tagPos+2:], "}}")
+		if tagEnd < 0 {
+			return -1
+		}
+		rawTag := strings.TrimSpace(s[tagPos+2 : tagPos+2+tagEnd])
+		if rawTag == "#"+fnName || strings.HasPrefix(rawTag, "#"+fnName+" ") {
+			nested++
+		}
+		pos = tagPos + 2 + tagEnd + 2
+	}
+	return -1
+}
+
+func expandIngestTemplate(val any, doc map[string]any) (any, error) {
+	remaining := maxIngestTemplateOutputBytesR66
+	return expandIngestTemplateBoundedR66(val, doc, 0, &remaining)
+}
+
+func expandIngestTemplateStringR66(val any, doc map[string]any) (string, error) {
+	exp, err := expandIngestTemplate(val, doc)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%v", exp), nil
+}
+
+func expandIngestTemplateBoundedR66(val any, doc map[string]any, depth int, remaining *int) (any, error) {
+	if depth > maxIngestTemplateDepthR66 {
+		return nil, fmt.Errorf("ingest template recursion depth limit (%d) exceeded", maxIngestTemplateDepthR66)
+	}
 	switch v := val.(type) {
 	case map[string]any:
 		out := make(map[string]any, len(v))
 		for k, elem := range v {
-			out[k] = expandIngestTemplate(elem, doc)
+			expElem, err := expandIngestTemplateBoundedR66(elem, doc, depth+1, remaining)
+			if err != nil {
+				return nil, err
+			}
+			out[k] = expElem
 		}
-		return out
+		return out, nil
 	case []any:
 		out := make([]any, len(v))
 		for i, elem := range v {
-			out[i] = expandIngestTemplate(elem, doc)
+			expElem, err := expandIngestTemplateBoundedR66(elem, doc, depth+1, remaining)
+			if err != nil {
+				return nil, err
+			}
+			out[i] = expElem
 		}
-		return out
+		return out, nil
 	}
 	s, ok := val.(string)
 	if !ok || !strings.Contains(s, "{{") {
-		return val
+		if ok {
+			if err := consumeIngestTemplateBudgetR66(remaining, len(s)); err != nil {
+				return nil, err
+			}
+		}
+		return val, nil
 	}
 	lookupTemplatePath := func(rawKey string) (any, bool) {
 		key := strings.TrimSpace(rawKey)
@@ -3843,14 +4079,25 @@ func expandIngestTemplate(val any, doc map[string]any) any {
 		return getIngestPath(doc, key)
 	}
 	var out strings.Builder
+	writeChunk := func(chunk string) error {
+		if err := consumeIngestTemplateBudgetR66(remaining, len(chunk)); err != nil {
+			return err
+		}
+		out.WriteString(chunk)
+		return nil
+	}
 	i := 0
 	for i < len(s) {
 		start := strings.Index(s[i:], "{{")
 		if start < 0 {
-			out.WriteString(s[i:])
+			if err := writeChunk(s[i:]); err != nil {
+				return nil, err
+			}
 			break
 		}
-		out.WriteString(s[i : i+start])
+		if err := writeChunk(s[i : i+start]); err != nil {
+			return nil, err
+		}
 		i += start
 		triple := strings.HasPrefix(s[i:], "{{{")
 		openLen := 2
@@ -3861,7 +4108,9 @@ func expandIngestTemplate(val any, doc map[string]any) any {
 		}
 		end := strings.Index(s[i+openLen:], closeSeq)
 		if end < 0 {
-			out.WriteString(s[i:])
+			if err := writeChunk(s[i:]); err != nil {
+				return nil, err
+			}
 			break
 		}
 		rawTag := strings.TrimSpace(s[i+openLen : i+openLen+end])
@@ -3871,7 +4120,7 @@ func expandIngestTemplate(val any, doc map[string]any) any {
 			rawTag == "#url" || strings.HasPrefix(rawTag, "#url ")) {
 			fnName := strings.TrimPrefix(strings.Fields(rawTag)[0], "#")
 			closeTag := "{{/" + fnName + "}}"
-			closePos := strings.Index(s[afterOpen:], closeTag)
+			closePos := findBalancedIngestSectionCloseR66(s, afterOpen, fnName)
 			if closePos >= 0 {
 				innerBody := s[afterOpen : afterOpen+closePos]
 				switch fnName {
@@ -3887,25 +4136,55 @@ func expandIngestTemplate(val any, doc map[string]any) any {
 					if fv, exists := lookupTemplatePath(innerBody); exists && fv != nil {
 						switch sl := fv.(type) {
 						case []any:
-							parts := make([]string, 0, len(sl))
-							for _, el := range sl {
-								parts = append(parts, fmt.Sprintf("%v", el))
+							for idx, el := range sl {
+								if idx > 0 {
+									if err := writeChunk(delim); err != nil {
+										return nil, err
+									}
+								}
+								if err := writeBoundedIngestTemplateValueR66(&out, el, depth, remaining); err != nil {
+									return nil, err
+								}
 							}
-							out.WriteString(strings.Join(parts, delim))
 						case []string:
-							out.WriteString(strings.Join(sl, delim))
+							for idx, el := range sl {
+								if idx > 0 {
+									if err := writeChunk(delim); err != nil {
+										return nil, err
+									}
+								}
+								if err := writeChunk(el); err != nil {
+									return nil, err
+								}
+							}
 						default:
-							_, _ = fmt.Fprintf(&out, "%v", fv)
+							if err := writeBoundedIngestTemplateValueR66(&out, fv, depth, remaining); err != nil {
+								return nil, err
+							}
 						}
 					}
 				case "toJson":
 					if fv, exists := lookupTemplatePath(innerBody); exists {
+						if _, err := estimateJSONMarshalBytesBoundedR66(fv, depth, *remaining); err != nil {
+							return nil, err
+						}
 						if b, err := json.Marshal(fv); err == nil {
+							if err := consumeIngestTemplateBudgetR66(remaining, len(b)); err != nil {
+								return nil, err
+							}
 							out.Write(b)
 						}
 					}
 				case "url":
-					expandedInner := fmt.Sprintf("%v", expandIngestTemplate(innerBody, doc))
+					expandedAny, err := expandIngestTemplateBoundedR66(innerBody, doc, depth+1, remaining)
+					if err != nil {
+						return nil, err
+					}
+					expandedInner := fmt.Sprintf("%v", expandedAny)
+					extra := urlQueryEscapedExtraBytesR66(expandedInner)
+					if err := consumeIngestTemplateBudgetR66(remaining, extra); err != nil {
+						return nil, err
+					}
 					out.WriteString(url.QueryEscape(expandedInner))
 				}
 				i = afterOpen + closePos + len(closeTag)
@@ -3913,11 +4192,13 @@ func expandIngestTemplate(val any, doc map[string]any) any {
 			}
 		}
 		if v, exists := lookupTemplatePath(rawTag); exists && v != nil {
-			_, _ = fmt.Fprintf(&out, "%v", v)
+			if err := writeBoundedIngestTemplateValueR66(&out, v, depth, remaining); err != nil {
+				return nil, err
+			}
 		}
 		i = afterOpen
 	}
-	return out.String()
+	return out.String(), nil
 }
 
 var defaultGrokPatterns = map[string]string{
@@ -5357,7 +5638,11 @@ func ingestValuesEqual(a, b any) bool {
 
 func expandIngestFieldName(raw string, doc map[string]any) string {
 	if strings.Contains(raw, "{{") {
-		return fmt.Sprintf("%v", expandIngestTemplate(raw, doc))
+		s, err := expandIngestTemplateStringR66(raw, doc)
+		if err != nil {
+			return ""
+		}
+		return s
 	}
 	return raw
 }
@@ -5627,7 +5912,10 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		return false, true, procType, procTag, specMap, nil
 	case "fail":
 		msg, _ := specMap["message"].(string)
-		expanded := fmt.Sprintf("%v", expandIngestTemplate(msg, doc))
+		expanded, err := expandIngestTemplateStringR66(msg, doc)
+		if err != nil {
+			return false, false, procType, procTag, specMap, err
+		}
 		if expanded == "" {
 			expanded = "fail processor triggered"
 		}
@@ -5637,7 +5925,11 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 			return false, false, procType, procTag, specMap, fmt.Errorf("ingest pipeline max depth (16) exceeded")
 		}
 		subName, _ := specMap["name"].(string)
-		subName = strings.TrimSpace(fmt.Sprintf("%v", expandIngestTemplate(subName, doc)))
+		expandedSubName, err := expandIngestTemplateStringR66(subName, doc)
+		if err != nil {
+			return false, false, procType, procTag, specMap, err
+		}
+		subName = strings.TrimSpace(expandedSubName)
 		origMeta, _ := doc["__internal_ingest_orig"].(map[string]any)
 		var substPipes map[string]map[string]any
 		var stack []string
@@ -5866,10 +6158,17 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		}
 	case "set":
 		if field, _ := specMap["field"].(string); field != "" {
-			field = fmt.Sprintf("%v", expandIngestTemplate(field, doc))
+			var err error
+			field, err = expandIngestTemplateStringR66(field, doc)
+			if err != nil {
+				return false, false, procType, procTag, specMap, err
+			}
 			ignoreEmpty, _ := specMap["ignore_empty_value"].(bool)
 			if copyFrom, _ := specMap["copy_from"].(string); copyFrom != "" {
-				copyFrom = fmt.Sprintf("%v", expandIngestTemplate(copyFrom, doc))
+				copyFrom, err = expandIngestTemplateStringR66(copyFrom, doc)
+				if err != nil {
+					return false, false, procType, procTag, specMap, err
+				}
 				val, exists := getIngestPath(doc, copyFrom)
 				if !exists {
 					if isExplicitIgnoreMissingFalse(specMap) {
@@ -5893,7 +6192,10 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 						return false, false, procType, procTag, specMap, nil
 					}
 				}
-				expandedVal := expandIngestTemplate(val, doc)
+				expandedVal, err := expandIngestTemplate(val, doc)
+				if err != nil {
+					return false, false, procType, procTag, specMap, err
+				}
 				if mt, ok := specMap["media_type"].(string); ok && strings.TrimSpace(mt) != "" {
 					decodedVal, err := decodeIngestSetMediaTypeValueRound59(expandedVal, mt)
 					if err != nil {
@@ -5910,9 +6212,17 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		}
 	case "default":
 		if field, _ := specMap["field"].(string); field != "" {
-			field = fmt.Sprintf("%v", expandIngestTemplate(field, doc))
+			var err error
+			field, err = expandIngestTemplateStringR66(field, doc)
+			if err != nil {
+				return false, false, procType, procTag, specMap, err
+			}
 			if existing, exists := getIngestPath(doc, field); !exists || existing == nil {
-				setIngestPath(doc, field, deepCloneIngestValue(expandIngestTemplate(specMap["value"], doc)))
+				expVal, err := expandIngestTemplate(specMap["value"], doc)
+				if err != nil {
+					return false, false, procType, procTag, specMap, err
+				}
+				setIngestPath(doc, field, deepCloneIngestValue(expVal))
 				mutated = true
 			}
 		}
@@ -5920,8 +6230,15 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		srcField, _ := specMap["field"].(string)
 		dstField, _ := specMap["target_field"].(string)
 		if srcField != "" && dstField != "" {
-			srcField = fmt.Sprintf("%v", expandIngestTemplate(srcField, doc))
-			dstField = fmt.Sprintf("%v", expandIngestTemplate(dstField, doc))
+			var err error
+			srcField, err = expandIngestTemplateStringR66(srcField, doc)
+			if err != nil {
+				return false, false, procType, procTag, specMap, err
+			}
+			dstField, err = expandIngestTemplateStringR66(dstField, doc)
+			if err != nil {
+				return false, false, procType, procTag, specMap, err
+			}
 			if srcField == dstField {
 				return false, false, procType, procTag, specMap, fmt.Errorf("source and target_field are the same: [%s]", srcField)
 			}
@@ -5951,8 +6268,15 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		srcField, _ := specMap["field"].(string)
 		dstField, _ := specMap["target_field"].(string)
 		if srcField != "" && dstField != "" {
-			srcField = fmt.Sprintf("%v", expandIngestTemplate(srcField, doc))
-			dstField = fmt.Sprintf("%v", expandIngestTemplate(dstField, doc))
+			var err error
+			srcField, err = expandIngestTemplateStringR66(srcField, doc)
+			if err != nil {
+				return false, false, procType, procTag, specMap, err
+			}
+			dstField, err = expandIngestTemplateStringR66(dstField, doc)
+			if err != nil {
+				return false, false, procType, procTag, specMap, err
+			}
 			if srcField == dstField {
 				return false, false, procType, procTag, specMap, fmt.Errorf("source and target_field are the same: [%s]", srcField)
 			}
@@ -5978,28 +6302,42 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 			mutated = true
 		}
 	case "remove":
-		extractRemoveStrings := func(raw any) []string {
+		extractRemoveStrings := func(raw any) ([]string, error) {
 			var res []string
 			switch tv := raw.(type) {
 			case string:
-				s := strings.TrimSpace(fmt.Sprintf("%v", expandIngestTemplate(tv, doc)))
+				expS, err := expandIngestTemplateStringR66(tv, doc)
+				if err != nil {
+					return nil, err
+				}
+				s := strings.TrimSpace(expS)
 				if s != "" {
 					res = append(res, s)
 				}
 			case []any:
 				for _, item := range tv {
 					if ks, ok := item.(string); ok {
-						s := strings.TrimSpace(fmt.Sprintf("%v", expandIngestTemplate(ks, doc)))
+						expS, err := expandIngestTemplateStringR66(ks, doc)
+						if err != nil {
+							return nil, err
+						}
+						s := strings.TrimSpace(expS)
 						if s != "" {
 							res = append(res, s)
 						}
 					}
 				}
 			}
-			return res
+			return res, nil
 		}
-		fieldsToRemove := extractRemoveStrings(specMap["field"])
-		fieldsToKeep := extractRemoveStrings(specMap["keep"])
+		fieldsToRemove, err := extractRemoveStrings(specMap["field"])
+		if err != nil {
+			return false, false, procType, procTag, specMap, err
+		}
+		fieldsToKeep, err := extractRemoveStrings(specMap["keep"])
+		if err != nil {
+			return false, false, procType, procTag, specMap, err
+		}
 		if len(fieldsToRemove) == 0 && len(fieldsToKeep) == 0 {
 			return false, false, procType, procTag, specMap, fmt.Errorf("either [field] or [keep] must be specified")
 		}
@@ -6117,13 +6455,13 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 					if s, ok := el.(string); ok {
 						out[i] = strings.ToUpper(s)
 					} else {
-						return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] contains non-string element", field)
+						return false, false, procType, procTag, specMap, fmt.Errorf("illegal_argument_exception: field [%s] contains non-string element", field)
 					}
 				}
 				setIngestPath(doc, target, out)
 				mutated = true
 			default:
-				return false, false, procType, procTag, specMap, fmt.Errorf("field [%s] is not a string", field)
+				return false, false, procType, procTag, specMap, fmt.Errorf("illegal_argument_exception: field [%s] is not a string", field)
 			}
 		}
 	case "trim":
@@ -6161,7 +6499,11 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		field = expandIngestFieldName(field, doc)
 		sep, _ := specMap["separator"].(string)
 		if strings.Contains(sep, "{{") {
-			sep = fmt.Sprintf("%v", expandIngestTemplate(sep, doc))
+			var err error
+			sep, err = expandIngestTemplateStringR66(sep, doc)
+			if err != nil {
+				return false, false, procType, procTag, specMap, err
+			}
 		}
 		target := field
 		if tf, _ := specMap["target_field"].(string); tf != "" {
@@ -6296,7 +6638,11 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 						}
 					}
 				}
-				expanded := deepCloneIngestValue(expandIngestTemplate(item, doc))
+				expItem, err := expandIngestTemplate(item, doc)
+				if err != nil {
+					return false, false, procType, procTag, specMap, err
+				}
+				expanded := deepCloneIngestValue(expItem)
 				appendSingleItem(expanded)
 			}
 			setIngestPath(doc, field, curSlice)
@@ -6342,17 +6688,29 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 	case "gsub":
 		field, _ := specMap["field"].(string)
 		if strings.Contains(field, "{{") {
-			field = fmt.Sprintf("%v", expandIngestTemplate(field, doc))
+			var err error
+			field, err = expandIngestTemplateStringR66(field, doc)
+			if err != nil {
+				return false, false, procType, procTag, specMap, err
+			}
 		}
 		pat, _ := specMap["pattern"].(string)
 		repl, _ := specMap["replacement"].(string)
 		if strings.Contains(repl, "{{") {
-			repl = fmt.Sprintf("%v", expandIngestTemplate(repl, doc))
+			var err error
+			repl, err = expandIngestTemplateStringR66(repl, doc)
+			if err != nil {
+				return false, false, procType, procTag, specMap, err
+			}
 		}
 		target := field
 		if tf, _ := specMap["target_field"].(string); tf != "" {
 			if strings.Contains(tf, "{{") {
-				tf = fmt.Sprintf("%v", expandIngestTemplate(tf, doc))
+				var err error
+				tf, err = expandIngestTemplateStringR66(tf, doc)
+				if err != nil {
+					return false, false, procType, procTag, specMap, err
+				}
 			}
 			target = tf
 		}
@@ -6720,11 +7078,19 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 	case "dot_expander":
 		field, _ := specMap["field"].(string)
 		if strings.Contains(field, "{{") {
-			field = fmt.Sprintf("%v", expandIngestTemplate(field, doc))
+			var err error
+			field, err = expandIngestTemplateStringR66(field, doc)
+			if err != nil {
+				return false, false, procType, procTag, specMap, err
+			}
 		}
 		subPath, _ := specMap["path"].(string)
 		if strings.Contains(subPath, "{{") {
-			subPath = fmt.Sprintf("%v", expandIngestTemplate(subPath, doc))
+			var err error
+			subPath, err = expandIngestTemplateStringR66(subPath, doc)
+			if err != nil {
+				return false, false, procType, procTag, specMap, err
+			}
 		}
 		override := true
 		if ov, hasOv := specMap["override"].(bool); hasOv {
@@ -6989,15 +7355,27 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		formats, _ := specMap["formats"].([]any)
 		tzName, _ := specMap["timezone"].(string)
 		if tzName != "" {
-			tzName = fmt.Sprintf("%v", expandIngestTemplate(tzName, doc))
+			var err error
+			tzName, err = expandIngestTemplateStringR66(tzName, doc)
+			if err != nil {
+				return false, false, procType, procTag, specMap, err
+			}
 		}
 		rawLocale, _ := specMap["locale"].(string)
 		if rawLocale != "" {
-			rawLocale = fmt.Sprintf("%v", expandIngestTemplate(rawLocale, doc))
+			var err error
+			rawLocale, err = expandIngestTemplateStringR66(rawLocale, doc)
+			if err != nil {
+				return false, false, procType, procTag, specMap, err
+			}
 		}
 		outFmt, _ := specMap["output_format"].(string)
 		if outFmt != "" {
-			outFmt = fmt.Sprintf("%v", expandIngestTemplate(outFmt, doc))
+			var err error
+			outFmt, err = expandIngestTemplateStringR66(outFmt, doc)
+			if err != nil {
+				return false, false, procType, procTag, specMap, err
+			}
 			if err := validateESDateFormatPatternRound59(outFmt); err != nil {
 				return false, false, procType, procTag, specMap, err
 			}
@@ -7053,12 +7431,20 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		field, _ := specMap["field"].(string)
 		prefix, _ := specMap["index_name_prefix"].(string)
 		if prefix != "" {
-			prefix = fmt.Sprintf("%v", expandIngestTemplate(prefix, doc))
+			var err error
+			prefix, err = expandIngestTemplateStringR66(prefix, doc)
+			if err != nil {
+				return false, false, procType, procTag, specMap, err
+			}
 		}
 		dateRounding, _ := specMap["date_rounding"].(string)
 		idxFmt, _ := specMap["index_name_format"].(string)
 		if idxFmt != "" {
-			idxFmt = fmt.Sprintf("%v", expandIngestTemplate(idxFmt, doc))
+			var err error
+			idxFmt, err = expandIngestTemplateStringR66(idxFmt, doc)
+			if err != nil {
+				return false, false, procType, procTag, specMap, err
+			}
 			if err := validateESDateFormatPatternRound59(idxFmt); err != nil {
 				return false, false, procType, procTag, specMap, err
 			}
@@ -7073,14 +7459,26 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		}
 		tzName, _ := specMap["timezone"].(string)
 		if tzName != "" {
-			tzName = fmt.Sprintf("%v", expandIngestTemplate(tzName, doc))
+			var err error
+			tzName, err = expandIngestTemplateStringR66(tzName, doc)
+			if err != nil {
+				return false, false, procType, procTag, specMap, err
+			}
 		}
 		rawLocale, _ := specMap["locale"].(string)
 		if rawLocale != "" {
-			rawLocale = fmt.Sprintf("%v", expandIngestTemplate(rawLocale, doc))
+			var err error
+			rawLocale, err = expandIngestTemplateStringR66(rawLocale, doc)
+			if err != nil {
+				return false, false, procType, procTag, specMap, err
+			}
 		}
 		if field != "" {
-			field = fmt.Sprintf("%v", expandIngestTemplate(field, doc))
+			var err error
+			field, err = expandIngestTemplateStringR66(field, doc)
+			if err != nil {
+				return false, false, procType, procTag, specMap, err
+			}
 			val, exists := getIngestPath(doc, field)
 			if skip, err := checkIngestFieldMissingOrNullRound60(doc, field, val, exists, specMap); skip {
 				return false, false, procType, procTag, specMap, err
@@ -8538,7 +8936,11 @@ func executeSingleIngestProcessor(s *Server, doc map[string]any, pMap map[string
 		}
 	case "inference":
 		modelID, _ := specMap["model_id"].(string)
-		modelID = strings.TrimSpace(fmt.Sprintf("%v", expandIngestTemplate(modelID, doc)))
+		expModelID, err := expandIngestTemplateStringR66(modelID, doc)
+		if err != nil {
+			return false, false, procType, procTag, specMap, err
+		}
+		modelID = strings.TrimSpace(expModelID)
 		if modelID == "" {
 			return false, false, procType, procTag, specMap, fmt.Errorf("[model_id] required property is missing")
 		}
@@ -13603,10 +14005,11 @@ func (s *Server) handleTermsEnum(w http.ResponseWriter, r *http.Request) {
 	}
 	rawIndex := strings.TrimSpace(r.PathValue("index"))
 	var targets []string
+	var aliasFilters map[string]*esast.Query
 	isVersionField := false
 	if rawIndex != "" {
 		var ok bool
-		targets, _, ok = s.resolveValidatedReadTargets(w, r, rawIndex)
+		targets, aliasFilters, ok = s.resolveValidatedReadTargets(w, r, rawIndex)
 		if !ok {
 			return
 		}
@@ -13648,12 +14051,7 @@ func (s *Server) handleTermsEnum(w http.ResponseWriter, r *http.Request) {
 	if limit > maxTermsEnumSize {
 		limit = maxTermsEnumSize
 	}
-	allowedTargets := make([]string, 0, len(targets))
-	for _, tgt := range targets {
-		if s.FilterTermsEnumByDLSWithRawTargetsR65(r, rawIndex, []string{tgt}, req.Field) {
-			allowedTargets = append(allowedTargets, tgt)
-		}
-	}
+	allowedTargets, effAliasFilters := s.resolveAuthorizedTermsEnumTargetsAndFiltersR66(r, rawIndex, targets, aliasFilters, req.Field)
 	if len(allowedTargets) == 0 && len(targets) > 0 {
 		writeJSONWithRequest(w, r, http.StatusOK, map[string]any{
 			"_shards":  map[string]any{"total": len(targets), "successful": len(targets), "failed": 0},
@@ -13661,10 +14059,6 @@ func (s *Server) handleTermsEnum(w http.ResponseWriter, r *http.Request) {
 			"complete": true,
 		})
 		return
-	}
-	searchTarget := r.PathValue("index")
-	if len(allowedTargets) > 0 && len(allowedTargets) < len(targets) {
-		searchTarget = strings.Join(allowedTargets, ",")
 	}
 	aggSize := 10000
 	if limit > aggSize {
@@ -13684,89 +14078,132 @@ func (s *Server) handleTermsEnum(w http.ResponseWriter, r *http.Request) {
 			},
 		},
 	}
-	resp, status, errType, errReason := s.executeSearchRequest(r.Context(), searchTarget, &searchReq)
-	if errType != "" {
-		writeESError(w, status, errType, errReason)
-		return
+	extractTermsEnumKeys := func(resp map[string]any) ([]string, bool) {
+		aggsMap, ok := resp["aggregations"].(map[string]any)
+		if !ok {
+			return nil, false
+		}
+		teObj, ok := aggsMap["_terms_enum"].(map[string]any)
+		if !ok {
+			return nil, false
+		}
+		var keys []string
+		switch buckets := teObj["buckets"].(type) {
+		case []map[string]any:
+			keys = make([]string, 0, len(buckets))
+			for _, b := range buckets {
+				keys = append(keys, fmt.Sprintf("%v", b["key"]))
+			}
+		case []any:
+			keys = make([]string, 0, len(buckets))
+			for _, item := range buckets {
+				if b, ok := item.(map[string]any); ok {
+					keys = append(keys, fmt.Sprintf("%v", b["key"]))
+				}
+			}
+		default:
+			return nil, false
+		}
+		return keys, true
+	}
+	var allKeys []string
+	if len(allowedTargets) == len(targets) && len(effAliasFilters) == 0 {
+		searchTarget := r.PathValue("index")
+		resp, status, errType, errReason := s.executeSearchRequest(r.Context(), searchTarget, &searchReq)
+		if errType != "" {
+			writeESError(w, status, errType, errReason)
+			return
+		}
+		if keys, ok := extractTermsEnumKeys(resp); ok {
+			allKeys = keys
+		}
+	} else {
+		keySet := make(map[string]struct{})
+		hasBuckets := false
+		for _, tgt := range allowedTargets {
+			tgtReq := searchReq
+			if af := effAliasFilters[tgt]; af != nil {
+				tgtReq.Query = combineQueryWithAliasFilter(req.IndexFilter, af)
+			}
+			resp, status, errType, errReason := s.executeSearchRequest(r.Context(), tgt, &tgtReq)
+			if errType != "" {
+				writeESError(w, status, errType, errReason)
+				return
+			}
+			if keys, ok := extractTermsEnumKeys(resp); ok {
+				hasBuckets = true
+				for _, k := range keys {
+					keySet[k] = struct{}{}
+				}
+			}
+		}
+		if hasBuckets {
+			allKeys = make([]string, 0, len(keySet))
+			for k := range keySet {
+				allKeys = append(allKeys, k)
+			}
+			sort.Strings(allKeys)
+		}
 	}
 	termsOut := make([]string, 0, limit)
 	complete := true
 	prefix := req.String
 	prefixLower := strings.ToLower(prefix)
 	hasWildcard := strings.ContainsAny(prefix, "*?")
-	if aggsMap, ok := resp["aggregations"].(map[string]any); ok {
-		if teObj, ok := aggsMap["_terms_enum"].(map[string]any); ok {
-			var allKeys []string
-			switch buckets := teObj["buckets"].(type) {
-			case []map[string]any:
-				allKeys = make([]string, 0, len(buckets))
-				for _, b := range buckets {
-					allKeys = append(allKeys, fmt.Sprintf("%v", b["key"]))
+	if allKeys != nil {
+		if isVersionField && !req.CaseInsensitive {
+			sort.Slice(allKeys, func(i, j int) bool {
+				return transpiler.CompareSemverStrings(allKeys[i], allKeys[j]) < 0
+			})
+		} else if req.CaseInsensitive {
+			sort.Slice(allKeys, func(i, j int) bool {
+				li, lj := strings.ToLower(allKeys[i]), strings.ToLower(allKeys[j])
+				if li != lj {
+					return li < lj
 				}
-			case []any:
-				allKeys = make([]string, 0, len(buckets))
-				for _, item := range buckets {
-					if b, ok := item.(map[string]any); ok {
-						allKeys = append(allKeys, fmt.Sprintf("%v", b["key"]))
-					}
-				}
-			}
-			if allKeys != nil {
+				return allKeys[i] < allKeys[j]
+			})
+		}
+		saLower := strings.ToLower(req.SearchAfter)
+		for _, k := range allKeys {
+			if req.SearchAfter != "" {
 				if isVersionField && !req.CaseInsensitive {
-					sort.Slice(allKeys, func(i, j int) bool {
-						return transpiler.CompareSemverStrings(allKeys[i], allKeys[j]) < 0
-					})
+					if transpiler.CompareSemverStrings(k, req.SearchAfter) <= 0 {
+						continue
+					}
 				} else if req.CaseInsensitive {
-					sort.Slice(allKeys, func(i, j int) bool {
-						li, lj := strings.ToLower(allKeys[i]), strings.ToLower(allKeys[j])
-						if li != lj {
-							return li < lj
-						}
-						return allKeys[i] < allKeys[j]
-					})
-				}
-				saLower := strings.ToLower(req.SearchAfter)
-				for _, k := range allKeys {
-					if req.SearchAfter != "" {
-						if isVersionField && !req.CaseInsensitive {
-							if transpiler.CompareSemverStrings(k, req.SearchAfter) <= 0 {
-								continue
-							}
-						} else if req.CaseInsensitive {
-							kLower := strings.ToLower(k)
-							if kLower < saLower || (kLower == saLower && k <= req.SearchAfter) {
-								continue
-							}
-						} else if k <= req.SearchAfter {
-							continue
-						}
+					kLower := strings.ToLower(k)
+					if kLower < saLower || (kLower == saLower && k <= req.SearchAfter) {
+						continue
 					}
-					if prefix != "" {
-						if hasWildcard {
-							targetKey := k
-							pat := prefix
-							if req.CaseInsensitive {
-								targetKey = strings.ToLower(k)
-								pat = prefixLower
-							}
-							if !matchWildcardPattern(pat, targetKey) {
-								continue
-							}
-						} else if req.CaseInsensitive {
-							if !strings.HasPrefix(strings.ToLower(k), prefixLower) {
-								continue
-							}
-						} else if !strings.HasPrefix(k, prefix) {
-							continue
-						}
-					}
-					if len(termsOut) >= limit {
-						complete = false
-						break
-					}
-					termsOut = append(termsOut, k)
+				} else if k <= req.SearchAfter {
+					continue
 				}
 			}
+			if prefix != "" {
+				if hasWildcard {
+					targetKey := k
+					pat := prefix
+					if req.CaseInsensitive {
+						targetKey = strings.ToLower(k)
+						pat = prefixLower
+					}
+					if !matchWildcardPattern(pat, targetKey) {
+						continue
+					}
+				} else if req.CaseInsensitive {
+					if !strings.HasPrefix(strings.ToLower(k), prefixLower) {
+						continue
+					}
+				} else if !strings.HasPrefix(k, prefix) {
+					continue
+				}
+			}
+			if len(termsOut) >= limit {
+				complete = false
+				break
+			}
+			termsOut = append(termsOut, k)
 		}
 	}
 	numShards := len(targets)
@@ -13849,8 +14286,11 @@ func (s *Server) handleExplainDoc(w http.ResponseWriter, r *http.Request) {
 	resolvedReq := s.resolveTermsLookupsInSearchRequest(r.Context(), &req)
 	idxSchema = s.augmentSchemaWithRuntimeMappings(idxSchema, resolvedReq.RuntimeMappings)
 	effQuery := combineQueryWithAliasFilter(resolvedReq.Query, aliasFilter)
-	tr := transpiler.NewTranspiler(idxSchema, s.effectiveTranspileOptsForIndexR62Search(r, indexName, idxSchema, resolvedReq.RuntimeMappings))
-	if _, err := tr.BuildSearchPlan(&esast.SearchRequest{Query: effQuery}); err != nil {
+	trOpts := s.effectiveTranspileOptsForIndexR62Search(r, indexName, idxSchema, resolvedReq.RuntimeMappings)
+	explainReq := &esast.SearchRequest{Query: effQuery}
+	s.populateCorpusBM25StatsIfNeededR66(r.Context(), idxSchema, explainReq, &trOpts)
+	tr := transpiler.NewTranspiler(idxSchema, trOpts)
+	if _, err := tr.BuildSearchPlan(explainReq); err != nil {
 		writeESError(w, http.StatusBadRequest, "parsing_exception", err.Error())
 		return
 	}
@@ -14742,23 +15182,11 @@ func executeGeoIPProcessor(doc map[string]any, specMap map[string]any) (bool, er
 	return false, nil
 }
 
-var enrichExecSearchesRegistryMuR64 sync.RWMutex
-var enrichExecSearchesRegistryR64 = make(map[*Server]*atomic.Int64)
-
 func getEnrichExecSearchesCounterR64(s *Server) *atomic.Int64 {
-	enrichExecSearchesRegistryMuR64.RLock()
-	c := enrichExecSearchesRegistryR64[s]
-	enrichExecSearchesRegistryMuR64.RUnlock()
-	if c != nil {
-		return c
+	if s == nil {
+		return &atomic.Int64{}
 	}
-	enrichExecSearchesRegistryMuR64.Lock()
-	defer enrichExecSearchesRegistryMuR64.Unlock()
-	if c = enrichExecSearchesRegistryR64[s]; c == nil {
-		c = &atomic.Int64{}
-		enrichExecSearchesRegistryR64[s] = c
-	}
-	return c
+	return &s.enrichExecSearches
 }
 
 func (s *Server) handleEnrichAPI(w http.ResponseWriter, r *http.Request) {

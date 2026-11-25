@@ -131,6 +131,64 @@ func lookupRawPathValueRound61(doc map[string]any, segs []string) (any, bool) {
 	return nil, false
 }
 
+func resolveAggregateMetricDefaultRound61(idxSchema *schema.IndexSchema, fPath string) string {
+	if idxSchema == nil || fPath == "" {
+		return ""
+	}
+	if b := idxSchema.ResolveField(fPath); strings.EqualFold(strings.TrimSpace(b.ESType), "aggregate_metric_double") {
+		if dm := strings.ToLower(strings.TrimSpace(b.DefaultMetric)); dm != "" {
+			return dm
+		}
+	}
+	if idxSchema.RawMapping != nil && len(idxSchema.RawMapping.Properties) > 0 {
+		props := idxSchema.RawMapping.Properties
+		segs := strings.Split(fPath, ".")
+		for i, seg := range segs {
+			p, ok := props[seg]
+			if !ok {
+				break
+			}
+			if i == len(segs)-1 {
+				if strings.EqualFold(strings.TrimSpace(p.Type), "aggregate_metric_double") {
+					return strings.ToLower(strings.TrimSpace(p.DefaultMetric))
+				}
+				break
+			}
+			if len(p.Properties) > 0 {
+				props = p.Properties
+			} else if len(p.Fields) > 0 {
+				props = p.Fields
+			} else {
+				break
+			}
+		}
+	}
+	return ""
+}
+
+func extractAggregateMetricScalarRound61(m map[string]any, metric string) (float64, bool) {
+	if m == nil || metric == "" {
+		return 0, false
+	}
+	if metric == "avg" {
+		sumVal, okS := toFloat64(m["sum"])
+		cntVal, okC := toFloat64(m["value_count"])
+		if okS && okC && cntVal > 0 {
+			return sumVal / cntVal, true
+		}
+		return 0, false
+	}
+	if v, ok := toFloat64(m[metric]); ok {
+		return v, true
+	}
+	if raw, exists := m[metric]; exists {
+		if f, ok := toFloat(raw); ok && !math.IsNaN(f) && !math.IsInf(f, 0) {
+			return f, true
+		}
+	}
+	return 0, false
+}
+
 // PrepareDocForRuntimeScriptRound61 enriches `prepareDocForRuntimeScript(idxSchema, doc)`
 // with Round-61 Painless runtime metadata:
 //   - `__keep_boolean_dups`: true in ES 8 (`[false, false, true]`), false in ES 7 (`[false, true]`)
@@ -272,8 +330,30 @@ func PrepareDocForRuntimeScriptRound61(idxSchema *schema.IndexSchema, doc map[st
 
 	// Preserve structured source objects (`flattened`, `geo_point`, `geo_shape`, `shape`, `dense_vector`) on `cp`
 	// when `doc` carries an unflattened map or coordinate slice at that path.
+	// For `aggregate_metric_double` fields with `default_metric`, resolve the default scalar onto `cp`
+	// and expose the numeric doc_values binding type (`double`) for Painless `doc[field].value`.
 	if doc != nil {
 		for fPath, ft := range ftMap {
+			if ft == "aggregate_metric_double" {
+				dm := resolveAggregateMetricDefaultRound61(idxSchema, fPath)
+				if dm != "" {
+					segs := strings.Split(fPath, ".")
+					rawV, ok := lookupRawPathValueRound61(cp, segs)
+					if !ok || rawV == nil {
+						rawV, _ = lookupRawPathValueRound61(doc, segs)
+					}
+					if m, okM := rawV.(map[string]any); okM {
+						if val, okVal := extractAggregateMetricScalarRound61(m, dm); okVal {
+							setRuntimeScriptDocPath(cp, segs, val)
+							if _, hasFlat := cp[fPath]; hasFlat {
+								cp[fPath] = val
+							}
+							ftMap[fPath] = "double"
+						}
+					}
+				}
+				continue
+			}
 			if ft != "flattened" && ft != "geo_point" && ft != "geo_shape" && ft != "shape" && ft != "dense_vector" {
 				continue
 			}

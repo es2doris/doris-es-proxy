@@ -493,9 +493,9 @@ func EncodeGeotileSQL(latExpr, lonExpr string, precision int) string {
 	}
 	n := int64(1) << zoom
 	nMinus1 := n - 1
-	clampedLat := fmt.Sprintf("LEAST(GREATEST(CAST(%s AS DOUBLE), -85.05112877980659), 85.05112877980659)", latExpr)
-	xExpr := fmt.Sprintf("LEAST(GREATEST(CAST(FLOOR(((CAST(%s AS DOUBLE) + 180.0) / 360.0) * %d.0) AS BIGINT), 0), %d)", lonExpr, n, nMinus1)
-	yExpr := fmt.Sprintf("LEAST(GREATEST(CAST(FLOOR((1.0 - LN(TAN(PI() / 4.0 + ((%s) * PI() / 360.0))) / PI()) / 2.0 * %d.0) AS BIGINT), 0), %d)", clampedLat, n, nMinus1)
+	clampedLat := fmt.Sprintf("LEAST(GREATEST(TRY_CAST(%s AS DOUBLE), -85.05112877980659), 85.05112877980659)", latExpr)
+	xExpr := fmt.Sprintf("LEAST(GREATEST(TRY_CAST(FLOOR(((TRY_CAST(%s AS DOUBLE) + 180.0) / 360.0) * %d.0) AS BIGINT), 0), %d)", lonExpr, n, nMinus1)
+	yExpr := fmt.Sprintf("LEAST(GREATEST(TRY_CAST(FLOOR((1.0 - LN(TAN(PI() / 4.0 + ((%s) * PI() / 360.0))) / PI()) / 2.0 * %d.0) AS BIGINT), 0), %d)", clampedLat, n, nMinus1)
 	return fmt.Sprintf("CASE WHEN %s IS NULL OR %s IS NULL THEN NULL ELSE CONCAT('%d/', CAST(%s AS STRING), '/', CAST(%s AS STRING)) END",
 		latExpr, lonExpr, zoom, xExpr, yExpr)
 }
@@ -864,6 +864,9 @@ func (t *Transpiler) compileKNNRound61(kq *esast.KNNQuery, scoring bool, nctx *n
 				effNumCand = min(10000, max(1, int(math.Ceil(1.5*float64(effSize)))))
 			}
 			topLimit = effNumCand
+			if t.Opts.NumberOfShards > 1 {
+				topLimit = effNumCand * t.Opts.NumberOfShards
+			}
 		}
 	}
 
@@ -1069,8 +1072,7 @@ func (t *Transpiler) compileKNNRound61(kq *esast.KNNQuery, scoring bool, nctx *n
 				simCond = fmt.Sprintf("(%s >= %s)", ipExpr, strconv.FormatFloat(*kq.Similarity, 'f', -1, 64))
 			}
 		default: // cosine: guard against zero-norm dynamic/unindexed vectors
-			baseCond = fmt.Sprintf("(%s IS NOT NULL AND array_size(%s) = %d AND INNER_PRODUCT(%s, %s) > 0)", colExpr, colExpr, dim, colExpr, colExpr)
-			safeCol = fmt.Sprintf("IF(array_size(%s) = %d AND INNER_PRODUCT(%s, %s) > 0, %s, %s)", colExpr, dim, colExpr, colExpr, colExpr, vecLit)
+			baseCond, safeCol = buildCosineSafeExprsR61(colExpr, vecLit, dim)
 			cdExpr := fmt.Sprintf("COSINE_DISTANCE(%s, %s)", safeCol, vecLit)
 			rawScoreExpr = fmt.Sprintf("GREATEST((2.0 - (%s)) / 2.0, 0.0)", cdExpr)
 			if kq.Similarity != nil {
@@ -1199,6 +1201,28 @@ func (t *Transpiler) compileKNNRound61(kq *esast.KNNQuery, scoring bool, nctx *n
 		ScoreSQL:          scoreSQL,
 		UsesFulltextMatch: usesFT,
 	}
+}
+
+func buildZeroVectorLiteralR61(dim int) string {
+	if dim <= 0 {
+		return "CAST([] AS ARRAY<FLOAT>)"
+	}
+	parts := make([]string, dim)
+	for i := range parts {
+		parts[i] = "0.0"
+	}
+	return fmt.Sprintf("CAST([%s] AS ARRAY<FLOAT>)", strings.Join(parts, ", "))
+}
+
+func buildCosineSafeExprsR61(colExpr, vecLit string, dim int) (baseCond, safeCol string) {
+	zeroVecLit := buildZeroVectorLiteralR61(dim)
+	// Guard L2_DISTANCE with matching vector dimension so Nereids never evaluates it on NULL/wrong-length arrays,
+	// avoiding Doris 4.1.3 INNER_PRODUCT failures on dynamic/non-const vector columns.
+	safeDimCol := fmt.Sprintf("IF(%s IS NOT NULL AND array_size(%s) = %d, %s, %s)", colExpr, colExpr, dim, colExpr, vecLit)
+	nonZeroCond := fmt.Sprintf("L2_DISTANCE(%s, %s) > 0", safeDimCol, zeroVecLit)
+	baseCond = fmt.Sprintf("(%s IS NOT NULL AND array_size(%s) = %d AND %s)", colExpr, colExpr, dim, nonZeroCond)
+	safeCol = fmt.Sprintf("IF(array_size(%s) = %d AND %s, %s, %s)", colExpr, dim, nonZeroCond, colExpr, vecLit)
+	return baseCond, safeCol
 }
 
 // foldNumericRangeBoundsOutOfBounds normalizes and folds out-of-bounds numeric range query bounds

@@ -1314,7 +1314,7 @@ func reconstructSyntheticGeoPointValue(
 		return nil, false
 	}
 	if arr, isArr := rawVal.([]any); isArr {
-		if len(arr) == 2 && isGeoNumericElem(arr[0]) && isGeoNumericElem(arr[1]) {
+		if isGeoLonLatPair(arr) {
 			if _, lat, lon, ok := parseAndFormatGeoPointValue(arr); ok {
 				return map[string]any{"lat": lat, "lon": lon}, true
 			}
@@ -1337,7 +1337,7 @@ func reconstructSyntheticGeoPointValue(
 				if item == nil {
 					continue
 				}
-				if subArr, isSub := item.([]any); isSub && (len(subArr) != 2 || !isGeoNumericElem(subArr[0]) || !isGeoNumericElem(subArr[1])) {
+				if subArr, isSub := item.([]any); isSub && !isGeoLonLatPair(subArr) {
 					collectItems(subArr)
 					continue
 				}
@@ -1398,8 +1398,6 @@ func reconstructSyntheticGeoPointValue(
 func isSyntheticDocValuesDedupType(esType string) bool {
 	switch esType {
 	case "keyword", "constant_keyword", "wildcard", "version", "ip",
-		"long", "integer", "short", "byte", "unsigned_long",
-		"double", "float", "half_float", "scaled_float",
 		"date", "date_nanos":
 		return true
 	default:

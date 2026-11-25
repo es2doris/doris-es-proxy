@@ -133,6 +133,16 @@ func (b *DorisSQLBackend) SetLogSQL(enabled bool) {
 	b.logSQL.Store(enabled)
 }
 
+func isDorisSchemaChangeRetryableError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "schema_change") ||
+		strings.Contains(msg, "is not normal") ||
+		strings.Contains(msg, "doing schema change")
+}
+
 func (b *DorisSQLBackend) ExecDDL(ctx context.Context, ddl string) error {
 	if b.logSQL.Load() {
 		log.Printf("[Doris DDL]\n%s", ddl)
@@ -140,8 +150,41 @@ func (b *DorisSQLBackend) ExecDDL(ctx context.Context, ddl string) error {
 	if b.db == nil {
 		return nil
 	}
-	_, err := b.db.ExecContext(ctx, ddl)
-	return err
+	logDDLErr := func(err error) error {
+		if err != nil && b.logSQL.Load() {
+			// #nosec G706 -- sanitized DDL statement logged only when --log-sql is enabled
+			log.Printf("[Doris DDL Error] %v\n%s", err, ddl)
+		}
+		return err
+	}
+	var lastErr error
+	const maxAttempts = 20
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			if lastErr != nil {
+				return logDDLErr(lastErr)
+			}
+			return logDDLErr(err)
+		}
+		_, err := b.db.ExecContext(ctx, ddl)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if !isDorisSchemaChangeRetryableError(err) || attempt == maxAttempts-1 {
+			return logDDLErr(err)
+		}
+		shift := min(attempt, 4)
+		backoff := min((50*time.Millisecond)<<shift, 500*time.Millisecond)
+		timer := time.NewTimer(backoff)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return logDDLErr(lastErr)
+		case <-timer.C:
+		}
+	}
+	return logDDLErr(lastErr)
 }
 
 // NormalizeDorisSQL rewrites internal transpiler markers (`__DORIS_DELETE_SIGN__`, `'\x1f'`,
@@ -1456,6 +1499,47 @@ func (b *DorisSQLBackend) QueryAggs(ctx context.Context, aggsSQL string) ([]AggR
 			r.Weight = -1
 		}
 		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// QueryRows executes a read-only SQL query and returns rows keyed by column name.
+func (b *DorisSQLBackend) QueryRows(ctx context.Context, querySQL string) ([]map[string]any, error) {
+	normSQL := prependSQLTraceComment(ctx, normalizeDorisSQL(querySQL))
+	if b.logSQL.Load() {
+		log.Printf("[Doris RowsSQL]\n%s", normSQL)
+	}
+	if b.db == nil {
+		return nil, nil
+	}
+	rows, err := b.db.QueryContext(ctx, normSQL)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	cols, err := rows.Columns()
+	if err != nil {
+		return nil, err
+	}
+	var out []map[string]any
+	for rows.Next() {
+		vals := make([]any, len(cols))
+		ptrs := make([]any, len(cols))
+		for i := range vals {
+			ptrs[i] = &vals[i]
+		}
+		if err := rows.Scan(ptrs...); err != nil {
+			return nil, err
+		}
+		row := make(map[string]any, len(cols))
+		for i, col := range cols {
+			if rawB, ok := vals[i].([]byte); ok {
+				row[col] = string(rawB)
+			} else {
+				row[col] = vals[i]
+			}
+		}
+		out = append(out, row)
 	}
 	return out, rows.Err()
 }

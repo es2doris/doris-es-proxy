@@ -485,7 +485,7 @@ func TestRound65_GeoPointLatLonCountedTermsAndSortEpoch(t *testing.T) {
 		]
 	}`)
 	geoSortPlan, err := tr.BuildSearchPlan(geoSortReq)
-	if err != nil || !strings.Contains(geoSortPlan.HitsSQL, "array_median") || !strings.Contains(geoSortPlan.HitsSQL, "array_filter") {
+	if err != nil || !strings.Contains(geoSortPlan.HitsSQL, "array_median") || !strings.Contains(geoSortPlan.HitsSQL, "CAST(NULL AS DOUBLE)") {
 		t.Fatalf("geo sort plan failed: err=%v sql=%s", err, geoSortPlan.HitsSQL)
 	}
 }

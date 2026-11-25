@@ -4239,6 +4239,11 @@ func (s *Server) handleIndexRecovery(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		recType := getIndexRecoverySourceR62Admin(s, idx)
+		isSourceSnapshot := false
+		if recType == "SNAPSHOT_SOURCE" {
+			recType = "SNAPSHOT"
+			isSourceSnapshot = true
+		}
 		if s.isIndexClosed(idx) && recType == "EMPTY_STORE" {
 			recType = "EXISTING_STORE"
 		}
@@ -4248,8 +4253,18 @@ func (s *Server) handleIndexRecovery(w http.ResponseWriter, r *http.Request) {
 		totalBytes := int64(0)
 		recoveredBytes := int64(0)
 		if recType == "SNAPSHOT" {
-			totalFiles = 1
-			recoveredFiles = 1
+			if isSourceSnapshot {
+				if isESVersionAtLeast77R48(s, r) {
+					totalFiles = 6
+					recoveredFiles = 6
+				} else {
+					totalFiles = 5
+					recoveredFiles = 5
+				}
+			} else {
+				totalFiles = 1
+				recoveredFiles = 1
+			}
 			totalBytes = 128
 			recoveredBytes = 128
 		}
@@ -6338,4 +6353,37 @@ func collectPercolateMatchedSlots(idxSchema *schema.IndexSchema, docMap map[stri
 	walk(q)
 	sort.Ints(out)
 	return out
+}
+
+func isESVersionAtLeast77R48(s *Server, r *http.Request) bool {
+	if s.isES8Mode(r) {
+		return true
+	}
+	ver := strings.TrimSpace(s.getTargetESVersion())
+	if ver == "" {
+		return true
+	}
+	parts := strings.Split(ver, ".")
+	major, err := strconv.Atoi(strings.TrimSpace(parts[0]))
+	if err != nil {
+		return true
+	}
+	if major != 7 {
+		return major > 7
+	}
+	if len(parts) < 2 {
+		return true
+	}
+	minorStr := strings.TrimSpace(parts[1])
+	for i := 0; i < len(minorStr); i++ {
+		if minorStr[i] < '0' || minorStr[i] > '9' {
+			minorStr = minorStr[:i]
+			break
+		}
+	}
+	minor, err := strconv.Atoi(minorStr)
+	if err != nil {
+		return true
+	}
+	return minor >= 7
 }

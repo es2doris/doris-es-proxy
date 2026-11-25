@@ -389,6 +389,17 @@ func (s *Server) appendAuthPrincipalToCacheKeyLockedR65(h hash.Hash, httpReq *ht
 	_, _ = h.Write([]byte{';'})
 }
 
+func (s *Server) buildQueryCacheAuthScopeR66(httpReq *http.Request) string {
+	if s == nil {
+		return ""
+	}
+	h := sha256.New()
+	s.mu.RLock()
+	s.appendAuthPrincipalToCacheKeyLockedR65(h, httpReq)
+	s.mu.RUnlock()
+	return hex.EncodeToString(h.Sum(nil))
+}
+
 func (st *shardRequestCacheStoreR63) removeFromOrderLocked(key string) {
 	for i, k := range st.order {
 		if k == key {

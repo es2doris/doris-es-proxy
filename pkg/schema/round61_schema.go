@@ -852,7 +852,7 @@ func reconstructSyntheticPositionGeoPoint(rawVal any) (any, bool) {
 			return reconstructSyntheticPositionGeoPoint(arr[0])
 		}
 		// Numeric [lon, lat] pair
-		if len(arr) == 2 && isGeoNumericElem(arr[0]) && isGeoNumericElem(arr[1]) {
+		if isGeoLonLatPair(arr) {
 			_, lat, lon, ok := parseAndFormatGeoPointValue(arr)
 			if !ok {
 				return nil, false

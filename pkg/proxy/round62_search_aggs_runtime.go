@@ -1135,6 +1135,27 @@ func (s *Server) handleIndexStatsR62Search(w http.ResponseWriter, r *http.Reques
 	_, _ = w.Write(rec.Body.Bytes())
 }
 
+func (s *Server) clearUnmergedOverwrittenSourcesForRawTargetR66(rawIndex string) {
+	if s == nil {
+		return
+	}
+	resolvedRaw := resolveCommaDateMathTokensR62Search(strings.TrimSpace(rawIndex))
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.unmergedDeletedSources) == 0 {
+		return
+	}
+	if resolvedRaw == "" || resolvedRaw == "_all" || resolvedRaw == "*" {
+		s.unmergedDeletedSources = make(map[string][][]byte)
+		return
+	}
+	for idxName := range s.unmergedDeletedSources {
+		if matchMultiWildcardWithExclusions(resolvedRaw, idxName) {
+			delete(s.unmergedDeletedSources, idxName)
+		}
+	}
+}
+
 func (s *Server) handleRefreshFlushForceMergeR62Search(w http.ResponseWriter, r *http.Request) {
 	trimmedPath := strings.Trim(r.URL.Path, "/")
 	isFlush := strings.HasSuffix(trimmedPath, "_flush") || strings.Contains(r.URL.Path, "/_flush/")
@@ -1160,6 +1181,7 @@ func (s *Server) handleRefreshFlushForceMergeR62Search(w http.ResponseWriter, r 
 				"setting only_expunge_deletes and max_num_segments at the same time is deprecated and will be rejected in a future version")
 		}
 		if q.Has("wait_for_completion") && !isTruthyBoolQueryParam(r, "wait_for_completion") {
+			s.clearUnmergedOverwrittenSourcesForRawTargetR66(strings.TrimSpace(r.PathValue("index")))
 			reg := s.getTaskRegistry()
 			entry := reg.register("indices:admin/forcemerge", "force-merge", -1, extractTaskHeadersFromRequest(r), func() {})
 			entry.markDone(map[string]any{
@@ -1168,6 +1190,9 @@ func (s *Server) handleRefreshFlushForceMergeR62Search(w http.ResponseWriter, r 
 			writeJSONWithRequest(w, r, http.StatusOK, map[string]any{"task": entry.fullID})
 			return
 		}
+	}
+	if isForceMerge {
+		s.clearUnmergedOverwrittenSourcesForRawTargetR66(strings.TrimSpace(r.PathValue("index")))
 	}
 	s.handleRefresh(w, r)
 }
@@ -3470,41 +3495,6 @@ func (s *Server) handleModifyDataStreamR62Search(w http.ResponseWriter, r *http.
 									break
 								}
 							}
-							if len(fsIndices) > 0 {
-								if lastM, okM := fsIndices[len(fsIndices)-1].(map[string]any); okM && lastM["index_name"] == idxName {
-									fsCurrentlyEnabled := true
-									if en, okB := parseOptionalBoolAny(fsObj["enabled"]); okB && !en {
-										fsCurrentlyEnabled = false
-									}
-									fsDisablingOrReplacingInBatch := false
-									for _, otherAct := range payload.Actions {
-										if optSpec, okOpt := otherAct["data_stream_options"]; okOpt {
-											if strings.TrimSpace(fmt.Sprintf("%v", optSpec["data_stream"])) == dsName {
-												if fsSub, okSub := optSpec["failure_store"].(map[string]any); okSub {
-													if en, okB := parseOptionalBoolAny(fsSub["enabled"]); okB && !en {
-														fsDisablingOrReplacingInBatch = true
-													}
-												} else if en, okB := parseOptionalBoolAny(optSpec["failure_store"]); okB && !en {
-													fsDisablingOrReplacingInBatch = true
-												}
-											}
-										}
-										if addSpec, okAdd := otherAct["add_backing_index"]; okAdd {
-											if strings.TrimSpace(fmt.Sprintf("%v", addSpec["data_stream"])) == dsName {
-												if addFS, okB := parseOptionalBoolAny(addSpec["failure_store"]); okB && addFS {
-													fsDisablingOrReplacingInBatch = true
-												}
-											}
-										}
-									}
-									if fsCurrentlyEnabled && !fsDisablingOrReplacingInBatch {
-										s.mu.Unlock()
-										writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
-											fmt.Sprintf("cannot remove backing index [%s] of data stream [%s] because it is the write index", idxName, dsName))
-										return
-									}
-								}
-							}
 						}
 						if !foundInFS {
 							s.mu.Unlock()
@@ -3654,7 +3644,7 @@ func (s *Server) handleModifyDataStreamR62Search(w http.ResponseWriter, r *http.
 				if isFS {
 					if fsObj, okFS := ds["failure_store"].(map[string]any); okFS {
 						if rawFS, okI := fsObj["indices"].([]any); okI {
-							var kept []any
+							kept := make([]any, 0, len(rawFS))
 							for _, item := range rawFS {
 								if m, okM := item.(map[string]any); okM && m["index_name"] == idxName {
 									continue
@@ -3665,7 +3655,7 @@ func (s *Server) handleModifyDataStreamR62Search(w http.ResponseWriter, r *http.
 						}
 					}
 				} else if rawIndices, okI := ds["indices"].([]any); okI {
-					var kept []any
+					kept := make([]any, 0, len(rawIndices))
 					for _, item := range rawIndices {
 						if m, okM := item.(map[string]any); okM && m["index_name"] == idxName {
 							continue
@@ -3995,16 +3985,7 @@ func (s *Server) handleRolloverR62Search(w http.ResponseWriter, r *http.Request)
 	}
 	curIndices, _ := liveDS["indices"].([]any)
 	liveDS["indices"] = append(curIndices, newEntry)
-	if newSchema != nil && newSchema.IndexMode == "time_series" {
-		liveDS["time_series"] = map[string]any{
-			"temporal_ranges": []any{
-				map[string]any{
-					"start": newSchema.TimeSeriesStartTime,
-					"end":   newSchema.TimeSeriesEndTime,
-				},
-			},
-		}
-	}
+	appendDataStreamTemporalRangeLockedR66(liveDS, newSchema)
 	snap := deepCloneDocMap(liveDS)
 	s.mu.Unlock()
 
@@ -4553,6 +4534,106 @@ func (s *Server) shredDocumentCopyOnWriteAutoDimsR62Search(
 	return shredded, idxSchema, nil
 }
 
+func appendDataStreamTemporalRangeLockedR66(liveDS map[string]any, newSchema *schema.IndexSchema) {
+	if liveDS == nil || newSchema == nil || newSchema.IndexMode != "time_series" {
+		return
+	}
+	tsObj, ok := liveDS["time_series"].(map[string]any)
+	if !ok || tsObj == nil {
+		tsObj = make(map[string]any)
+		liveDS["time_series"] = tsObj
+	}
+	var ranges []any
+	if existing, okR := tsObj["temporal_ranges"].([]any); okR {
+		ranges = make([]any, 0, len(existing)+1)
+		ranges = append(ranges, existing...)
+	} else {
+		ranges = make([]any, 0, 1)
+	}
+	ranges = append(ranges, map[string]any{
+		"start": newSchema.TimeSeriesStartTime,
+		"end":   newSchema.TimeSeriesEndTime,
+	})
+	tsObj["temporal_ranges"] = ranges
+}
+
+func (s *Server) maybePerformLazyRolloverR66(ctx context.Context, r *http.Request, target string) (int, string, string) {
+	var needFast bool
+	s.mu.RLock()
+	if dsObj := s.dataStreams[target]; dsObj != nil {
+		needFast, _ = dsObj["__lazy_rollover"].(bool)
+	}
+	s.mu.RUnlock()
+	if !needFast {
+		return 0, "", ""
+	}
+
+	s.lazyRolloverMu.Lock()
+	defer s.lazyRolloverMu.Unlock()
+
+	var needLazyRollover bool
+	var nextGen int
+	s.mu.RLock()
+	if dsObj := s.dataStreams[target]; dsObj != nil {
+		if lazy, _ := dsObj["__lazy_rollover"].(bool); lazy {
+			needLazyRollover = true
+			curGen, _ := toInt64(dsObj["generation"])
+			nextGen = int(curGen) + 1
+			if nextGen < 2 {
+				nextGen = 2
+			}
+		}
+	}
+	s.mu.RUnlock()
+	if !needLazyRollover {
+		return 0, "", ""
+	}
+
+	newIdx := formatDataStreamBackingIndexNameR62Search(target, nextGen, s.hasExplicitTargetESVersion())
+	newSchema, ddlErr := s.createPhysicalBackingIndexR62Search(ctx, target, newIdx, false, nil, nil, s.isES8Mode(r))
+	if ddlErr != nil {
+		return http.StatusInternalServerError, "doris_ddl_exception", ddlErr.Error()
+	}
+
+	s.mu.Lock()
+	liveDS := s.dataStreams[target]
+	if liveDS == nil {
+		s.mu.Unlock()
+		return 0, "", ""
+	}
+	if lazy, _ := liveDS["__lazy_rollover"].(bool); !lazy {
+		s.mu.Unlock()
+		return 0, "", ""
+	}
+	delete(liveDS, "__lazy_rollover")
+	liveDS["generation"] = nextGen
+	preferILM, _ := liveDS["prefer_ilm"].(bool)
+	nextManagedBy, _ := liveDS["next_generation_managed_by"].(string)
+	if nextManagedBy == "" {
+		nextManagedBy = "Unmanaged"
+	}
+	newEntry := map[string]any{
+		"index_name": newIdx,
+		"index_uuid": indexUUIDForNameRound61(newIdx),
+		"prefer_ilm": preferILM,
+		"managed_by": nextManagedBy,
+	}
+	if ilmPol, okP := liveDS["ilm_policy"].(string); okP && ilmPol != "" {
+		newEntry["ilm_policy"] = ilmPol
+	}
+	curIndices, _ := liveDS["indices"].([]any)
+	nextIndices := make([]any, 0, len(curIndices)+1)
+	nextIndices = append(nextIndices, curIndices...)
+	liveDS["indices"] = append(nextIndices, newEntry)
+	appendDataStreamTemporalRangeLockedR66(liveDS, newSchema)
+	snap := deepCloneDocMap(liveDS)
+	s.mu.Unlock()
+
+	s.persistDataStream(ctx, target, snap)
+	s.queryCache.InvalidateAll()
+	return 0, "", ""
+}
+
 func (s *Server) prepareAutoCreateTargetR62Search(
 	ctx context.Context,
 	r *http.Request,
@@ -4575,65 +4656,7 @@ func (s *Server) prepareAutoCreateTargetR62Search(
 		if !isCreateOp && s.isDataStream(target) {
 			return http.StatusBadRequest, "illegal_argument_exception", "only write ops with an op_type of create are allowed in data streams"
 		}
-		var needLazyRollover bool
-		var nextGen int
-		s.mu.RLock()
-		if dsObj := s.dataStreams[target]; dsObj != nil {
-			if lazy, _ := dsObj["__lazy_rollover"].(bool); lazy {
-				needLazyRollover = true
-				curGen, _ := toInt64(dsObj["generation"])
-				nextGen = int(curGen) + 1
-				if nextGen < 2 {
-					nextGen = 2
-				}
-			}
-		}
-		s.mu.RUnlock()
-		if needLazyRollover {
-			newIdx := formatDataStreamBackingIndexNameR62Search(target, nextGen, s.hasExplicitTargetESVersion())
-			newSchema, ddlErr := s.createPhysicalBackingIndexR62Search(ctx, target, newIdx, false, nil, nil, s.isES8Mode(r))
-			if ddlErr != nil {
-				return http.StatusInternalServerError, "doris_ddl_exception", ddlErr.Error()
-			}
-			s.mu.Lock()
-			if liveDS := s.dataStreams[target]; liveDS != nil {
-				delete(liveDS, "__lazy_rollover")
-				liveDS["generation"] = nextGen
-				preferILM, _ := liveDS["prefer_ilm"].(bool)
-				nextManagedBy, _ := liveDS["next_generation_managed_by"].(string)
-				if nextManagedBy == "" {
-					nextManagedBy = "Unmanaged"
-				}
-				newEntry := map[string]any{
-					"index_name": newIdx,
-					"index_uuid": indexUUIDForNameRound61(newIdx),
-					"prefer_ilm": preferILM,
-					"managed_by": nextManagedBy,
-				}
-				if ilmPol, okP := liveDS["ilm_policy"].(string); okP && ilmPol != "" {
-					newEntry["ilm_policy"] = ilmPol
-				}
-				curIndices, _ := liveDS["indices"].([]any)
-				liveDS["indices"] = append(curIndices, newEntry)
-				if newSchema != nil && newSchema.IndexMode == "time_series" {
-					liveDS["time_series"] = map[string]any{
-						"temporal_ranges": []any{
-							map[string]any{
-								"start": newSchema.TimeSeriesStartTime,
-								"end":   newSchema.TimeSeriesEndTime,
-							},
-						},
-					}
-				}
-				snap := deepCloneDocMap(liveDS)
-				s.mu.Unlock()
-				s.persistDataStream(ctx, target, snap)
-				s.queryCache.InvalidateAll()
-			} else {
-				s.mu.Unlock()
-			}
-		}
-		return 0, "", ""
+		return s.maybePerformLazyRolloverR66(ctx, r, target)
 	}
 	if !isIdx && !isAlias {
 		if stCode, errType, errReason := s.checkAutoCreateIndexClusterSettingRound60(target); stCode != 0 {
@@ -6200,6 +6223,11 @@ func validateScriptedMetricAllowListR62Search(s *Server, aggs map[string]esast.A
 
 func compareTermsKeysSchemaAwareR62Search(a, b, esType string) bool {
 	switch strings.ToLower(strings.TrimSpace(esType)) {
+	case "_tsid":
+		ha, hb := transpiler.DecodeTSIDRawHex(a), transpiler.DecodeTSIDRawHex(b)
+		if ha != hb {
+			return ha < hb
+		}
 	case "ip":
 		addrA, errA := netip.ParseAddr(strings.TrimSpace(a))
 		addrB, errB := netip.ParseAddr(strings.TrimSpace(b))
@@ -6542,6 +6570,9 @@ func (s *Server) effectiveTranspileOptsForIndexR62Search(
 			idxCustom = deepCloneDocMap(cs)
 		}
 	}
+	if resolvedIdx != "" && s.implicitTimestampSortEligible != nil {
+		opts.ImplicitTimestampSort = s.implicitTimestampSortEligible[resolvedIdx]
+	}
 	lookupCluster := func(key string) (any, bool) {
 		if v, ok := lookupNestedClusterSettingR62Admin(s.clusterTransientSettings, key); ok {
 			return v, true
@@ -6600,6 +6631,8 @@ func (s *Server) effectiveTranspileOptsForIndexR62Search(
 	opts.AnalysisOpts = anOpts
 	opts.StrictTextTermRouting = s.hasExplicitTargetESVersion()
 	opts.DynamicTextFields = s.dynamicTextFieldsCopyWave3R63(resolvedIdx)
+	nShards, _, _ := s.getIndexShardAndReplicaCounts(resolvedIdx)
+	opts.NumberOfShards = nShards
 	if mb, ok := s.backend.(*MemoryBackend); ok && idxSchema != nil && idxSchema.DorisTable != "" {
 		tbl := idxSchema.DorisTable
 		opts.TermDocFreqFn = func(colExpr string, terms []string, caseSensitive bool) (int, map[string]int) {
@@ -7876,32 +7909,31 @@ func computeSignificantScoreWithSupersetR62Search(heur sigHeuristicSpecR62Search
 		}
 		return float64(fgCount) / float64(bgCount)
 	case "gnd":
-		n11 := float64(fgCount)
-		n10 := float64(fgTotal - fgCount)
-		var n01, n00 float64
-		if bgIsSuperset {
-			n01 = float64(bgCount - fgCount)
-			n00 = float64((bgTotal - fgTotal) - (bgCount - fgCount))
-		} else {
-			n01 = float64(bgCount)
-			n00 = float64(bgTotal - bgCount)
-		}
-		if n01 < 0 {
-			n01 = 0
-		}
-		if n00 < 0 {
-			n00 = 0
-		}
-		total := n11 + n10 + n01 + n00
-		if total <= 0 {
+		if fgFreq < bgFreq {
 			return 0
 		}
-		dx := math.Max(n11*n00-n10*n01, 0)
-		denom := (n11 + n10) * (n01 + n00)
+		effBgFreqCount := float64(bgCount)
+		effBgTotalCount := float64(bgTotal)
+		if !bgIsSuperset {
+			effBgFreqCount += float64(fgCount)
+			effBgTotalCount += float64(fgTotal)
+		}
+		if effBgFreqCount <= 0 || effBgTotalCount <= 0 {
+			return 0
+		}
+		logX := math.Log(float64(fgTotal))
+		logY := math.Log(effBgFreqCount)
+		logXY := math.Log(float64(fgCount))
+		logN := math.Log(effBgTotalCount)
+		denom := logN - math.Min(logX, logY)
 		if denom <= 0 {
 			return 0
 		}
-		return dx / (denom * math.Max(1.0, math.Sqrt(total)))
+		gnd := (math.Max(logX, logY) - logXY) / denom
+		if gnd < 0 {
+			gnd = 0
+		}
+		return math.Exp(-2.0 * gnd)
 	case "mutual_information":
 		includeNeg := false
 		if b, ok := heur.params["include_negatives"].(bool); ok {
@@ -8101,34 +8133,61 @@ func emitRuntimeSignificantTextAggRowsR62Search(
 			}
 			rawTexts = append(rawTexts, vals...)
 		}
-		joined := strings.Join(rawTexts, " ")
-		if strings.TrimSpace(joined) == "" {
-			return nil, ""
+		isAnnotatedField := effSc != nil && func() bool {
+			fType := effSc.ResolveField(fieldName).ESType
+			return fType == "annotated_text" || fType == "annotated-text"
+		}()
+		var analyzeTexts []string
+		if isAnnotatedField {
+			analyzeTexts = make([]string, 0, len(rawTexts))
+			for _, rt := range rawTexts {
+				segs := parseAnnotatedTextSegmentsWave3R63(rt)
+				if len(segs) == 0 {
+					analyzeTexts = append(analyzeTexts, rt)
+					continue
+				}
+				var sb strings.Builder
+				for _, seg := range segs {
+					sb.WriteString(seg.visible)
+				}
+				analyzeTexts = append(analyzeTexts, sb.String())
+			}
+		} else {
+			analyzeTexts = rawTexts
 		}
-		graph, err := analysis.AnalyzeForQuery(joined, analyzerName, anCfg, analysis.Options{})
-		if err != nil || graph.IsEmpty() {
-			return transpiler.TokenizeByAnalyzer(joined, analyzerName), joined
+		joined := strings.Join(analyzeTexts, " ")
+		if strings.TrimSpace(joined) == "" && !isAnnotatedField {
+			return nil, ""
 		}
 		seen := make(map[string]bool)
 		var toks []string
-		if effSc != nil {
-			fType := effSc.ResolveField(fieldName).ESType
-			if fType == "annotated_text" || fType == "annotated-text" {
-				for _, rt := range rawTexts {
-					for _, ann := range extractAnnotatedTextAnnotationsWave3R63(rt) {
-						if ann != "" && !seen[ann] {
-							seen[ann] = true
-							toks = append(toks, ann)
-						}
+		if isAnnotatedField {
+			for _, rt := range rawTexts {
+				for _, ann := range extractAnnotatedTextAnnotationsWave3R63(rt) {
+					if ann != "" && !seen[ann] {
+						seen[ann] = true
+						toks = append(toks, ann)
 					}
 				}
 			}
 		}
-		for _, pos := range graph.Positions {
-			for _, tk := range pos.Terms {
-				if !seen[tk] {
-					seen[tk] = true
-					toks = append(toks, tk)
+		if strings.TrimSpace(joined) != "" {
+			graph, err := analysis.AnalyzeForQuery(joined, analyzerName, anCfg, analysis.Options{})
+			if err != nil || graph.IsEmpty() {
+				for _, tk := range transpiler.TokenizeByAnalyzer(joined, analyzerName) {
+					if tk != "" && !seen[tk] {
+						seen[tk] = true
+						toks = append(toks, tk)
+					}
+				}
+				return toks, joined
+			}
+			for _, pos := range graph.Positions {
+				for _, tk := range pos.Terms {
+					if !seen[tk] {
+						seen[tk] = true
+						toks = append(toks, tk)
+					}
 				}
 			}
 		}
@@ -8189,6 +8248,36 @@ func emitRuntimeSignificantTextAggRowsR62Search(
 			}
 		}
 	}
+	var unmergedBGExtra int64
+	if bgFilter == nil && scope != nil && scope.srv != nil && idxSchema != nil && idxSchema.IndexName != "" {
+		unmergedList := scope.srv.getUnmergedOverwrittenSourcesR66(idxSchema.IndexName)
+		for _, rawSrc := range unmergedList {
+			var docMap map[string]any
+			if len(rawSrc) > 0 {
+				dec := json.NewDecoder(bytes.NewReader(rawSrc))
+				dec.UseNumber()
+				_ = dec.Decode(&docMap)
+			}
+			if docMap == nil {
+				docMap = make(map[string]any)
+			}
+			unmergedBGExtra++
+			md := runtimeMatchedDoc{
+				hit:        HitRow{Schema: idxSchema, SearchScope: scope},
+				doc:        docMap,
+				rootDoc:    docMap,
+				rootSchema: idxSchema,
+			}
+			toks, _ := extractDocTokens(md)
+			seen := make(map[string]bool, len(toks))
+			for _, tk := range toks {
+				if !seen[tk] {
+					seen[tk] = true
+					bgDocFreq[tk]++
+				}
+			}
+		}
+	}
 
 	fgDocsByTerm := make(map[string][]runtimeMatchedDoc)
 	for i, md := range fgDeduplicated {
@@ -8224,7 +8313,7 @@ func emitRuntimeSignificantTextAggRowsR62Search(
 		docs    []runtimeMatchedDoc
 	}
 	fgTotal := int64(len(fgDeduplicated))
-	bgTotal := int64(len(bgDocs))
+	bgTotal := int64(len(bgDocs)) + unmergedBGExtra
 	var cands []sigCand
 	for term, tDocs := range fgDocsByTerm {
 		fgCnt := int64(len(tDocs))
@@ -9143,8 +9232,8 @@ func enrichSearchProfilePayloadR62Search(
 		srv.mu.RUnlock()
 	}
 
-	var buildAggNode func(aggName string, spec esast.AggSpec, outObj map[string]any, isTopLevel bool) map[string]any
-	buildAggNode = func(aggName string, spec esast.AggSpec, outObj map[string]any, isTopLevel bool) map[string]any {
+	var buildAggNode func(aggName string, spec esast.AggSpec, outObj map[string]any, isTopLevel bool, parentSpec *esast.AggSpec, parentOut map[string]any) map[string]any
+	buildAggNode = func(aggName string, spec esast.AggSpec, outObj map[string]any, isTopLevel bool, parentSpec *esast.AggSpec, parentOut map[string]any) map[string]any {
 		aggType := profileAggClassR62Search(spec, req, idxSchema, isTopLevel, rewriteToFilterByFilter, hasDocCountField)
 		if !isES8Prof && aggType == "StringTermsAggregatorFromFilters" {
 			aggType = "GlobalOrdinalsStringTermsAggregator"
@@ -9247,9 +9336,10 @@ func enrichSearchProfilePayloadR62Search(
 			debugMap["total_buckets"] = bucketCount
 		case "MapStringTermsAggregator":
 			if spec.SignificantText != nil {
-				debugMap["collection_strategy"] = "analyze text from _source"
-				debugMap["result_strategy"] = "significant_terms"
-				debugMap["total_buckets"] = bucketCount
+				stDbg := computeSignificantTextProfileDebugR66(srv, idxSchema, spec.SignificantText, allHits, parentSpec, parentOut, bucketCount)
+				for dk, dv := range stDbg {
+					debugMap[dk] = dv
+				}
 			} else {
 				if len(subNames) > 0 && spec.Terms != nil && strings.EqualFold(spec.Terms.CollectMode, "breadth_first") {
 					debugMap["deferred_aggregators"] = subNames
@@ -9357,7 +9447,7 @@ func enrichSearchProfilePayloadR62Search(
 					sampleSubOut = subM
 				}
 			}
-			children = append(children, buildAggNode(sn, subSpec, sampleSubOut, false))
+			children = append(children, buildAggNode(sn, subSpec, sampleSubOut, false, &spec, outObj))
 		}
 
 		node := map[string]any{
@@ -9403,11 +9493,232 @@ func enrichSearchProfilePayloadR62Search(
 			if aggsOut != nil {
 				subOut, _ = aggsOut[an].(map[string]any)
 			}
-			aggProfiles = append(aggProfiles, buildAggNode(an, spec, subOut, true))
+			aggProfiles = append(aggProfiles, buildAggNode(an, spec, subOut, true, nil, nil))
 		}
 		shard["aggregations"] = aggProfiles
 	}
 	return profilePayload
+}
+
+func computeSignificantTextProfileDebugR66(
+	srv *Server,
+	idxSchema *schema.IndexSchema,
+	stSpec *esast.SignificantTextAggSpec,
+	allHits []HitRow,
+	parentSpec *esast.AggSpec,
+	parentOut map[string]any,
+	fallbackBuckets int,
+) map[string]any {
+	debugMap := map[string]any{
+		"collection_strategy": "analyze text from _source",
+		"result_strategy":     "significant_terms",
+		"total_buckets":       fallbackBuckets,
+	}
+	if stSpec == nil {
+		return debugMap
+	}
+	fieldName := stSpec.Field
+	sourceFields := stSpec.SourceFields
+	if len(sourceFields) == 0 && fieldName != "" {
+		sourceFields = []string{fieldName}
+	}
+	analyzerName := "standard"
+	isAnnotatedField := false
+	if idxSchema != nil {
+		b := idxSchema.ResolveField(fieldName)
+		if b.Analyzer != "" {
+			analyzerName = b.Analyzer
+		}
+		if b.ESType == "annotated_text" || b.ESType == "annotated-text" {
+			isAnnotatedField = true
+		}
+	}
+	var anCfg *analysis.IndexAnalysisConfig
+	if idxSchema != nil && idxSchema.IndexName != "" && srv != nil {
+		srv.mu.RLock()
+		cs := deepCloneDocMap(srv.indexCustomSettings[idxSchema.IndexName])
+		srv.mu.RUnlock()
+		if len(cs) > 0 {
+			anCfg, _ = analysis.ParseIndexAnalysisConfig(cs, analysis.Options{})
+		}
+	}
+	if anCfg == nil {
+		anCfg = analysis.DefaultIndexAnalysisConfig()
+	}
+
+	var valuesFetched, charsFetched, extractCount, collectAnalyzedCount, extractNs, collectAnalyzedNs int64
+	uniqueTermsPerDoc := make([][]string, len(allHits))
+	docMaps := make([]map[string]any, len(allHits))
+	allUniqueTerms := make(map[string]bool)
+
+	for i, h := range allHits {
+		doc := decodeHitDocMapRound60(h)
+		docMaps[i] = doc
+		effSc := h.Schema
+		if effSc == nil {
+			effSc = idxSchema
+		}
+
+		tExt := time.Now()
+		var rawTexts []string
+		for _, sf := range sourceFields {
+			segs := strings.Split(sf, ".")
+			if effSc != nil {
+				if b := effSc.ResolveField(sf); len(b.SourceJSONPath) > 0 {
+					segs = b.SourceJSONPath
+				}
+			}
+			vals := collectStringValuesAtPath(doc, segs)
+			if len(vals) == 0 && effSc != nil && effSc.RawMapping != nil {
+				for _, ctSrc := range collectCopyToSourcePaths(effSc.RawMapping.Properties, "", sf) {
+					vals = append(vals, collectStringValuesAtPath(doc, strings.Split(ctSrc, "."))...)
+				}
+			}
+			rawTexts = append(rawTexts, vals...)
+		}
+		extractNs += time.Since(tExt).Nanoseconds()
+		valuesFetched += int64(len(rawTexts))
+		extractCount += int64(len(rawTexts))
+		for _, rt := range rawTexts {
+			charsFetched += int64(len(rt))
+		}
+
+		tAna := time.Now()
+		analyzeTexts := rawTexts
+		if isAnnotatedField {
+			analyzeTexts = make([]string, 0, len(rawTexts))
+			for _, rt := range rawTexts {
+				segs := parseAnnotatedTextSegmentsWave3R63(rt)
+				if len(segs) == 0 {
+					analyzeTexts = append(analyzeTexts, rt)
+					continue
+				}
+				var sb strings.Builder
+				for _, seg := range segs {
+					sb.WriteString(seg.visible)
+				}
+				analyzeTexts = append(analyzeTexts, sb.String())
+			}
+		}
+		joined := strings.Join(analyzeTexts, " ")
+		seenDoc := make(map[string]bool)
+		var docToks []string
+		if isAnnotatedField {
+			for _, rt := range rawTexts {
+				for _, ann := range extractAnnotatedTextAnnotationsWave3R63(rt) {
+					if ann != "" {
+						collectAnalyzedCount++
+						if !seenDoc[ann] {
+							seenDoc[ann] = true
+							docToks = append(docToks, ann)
+							allUniqueTerms[ann] = true
+						}
+					}
+				}
+			}
+		}
+		if strings.TrimSpace(joined) != "" {
+			graph, err := analysis.AnalyzeForQuery(joined, analyzerName, anCfg, analysis.Options{})
+			if err != nil || graph.IsEmpty() {
+				tokSeq := transpiler.TokenizeByAnalyzer(joined, analyzerName)
+				collectAnalyzedCount += int64(len(tokSeq))
+				for _, tk := range tokSeq {
+					if tk != "" && !seenDoc[tk] {
+						seenDoc[tk] = true
+						docToks = append(docToks, tk)
+						allUniqueTerms[tk] = true
+					}
+				}
+			} else {
+				for _, pos := range graph.Positions {
+					if len(pos.Terms) > 0 {
+						collectAnalyzedCount++
+					}
+					for _, tk := range pos.Terms {
+						if !seenDoc[tk] {
+							seenDoc[tk] = true
+							docToks = append(docToks, tk)
+							allUniqueTerms[tk] = true
+						}
+					}
+				}
+			}
+		}
+		collectAnalyzedNs += time.Since(tAna).Nanoseconds()
+		uniqueTermsPerDoc[i] = docToks
+	}
+
+	totalBuckets := len(allUniqueTerms)
+	if parentSpec != nil && parentSpec.Terms != nil && parentOut != nil {
+		parentField := parentSpec.Terms.Field
+		parentKeys := make(map[string]map[string]bool)
+		switch bs := parentOut["buckets"].(type) {
+		case []map[string]any:
+			for _, b := range bs {
+				parentKeys[fmt.Sprintf("%v", b["key"])] = make(map[string]bool)
+			}
+		case []any:
+			for _, el := range bs {
+				if bm, ok := el.(map[string]any); ok {
+					parentKeys[fmt.Sprintf("%v", bm["key"])] = make(map[string]bool)
+				}
+			}
+		case map[string]any:
+			for k := range bs {
+				parentKeys[k] = make(map[string]bool)
+			}
+		}
+		if len(parentKeys) > 0 && parentField != "" {
+			segs := strings.Split(parentField, ".")
+			for i, doc := range docMaps {
+				effSc := allHits[i].Schema
+				if effSc == nil {
+					effSc = idxSchema
+				}
+				fSegs := segs
+				if effSc != nil {
+					if b := effSc.ResolveField(parentField); len(b.SourceJSONPath) > 0 {
+						fSegs = b.SourceJSONPath
+					} else if strings.HasSuffix(parentField, ".keyword") {
+						base := strings.TrimSuffix(parentField, ".keyword")
+						if bBase := effSc.ResolveField(base); len(bBase.SourceJSONPath) > 0 {
+							fSegs = bBase.SourceJSONPath
+						} else {
+							fSegs = strings.Split(base, ".")
+						}
+					}
+				}
+				pVals := collectStringValuesAtPath(doc, fSegs)
+				for _, pv := range pVals {
+					if termSet, ok := parentKeys[pv]; ok {
+						for _, tk := range uniqueTermsPerDoc[i] {
+							termSet[tk] = true
+						}
+					}
+				}
+			}
+			sumB := 0
+			for _, termSet := range parentKeys {
+				sumB += len(termSet)
+			}
+			totalBuckets = sumB
+		}
+	}
+
+	if extractNs <= 0 {
+		extractNs = 1
+	}
+	if collectAnalyzedNs <= 0 {
+		collectAnalyzedNs = 1
+	}
+	debugMap["total_buckets"] = totalBuckets
+	debugMap["values_fetched"] = valuesFetched
+	debugMap["chars_fetched"] = charsFetched
+	debugMap["extract_ns"] = extractNs
+	debugMap["extract_count"] = extractCount
+	debugMap["collect_analyzed_ns"] = collectAnalyzedNs
+	debugMap["collect_analyzed_count"] = collectAnalyzedCount
+	return debugMap
 }
 
 func profileAggClassR62Search(
@@ -10715,6 +11026,49 @@ func (s *Server) executeRRFSearchR62Search(
 						subHits = append(subHits, m)
 					}
 				}
+			}
+		}
+		if len(subReq.Sort) == 0 && len(subHits) > 1 {
+			anyMultiShard := false
+			for _, hm := range subHits {
+				hIdx, _ := hm["_index"].(string)
+				if nShards, _, _ := s.getIndexShardAndReplicaCounts(hIdx); nShards > 1 {
+					anyMultiShard = true
+					break
+				}
+			}
+			if anyMultiShard {
+				sort.SliceStable(subHits, func(i, j int) bool {
+					si, oki := toFloat64(subHits[i]["_score"])
+					sj, okj := toFloat64(subHits[j]["_score"])
+					if oki != okj {
+						return oki
+					}
+					if oki && float32(si) != float32(sj) {
+						return float32(si) > float32(sj)
+					}
+					idxI, _ := subHits[i]["_index"].(string)
+					idI, _ := subHits[i]["_id"].(string)
+					rtI, _ := subHits[i]["_routing"].(string)
+					if rtI == "" {
+						rtI = s.getDocRouting(idxI, idI)
+					}
+					idxJ, _ := subHits[j]["_index"].(string)
+					idJ, _ := subHits[j]["_id"].(string)
+					rtJ, _ := subHits[j]["_routing"].(string)
+					if rtJ == "" {
+						rtJ = s.getDocRouting(idxJ, idJ)
+					}
+					shI := s.shardForDocRoutingRound60(idxI, idI, rtI)
+					shJ := s.shardForDocRoutingRound60(idxJ, idJ, rtJ)
+					if shI != shJ {
+						return shI < shJ
+					}
+					if idxI != idxJ {
+						return idxI < idxJ
+					}
+					return idI < idJ
+				})
 			}
 		}
 		for idxInSub, hm := range subHits {

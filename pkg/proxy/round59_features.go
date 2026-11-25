@@ -1856,9 +1856,7 @@ func (s *Server) restoreSnapshotExtraGlobalStateRound59(ctx context.Context, raw
 		if s.clusterPersistentSettings == nil {
 			s.clusterPersistentSettings = make(map[string]any)
 		}
-		for ck, cv := range savedCluster {
-			s.clusterPersistentSettings[ck] = deepCloneIngestValue(cv)
-		}
+		mergeRestoredClusterPersistentSettingsR66(s.clusterPersistentSettings, savedCluster)
 	}
 	s.mu.Unlock()
 
@@ -1875,6 +1873,49 @@ func (s *Server) restoreSnapshotExtraGlobalStateRound59(ctx context.Context, raw
 					UpdatedEpochMs: s.allocVersion(0),
 				})
 			}
+		}
+	}
+}
+
+func stripStaticOnlyClusterSettingsValueR66(prefix string, val any) (any, bool) {
+	sub, ok := val.(map[string]any)
+	if !ok || sub == nil {
+		return deepCloneIngestValue(val), true
+	}
+	if len(sub) == 0 {
+		return map[string]any{}, true
+	}
+	out := make(map[string]any, len(sub))
+	for k, v := range sub {
+		fullKey := k
+		if prefix != "" {
+			fullKey = prefix + "." + k
+		}
+		if IsStaticOnlyClusterSettingRound62(fullKey) {
+			continue
+		}
+		cleaned, keep := stripStaticOnlyClusterSettingsValueR66(fullKey, v)
+		if keep {
+			out[k] = cleaned
+		}
+	}
+	if len(out) == 0 {
+		return nil, false
+	}
+	return out, true
+}
+
+func mergeRestoredClusterPersistentSettingsR66(dst, saved map[string]any) {
+	if dst == nil || len(saved) == 0 {
+		return
+	}
+	for ck, cv := range saved {
+		if IsStaticOnlyClusterSettingRound62(ck) {
+			continue
+		}
+		cleaned, keep := stripStaticOnlyClusterSettingsValueR66(ck, cv)
+		if keep {
+			dst[ck] = cleaned
 		}
 	}
 }

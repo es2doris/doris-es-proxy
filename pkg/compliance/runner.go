@@ -6742,7 +6742,7 @@ func (c *runnerContext) expandStash(v any) any {
 	}
 }
 
-var reStashVar = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_.\-]*)\}|\$([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z0-9_\-]+)*)`)
+var reStashVar = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_.\-]*)\}|\$([A-Za-z_][A-Za-z0-9_\-]*(?:\.[A-Za-z0-9_\-]+)*)`)
 
 func normalizeStashKey(s string) string {
 	trimmed := strings.TrimSpace(s)
@@ -6786,19 +6786,36 @@ func (c *runnerContext) resolveStashMatch(match string) (any, string, bool) {
 	if sv, ok := c.lookupStashVar(key); ok {
 		return sv, "", true
 	}
-	if !strings.HasPrefix(match, "${") && strings.Contains(key, ".") {
-		cur := key
-		for {
-			dotIdx := strings.LastIndexByte(cur, '.')
-			if dotIdx <= 0 {
-				break
+	if !strings.HasPrefix(match, "${") {
+		if strings.Contains(key, ".") {
+			cur := key
+			for {
+				dotIdx := strings.LastIndexByte(cur, '.')
+				if dotIdx <= 0 {
+					break
+				}
+				prefix := cur[:dotIdx]
+				suffix := key[dotIdx:]
+				if sv, ok := c.lookupStashVar(prefix); ok {
+					return sv, suffix, true
+				}
+				cur = prefix
 			}
-			prefix := cur[:dotIdx]
-			suffix := key[dotIdx:]
-			if sv, ok := c.lookupStashVar(prefix); ok {
-				return sv, suffix, true
+		}
+		if strings.Contains(key, "-") {
+			cur := key
+			for {
+				dashIdx := strings.LastIndexByte(cur, '-')
+				if dashIdx <= 0 {
+					break
+				}
+				prefix := cur[:dashIdx]
+				suffix := key[dashIdx:]
+				if sv, ok := c.lookupStashVar(prefix); ok {
+					return sv, suffix, true
+				}
+				cur = prefix
 			}
-			cur = prefix
 		}
 	}
 	return nil, "", false
@@ -9350,6 +9367,26 @@ func (c *runnerContext) resolveResponseRootAndSegments(rawPath string) (any, []s
 	return cur, segments, true
 }
 
+func compactNonEmptyPathSegments(segments []string) ([]string, bool) {
+	hasEmpty := false
+	for _, seg := range segments {
+		if seg == "" {
+			hasEmpty = true
+			break
+		}
+	}
+	if !hasEmpty {
+		return segments, false
+	}
+	compacted := make([]string, 0, len(segments))
+	for _, seg := range segments {
+		if seg != "" {
+			compacted = append(compacted, seg)
+		}
+	}
+	return compacted, true
+}
+
 func (c *runnerContext) lookupResponsePath(rawPath string) (any, bool) {
 	root, segments, ok := c.resolveResponseRootAndSegments(rawPath)
 	if !ok {
@@ -9358,7 +9395,13 @@ func (c *runnerContext) lookupResponsePath(rawPath string) (any, bool) {
 	if len(segments) == 0 {
 		return root, true
 	}
-	return lookupSegments(root, segments)
+	if val, found := lookupSegments(root, segments); found {
+		return val, true
+	}
+	if compacted, changed := compactNonEmptyPathSegments(segments); changed && len(compacted) > 0 {
+		return lookupSegments(root, compacted)
+	}
+	return nil, false
 }
 
 func (c *runnerContext) lookupAllResponsePaths(rawPath string) []any {
@@ -9372,7 +9415,13 @@ func (c *runnerContext) lookupAllResponsePaths(rawPath string) []any {
 		}
 		return []any{root}
 	}
-	return lookupAllSegments(root, segments)
+	if vals := lookupAllSegments(root, segments); len(vals) > 0 {
+		return vals
+	}
+	if compacted, changed := compactNonEmptyPathSegments(segments); changed && len(compacted) > 0 {
+		return lookupAllSegments(root, compacted)
+	}
+	return nil
 }
 
 func lookupSegments(cur any, segments []string) (any, bool) {

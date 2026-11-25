@@ -3,10 +3,13 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/netip"
@@ -502,10 +505,6 @@ func extractConfiguredPathReposLockedR65(settings map[string]any) []string {
 		out = append(out, resolved)
 	}
 	return out
-}
-
-func extractAllowedRepoURLsLockedR65(settings map[string]any) []string {
-	return extractSettingStringsLockedR65(settings, "repositories.url.allowed_urls")
 }
 
 func isPathContainedR65(targetPath, rootDir string) bool {
@@ -1110,11 +1109,9 @@ func (s *Server) syncURLRepoSnapshotsByExprR64(repoExpr string) {
 		url  string
 	}
 	var targets []repoTarget
-	var pathRepos []string
-	var allowedURLs []string
+	pathRepos := s.getStaticPathReposResolvedR66()
+	allowedURLs := s.getStaticAllowedRepoURLsR66()
 	s.mu.RLock()
-	pathRepos = extractConfiguredPathReposLockedR65(s.clusterPersistentSettings)
-	allowedURLs = extractAllowedRepoURLsLockedR65(s.clusterPersistentSettings)
 	for rName, rObj := range s.snapshotRepos {
 		if rObj == nil {
 			continue
@@ -1230,9 +1227,8 @@ func (s *Server) syncAllFSRepositoriesDiskR64() {
 		payload []byte
 	}
 	var pairs []fsPayloadPair
-	var pathRepos []string
+	pathRepos := s.getStaticPathReposResolvedR66()
 	s.mu.RLock()
-	pathRepos = extractConfiguredPathReposLockedR65(s.clusterPersistentSettings)
 	if len(pathRepos) > 0 {
 		for rName, rObj := range s.snapshotRepos {
 			if rObj == nil {
@@ -1367,10 +1363,8 @@ func (s *Server) handleSnapshotRepo(w http.ResponseWriter, r *http.Request) {
 		if st, ok := reqMap["settings"].(map[string]any); ok && st != nil {
 			settings = st
 		}
-		s.mu.RLock()
-		pathRepos := extractConfiguredPathReposLockedR65(s.clusterPersistentSettings)
-		allowedURLs := extractAllowedRepoURLsLockedR65(s.clusterPersistentSettings)
-		s.mu.RUnlock()
+		pathRepos := s.getStaticPathReposResolvedR66()
+		allowedURLs := s.getStaticAllowedRepoURLsR66()
 		if repoType == "fs" {
 			loc, _ := settings["location"].(string)
 			if len(pathRepos) > 0 {
@@ -1840,7 +1834,7 @@ func (s *Server) handleSnapshotActionOrItem(w http.ResponseWriter, r *http.Reque
 		snapFailedShards := 0
 		s.mu.RLock()
 		for _, idxName := range indices {
-			ns, _, _ := s.getIndexShardAndReplicaCounts(idxName)
+			ns, _, _ := s.getIndexShardAndReplicaCountsLocked(idxName)
 			if ns < 1 {
 				ns = 1
 			}
@@ -2111,7 +2105,9 @@ func (s *Server) handleSnapshotItemAction(w http.ResponseWriter, r *http.Request
 
 	s.syncURLRepoSnapshotsByExprR64(repo)
 	s.mu.RLock()
-	_, repoExists := s.snapshotRepos[repo]
+	repoObj, repoExists := s.snapshotRepos[repo]
+	repoType, _ := repoObj["type"].(string)
+	isSourceSnapshotRepo := strings.EqualFold(strings.TrimSpace(repoType), "source")
 	var snapObj map[string]any
 	var rawSnapRef map[string]any
 	var savedSchemas map[string]*schema.IndexSchema
@@ -2246,7 +2242,11 @@ func (s *Server) handleSnapshotItemAction(w http.ResponseWriter, r *http.Request
 		if restoredSchema != nil {
 			s.persistIndex(r.Context(), targetIdx, restoredSchema)
 		}
-		recordIndexRecoverySourceR62Admin(s, targetIdx, "SNAPSHOT")
+		mountRecSrc := "SNAPSHOT"
+		if isSourceSnapshotRepo {
+			mountRecSrc = "SNAPSHOT_SOURCE"
+		}
+		recordIndexRecoverySourceR62Admin(s, targetIdx, mountRecSrc)
 		writeJSON(w, http.StatusOK, map[string]any{
 			"accepted": true,
 			"snapshot": map[string]any{
@@ -2356,7 +2356,11 @@ func (s *Server) handleSnapshotItemAction(w http.ResponseWriter, r *http.Request
 				s.persistIndex(r.Context(), targetIdx, restoredSchema)
 			}
 			s.restoreSnapshotIndexArtifacts(r.Context(), rawSnapRef, srcIdx, targetIdx, restoredSchema, reqMap, false)
-			recordIndexRecoverySourceR62Admin(s, targetIdx, "SNAPSHOT")
+			restoreRecSrc := "SNAPSHOT"
+			if isSourceSnapshotRepo {
+				restoreRecSrc = "SNAPSHOT_SOURCE"
+			}
+			recordIndexRecoverySourceR62Admin(s, targetIdx, restoreRecSrc)
 			if restoredSchema != nil {
 				s.persistIndex(r.Context(), targetIdx, restoredSchema)
 			}
@@ -5195,6 +5199,7 @@ func (s *Server) handleTransformStats(w http.ResponseWriter, r *http.Request) {
 				"name":              "doris-fe-1",
 				"ephemeral_id":      "doris-ephemeral-1",
 				"transport_address": "127.0.0.1:9300",
+				"attributes":        map[string]any{},
 			},
 			"stats": map[string]any{
 				"pages_processed":                        pagesProc,
@@ -5449,11 +5454,23 @@ var localNodeAutoscalingRolesR65 = map[string]bool{
 	"remote_cluster_client": true,
 }
 
+const maxFloatInt64ExclusiveR66 = 9223372036854775808.0
+
+func saturatingMulInt64R66(a, b int64) int64 {
+	if a <= 0 || b <= 0 {
+		return 0
+	}
+	if a > math.MaxInt64/b {
+		return math.MaxInt64
+	}
+	return a * b
+}
+
 func parseAutoscalingByteSizeR65(v any) (int64, error) {
 	switch tv := v.(type) {
 	case float64:
-		if tv < 0 {
-			return 0, fmt.Errorf("byte size must be non-negative")
+		if math.IsNaN(tv) || math.IsInf(tv, 0) || tv < 0 || tv >= maxFloatInt64ExclusiveR66 {
+			return 0, fmt.Errorf("byte size must be a finite non-negative int64")
 		}
 		return int64(tv), nil
 	case int64:
@@ -5467,8 +5484,14 @@ func parseAutoscalingByteSizeR65(v any) (int64, error) {
 		}
 		return int64(tv), nil
 	case json.Number:
+		if iv, err := tv.Int64(); err == nil {
+			if iv < 0 {
+				return 0, fmt.Errorf("byte size must be non-negative")
+			}
+			return iv, nil
+		}
 		f, err := tv.Float64()
-		if err != nil || f < 0 {
+		if err != nil || math.IsNaN(f) || math.IsInf(f, 0) || f < 0 || f >= maxFloatInt64ExclusiveR66 {
 			return 0, fmt.Errorf("invalid byte size [%v]", v)
 		}
 		return int64(f), nil
@@ -5497,10 +5520,14 @@ func parseAutoscalingByteSizeR65(v any) (int64, error) {
 			}
 		}
 		f, err := strconv.ParseFloat(numStr, 64)
-		if err != nil || f < 0 {
+		if err != nil || math.IsNaN(f) || math.IsInf(f, 0) || f < 0 {
 			return 0, fmt.Errorf("failed to parse byte size [%s]", tv)
 		}
-		return int64(f * float64(mult)), nil
+		prod := f * float64(mult)
+		if math.IsNaN(prod) || math.IsInf(prod, 0) || prod < 0 || prod >= maxFloatInt64ExclusiveR66 {
+			return 0, fmt.Errorf("byte size [%s] exceeds int64 range", tv)
+		}
+		return int64(prod), nil
 	default:
 		return 0, fmt.Errorf("invalid byte size [%v]", v)
 	}
@@ -5529,7 +5556,7 @@ func validateAutoscalingDecidersR65(deciders map[string]any) error {
 						return err
 					}
 				case "processors", "nodes":
-					if fv, okF := toFloat64(settingVal); !okF || fv < 0 {
+					if fv, okF := toFloat64(settingVal); !okF || math.IsNaN(fv) || math.IsInf(fv, 0) || fv < 0 {
 						return fmt.Errorf("decider setting [%s] must be a non-negative number", settingKey)
 					}
 				default:
@@ -5603,20 +5630,25 @@ func (s *Server) handleAutoscaling(w http.ResponseWriter, r *http.Request) {
 						}
 					}
 					fNodeMap := map[string]any{"storage": fStorage, "memory": fMemory}
-					fTotalMap := map[string]any{"storage": fStorage * fNodes, "memory": fMemory * fNodes}
+					totalStorage := saturatingMulInt64R66(fStorage, fNodes)
+					totalMemory := saturatingMulInt64R66(fMemory, fNodes)
+					fTotalMap := map[string]any{"storage": totalStorage, "memory": totalMemory}
 					reqNodeMap := map[string]any{"storage": fStorage, "memory": fMemory}
-					reqTotalMap := map[string]any{"storage": fStorage * fNodes, "memory": fMemory * fNodes}
+					reqTotalMap := map[string]any{"storage": totalStorage, "memory": totalMemory}
 					procSummary := "null"
 					if pv, hasP := fixedCfg["processors"]; hasP && pv != nil {
-						if pFloat, okP := toFloat64(pv); okP {
+						if pFloat, okP := toFloat64(pv); okP && !math.IsNaN(pFloat) && !math.IsInf(pFloat, 0) && pFloat >= 0 {
 							pVal := pv
-							if pFloat == float64(int64(pFloat)) {
+							if pFloat < maxFloatInt64ExclusiveR66 && pFloat == float64(int64(pFloat)) {
 								pVal = int64(pFloat)
 							}
 							fNodeMap["processors"] = pVal
-							fTotalMap["processors"] = pFloat * float64(fNodes)
-							if pFloat*float64(fNodes) == float64(int64(pFloat*float64(fNodes))) {
-								fTotalMap["processors"] = int64(pFloat * float64(fNodes))
+							pTot := pFloat * float64(fNodes)
+							if !math.IsNaN(pTot) && !math.IsInf(pTot, 0) {
+								fTotalMap["processors"] = pTot
+								if pTot >= 0 && pTot < maxFloatInt64ExclusiveR66 && pTot == float64(int64(pTot)) {
+									fTotalMap["processors"] = int64(pTot)
+								}
 							}
 							reqNodeMap["processors"] = pVal
 							reqTotalMap["processors"] = fTotalMap["processors"]
@@ -6958,6 +6990,8 @@ func (s *Server) handleFeatures(w http.ResponseWriter, r *http.Request, segs []s
 		statuses := make([]any, 0, len(featureNames))
 		for _, f := range featureNames {
 			statuses = append(statuses, map[string]any{
+				"name":         f.name,
+				"description":  f.desc,
 				"feature_name": f.name,
 				"status":       "SUCCESS",
 			})
@@ -6979,7 +7013,7 @@ func (s *Server) handleVotingConfigExclusions(w http.ResponseWriter, r *http.Req
 			}
 		}
 		if len(segs) >= 3 && strings.TrimSpace(segs[2]) != "" {
-			emitESDeprecationWarningRound61(w, s, r, "[POST /_cluster/voting_config_exclusions/{node_name}] has been removed. Use POST /_cluster/voting_config_exclusions?node_names=... instead.")
+			emitESDeprecationWarningRound61(w, s, r, "POST /_cluster/voting_config_exclusions/{node_name} has been removed. Use POST /_cluster/voting_config_exclusions?node_names=... instead.")
 			writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
 				"[node_name] has been removed, you must set [node_names] or [node_ids]")
 			return
@@ -7433,9 +7467,29 @@ func (s *Server) handleRollup(w http.ResponseWriter, r *http.Request, segs []str
 				}
 			}
 		}
+		isES8 := s.isES8Mode(r)
 		s.mu.Lock()
 		if s.rollupJobs == nil {
 			s.rollupJobs = make(map[string]map[string]any)
+		}
+		if isES8 && strings.TrimSpace(r.Header.Get("Authorization")) != "" {
+			hasRollupUsage := len(s.rollupJobs) > 0
+			if !hasRollupUsage {
+				for _, idxSc := range s.indices {
+					if idxSc != nil && idxSc.RawMapping != nil && idxSc.RawMapping.Meta != nil {
+						if _, okR := idxSc.RawMapping.Meta["_rollup"]; okR {
+							hasRollupUsage = true
+							break
+						}
+					}
+				}
+			}
+			if !hasRollupUsage {
+				s.mu.Unlock()
+				writeESError(w, http.StatusBadRequest, "validation_exception",
+					"Validation Failed: 1: new rollup jobs are not allowed in clusters that don't have any rollup usage, since rollup has been deprecated;")
+				return
+			}
 		}
 		if _, exists := s.rollupJobs[jobID]; exists {
 			s.mu.Unlock()
@@ -7509,21 +7563,26 @@ func (s *Server) handleRollup(w http.ResponseWriter, r *http.Request, segs []str
 		rollupSchema := s.ensureIndexSchema(r.Context(), rollupIdx)
 		if rollupSchema != nil {
 			s.mu.Lock()
-			if rollupSchema.RawMapping == nil {
-				rollupSchema.RawMapping = &esast.MappingSpec{}
+			baseSchema := s.indices[rollupIdx]
+			if baseSchema == nil {
+				baseSchema = rollupSchema
 			}
-			if rollupSchema.RawMapping.Meta == nil {
-				rollupSchema.RawMapping.Meta = make(map[string]any)
+			cloned := baseSchema.CloneIndexSchema()
+			if cloned.RawMapping == nil {
+				cloned.RawMapping = &esast.MappingSpec{}
 			}
-			rollupMetaMap, _ := rollupSchema.RawMapping.Meta["_rollup"].(map[string]any)
+			if cloned.RawMapping.Meta == nil {
+				cloned.RawMapping.Meta = make(map[string]any)
+			}
+			rollupMetaMap, _ := cloned.RawMapping.Meta["_rollup"].(map[string]any)
 			if rollupMetaMap == nil {
 				rollupMetaMap = make(map[string]any)
 			}
 			rollupMetaMap[jobID] = deepCloneDocMap(cfg)
-			rollupSchema.RawMapping.Meta["_rollup"] = rollupMetaMap
-			rollupSchema.RawMapping.Meta["rollup-version"] = "2"
+			cloned.RawMapping.Meta["_rollup"] = rollupMetaMap
+			cloned.RawMapping.Meta["rollup-version"] = "2"
 			hasStringsDT, hasDateHistDT := false, false
-			for _, dt := range rollupSchema.RawMapping.DynamicTemplates {
+			for _, dt := range cloned.RawMapping.DynamicTemplates {
 				if _, ok := dt["strings"]; ok {
 					hasStringsDT = true
 				}
@@ -7532,7 +7591,7 @@ func (s *Server) handleRollup(w http.ResponseWriter, r *http.Request, segs []str
 				}
 			}
 			if !hasStringsDT {
-				rollupSchema.RawMapping.DynamicTemplates = append(rollupSchema.RawMapping.DynamicTemplates, map[string]any{
+				cloned.RawMapping.DynamicTemplates = append(cloned.RawMapping.DynamicTemplates, map[string]any{
 					"strings": map[string]any{
 						"match_mapping_type": "string",
 						"mapping":            map[string]any{"type": "keyword"},
@@ -7540,15 +7599,16 @@ func (s *Server) handleRollup(w http.ResponseWriter, r *http.Request, segs []str
 				})
 			}
 			if !hasDateHistDT {
-				rollupSchema.RawMapping.DynamicTemplates = append(rollupSchema.RawMapping.DynamicTemplates, map[string]any{
+				cloned.RawMapping.DynamicTemplates = append(cloned.RawMapping.DynamicTemplates, map[string]any{
 					"date_histograms": map[string]any{
 						"path_match": "*.date_histogram.timestamp",
 						"mapping":    map[string]any{"type": "date"},
 					},
 				})
 			}
+			s.indices[rollupIdx] = cloned
 			s.mu.Unlock()
-			s.persistIndex(r.Context(), rollupIdx, rollupSchema)
+			s.persistIndex(r.Context(), rollupIdx, cloned)
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
 
@@ -7857,26 +7917,40 @@ func (s *Server) handleSearchableSnapshots(w http.ResponseWriter, r *http.Reques
 		})
 		return
 	}
-	if len(segs) == 3 && segs[0] == "_searchable_snapshots" && segs[1] == "cache" && segs[2] == "stats" {
+	if (len(segs) == 3 && segs[0] == "_searchable_snapshots" && segs[1] == "cache" && segs[2] == "stats") ||
+		(len(segs) == 4 && segs[0] == "_searchable_snapshots" && segs[2] == "cache" && segs[3] == "stats") {
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
 			writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{
-			"nodes": map[string]any{
-				"doris-fe-1": map[string]any{
-					"shared_cache": map[string]any{
-						"reads":                0,
-						"bytes_read_in_bytes":  0,
-						"hits":                 0,
-						"misses":               0,
-						"evictions":            0,
-						"num_regions":          0,
-						"size_in_bytes":        0,
-						"region_size_in_bytes": 16777216,
-					},
+		if r.Method == http.MethodHead {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		nodesOut := map[string]any{
+			"doris-fe-1": map[string]any{
+				"shared_cache": map[string]any{
+					"reads":                  0,
+					"bytes_read_in_bytes":    0,
+					"writes":                 0,
+					"bytes_written_in_bytes": 0,
+					"hits":                   0,
+					"misses":                 0,
+					"evictions":              0,
+					"num_regions":            0,
+					"size_in_bytes":          0,
+					"region_size_in_bytes":   16777216,
 				},
 			},
+		}
+		if len(segs) == 4 {
+			nodeFilter := strings.TrimSpace(segs[1])
+			if nodeFilter != "" && nodeFilter != "_all" && nodeFilter != "*" && nodeFilter != "_local" && !matchSimpleWildcard(nodeFilter, "doris-fe-1") {
+				nodesOut = map[string]any{}
+			}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"nodes": nodesOut,
 		})
 		return
 	}
@@ -7972,7 +8046,18 @@ func (s *Server) handleCCR(w http.ResponseWriter, r *http.Request, segs []string
 				"remote_cluster": remoteCluster,
 				"leader_index":   leaderIndex,
 				"status":         "active",
-				"parameters":     map[string]any{},
+				"parameters": map[string]any{
+					"max_outstanding_read_requests":     int64(12),
+					"max_outstanding_write_requests":    int64(9),
+					"max_read_request_operation_count":  int64(5120),
+					"max_read_request_size":             "32mb",
+					"max_retry_delay":                   "500ms",
+					"max_write_buffer_count":            int64(2147483647),
+					"max_write_buffer_size":             "512mb",
+					"max_write_request_operation_count": int64(5120),
+					"max_write_request_size":            "9223372036854775807b",
+					"read_poll_timeout":                 "1m",
+				},
 			}
 			s.mu.Unlock()
 			writeJSON(w, http.StatusOK, map[string]any{
@@ -8020,14 +8105,34 @@ func (s *Server) handleCCR(w http.ResponseWriter, r *http.Request, segs []string
 						"index": indexName,
 						"shards": []any{
 							map[string]any{
-								"remote_cluster":             rc,
-								"leader_index":               li,
-								"follower_index":             indexName,
-								"shard_id":                   0,
-								"leader_global_checkpoint":   0,
-								"leader_max_seq_no":          0,
-								"follower_global_checkpoint": 0,
-								"follower_max_seq_no":        0,
+								"remote_cluster":                     rc,
+								"leader_index":                       li,
+								"follower_index":                     indexName,
+								"shard_id":                           0,
+								"leader_global_checkpoint":           0,
+								"leader_max_seq_no":                  0,
+								"follower_global_checkpoint":         0,
+								"follower_max_seq_no":                0,
+								"last_requested_seq_no":              0,
+								"outstanding_read_requests":          0,
+								"outstanding_write_requests":         0,
+								"write_buffer_operation_count":       0,
+								"write_buffer_size_in_bytes":         "0b",
+								"follower_mapping_version":           1,
+								"follower_settings_version":          1,
+								"follower_aliases_version":           1,
+								"total_read_time_millis":             0,
+								"total_read_remote_exec_time_millis": 0,
+								"successful_read_requests":           0,
+								"failed_read_requests":               0,
+								"operations_read":                    0,
+								"bytes_read":                         0,
+								"total_write_time_millis":            0,
+								"successful_write_requests":          0,
+								"failed_write_requests":              0,
+								"operations_written":                 0,
+								"time_since_last_read_millis":        0,
+								"read_exceptions":                    []any{},
 							},
 						},
 					},
@@ -8108,6 +8213,7 @@ func (s *Server) handleCCR(w http.ResponseWriter, r *http.Request, segs []string
 				"number_of_successful_follow_indices":            0,
 				"total_read_time_millis":                         0,
 				"auto_followed_clusters":                         []any{},
+				"recent_auto_follow_errors":                      []any{},
 			},
 			"follow_stats": map[string]any{
 				"indices": []any{},
@@ -8181,6 +8287,12 @@ func (s *Server) handleCCR(w http.ResponseWriter, r *http.Request, segs []string
 			}
 			cp := deepCloneDocMap(body)
 			cp["active"] = true
+			if cp["leader_index_exclusion_patterns"] == nil {
+				cp["leader_index_exclusion_patterns"] = []any{}
+			}
+			if cp["max_outstanding_read_requests"] == nil {
+				cp["max_outstanding_read_requests"] = int64(12)
+			}
 			s.ccrAutoFollow[name] = cp
 			s.mu.Unlock()
 			writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
@@ -8196,7 +8308,7 @@ func (s *Server) handleCCR(w http.ResponseWriter, r *http.Request, segs []string
 				}
 				cp := deepCloneDocMap(entry)
 				active, _ := cp["active"].(bool)
-				delete(cp, "active")
+				cp["active"] = active
 				s.mu.RUnlock()
 				writeJSON(w, http.StatusOK, map[string]any{
 					"patterns": []any{
@@ -8218,7 +8330,7 @@ func (s *Server) handleCCR(w http.ResponseWriter, r *http.Request, segs []string
 			for _, k := range names {
 				cp := deepCloneDocMap(s.ccrAutoFollow[k])
 				active, _ := cp["active"].(bool)
-				delete(cp, "active")
+				cp["active"] = active
 				patterns = append(patterns, map[string]any{
 					"name":    k,
 					"active":  active,
@@ -8249,6 +8361,31 @@ func (s *Server) handleCCR(w http.ResponseWriter, r *http.Request, segs []string
 		return
 	}
 	writeESError(w, http.StatusNotFound, "invalid_index_name_exception", "unknown endpoint: "+r.URL.Path)
+}
+
+func hashSecuritySecretR66(secret string) string {
+	sum := sha256.Sum256([]byte(secret))
+	return hex.EncodeToString(sum[:])
+}
+
+func cloneSanitizedSecurityUserR66(u map[string]any) map[string]any {
+	if u == nil {
+		return nil
+	}
+	cp := deepCloneDocMap(u)
+	delete(cp, "__password_sha256")
+	delete(cp, "password")
+	return cp
+}
+
+func cloneSanitizedSecurityAPIKeyR66(k map[string]any) map[string]any {
+	if k == nil {
+		return nil
+	}
+	cp := deepCloneDocMap(k)
+	delete(cp, "__secret_sha256")
+	delete(cp, "api_key")
+	return cp
 }
 
 // handleSecurityAPI implements Elasticsearch `/_security/*` management endpoints (users, roles, privileges, API keys, OAuth2 tokens, service accounts) (F8).
@@ -8284,7 +8421,7 @@ func (s *Server) handleSecurityAPI(w http.ResponseWriter, r *http.Request, segs 
 				"enabled":   true,
 			}
 			for u, info := range s.securityUsers {
-				out[u] = deepCloneDocMap(info)
+				out[u] = cloneSanitizedSecurityUserR66(info)
 			}
 			s.mu.RUnlock()
 			writeJSON(w, http.StatusOK, out)
@@ -8365,10 +8502,31 @@ func (s *Server) handleSecurityAPI(w http.ResponseWriter, r *http.Request, segs 
 				}
 				var body map[string]any
 				_ = json.Unmarshal(bodyBytes, &body)
-				if pw, _ := body["password"].(string); strings.TrimSpace(pw) == "" {
+				pw, _ := body["password"].(string)
+				if strings.TrimSpace(pw) == "" {
 					writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "[password] is required")
 					return
 				}
+				pwHash := hashSecuritySecretR66(pw)
+				s.mu.Lock()
+				if s.securityUsers == nil {
+					s.securityUsers = make(map[string]map[string]any)
+				}
+				if cur, okU := s.securityUsers[target]; okU && cur != nil {
+					cur["__password_sha256"] = pwHash
+					delete(cur, "password")
+				} else if target == "elastic" {
+					s.securityUsers["elastic"] = map[string]any{
+						"username":          "elastic",
+						"roles":             []string{"superuser"},
+						"full_name":         "Built-in Superuser",
+						"email":             "",
+						"metadata":          map[string]any{},
+						"enabled":           true,
+						"__password_sha256": pwHash,
+					}
+				}
+				s.mu.Unlock()
 				writeJSON(w, http.StatusOK, map[string]any{})
 			case "_clear_cache":
 				s.mu.Unlock()
@@ -8416,7 +8574,7 @@ func (s *Server) handleSecurityAPI(w http.ResponseWriter, r *http.Request, segs 
 			if meta == nil {
 				meta = map[string]any{}
 			}
-			s.securityUsers[target] = map[string]any{
+			userRecord := map[string]any{
 				"username":  target,
 				"roles":     roles,
 				"full_name": fullName,
@@ -8424,9 +8582,18 @@ func (s *Server) handleSecurityAPI(w http.ResponseWriter, r *http.Request, segs 
 				"metadata":  meta,
 				"enabled":   enabled,
 			}
+			if pw, okPW := body["password"].(string); okPW && pw != "" {
+				userRecord["__password_sha256"] = hashSecuritySecretR66(pw)
+			} else if existed && s.securityUsers[target] != nil {
+				if prevHash, okPH := s.securityUsers[target]["__password_sha256"].(string); okPH && prevHash != "" {
+					userRecord["__password_sha256"] = prevHash
+				}
+			}
+			s.securityUsers[target] = userRecord
 			s.mu.Unlock()
 			writeJSON(w, http.StatusOK, map[string]any{
-				"user": map[string]any{"created": !existed},
+				"created": !existed,
+				"user":    map[string]any{"created": !existed},
 			})
 
 		case http.MethodGet, http.MethodHead:
@@ -8448,7 +8615,7 @@ func (s *Server) handleSecurityAPI(w http.ResponseWriter, r *http.Request, segs 
 				writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("user [%s] not found", target))
 				return
 			}
-			cp := deepCloneDocMap(u)
+			cp := cloneSanitizedSecurityUserR66(u)
 			s.mu.RUnlock()
 			writeJSON(w, http.StatusOK, map[string]any{target: cp})
 
@@ -8467,18 +8634,164 @@ func (s *Server) handleSecurityAPI(w http.ResponseWriter, r *http.Request, segs 
 
 	case "role":
 		if len(segs) == 2 {
-			if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			switch r.Method {
+			case http.MethodGet, http.MethodHead:
+				s.mu.RLock()
+				out := make(map[string]any, len(s.securityRoles))
+				for k, v := range s.securityRoles {
+					out[k] = deepCloneDocMap(v)
+				}
+				s.mu.RUnlock()
+				if r.Method == http.MethodHead {
+					w.WriteHeader(http.StatusOK)
+					return
+				}
+				writeJSON(w, http.StatusOK, out)
+				return
+
+			case http.MethodPost:
+				body, ok := parseJSONBody(w, r)
+				if !ok {
+					return
+				}
+				var rolesMap map[string]any
+				if rawRoles, hasRoles := body["roles"]; hasRoles {
+					rm, okM := rawRoles.(map[string]any)
+					if !okM {
+						writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: roles must be an object;")
+						return
+					}
+					rolesMap = rm
+				} else if len(body) > 0 {
+					allMaps := true
+					for _, v := range body {
+						if _, okM := v.(map[string]any); !okM {
+							allMaps = false
+							break
+						}
+					}
+					if allMaps {
+						rolesMap = body
+					}
+				}
+				if len(rolesMap) == 0 {
+					writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: roles are missing;")
+					return
+				}
+				roleNames := make([]string, 0, len(rolesMap))
+				for rn := range rolesMap {
+					roleNames = append(roleNames, rn)
+				}
+				sort.Strings(roleNames)
+
+				created := make([]string, 0)
+				updated := make([]string, 0)
+				noop := make([]string, 0)
+				errDetails := make(map[string]any)
+
+				s.mu.Lock()
+				if s.securityRoles == nil {
+					s.securityRoles = make(map[string]map[string]any)
+				}
+				for _, rn := range roleNames {
+					trimmedRN := strings.TrimSpace(rn)
+					descMap, okD := rolesMap[rn].(map[string]any)
+					if trimmedRN == "" || !okD || descMap == nil {
+						errDetails[rn] = map[string]any{
+							"type":   "illegal_argument_exception",
+							"reason": fmt.Sprintf("role [%s] descriptor must be an object", rn),
+						}
+						continue
+					}
+					nextObj := deepCloneDocMap(descMap)
+					prevObj, existed := s.securityRoles[trimmedRN]
+					if !existed {
+						s.securityRoles[trimmedRN] = nextObj
+						created = append(created, trimmedRN)
+						continue
+					}
+					prevBytes, _ := json.Marshal(prevObj)
+					nextBytes, _ := json.Marshal(nextObj)
+					if bytes.Equal(prevBytes, nextBytes) {
+						noop = append(noop, trimmedRN)
+						continue
+					}
+					s.securityRoles[trimmedRN] = nextObj
+					updated = append(updated, trimmedRN)
+				}
+				s.mu.Unlock()
+				resp := map[string]any{
+					"created": created,
+					"updated": updated,
+					"noop":    noop,
+				}
+				if len(errDetails) > 0 {
+					resp["errors"] = map[string]any{
+						"count":   len(errDetails),
+						"details": errDetails,
+					}
+				}
+				writeJSON(w, http.StatusOK, resp)
+				return
+
+			case http.MethodDelete:
+				var body map[string]any
+				if r.ContentLength != 0 {
+					var ok bool
+					body, ok = parseJSONBody(w, r)
+					if !ok {
+						return
+					}
+				}
+				var names []string
+				seen := make(map[string]bool)
+				addName := func(n string) {
+					n = strings.TrimSpace(n)
+					if n != "" && !seen[n] {
+						seen[n] = true
+						names = append(names, n)
+					}
+				}
+				if body != nil {
+					if rawNames, okN := body["names"].([]any); okN {
+						for _, item := range rawNames {
+							addName(fmt.Sprintf("%v", item))
+						}
+					}
+				}
+				if len(names) == 0 && r.URL != nil {
+					if qNames := strings.TrimSpace(r.URL.Query().Get("names")); qNames != "" {
+						for _, part := range strings.Split(qNames, ",") {
+							addName(part)
+						}
+					}
+				}
+				if len(names) == 0 {
+					writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: names are required;")
+					return
+				}
+				deleted := make([]string, 0)
+				notFound := make([]string, 0)
+				s.mu.Lock()
+				for _, rn := range names {
+					if _, exists := s.securityRoles[rn]; exists {
+						delete(s.securityRoles, rn)
+						deleted = append(deleted, rn)
+					} else {
+						notFound = append(notFound, rn)
+					}
+				}
+				s.mu.Unlock()
+				writeJSON(w, http.StatusOK, map[string]any{
+					"deleted":   deleted,
+					"not_found": notFound,
+				})
+				return
+
+			default:
 				writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
 				return
 			}
-			s.mu.RLock()
-			out := make(map[string]any, len(s.securityRoles))
-			for k, v := range s.securityRoles {
-				out[k] = deepCloneDocMap(v)
-			}
-			s.mu.RUnlock()
-			writeJSON(w, http.StatusOK, out)
-			return
 		}
 		roleName := strings.TrimSpace(segs[2])
 		if len(segs) == 4 && segs[3] == "_clear_cache" {
@@ -8515,7 +8828,16 @@ func (s *Server) handleSecurityAPI(w http.ResponseWriter, r *http.Request, segs 
 				s.securityRoles = make(map[string]map[string]any)
 			}
 			_, existed := s.securityRoles[roleName]
-			s.securityRoles[roleName] = deepCloneDocMap(body)
+			roleStore := deepCloneDocMap(body)
+			for _, arrKey := range []string{"cluster", "indices", "run_as", "applications"} {
+				if roleStore[arrKey] == nil {
+					roleStore[arrKey] = []any{}
+				}
+			}
+			if roleStore["metadata"] == nil {
+				roleStore["metadata"] = map[string]any{}
+			}
+			s.securityRoles[roleName] = roleStore
 			s.mu.Unlock()
 			writeJSON(w, http.StatusOK, map[string]any{
 				"role": map[string]any{"created": !existed},
@@ -8530,6 +8852,14 @@ func (s *Server) handleSecurityAPI(w http.ResponseWriter, r *http.Request, segs 
 				return
 			}
 			cp := deepCloneDocMap(roleObj)
+			for _, arrKey := range []string{"cluster", "indices", "run_as", "applications"} {
+				if cp[arrKey] == nil {
+					cp[arrKey] = []any{}
+				}
+			}
+			if cp["metadata"] == nil {
+				cp["metadata"] = map[string]any{}
+			}
 			s.mu.RUnlock()
 			writeJSON(w, http.StatusOK, map[string]any{roleName: cp})
 
@@ -8667,6 +8997,14 @@ func (s *Server) handleSecurityAPI(w http.ResponseWriter, r *http.Request, segs 
 		}
 
 	case "api_key":
+		if len(segs) == 4 && segs[3] == "_clear_cache" {
+			if r.Method != http.MethodPost && r.Method != http.MethodPut {
+				writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+				return
+			}
+			writeJSON(w, http.StatusOK, securityNodesCacheClearResponse())
+			return
+		}
 		switch r.Method {
 		case http.MethodPost, http.MethodPut:
 			bodyBytes, ok := readRequestBody(w, r)
@@ -8680,7 +9018,22 @@ func (s *Server) handleSecurityAPI(w http.ResponseWriter, r *http.Request, segs 
 					return
 				}
 			}
-			if len(segs) == 3 && segs[2] == "_grant" {
+			grantOwner := ""
+			if len(segs) == 3 && (segs[2] == "_grant" || segs[2] == "grant") {
+				if gt, hasGT := body["grant_type"].(string); hasGT && strings.TrimSpace(gt) != "" {
+					switch strings.TrimSpace(gt) {
+					case "access_token", "password":
+					default:
+						writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "unsupported grant_type ["+gt+"]")
+						return
+					}
+				}
+				if u, okU := body["username"].(string); okU && strings.TrimSpace(u) != "" {
+					grantOwner = strings.TrimSpace(u)
+				}
+				if runAs, okRA := body["run_as"].(string); okRA && strings.TrimSpace(runAs) != "" {
+					grantOwner = strings.TrimSpace(runAs)
+				}
 				if subKey, ok := body["api_key"].(map[string]any); ok {
 					body = subKey
 				}
@@ -8690,15 +9043,27 @@ func (s *Server) handleSecurityAPI(w http.ResponseWriter, r *http.Request, segs 
 				writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "api_key [name] is required")
 				return
 			}
+			nowMS := time.Now().UTC().UnixMilli()
+			var expVal any
+			if expStr, okE := body["expiration"].(string); okE && strings.TrimSpace(expStr) != "" {
+				durMS, valid := parsePositiveESDurationMillis(expStr)
+				if !valid {
+					writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "invalid [expiration] duration ["+expStr+"]")
+					return
+				}
+				expVal = nowMS + durMS
+			}
 			ownerUsername := "elastic"
-			if basicUser, _, okBasic := r.BasicAuth(); okBasic && strings.TrimSpace(basicUser) != "" {
+			if grantOwner != "" {
+				ownerUsername = grantOwner
+			} else if basicUser, _, okBasic := r.BasicAuth(); okBasic && strings.TrimSpace(basicUser) != "" {
 				ownerUsername = strings.TrimSpace(basicUser)
 			}
 			s.mu.Lock()
 			if s.securityAPIKeys == nil {
 				s.securityAPIKeys = make(map[string]map[string]any)
 			}
-			if ownerUsername == "elastic" {
+			if ownerUsername == "elastic" && grantOwner == "" {
 				if authHdr := strings.TrimSpace(r.Header.Get("Authorization")); strings.HasPrefix(strings.ToLower(authHdr), "apikey ") {
 					// Resolve owning user from calling ApiKey when creating nested keys.
 					if decOwner := resolveAPIKeyUsernameFromHeaderR64(authHdr[7:], s.securityAPIKeys); decOwner != "" {
@@ -8715,17 +9080,23 @@ func (s *Server) handleSecurityAPI(w http.ResponseWriter, r *http.Request, segs 
 				"username":         ownerUsername,
 				"realm":            "default_native",
 				"invalidated":      false,
-				"creation":         time.Now().UTC().UnixMilli(),
+				"creation":         nowMS,
+				"expiration":       expVal,
 				"metadata":         body["metadata"],
 				"role_descriptors": body["role_descriptors"],
+				"__secret_sha256":  hashSecuritySecretR66(secret),
 			}
 			s.mu.Unlock()
-			writeJSON(w, http.StatusOK, map[string]any{
+			respObj := map[string]any{
 				"id":      keyID,
 				"name":    name,
 				"api_key": secret,
 				"encoded": encoded,
-			})
+			}
+			if expVal != nil {
+				respObj["expiration"] = expVal
+			}
+			writeJSON(w, http.StatusOK, respObj)
 
 		case http.MethodGet:
 			qID := strings.TrimSpace(r.URL.Query().Get("id"))
@@ -8739,7 +9110,7 @@ func (s *Server) handleSecurityAPI(w http.ResponseWriter, r *http.Request, segs 
 				if qName != "" && kObj["name"] != qName {
 					continue
 				}
-				keys = append(keys, deepCloneDocMap(kObj))
+				keys = append(keys, cloneSanitizedSecurityAPIKeyR66(kObj))
 			}
 			s.mu.RUnlock()
 			writeJSON(w, http.StatusOK, map[string]any{"api_keys": keys})
@@ -8790,7 +9161,7 @@ func (s *Server) handleSecurityAPI(w http.ResponseWriter, r *http.Request, segs 
 			s.mu.RLock()
 			hits := make([]any, 0, len(s.securityAPIKeys))
 			for _, kObj := range s.securityAPIKeys {
-				hits = append(hits, deepCloneDocMap(kObj))
+				hits = append(hits, cloneSanitizedSecurityAPIKeyR66(kObj))
 			}
 			s.mu.RUnlock()
 			writeJSON(w, http.StatusOK, map[string]any{
@@ -8803,9 +9174,7 @@ func (s *Server) handleSecurityAPI(w http.ResponseWriter, r *http.Request, segs 
 		writeESError(w, http.StatusNotFound, "invalid_index_name_exception", "unknown endpoint: "+r.URL.Path)
 
 	case "_clear_api_key_cache":
-		writeJSON(w, http.StatusOK, map[string]any{
-			"_nodes": map[string]any{"total": 1, "successful": 1, "failed": 0},
-		})
+		writeJSON(w, http.StatusOK, securityNodesCacheClearResponse())
 
 	case "oauth2":
 		if len(segs) == 3 && segs[2] == "token" {
@@ -8827,17 +9196,33 @@ func (s *Server) handleSecurityAPI(w http.ResponseWriter, r *http.Request, segs 
 					writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "[grant_type] is required")
 					return
 				}
+				authUser, _ := body["username"].(string)
+				if strings.TrimSpace(authUser) == "" {
+					authUser = "elastic"
+				}
 				// #nosec G101 -- synthetic OAuth2 token response for Elasticsearch REST API compatibility
 				writeJSON(w, http.StatusOK, map[string]any{
 					"access_token":  "doris-oauth2-access-token",
 					"type":          "Bearer",
 					"expires_in":    1200,
 					"refresh_token": "doris-oauth2-refresh-token",
+					"authentication": map[string]any{
+						"username":             authUser,
+						"roles":                []string{"superuser"},
+						"full_name":            "Built-in Superuser",
+						"email":                "",
+						"metadata":             map[string]any{},
+						"enabled":              true,
+						"authentication_realm": map[string]any{"name": "default_native", "type": "native"},
+						"lookup_realm":         map[string]any{"name": "default_native", "type": "native"},
+						"authentication_type":  "TOKEN",
+					},
 				})
 			case http.MethodDelete:
 				writeJSON(w, http.StatusOK, map[string]any{
-					"invalidated_tokens": 1,
-					"error_count":        0,
+					"invalidated_tokens":            1,
+					"previously_invalidated_tokens": 0,
+					"error_count":                   0,
 				})
 			default:
 				writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
@@ -8849,8 +9234,18 @@ func (s *Server) handleSecurityAPI(w http.ResponseWriter, r *http.Request, segs 
 	case "service":
 		if len(segs) == 2 {
 			writeJSON(w, http.StatusOK, map[string]any{
-				"elastic/fleet-server": map[string]any{"account": "elastic/fleet-server"},
-				"elastic/kibana":       map[string]any{"account": "elastic/kibana"},
+				"elastic/fleet-server": map[string]any{
+					"role_descriptor": map[string]any{
+						"cluster": []string{"monitor", "manage_fleet"},
+						"indices": []any{},
+					},
+				},
+				"elastic/kibana": map[string]any{
+					"role_descriptor": map[string]any{
+						"cluster": []string{"monitor"},
+						"indices": []any{},
+					},
+				},
 			})
 			return
 		}
@@ -8908,6 +9303,38 @@ func (s *Server) handleSecurityAPI(w http.ResponseWriter, r *http.Request, segs 
 			default:
 				writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
 			}
+			return
+		}
+		if len(segs) == 5 && segs[4] == "credential" {
+			if r.Method != http.MethodGet && r.Method != http.MethodHead {
+				writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+				return
+			}
+			if r.Method == http.MethodHead {
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			ns, svc := segs[2], segs[3]
+			acct := ns + "/" + svc
+			s.mu.RLock()
+			tokens := make(map[string]any)
+			prefix := acct + "/"
+			for k, v := range s.securityServiceTokens {
+				if strings.HasPrefix(k, prefix) {
+					tName := strings.TrimPrefix(k, prefix)
+					tokens[tName] = deepCloneDocMap(v)
+				}
+			}
+			s.mu.RUnlock()
+			writeJSON(w, http.StatusOK, map[string]any{
+				"service_account": acct,
+				"count":           len(tokens),
+				"tokens":          tokens,
+				"nodes_credentials": map[string]any{
+					"_nodes":      map[string]any{"total": 1, "successful": 1, "failed": 0},
+					"file_tokens": map[string]any{},
+				},
+			})
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"account": strings.Join(segs[2:], "/")})
@@ -9026,12 +9453,32 @@ func (s *Server) handleSecurityAPI(w http.ResponseWriter, r *http.Request, segs 
 
 	case "enroll":
 		if len(segs) == 3 && (segs[2] == "kibana" || segs[2] == "node") {
-			if r.Method != http.MethodPost {
+			if r.Method != http.MethodGet && r.Method != http.MethodPost && r.Method != http.MethodHead {
 				writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
 				return
 			}
+			if r.Method == http.MethodHead {
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			if segs[2] == "kibana" {
+				writeJSON(w, http.StatusOK, map[string]any{
+					"token": map[string]any{
+						"name":  "doris-enrollment-kibana",
+						"value": "doris-enrollment-token-kibana",
+					},
+					"http_ca": "-----BEGIN CERTIFICATE-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8A\n-----END CERTIFICATE-----\n",
+				})
+				return
+			}
+			// #nosec G101 -- synthetic enrollment certificate placeholders for Elasticsearch enroll/node REST compatibility
 			writeJSON(w, http.StatusOK, map[string]any{
-				"token": "doris-enrollment-" + segs[2],
+				"http_ca_key":       "doris-http-ca-key",
+				"http_ca_cert":      "doris-http-ca-cert",
+				"transport_ca_cert": "doris-transport-ca-cert",
+				"transport_key":     "doris-transport-key",
+				"transport_cert":    "doris-transport-cert",
+				"nodes_addresses":   []string{"127.0.0.1:9300"},
 			})
 			return
 		}
@@ -9126,6 +9573,26 @@ func (s *Server) handleLogstashPipeline(w http.ResponseWriter, r *http.Request, 
 		cp["last_modified"] = "2026-01-01T00:00:00.000Z"
 		if cp["username"] == nil {
 			cp["username"] = "elastic"
+		}
+		if cp["description"] == nil {
+			cp["description"] = ""
+		}
+		if cp["pipeline_metadata"] == nil {
+			cp["pipeline_metadata"] = map[string]any{
+				"type":    "logstash_pipeline",
+				"version": "1",
+			}
+		}
+		if cp["pipeline_settings"] == nil {
+			cp["pipeline_settings"] = map[string]any{
+				"pipeline.workers":        1,
+				"pipeline.batch.size":     125,
+				"pipeline.batch.delay":    50,
+				"queue.type":              "memory",
+				"queue.max_bytes.number":  1024,
+				"queue.max_bytes.units":   "mb",
+				"queue.checkpoint.writes": 1024,
+			}
 		}
 		s.logstashPipelines[id] = cp
 		s.mu.Unlock()
@@ -9532,9 +9999,179 @@ func (s *Server) handleInferenceAPI(w http.ResponseWriter, r *http.Request, segs
 	}
 }
 
+const connectorSecretsStoreKeyR66 = "__secrets__"
+
+func (s *Server) handleConnectorSecretsR66(w http.ResponseWriter, r *http.Request, segs []string, nowISO string) {
+	ensureSecretStoreLocked := func() map[string]any {
+		if s.connectors == nil {
+			s.connectors = make(map[string]map[string]any)
+		}
+		store, ok := s.connectors[connectorSecretsStoreKeyR66]
+		if !ok || store == nil {
+			store = make(map[string]any)
+			s.connectors[connectorSecretsStoreKeyR66] = store
+		}
+		return store
+	}
+	if len(segs) == 2 {
+		if r.Method != http.MethodPost {
+			writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+			return
+		}
+		body, ok := parseJSONBody(w, r)
+		if !ok {
+			return
+		}
+		valStr, hasVal := body["value"].(string)
+		if !hasVal || valStr == "" {
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "secret [value] is required")
+			return
+		}
+		s.mu.Lock()
+		secStore := ensureSecretStoreLocked()
+		secID, _ := body["id"].(string)
+		secID = strings.TrimSpace(secID)
+		if secID == connectorSecretsStoreKeyR66 {
+			s.mu.Unlock()
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "invalid secret [id]")
+			return
+		}
+		if secID == "" {
+			secID = fmt.Sprintf("connector-secret-%d", len(secStore)+1)
+			for secStore[secID] != nil {
+				secID = fmt.Sprintf("connector-secret-%d-%d", len(secStore)+1, time.Now().UTC().UnixNano()%10000)
+			}
+		} else if secStore[secID] != nil {
+			s.mu.Unlock()
+			writeESError(w, http.StatusConflict, "resource_already_exists_exception", fmt.Sprintf("Connector secret [%s] already exists", secID))
+			return
+		}
+		entry := map[string]any{
+			"id":         secID,
+			"value":      valStr,
+			"created_at": nowISO,
+			"updated_at": nowISO,
+		}
+		if name, okN := body["name"].(string); okN && strings.TrimSpace(name) != "" {
+			entry["name"] = strings.TrimSpace(name)
+		}
+		secStore[secID] = entry
+		s.mu.Unlock()
+		writeJSON(w, http.StatusCreated, map[string]any{
+			"id":           secID,
+			"result":       "created",
+			"acknowledged": true,
+		})
+		return
+	}
+	if len(segs) == 3 {
+		secID := strings.TrimSpace(segs[2])
+		if secID == "" || secID == connectorSecretsStoreKeyR66 {
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "secret [id] is required")
+			return
+		}
+		switch r.Method {
+		case http.MethodPut:
+			body, ok := parseJSONBody(w, r)
+			if !ok {
+				return
+			}
+			valStr, hasVal := body["value"].(string)
+			if !hasVal || valStr == "" {
+				writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "secret [value] is required")
+				return
+			}
+			s.mu.Lock()
+			secStore := ensureSecretStoreLocked()
+			prevEntry, existed := secStore[secID].(map[string]any)
+			createdAt := nowISO
+			if existed && prevEntry != nil {
+				if ca, okCA := prevEntry["created_at"].(string); okCA && ca != "" {
+					createdAt = ca
+				}
+			}
+			entry := map[string]any{
+				"id":         secID,
+				"value":      valStr,
+				"created_at": createdAt,
+				"updated_at": nowISO,
+			}
+			if name, okN := body["name"].(string); okN && strings.TrimSpace(name) != "" {
+				entry["name"] = strings.TrimSpace(name)
+			}
+			secStore[secID] = entry
+			s.mu.Unlock()
+			statusCode := http.StatusCreated
+			resStr := "created"
+			if existed {
+				statusCode = http.StatusOK
+				resStr = "updated"
+			}
+			writeJSON(w, statusCode, map[string]any{
+				"id":           secID,
+				"result":       resStr,
+				"acknowledged": true,
+			})
+
+		case http.MethodGet, http.MethodHead:
+			s.mu.RLock()
+			var entryCopy map[string]any
+			if secStore := s.connectors[connectorSecretsStoreKeyR66]; secStore != nil {
+				if entry, okE := secStore[secID].(map[string]any); okE && entry != nil {
+					entryCopy = deepCloneDocMap(entry)
+				}
+			}
+			s.mu.RUnlock()
+			if entryCopy == nil {
+				if r.Method == http.MethodHead {
+					w.WriteHeader(http.StatusNotFound)
+					return
+				}
+				writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("Connector secret [%s] not found", secID))
+				return
+			}
+			if r.Method == http.MethodHead {
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			writeJSON(w, http.StatusOK, entryCopy)
+
+		case http.MethodDelete:
+			s.mu.Lock()
+			existed := false
+			if secStore := s.connectors[connectorSecretsStoreKeyR66]; secStore != nil {
+				if _, okE := secStore[secID]; okE {
+					existed = true
+					delete(secStore, secID)
+				}
+			}
+			s.mu.Unlock()
+			if !existed {
+				writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("Connector secret [%s] not found", secID))
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]any{
+				"result":       "deleted",
+				"acknowledged": true,
+			})
+
+		default:
+			writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+		}
+		return
+	}
+	writeESError(w, http.StatusNotFound, "invalid_index_name_exception", "unknown connector secret endpoint: "+r.URL.Path)
+}
+
 // handleConnectorAPI implements `/_connector` and `/_connector/*` (Round 54 F3).
 func (s *Server) handleConnectorAPI(w http.ResponseWriter, r *http.Request, segs []string) {
 	nowISO := time.Now().UTC().Format(time.RFC3339)
+
+	// Connector secrets sub-API: `/_connector/_secret` and `/_connector/_secret/{id}`
+	if len(segs) >= 2 && segs[1] == "_secret" {
+		s.handleConnectorSecretsR66(w, r, segs, nowISO)
+		return
+	}
 
 	// Sync job sub-API: `/_connector/_sync_job` and `/_connector/_sync_job/{id}[/{action}]`
 	if len(segs) >= 2 && segs[1] == "_sync_job" {
@@ -9547,6 +10184,9 @@ func (s *Server) handleConnectorAPI(w http.ResponseWriter, r *http.Request, segs
 		}
 		switch {
 		case jobID == "_claim" && jobAction == "":
+			s.handleConnectorSyncJobClaimRound57(w, r)
+
+		case jobID != "" && jobAction == "_claim":
 			s.handleConnectorSyncJobClaimRound57(w, r)
 
 		case jobID == "" && r.Method == http.MethodPost:
@@ -9568,7 +10208,11 @@ func (s *Server) handleConnectorAPI(w http.ResponseWriter, r *http.Request, segs
 				triggerMethod = "on_demand"
 			}
 			s.mu.Lock()
-			parentConn, connExists := s.connectors[connID]
+			var parentConn map[string]any
+			var connExists bool
+			if connID != connectorSecretsStoreKeyR66 {
+				parentConn, connExists = s.connectors[connID]
+			}
 			if !connExists || parentConn == nil {
 				s.mu.Unlock()
 				writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("Connector [%s] not found", connID))
@@ -9582,19 +10226,34 @@ func (s *Server) handleConnectorAPI(w http.ResponseWriter, r *http.Request, segs
 				newID = fmt.Sprintf("sync-job-%d", len(s.connectorSyncJobs)+1)
 			}
 			jobObj := map[string]any{
-				"id":                     newID,
-				"connector_id":           connID,
-				"index_name":             parentConn["index_name"],
-				"service_type":           parentConn["service_type"],
-				"job_type":               jobType,
-				"trigger_method":         triggerMethod,
-				"status":                 "pending",
-				"created_at":             nowISO,
-				"last_seen":              nowISO,
-				"indexed_document_count": 0,
-				"deleted_document_count": 0,
-				"total_document_count":   0,
-				"metadata":               map[string]any{},
+				"id":           newID,
+				"connector_id": connID,
+				"connector": map[string]any{
+					"id":            connID,
+					"index_name":    parentConn["index_name"],
+					"service_type":  parentConn["service_type"],
+					"configuration": map[string]any{},
+					"filtering": map[string]any{
+						"advanced_snippet": map[string]any{"value": ""},
+						"rules":            []any{},
+						"validation": map[string]any{
+							"errors": []any{},
+							"state":  "valid",
+						},
+					},
+				},
+				"index_name":              parentConn["index_name"],
+				"service_type":            parentConn["service_type"],
+				"job_type":                jobType,
+				"trigger_method":          triggerMethod,
+				"status":                  "pending",
+				"created_at":              nowISO,
+				"last_seen":               nowISO,
+				"indexed_document_count":  0,
+				"indexed_document_volume": 0,
+				"deleted_document_count":  0,
+				"total_document_count":    0,
+				"metadata":                map[string]any{},
 			}
 			s.connectorSyncJobs[newID] = jobObj
 			s.mu.Unlock()
@@ -9705,7 +10364,7 @@ func (s *Server) handleConnectorAPI(w http.ResponseWriter, r *http.Request, segs
 				return
 			}
 			s.mu.Unlock()
-			writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
+			writeJSON(w, http.StatusOK, map[string]any{"result": "updated", "acknowledged": true})
 
 		default:
 			writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
@@ -9726,6 +10385,9 @@ func (s *Server) handleConnectorAPI(w http.ResponseWriter, r *http.Request, segs
 		s.mu.RLock()
 		ids := make([]string, 0, len(s.connectors))
 		for id := range s.connectors {
+			if id == connectorSecretsStoreKeyR66 {
+				continue
+			}
 			ids = append(ids, id)
 		}
 		sort.Strings(ids)
@@ -9743,7 +10405,11 @@ func (s *Server) handleConnectorAPI(w http.ResponseWriter, r *http.Request, segs
 			"results": results,
 		})
 
-	case (connID == "" && r.Method == http.MethodPost) || (connID != "" && connAction == "" && (r.Method == http.MethodPut || r.Method == http.MethodPost)):
+	case (connID == "" && (r.Method == http.MethodPost || r.Method == http.MethodPut)) || (connID != "" && connAction == "" && (r.Method == http.MethodPut || r.Method == http.MethodPost)):
+		if connID == connectorSecretsStoreKeyR66 {
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "invalid connector id")
+			return
+		}
 		body, ok := parseJSONBody(w, r)
 		if !ok {
 			return
@@ -9756,8 +10422,23 @@ func (s *Server) handleConnectorAPI(w http.ResponseWriter, r *http.Request, segs
 			if bodyID, ok := body["id"].(string); ok && strings.TrimSpace(bodyID) != "" {
 				connID = strings.TrimSpace(bodyID)
 			} else {
-				connID = fmt.Sprintf("connector-%d", len(s.connectors)+1)
+				connCount := 0
+				for k := range s.connectors {
+					if k != connectorSecretsStoreKeyR66 {
+						connCount++
+					}
+				}
+				connID = fmt.Sprintf("connector-%d", connCount+1)
+				for s.connectors[connID] != nil {
+					connCount++
+					connID = fmt.Sprintf("connector-%d", connCount+1)
+				}
 			}
+		}
+		if connID == connectorSecretsStoreKeyR66 {
+			s.mu.Unlock()
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "invalid connector id")
+			return
 		}
 		_, existed := s.connectors[connID]
 		isNative, _ := body["is_native"].(bool)
@@ -9765,42 +10446,51 @@ func (s *Server) handleConnectorAPI(w http.ResponseWriter, r *http.Request, segs
 		if status == "" {
 			status = "created"
 		}
+		syncNow, _ := body["sync_now"].(bool)
 		connObj := map[string]any{
-			"id":            connID,
-			"name":          body["name"],
-			"description":   body["description"],
-			"service_type":  body["service_type"],
-			"index_name":    body["index_name"],
-			"is_native":     isNative,
-			"status":        status,
-			"configuration": map[string]any{},
-			"filtering":     []any{},
-			"scheduling":    map[string]any{},
-			"updated_at":    nowISO,
+			"id":                connID,
+			"name":              body["name"],
+			"description":       body["description"],
+			"service_type":      body["service_type"],
+			"index_name":        body["index_name"],
+			"is_native":         isNative,
+			"status":            status,
+			"sync_now":          syncNow,
+			"configuration":     map[string]any{},
+			"filtering":         []any{},
+			"scheduling":        map[string]any{},
+			"custom_scheduling": map[string]any{},
+			"updated_at":        nowISO,
 		}
-		for _, k := range []string{"configuration", "filtering", "scheduling", "pipeline", "custom_scheduling", "error"} {
+		for _, k := range []string{"configuration", "filtering", "scheduling", "pipeline", "custom_scheduling", "error", "features"} {
 			if v, has := body[k]; has && v != nil {
 				connObj[k] = v
 			}
 		}
 		s.connectors[connID] = connObj
 		s.mu.Unlock()
-		if r.Method == http.MethodPost && len(segs) == 1 {
-			writeJSON(w, http.StatusCreated, map[string]any{"id": connID, "acknowledged": true})
+		if len(segs) == 1 {
+			writeJSON(w, http.StatusCreated, map[string]any{"id": connID, "result": "created", "acknowledged": true})
 			return
 		}
 		code := http.StatusCreated
+		resStr := "created"
 		if existed {
 			code = http.StatusOK
+			resStr = "updated"
 		}
-		writeJSON(w, code, map[string]any{"id": connID, "acknowledged": true})
+		writeJSON(w, code, map[string]any{"id": connID, "result": resStr, "acknowledged": true})
 
 	case connID != "" && connAction == "" && (r.Method == http.MethodGet || r.Method == http.MethodHead):
 		s.mu.RLock()
-		conn, exists := s.connectors[connID]
 		var connCopy map[string]any
-		if exists && conn != nil {
-			connCopy = deepCloneDocMap(conn)
+		var exists bool
+		if connID != connectorSecretsStoreKeyR66 {
+			var conn map[string]any
+			conn, exists = s.connectors[connID]
+			if exists && conn != nil {
+				connCopy = deepCloneDocMap(conn)
+			}
 		}
 		s.mu.RUnlock()
 		if !exists {
@@ -9815,13 +10505,18 @@ func (s *Server) handleConnectorAPI(w http.ResponseWriter, r *http.Request, segs
 
 	case connID != "" && connAction == "" && r.Method == http.MethodDelete:
 		s.mu.Lock()
-		if _, exists := s.connectors[connID]; !exists {
-			s.mu.Unlock()
+		exists := false
+		if connID != connectorSecretsStoreKeyR66 {
+			if _, ok := s.connectors[connID]; ok {
+				exists = true
+				delete(s.connectors, connID)
+			}
+		}
+		s.mu.Unlock()
+		if !exists {
 			writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("Connector [%s] not found", connID))
 			return
 		}
-		delete(s.connectors, connID)
-		s.mu.Unlock()
 		writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
 
 	case connID != "" && connAction != "" && (r.Method == http.MethodPut || r.Method == http.MethodPost):
@@ -9836,8 +10531,12 @@ func (s *Server) handleConnectorAPI(w http.ResponseWriter, r *http.Request, segs
 			body = map[string]any{}
 		}
 		s.mu.Lock()
-		conn, exists := s.connectors[connID]
-		if !exists {
+		var conn map[string]any
+		var exists bool
+		if connID != connectorSecretsStoreKeyR66 {
+			conn, exists = s.connectors[connID]
+		}
+		if !exists || conn == nil {
 			s.mu.Unlock()
 			writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("Connector [%s] not found", connID))
 			return
@@ -9854,7 +10553,7 @@ func (s *Server) handleConnectorAPI(w http.ResponseWriter, r *http.Request, segs
 			}
 			conn["updated_at"] = nowISO
 			s.mu.Unlock()
-			writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
+			writeJSON(w, http.StatusOK, map[string]any{"result": "updated", "acknowledged": true})
 			return
 		}
 		switch connAction {
@@ -9932,6 +10631,20 @@ func (s *Server) handleConnectorAPI(w http.ResponseWriter, r *http.Request, segs
 			for k, v := range body {
 				conn[k] = v
 			}
+		case "_check_in":
+			conn["last_seen"] = nowISO
+		case "_features":
+			if rawF, hasF := body["features"]; hasF {
+				fm, okFM := rawF.(map[string]any)
+				if !okFM {
+					s.mu.Unlock()
+					writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "[features] must be an object")
+					return
+				}
+				conn["features"] = deepCloneDocMap(fm)
+			} else {
+				conn["features"] = deepCloneDocMap(body)
+			}
 		default:
 			s.mu.Unlock()
 			writeESError(w, http.StatusNotFound, "invalid_index_name_exception", "unknown connector action: "+connAction)
@@ -9939,7 +10652,7 @@ func (s *Server) handleConnectorAPI(w http.ResponseWriter, r *http.Request, segs
 		}
 		conn["updated_at"] = nowISO
 		s.mu.Unlock()
-		writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
+		writeJSON(w, http.StatusOK, map[string]any{"result": "updated", "acknowledged": true})
 
 	default:
 		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
@@ -10622,6 +11335,14 @@ func (s *Server) handleTextStructureAPI(w http.ResponseWriter, r *http.Request, 
 		}
 		if action == "find_structure" {
 			resp["has_byte_order_marker"] = false
+			sampleStart := ""
+			if len(lines) > 0 {
+				sampleStart = lines[0]
+				if len(sampleStart) > 256 {
+					sampleStart = sampleStart[:256]
+				}
+			}
+			resp["sample_start"] = sampleStart
 		}
 		if tsField != "" {
 			resp["timestamp_field"] = tsField
@@ -11323,9 +12044,19 @@ func (s *Server) handleWatcherQueryWatches(w http.ResponseWriter, r *http.Reques
 		watchSpec := deepCloneDocMap(wObj)
 		delete(watchSpec, "status")
 		delete(watchSpec, "_id")
-		if len(watchSpec) > 0 {
-			watchEntry["watch"] = watchSpec
+		if watchSpec["actions"] == nil {
+			watchSpec["actions"] = map[string]any{}
 		}
+		if watchSpec["condition"] == nil {
+			watchSpec["condition"] = map[string]any{"always": map[string]any{}}
+		}
+		if watchSpec["input"] == nil {
+			watchSpec["input"] = map[string]any{"none": map[string]any{}}
+		}
+		if watchSpec["trigger"] == nil {
+			watchSpec["trigger"] = map[string]any{}
+		}
+		watchEntry["watch"] = watchSpec
 		watches = append(watches, watchEntry)
 	}
 	s.mu.RUnlock()
@@ -11464,20 +12195,16 @@ type analyticsUsageTrackerR65 struct {
 	multiTerms            atomic.Int64
 }
 
-var (
-	serverAnalyticsUsageMuR65 sync.Mutex
-	serverAnalyticsUsageR65   = make(map[*Server]*analyticsUsageTrackerR65)
-)
-
 func getAnalyticsUsageTrackerR65(s *Server) *analyticsUsageTrackerR65 {
-	serverAnalyticsUsageMuR65.Lock()
-	defer serverAnalyticsUsageMuR65.Unlock()
-	tr := serverAnalyticsUsageR65[s]
-	if tr == nil {
-		tr = &analyticsUsageTrackerR65{}
-		serverAnalyticsUsageR65[s] = tr
+	if s == nil {
+		return &analyticsUsageTrackerR65{}
 	}
-	return tr
+	s.telemetryMu.Lock()
+	defer s.telemetryMu.Unlock()
+	if s.analyticsUsage == nil {
+		s.analyticsUsage = &analyticsUsageTrackerR65{}
+	}
+	return s.analyticsUsage
 }
 
 func (tr *analyticsUsageTrackerR65) record(aggType string) {
@@ -11533,24 +12260,24 @@ type healthAPIUsageR65 struct {
 	diagnoses   map[string]map[string]int64
 }
 
-var (
-	serverHealthUsageMuR65 sync.Mutex
-	serverHealthUsageR65   = make(map[*Server]*healthAPIUsageR65)
-)
+func newHealthAPIUsageR65() *healthAPIUsageR65 {
+	return &healthAPIUsageR65{
+		statuses:   make(map[string]int64),
+		indicators: make(map[string]map[string]int64),
+		diagnoses:  make(map[string]map[string]int64),
+	}
+}
 
 func getHealthAPIUsageTrackerR65(s *Server) *healthAPIUsageR65 {
-	serverHealthUsageMuR65.Lock()
-	defer serverHealthUsageMuR65.Unlock()
-	tr := serverHealthUsageR65[s]
-	if tr == nil {
-		tr = &healthAPIUsageR65{
-			statuses:   make(map[string]int64),
-			indicators: make(map[string]map[string]int64),
-			diagnoses:  make(map[string]map[string]int64),
-		}
-		serverHealthUsageR65[s] = tr
+	if s == nil {
+		return newHealthAPIUsageR65()
 	}
-	return tr
+	s.telemetryMu.Lock()
+	defer s.telemetryMu.Unlock()
+	if s.healthUsage == nil {
+		s.healthUsage = newHealthAPIUsageR65()
+	}
+	return s.healthUsage
 }
 
 func (tr *healthAPIUsageR65) record(verbose bool, payload map[string]any) {
@@ -11713,27 +12440,18 @@ func checkAcceptEnterpriseQueryParamR65(w http.ResponseWriter, s *Server, r *htt
 	return true
 }
 
-var (
-	serverLicenseTrialMuR65        sync.Mutex
-	serverLicenseTrialActivatedR65 = make(map[*Server]bool)
-)
-
 func isLicenseTrialActivatedR65(s *Server) bool {
 	if s == nil {
 		return false
 	}
-	serverLicenseTrialMuR65.Lock()
-	defer serverLicenseTrialMuR65.Unlock()
-	return serverLicenseTrialActivatedR65[s]
+	return s.licenseTrialActivated.Load()
 }
 
 func setLicenseTrialActivatedR65(s *Server, activated bool) {
 	if s == nil {
 		return
 	}
-	serverLicenseTrialMuR65.Lock()
-	defer serverLicenseTrialMuR65.Unlock()
-	serverLicenseTrialActivatedR65[s] = activated
+	s.licenseTrialActivated.Store(activated)
 }
 
 func (s *Server) ensureLicenseStateLocked() map[string]any {
@@ -12075,6 +12793,18 @@ func (s *Server) handleXPackAPI(w http.ResponseWriter, r *http.Request, segs []s
 			dlmAvg = sum / int64(len(dlmRetentions))
 		}
 
+		tierPhaseZero := map[string]any{
+			"node_count":                      0,
+			"index_count":                     0,
+			"total_shard_count":               0,
+			"primary_shard_count":             0,
+			"doc_count":                       0,
+			"total_size_bytes":                0,
+			"primary_size_bytes":              0,
+			"primary_shard_size_avg_bytes":    0,
+			"primary_shard_size_median_bytes": 0,
+			"primary_shard_size_mad_bytes":    0,
+		}
 		usage := make(map[string]any, len(featureNames)+2)
 		for _, fn := range featureNames {
 			usage[fn] = map[string]any{
@@ -12082,14 +12812,141 @@ func (s *Server) handleXPackAPI(w http.ResponseWriter, r *http.Request, segs []s
 				"enabled":   true,
 			}
 		}
-		usage["watcher"] = map[string]any{"available": true, "enabled": true, "count": map[string]any{"total": watchCount, "active": watchCount}}
-		usage["ilm"] = map[string]any{"available": true, "enabled": true, "policy_count": ilmCount}
+		usage["archive"] = map[string]any{
+			"available":     true,
+			"enabled":       true,
+			"indices_count": 0,
+		}
+		usage["ccr"] = map[string]any{
+			"available":                  true,
+			"enabled":                    true,
+			"auto_follow_patterns_count": 0,
+			"follower_indices_count":     0,
+		}
+		usage["data_tiers"] = map[string]any{
+			"available":    true,
+			"enabled":      true,
+			"data_warm":    tierPhaseZero,
+			"data_cold":    tierPhaseZero,
+			"data_content": tierPhaseZero,
+			"data_hot":     tierPhaseZero,
+		}
+		usage["eql"] = map[string]any{
+			"available": true,
+			"enabled":   true,
+			"features": map[string]any{
+				"event":    0,
+				"join":     0,
+				"sequence": 0,
+				"joins": map[string]any{
+					"join_queries_two":          0,
+					"join_queries_three":        0,
+					"join_queries_four":         0,
+					"join_queries_five_or_more": 0,
+					"join_until":                0,
+				},
+				"keys": map[string]any{
+					"join_keys_one":          0,
+					"join_keys_two":          0,
+					"join_keys_three":        0,
+					"join_keys_four":         0,
+					"join_keys_five_or_more": 0,
+				},
+				"pipes": map[string]any{
+					"pipe_head": 0,
+					"pipe_tail": 0,
+				},
+				"sequences": map[string]any{
+					"sequence_queries_two":          0,
+					"sequence_queries_three":        0,
+					"sequence_queries_four":         0,
+					"sequence_queries_five_or_more": 0,
+					"sequence_until":                0,
+					"sequence_maxspan":              0,
+				},
+			},
+			"queries": map[string]any{},
+		}
+		usage["frozen_indices"] = map[string]any{
+			"available":     true,
+			"enabled":       true,
+			"indices_count": 0,
+		}
+		usage["watcher"] = map[string]any{
+			"available": true,
+			"enabled":   true,
+			"count":     map[string]any{"total": watchCount, "active": watchCount},
+			"execution": map[string]any{"actions": map[string]any{}},
+			"watch": map[string]any{
+				"input": map[string]any{},
+				"trigger": map[string]any{
+					"_all": map[string]any{"total": watchCount, "active": watchCount},
+				},
+			},
+		}
+		usage["ilm"] = map[string]any{
+			"available":    true,
+			"enabled":      true,
+			"policy_count": ilmCount,
+			"policy_stats": []any{},
+		}
+		usage["ml"] = map[string]any{
+			"available":                 true,
+			"enabled":                   true,
+			"datafeeds":                 map[string]any{},
+			"jobs":                      map[string]any{},
+			"node_count":                1,
+			"data_frame_analytics_jobs": map[string]any{"_all": map[string]any{"count": 0}},
+			"inference": map[string]any{
+				"ingest_processors": map[string]any{},
+				"trained_models":    map[string]any{"_all": map[string]any{"count": 0}},
+			},
+		}
+		usage["monitoring"] = map[string]any{
+			"available":          true,
+			"enabled":            true,
+			"collection_enabled": false,
+			"enabled_exporters":  map[string]any{},
+		}
+		usage["security"] = map[string]any{
+			"available":       true,
+			"enabled":         true,
+			"api_key_service": map[string]any{"enabled": true},
+			"anonymous":       map[string]any{"enabled": false},
+			"audit":           map[string]any{"enabled": false},
+			"fips_140":        map[string]any{"enabled": false},
+			"ipfilter":        map[string]any{"http": false, "transport": false},
+			"realms":          map[string]any{},
+			"role_mapping":    map[string]any{},
+			"roles": map[string]any{
+				"native": map[string]any{"dls": false, "fls": false, "size": 0},
+				"dls":    map[string]any{"bit_set_cache": map[string]any{"count": 0, "memory_in_bytes": 0}},
+				"file":   map[string]any{"dls": false, "fls": false, "size": 0},
+			},
+			"ssl":                 map[string]any{"http": map[string]any{"enabled": false}, "transport": map[string]any{"enabled": false}},
+			"token_service":       map[string]any{"enabled": true},
+			"operator_privileges": map[string]any{"available": true, "enabled": true},
+		}
 		usage["slm"] = map[string]any{"available": true, "enabled": true, "policy_count": slmCount}
+		usage["flattened"] = map[string]any{"available": true, "enabled": true, "field_count": 0}
+		usage["runtime_fields"] = map[string]any{"available": true, "enabled": true, "field_types": []any{}}
+		usage["vectors"] = map[string]any{
+			"available":                   true,
+			"enabled":                     true,
+			"dense_vector_dims_avg_count": 0,
+			"dense_vector_fields_count":   0,
+		}
+		usage["sql"] = map[string]any{
+			"available": true,
+			"enabled":   true,
+			"features":  map[string]any{},
+			"queries":   map[string]any{},
+		}
 		usage["transform"] = map[string]any{"available": true, "enabled": true, "count": transformCount}
 		usage["rollup"] = map[string]any{"available": true, "enabled": true, "count": rollupCount, "number_of_rollup_jobs": rollupCount}
 		usage["enrich"] = map[string]any{"available": true, "enabled": true, "count": enrichCount}
 		usage["inference"] = map[string]any{"available": true, "enabled": true, "count": inferenceCount}
-		usage["data_streams"] = map[string]any{"available": true, "enabled": true, "data_streams": dsCount}
+		usage["data_streams"] = map[string]any{"available": true, "enabled": true, "data_streams": dsCount, "indices_count": dsCount}
 		usage["data_lifecycle"] = map[string]any{
 			"available":             true,
 			"enabled":               true,
@@ -12690,18 +13547,32 @@ func (s *Server) handleMLAPI(w http.ResponseWriter, r *http.Request, segs []stri
 					"categorization_examples_limit":             4,
 					"model_snapshot_retention_days":             10,
 					"daily_model_snapshot_retention_after_days": 1,
+					"categorization_analyzer":                   "standard",
 				},
 				"datafeeds": map[string]any{
 					"scroll_size": 1000,
 				},
 			},
 			"limits": map[string]any{
-				"max_model_memory_limit": "0b",
+				"max_model_memory_limit":           "0b",
+				"effective_max_model_memory_limit": "0b",
+				"total_ml_memory":                  "2gb",
 			},
 			"upgrade_mode": upMode,
+			"native_code": map[string]any{
+				"build_hash": "00000000",
+				"version":    "8.15.0",
+			},
 		})
 
-	case "memory_stats":
+	case "memory_stats", "memory":
+		if segs[1] == "memory" {
+			validRoute := (len(segs) == 3 && segs[2] == "_stats") || (len(segs) == 4 && segs[3] == "_stats")
+			if !validRoute {
+				writeESError(w, http.StatusNotFound, "invalid_index_name_exception", "unknown endpoint: "+r.URL.Path)
+				return
+			}
+		}
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
 			writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
 			return
@@ -12710,38 +13581,55 @@ func (s *Server) handleMLAPI(w http.ResponseWriter, r *http.Request, segs []stri
 			w.WriteHeader(http.StatusOK)
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{
-			"_nodes":       map[string]any{"total": 1, "successful": 1, "failed": 0},
-			"cluster_name": "apache-doris-search-cluster",
-			"nodes": map[string]any{
-				"doris-fe-1": map[string]any{
-					"name": "doris-fe-1",
-					"jvm": map[string]any{
-						"heap_max":                "1gb",
-						"heap_max_in_bytes":       1073741824,
-						"java_inference":          "0b",
-						"java_inference_in_bytes": 0,
-					},
-					"mem": map[string]any{
-						"total":                   "8gb",
-						"total_in_bytes":          8589934592,
-						"adjusted_total":          "8gb",
-						"adjusted_total_in_bytes": 8589934592,
-						"ml": map[string]any{
-							"max":                           "2gb",
-							"max_in_bytes":                  2147483648,
-							"native_code_overhead":          "0b",
-							"native_code_overhead_in_bytes": 0,
-							"anomaly_detectors":             "0b",
-							"anomaly_detectors_in_bytes":    0,
-							"data_frame_analytics":          "0b",
-							"data_frame_analytics_in_bytes": 0,
-							"native_inference":              "0b",
-							"native_inference_in_bytes":     0,
-						},
+		includeNode := true
+		if len(segs) == 4 && segs[1] == "memory" {
+			nf := strings.TrimSpace(segs[2])
+			if nf != "" && nf != "_all" && nf != "*" && nf != "_local" && !matchSimpleWildcard(nf, "doris-fe-1") {
+				includeNode = false
+			}
+		}
+		nodesOut := map[string]any{}
+		nodeTotal := 0
+		if includeNode {
+			nodeTotal = 1
+			nodesOut["doris-fe-1"] = map[string]any{
+				"name":              "doris-fe-1",
+				"ephemeral_id":      "doris-ephemeral-1",
+				"transport_address": "127.0.0.1:9300",
+				"roles":             []string{"master", "data", "ingest", "ml"},
+				"attributes":        map[string]any{},
+				"jvm": map[string]any{
+					"heap_max":                    "1gb",
+					"heap_max_in_bytes":           1073741824,
+					"java_inference":              "0b",
+					"java_inference_in_bytes":     0,
+					"java_inference_max":          "0b",
+					"java_inference_max_in_bytes": 0,
+				},
+				"mem": map[string]any{
+					"total":                   "8gb",
+					"total_in_bytes":          8589934592,
+					"adjusted_total":          "8gb",
+					"adjusted_total_in_bytes": 8589934592,
+					"ml": map[string]any{
+						"max":                           "2gb",
+						"max_in_bytes":                  2147483648,
+						"native_code_overhead":          "0b",
+						"native_code_overhead_in_bytes": 0,
+						"anomaly_detectors":             "0b",
+						"anomaly_detectors_in_bytes":    0,
+						"data_frame_analytics":          "0b",
+						"data_frame_analytics_in_bytes": 0,
+						"native_inference":              "0b",
+						"native_inference_in_bytes":     0,
 					},
 				},
-			},
+			}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"_nodes":       map[string]any{"total": nodeTotal, "successful": nodeTotal, "failed": 0},
+			"cluster_name": "apache-doris-search-cluster",
+			"nodes":        nodesOut,
 		})
 
 	case "set_upgrade_mode":
@@ -12852,15 +13740,33 @@ func (s *Server) handleMLAnomalyDetectors(w http.ResponseWriter, r *http.Request
 					"bucket_count":                 bucketCnt,
 					"input_record_count":           procRecs,
 				},
+				"forecasts_stats": map[string]any{
+					"total":           0,
+					"forecasted_jobs": 0,
+				},
+				"timing_stats": map[string]any{
+					"job_id":                          id,
+					"bucket_count":                    bucketCnt,
+					"total_bucket_processing_time_ms": 0.0,
+					"exponential_average_bucket_processing_time_per_hour_ms": 0.0,
+				},
 				"model_size_stats": map[string]any{
 					"job_id":                           id,
 					"result_type":                      "model_size_stats",
+					"log_time":                         time.Now().UTC().Format(time.RFC3339),
 					"model_bytes":                      0,
 					"total_by_field_count":             0,
 					"total_over_field_count":           0,
 					"total_partition_field_count":      0,
 					"bucket_allocation_failures_count": 0,
 					"memory_status":                    "ok",
+					"categorization_status":            "ok",
+					"categorized_doc_count":            0,
+					"dead_category_count":              0,
+					"failed_category_count":            0,
+					"frequent_category_count":          0,
+					"rare_category_count":              0,
+					"total_category_count":             0,
 				},
 			})
 		}
@@ -12905,7 +13811,7 @@ func (s *Server) handleMLAnomalyDetectors(w http.ResponseWriter, r *http.Request
 		case "_open":
 			job["state"] = "opened"
 			s.mu.Unlock()
-			writeJSON(w, http.StatusOK, map[string]any{"opened": true})
+			writeJSON(w, http.StatusOK, map[string]any{"opened": true, "node": "doris-fe-1"})
 		case "_close":
 			job["state"] = "closed"
 			s.mu.Unlock()
@@ -12956,11 +13862,33 @@ func (s *Server) handleMLAnomalyDetectors(w http.ResponseWriter, r *http.Request
 		if dc == nil {
 			dc = map[string]any{"time_field": "@timestamp", "time_format": "epoch_ms"}
 		}
+		if ac["bucket_span"] == nil {
+			ac["bucket_span"] = "5m"
+		}
+		if ac["influencers"] == nil {
+			ac["influencers"] = []any{}
+		}
 		entry := deepCloneDocMap(body)
 		entry["job_id"] = jobID
 		entry["job_type"] = "anomaly_detector"
+		entry["job_version"] = "8.15.0"
 		entry["create_time"] = time.Now().UTC().UnixMilli()
 		entry["state"] = "closed"
+		if _, hasLazy := entry["allow_lazy_open"]; !hasLazy {
+			entry["allow_lazy_open"] = false
+		}
+		if entry["analysis_limits"] == nil {
+			entry["analysis_limits"] = map[string]any{"model_memory_limit": "10mb"}
+		}
+		if entry["daily_model_snapshot_retention_after_days"] == nil {
+			entry["daily_model_snapshot_retention_after_days"] = int64(1)
+		}
+		if entry["model_snapshot_retention_days"] == nil {
+			entry["model_snapshot_retention_days"] = int64(10)
+		}
+		if entry["results_index_name"] == nil {
+			entry["results_index_name"] = ".ml-anomalies-shared"
+		}
 		entry["analysis_config"] = ac
 		entry["data_description"] = dc
 		s.mu.Lock()
@@ -13042,9 +13970,17 @@ func (s *Server) handleMLDatafeeds(w http.ResponseWriter, r *http.Request, segs 
 			if state == "" {
 				state = "stopped"
 			}
+			dfJobID, _ := df["job_id"].(string)
 			statsList = append(statsList, map[string]any{
 				"datafeed_id": id,
 				"state":       state,
+				"timing_stats": map[string]any{
+					"job_id":               dfJobID,
+					"bucket_count":         0,
+					"search_count":         0,
+					"total_search_time_ms": 0.0,
+					"exponential_average_search_time_per_hour_ms": 0.0,
+				},
 			})
 		}
 		s.mu.RUnlock()
@@ -13089,7 +14025,7 @@ func (s *Server) handleMLDatafeeds(w http.ResponseWriter, r *http.Request, segs 
 			}
 			df["state"] = "started"
 			s.mu.Unlock()
-			writeJSON(w, http.StatusOK, map[string]any{"started": true})
+			writeJSON(w, http.StatusOK, map[string]any{"started": true, "node": "doris-fe-1"})
 		case "_stop":
 			if r.Method != http.MethodPost {
 				s.mu.Unlock()
@@ -13173,6 +14109,18 @@ func (s *Server) handleMLDatafeeds(w http.ResponseWriter, r *http.Request, segs 
 		}
 		if entry["query"] == nil {
 			entry["query"] = map[string]any{"match_all": map[string]any{}}
+		}
+		if entry["chunking_config"] == nil {
+			entry["chunking_config"] = map[string]any{"mode": "auto"}
+		}
+		if entry["query_delay"] == nil {
+			entry["query_delay"] = "60s"
+		}
+		if entry["scroll_size"] == nil {
+			entry["scroll_size"] = 1000
+		}
+		if entry["delayed_data_check_config"] == nil {
+			entry["delayed_data_check_config"] = map[string]any{"enabled": true}
 		}
 		s.mu.Lock()
 		if s.mlDatafeeds == nil {
@@ -13264,6 +14212,10 @@ func (s *Server) handleMLTrainedModels(w http.ResponseWriter, r *http.Request, s
 				"model_id":       id,
 				"pipeline_count": 0,
 				"ingest":         map[string]any{"total": map[string]any{"count": infCnt}},
+				"model_size_stats": map[string]any{
+					"model_size_bytes":             "1kb",
+					"required_native_memory_bytes": "1mb",
+				},
 			}
 			if depID, dep := s.findDeploymentForModelLocked(id); dep != nil {
 				allocs, _ := toInt64(dep["number_of_allocations"])
@@ -13272,22 +14224,48 @@ func (s *Server) handleMLTrainedModels(w http.ResponseWriter, r *http.Request, s
 				depInf, _ := toInt64(dep["inference_count"])
 				startMS, _ := toInt64(dep["start_time"])
 				statObj["deployment_stats"] = map[string]any{
-					"model_id":               id,
-					"deployment_id":          depID,
-					"state":                  "started",
-					"number_of_allocations":  allocs,
-					"threads_per_allocation": threads,
-					"queue_capacity":         qCap,
-					"inference_count":        depInf,
-					"start_time":             startMS,
+					"model_id":                 id,
+					"deployment_id":            depID,
+					"state":                    "started",
+					"reason":                   "",
+					"number_of_allocations":    allocs,
+					"threads_per_allocation":   threads,
+					"queue_capacity":           qCap,
+					"inference_count":          depInf,
+					"error_count":              0,
+					"rejected_execution_count": 0,
+					"timeout_count":            0,
+					"start_time":               startMS,
+					"allocation_status": map[string]any{
+						"allocation_count":        allocs,
+						"target_allocation_count": allocs,
+						"state":                   "fully_allocated",
+					},
 					"nodes": []any{
 						map[string]any{
 							"node": map[string]any{
-								"id":   "local-node-1",
-								"name": "doris-es-proxy-node-1",
+								"id":                "local-node-1",
+								"name":              "doris-es-proxy-node-1",
+								"ephemeral_id":      "doris-ephemeral-1",
+								"transport_address": "127.0.0.1:9300",
+								"attributes":        map[string]any{},
 							},
-							"routing_state":   map[string]any{"routing_state": "started"},
-							"inference_count": depInf,
+							"routing_state": map[string]any{
+								"routing_state":       "started",
+								"current_allocations": allocs,
+								"target_allocations":  allocs,
+								"reason":              "",
+							},
+							"inference_count":            depInf,
+							"error_count":                0,
+							"rejection_execution_count":  0,
+							"timeout_count":              0,
+							"average_inference_time_ms":  0.0,
+							"last_access":                startMS,
+							"number_of_allocations":      allocs,
+							"number_of_pending_requests": 0,
+							"start_time":                 startMS,
+							"threads_per_allocation":     threads,
 						},
 					},
 				}
@@ -13566,7 +14544,7 @@ func (s *Server) handleMLCalendars(w http.ResponseWriter, r *http.Request, segs 
 		calID = strings.TrimSpace(segs[2])
 	}
 	switch r.Method {
-	case http.MethodPut, http.MethodPost:
+	case http.MethodPut:
 		if calID == "" {
 			writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: calendar_id is missing;")
 			return
@@ -13596,7 +14574,12 @@ func (s *Server) handleMLCalendars(w http.ResponseWriter, r *http.Request, segs 
 		s.mu.Unlock()
 		writeJSON(w, http.StatusOK, cp)
 
-	case http.MethodGet, http.MethodHead:
+	case http.MethodGet, http.MethodPost, http.MethodHead:
+		if r.Method == http.MethodPost && r.ContentLength != 0 {
+			if _, ok := parseJSONBody(w, r); !ok {
+				return
+			}
+		}
 		s.mu.RLock()
 		var list []any
 		for id, cal := range s.mlCalendars {
@@ -13788,9 +14771,32 @@ func (s *Server) handleFleetAPI(w http.ResponseWriter, r *http.Request, segs []s
 		action = segs[2]
 	}
 	switch action {
-	case "msearch":
-		s.handleMSearch(w, r)
-	case "search":
+	case "msearch", "_fleet_msearch":
+		capW := &asyncCaptureResponseWriter{}
+		s.handleMSearch(capW, r)
+		for hk, hvs := range capW.Header() {
+			for _, hv := range hvs {
+				w.Header().Add(hk, hv)
+			}
+		}
+		statusCode := capW.code
+		if statusCode == 0 {
+			statusCode = http.StatusOK
+		}
+		if statusCode == http.StatusOK {
+			var respMap map[string]any
+			if err := json.Unmarshal(capW.body.Bytes(), &respMap); err == nil && respMap != nil {
+				if respMap["docs"] == nil && respMap["responses"] != nil {
+					respMap["docs"] = respMap["responses"]
+				}
+				writeJSONWithRequest(w, r, http.StatusOK, respMap)
+				return
+			}
+		}
+		w.WriteHeader(statusCode)
+		// #nosec G705 -- re-emitting already-encoded proxy JSON error/msearch response bytes with preserved Content-Type
+		_, _ = w.Write(capW.body.Bytes())
+	case "search", "_fleet_search":
 		s.handleSearch(w, r)
 	case "global_checkpoints":
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
@@ -13809,8 +14815,9 @@ func (s *Server) handleFleetAPI(w http.ResponseWriter, r *http.Request, segs []s
 		writeJSON(w, http.StatusOK, map[string]any{
 			"global_checkpoints":            []int{0},
 			"last_known_global_checkpoints": []int{0},
+			"timed_out":                     false,
 		})
-	case "secrets":
+	case "secrets", "secret":
 		s.handleFleetSecretsRound57(w, r, segs)
 	default:
 		writeESError(w, http.StatusNotFound, "invalid_index_name_exception", "unknown endpoint: "+r.URL.Path)
@@ -13841,7 +14848,29 @@ func (s *Server) handleGraphExplore(w http.ResponseWriter, r *http.Request, segs
 	connectionsOut := make([]any, 0)
 	if len(targets) > 0 && body != nil {
 		if rawVerts, okV := body["vertices"].([]any); okV && len(rawVerts) > 0 {
+			const (
+				maxGraphSampleDocsR66  = 2000
+				maxGraphFieldSpecsR66  = 64
+				maxGraphVertexSizeR66  = 100
+				maxGraphDocVerticesR66 = 256
+				maxGraphConnectionsR66 = 10000
+			)
+			sampleSize := maxGraphSampleDocsR66
+			if ctrl, okC := body["controls"].(map[string]any); okC && ctrl != nil {
+				if ss, okS := toInt64(ctrl["sample_size"]); okS && ss > 0 {
+					if ss < int64(sampleSize) {
+						sampleSize = int(ss)
+					}
+				}
+			} else if ss, okS := toInt64(body["sample_size"]); okS && ss > 0 {
+				if ss < int64(sampleSize) {
+					sampleSize = int(ss)
+				}
+			}
 			docs, _ := s.collectSourceDocsForJob(r.Context(), targets, body["query"], nil)
+			if len(docs) > sampleSize {
+				docs = docs[:sampleSize]
+			}
 			type graphVertexKey struct {
 				field string
 				term  string
@@ -13854,6 +14883,9 @@ func (s *Server) handleGraphExplore(w http.ResponseWriter, r *http.Request, segs
 				size        int
 			}
 			for _, rv := range rawVerts {
+				if len(fieldSpecs) >= maxGraphFieldSpecsR66 {
+					break
+				}
 				vm, okM := rv.(map[string]any)
 				if !okM || vm == nil {
 					continue
@@ -13869,6 +14901,9 @@ func (s *Server) handleGraphExplore(w http.ResponseWriter, r *http.Request, segs
 				}
 				sz := 5
 				if sVal, okSz := toInt64(vm["size"]); okSz && sVal > 0 {
+					if sVal > maxGraphVertexSizeR66 {
+						sVal = maxGraphVertexSizeR66
+					}
 					sz = int(sVal)
 				}
 				fieldSpecs = append(fieldSpecs, struct {
@@ -13891,7 +14926,9 @@ func (s *Server) handleGraphExplore(w http.ResponseWriter, r *http.Request, segs
 							seenInDoc[gk] = true
 							docCountMap[gk]++
 							termValMap[gk] = rawVal
-							docKeysPerDoc[di] = append(docKeysPerDoc[di], gk)
+							if len(docKeysPerDoc[di]) < maxGraphDocVerticesR66 {
+								docKeysPerDoc[di] = append(docKeysPerDoc[di], gk)
+							}
 						}
 					}
 				}
@@ -13932,12 +14969,19 @@ func (s *Server) handleGraphExplore(w http.ResponseWriter, r *http.Request, segs
 				for _, gk := range gks {
 					if idx, okIdx := vertexIdxMap[gk]; okIdx {
 						docIdxs = append(docIdxs, idx)
+						if len(docIdxs) >= maxGraphDocVerticesR66 {
+							break
+						}
 					}
 				}
 				sort.Ints(docIdxs)
 				for i := 0; i < len(docIdxs); i++ {
 					for j := i + 1; j < len(docIdxs); j++ {
-						connCounts[connPair{a: docIdxs[i], b: docIdxs[j]}]++
+						pair := connPair{a: docIdxs[i], b: docIdxs[j]}
+						if _, exists := connCounts[pair]; !exists && len(connCounts) >= maxGraphConnectionsR66 {
+							continue
+						}
+						connCounts[pair]++
 					}
 				}
 			}
@@ -14323,16 +15367,18 @@ func (s *Server) handleClusterInfo(w http.ResponseWriter, r *http.Request, segs 
 	})
 }
 
-// handleNodesRepositoriesMetering implements `GET/HEAD /_nodes/repositories_metering`, `/_nodes/{node_id}/repositories_metering`, and `DELETE /_nodes/clear_repositories_metering_archive/{max_archive_version}` (Round 55 F9).
+// handleNodesRepositoriesMetering implements `GET/HEAD /_nodes/repositories_metering`, `/_nodes/{node_id}/repositories_metering`, and `DELETE /_nodes/clear_repositories_metering_archive/{max_archive_version}` or `DELETE /_nodes/{node_id}/_repositories_metering/{max_archive_version}` (Round 55 F9).
 func (s *Server) handleNodesRepositoriesMetering(w http.ResponseWriter, r *http.Request, segs []string) {
-	isClear := segs[1] == "clear_repositories_metering_archive" || (len(segs) >= 3 && segs[2] == "clear_repositories_metering_archive")
+	isClear := segs[1] == "clear_repositories_metering_archive" ||
+		(len(segs) >= 3 && segs[2] == "clear_repositories_metering_archive") ||
+		(r.Method == http.MethodDelete && (segs[1] == "repositories_metering" || (len(segs) >= 3 && segs[2] == "repositories_metering")))
 	if isClear {
 		if r.Method != http.MethodDelete {
 			writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
 			return
 		}
 		verIdx := 2
-		if segs[2] == "clear_repositories_metering_archive" {
+		if len(segs) >= 3 && (segs[2] == "clear_repositories_metering_archive" || segs[2] == "repositories_metering") {
 			verIdx = 3
 		}
 		if len(segs) <= verIdx || strings.TrimSpace(segs[verIdx]) == "" {
@@ -14346,9 +15392,7 @@ func (s *Server) handleNodesRepositoriesMetering(w http.ResponseWriter, r *http.
 		writeJSON(w, http.StatusOK, map[string]any{
 			"_nodes":       map[string]any{"total": 1, "successful": 1, "failed": 0},
 			"cluster_name": "apache-doris-search-cluster",
-			"nodes": map[string]any{
-				"doris-fe-1": map[string]any{"name": "doris-fe-1"},
-			},
+			"nodes":        map[string]any{},
 		})
 		return
 	}
@@ -14363,11 +15407,7 @@ func (s *Server) handleNodesRepositoriesMetering(w http.ResponseWriter, r *http.
 	writeJSON(w, http.StatusOK, map[string]any{
 		"_nodes":       map[string]any{"total": 1, "successful": 1, "failed": 0},
 		"cluster_name": "apache-doris-search-cluster",
-		"nodes": map[string]any{
-			"doris-fe-1": map[string]any{
-				"repositories_metering": []any{},
-			},
-		},
+		"nodes":        map[string]any{},
 	})
 }
 
@@ -14473,22 +15513,22 @@ type esqlServerTelemetryR64 struct {
 	kibana   esqlTelemetryBucketR64
 }
 
-var (
-	esqlTelemetryRegistryMuR64 sync.Mutex
-	esqlTelemetryRegistryR64   = make(map[*Server]*esqlServerTelemetryR64)
-)
+func newESQLServerTelemetryR64() *esqlServerTelemetryR64 {
+	return &esqlServerTelemetryR64{
+		features: ESQLSupportedFeaturesMapR64(),
+	}
+}
 
 func getOrCreateESQLTelemetryR64(s *Server) *esqlServerTelemetryR64 {
-	esqlTelemetryRegistryMuR64.Lock()
-	defer esqlTelemetryRegistryMuR64.Unlock()
-	st := esqlTelemetryRegistryR64[s]
-	if st == nil {
-		st = &esqlServerTelemetryR64{
-			features: ESQLSupportedFeaturesMapR64(),
-		}
-		esqlTelemetryRegistryR64[s] = st
+	if s == nil {
+		return newESQLServerTelemetryR64()
 	}
-	return st
+	s.telemetryMu.Lock()
+	defer s.telemetryMu.Unlock()
+	if s.esqlTelemetry == nil {
+		s.esqlTelemetry = newESQLServerTelemetryR64()
+	}
+	return s.esqlTelemetry
 }
 
 func (s *Server) recordESQLTelemetryR64(r *http.Request, queryStr string, ok bool, elapsedMs int64) {

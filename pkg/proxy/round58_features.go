@@ -3342,7 +3342,11 @@ func executeRerouteProcessorRound58(doc map[string]any, specMap map[string]any) 
 				}
 			}
 			if v, ok := getIngestPath(doc, docPath); ok && v != nil {
-				if sVal := strings.TrimSpace(fmt.Sprintf("%v", expandIngestTemplate(fmt.Sprintf("%v", v), doc))); sVal != "" {
+				expStr, expErr := expandIngestTemplateStringR66(fmt.Sprintf("%v", v), doc)
+				if expErr != nil {
+					return "", expErr
+				}
+				if sVal := strings.TrimSpace(expStr); sVal != "" {
 					if !hasRemoveFields || removeFieldsExplicit {
 						deleteIngestPath(doc, docPath)
 					}

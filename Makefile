@@ -47,6 +47,7 @@ fuzz:
 	go test -fuzz='^FuzzParseESDateMath$$' -fuzztime=$(FUZZTIME) ./pkg/schema
 	go test -fuzz='^FuzzInferAndShredDocument$$' -fuzztime=$(FUZZTIME) ./pkg/schema
 	go test -fuzz='^FuzzValidateTSDBSettingsAndMappings$$' -fuzztime=$(FUZZTIME) ./pkg/schema
+	go test -fuzz='^FuzzShredVariantAndHistogram$$' -fuzztime=$(FUZZTIME) ./pkg/schema
 	go test -fuzz='^FuzzShredDocument$$' -fuzztime=$(FUZZTIME) ./pkg/schema
 	go test -fuzz='^FuzzBulkNDJSONInvariants$$' -fuzztime=$(FUZZTIME) ./pkg/esast
 	go test -fuzz='^FuzzUnmarshalSearchRequest$$' -fuzztime=$(FUZZTIME) ./pkg/esast
@@ -67,6 +68,11 @@ fuzz:
 	go test -fuzz='^FuzzTermsEnumDLSFLS$$' -fuzztime=$(FUZZTIME) ./pkg/proxy
 	go test -fuzz='^FuzzWireMiddlewareYAMLHead$$' -fuzztime=$(FUZZTIME) ./pkg/proxy
 	go test -fuzz='^FuzzRepositoryURLValidator$$' -fuzztime=$(FUZZTIME) ./pkg/proxy
+	go test -fuzz='^FuzzExpandIngestTemplate$$' -fuzztime=$(FUZZTIME) ./pkg/proxy
+	go test -fuzz='^FuzzStrictNereidsSQLGuards$$' -fuzztime=$(FUZZTIME) ./pkg/proxy
+	go test -fuzz='^FuzzHistogramBoundsAndSQL$$' -fuzztime=$(FUZZTIME) ./pkg/proxy
+	go test -fuzz='^FuzzMonitoringBulkNDJSON$$' -fuzztime=$(FUZZTIME) ./pkg/proxy
+	go test -fuzz='^FuzzAutoscalingByteSize$$' -fuzztime=$(FUZZTIME) ./pkg/proxy
 
 test-e2e:
 	DORIS_E2E_DSN="$(DORIS_E2E_DSN)" DORIS_E2E_HTTP="$(DORIS_E2E_HTTP)" go test -race -count=1 -v ./e2e -run TestLiveApacheDoris_E2E
@@ -79,7 +85,7 @@ test-sdk-conformance:
 
 test-conformance:
 	bash scripts/fetch-conformance-specs.sh
-	CONFORMANCE_REQUIRE_UPSTREAM=1 CONFORMANCE_MIN_V7_PASSED=1980 CONFORMANCE_MIN_V8_PASSED=4500 go test -race -count=1 -v ./pkg/compliance -run 'TestUpstream|TestSpecSchemaValidatorLiveUpstreamSchema'
+	CONFORMANCE_REQUIRE_UPSTREAM=1 CONFORMANCE_MIN_V7_PASSED=1980 CONFORMANCE_MIN_V8_PASSED=4600 go test -race -count=1 -v ./pkg/compliance -run 'TestUpstream|TestSpecSchemaValidatorLiveUpstreamSchema'
 	go -C e2e/sdkconformance test -race -count=1 -v ./...
 
 lint:

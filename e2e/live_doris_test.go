@@ -1934,6 +1934,232 @@ func TestLiveApacheDoris_E2E(t *testing.T) {
 		}
 	})
 
+	t.Run("Round66_SparseVectorExists_And_NestedTextMustNotExists", func(st *testing.T) {
+		srvR66 := proxy.NewServer(dorisDB, backend, transpiler.TranspilerOptions{})
+		srvR66.SetBulkCoalesce(0, 0)
+		srvR66.SetQueryCacheTTL(0, 0)
+		srvR66.SetTargetESVersion("8.15.5")
+		tsR66 := httptest.NewServer(srvR66.Handler())
+		defer tsR66.Close()
+		defer func() {
+			closeCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			_ = srvR66.Close(closeCtx)
+		}()
+
+		doR66Req := func(tSub *testing.T, method, path, body string) (int, []byte) {
+			tSub.Helper()
+			var rdr io.Reader
+			if body != "" {
+				rdr = strings.NewReader(body)
+			}
+			req, reqErr := http.NewRequest(method, tsR66.URL+path, rdr)
+			if reqErr != nil {
+				tSub.Fatalf("%s %s request build error: %v", method, path, reqErr)
+			}
+			if body != "" {
+				req.Header.Set("Content-Type", "application/json")
+			}
+			res, doErr := http.DefaultClient.Do(req)
+			if doErr != nil {
+				tSub.Fatalf("%s %s transport error: %v", method, path, doErr)
+			}
+			raw, _ := io.ReadAll(res.Body)
+			_ = res.Body.Close()
+			return res.StatusCode, raw
+		}
+
+		// Sub-case A: 90_sparse_vector.yml multi-value exists with empty array [] vs empty object {}.
+		if code, raw := doR66Req(st, http.MethodPut, "/r66_sparse_exists", `{
+			"mappings": {
+				"properties": {
+					"text": {"type": "text"},
+					"ml.tokens": {"type": "sparse_vector"},
+					"embeddings": {"type": "sparse_vector"}
+				}
+			}
+		}`); code != http.StatusOK {
+			st.Fatalf("PUT /r66_sparse_exists failed: status=%d body=%s", code, string(raw))
+		}
+		sparseDocs := []struct {
+			id, body string
+		}{
+			{"1", `{"text":"running is good for you","ml":{"tokens":[{"running":2.4,"good":2.1},{"race":1.4}]}}`},
+			{"2", `{"text":"walking is a healthy exercise","ml":{"tokens":{"walking":2.4,"exercise":2.0}}}`},
+			{"3", `{"text":"empty array with no values","ml":{"tokens":[]}}`},
+			{"4", `{"text":"empty object should match exists","ml":{"tokens":{}}}`},
+			{"5", `{"text":"other embeddings available only","embeddings":{"aardvark":0.5}}`},
+		}
+		for _, d := range sparseDocs {
+			if code, raw := doR66Req(st, http.MethodPut, "/r66_sparse_exists/_doc/"+d.id, d.body); code >= 300 {
+				st.Fatalf("PUT /r66_sparse_exists/_doc/%s failed: status=%d body=%s", d.id, code, string(raw))
+			}
+		}
+		if code, raw := doR66Req(st, http.MethodPost, "/r66_sparse_exists/_refresh", ""); code != http.StatusOK {
+			st.Fatalf("POST /r66_sparse_exists/_refresh failed: status=%d body=%s", code, string(raw))
+		}
+		if code, raw := doR66Req(st, http.MethodPost, "/r66_sparse_exists/_search?rest_total_hits_as_int=true", `{"query":{"exists":{"field":"ml.tokens"}}}`); code != http.StatusOK {
+			st.Fatalf("sparse exists search failed: status=%d body=%s", code, string(raw))
+		} else {
+			var sr struct {
+				Hits struct {
+					Total int `json:"total"`
+					Hits  []struct {
+						ID string `json:"_id"`
+					} `json:"hits"`
+				} `json:"hits"`
+			}
+			_ = json.Unmarshal(raw, &sr)
+			if sr.Hits.Total != 3 || len(sr.Hits.Hits) != 3 {
+				st.Fatalf("expected 3 hits for sparse exists (docs 1,2,4; not []), got: %s", string(raw))
+			}
+		}
+
+		// Sub-case B: 100_knn_nested_search.yml & 130_knn_query_nested_search.yml Section 7 (nested_text).
+		if code, raw := doR66Req(st, http.MethodPut, "/r66_nested_text", `{
+			"mappings": {
+				"properties": {
+					"range": {"type": "long"},
+					"other_nested_thing": {
+						"type": "nested",
+						"properties": {
+							"text": {"type": "text"}
+						}
+					},
+					"paragraphs": {
+						"type": "nested",
+						"properties": {
+							"other_nested_thing": {
+								"type": "nested",
+								"properties": {
+									"text": {"type": "text"},
+									"vector": {"type": "dense_vector", "dims": 2, "index": true, "similarity": "cosine"}
+								}
+							},
+							"vector": {"type": "dense_vector", "dims": 2, "index": true, "similarity": "cosine"}
+						}
+					}
+				}
+			}
+		}`); code != http.StatusOK {
+			st.Fatalf("PUT /r66_nested_text failed: status=%d body=%s", code, string(raw))
+		}
+		if code, raw := doR66Req(st, http.MethodPut, "/r66_nested_text/_doc/1", `{
+			"publish_date": "1",
+			"paragraphs": [
+				{"vector": [1, 1], "text": "some text"},
+				{"vector": [1, 2], "text": "some text", "other_nested_thing": [{"text": "some text", "vector": [1, 2]}]}
+			]
+		}`); code >= 300 {
+			st.Fatalf("PUT /r66_nested_text/_doc/1 failed: status=%d body=%s", code, string(raw))
+		}
+		if code, raw := doR66Req(st, http.MethodPut, "/r66_nested_text/_doc/2", `{
+			"paragraphs": [
+				{"vector": [2, 1], "text": "some text"},
+				{"vector": [2, 2], "text": "some text", "other_nested_thing": [{"text": "some text", "vector": [1, 2]}]}
+			]
+		}`); code >= 300 {
+			st.Fatalf("PUT /r66_nested_text/_doc/2 failed: status=%d body=%s", code, string(raw))
+		}
+		if code, raw := doR66Req(st, http.MethodPost, "/r66_nested_text/_refresh", ""); code != http.StatusOK {
+			st.Fatalf("POST /r66_nested_text/_refresh failed: status=%d body=%s", code, string(raw))
+		}
+
+		logLiveNestedTextDiagnostics := func() {
+			var tblName, createDDL string
+			if err := db.QueryRow(fmt.Sprintf("SHOW CREATE TABLE `%s`.`r66_nested_text`", dorisDB)).Scan(&tblName, &createDDL); err != nil {
+				st.Logf("SHOW CREATE TABLE failed: %v", err)
+			} else {
+				st.Logf("LIVE CREATE TABLE %s:\n%s", tblName, createDDL)
+			}
+			rows, qErr := db.Query(fmt.Sprintf("SELECT `_id`, `f__publish_date`, `n__paragraphs` FROM `%s`.`r66_nested_text` ORDER BY `_id`", dorisDB))
+			if qErr != nil {
+				st.Logf("SELECT diagnostic rows failed: %v", qErr)
+				return
+			}
+			defer func() { _ = rows.Close() }()
+			for rows.Next() {
+				var id string
+				var pubDate, paragraphs sql.NullString
+				if sErr := rows.Scan(&id, &pubDate, &paragraphs); sErr != nil {
+					st.Logf("diagnostic scan failed: %v", sErr)
+					continue
+				}
+				st.Logf("LIVE ROW _id=%q f__publish_date=(valid=%v val=%q) n__paragraphs=(valid=%v val=%q)",
+					id, pubDate.Valid, pubDate.String, paragraphs.Valid, paragraphs.String)
+			}
+		}
+
+		for _, tc := range []struct {
+			name string
+			body string
+		}{
+			{
+				name: "100_top_level_knn",
+				body: `{
+					"knn": {
+						"field": "paragraphs.vector",
+						"query_vector": [1, 2],
+						"num_candidates": 10,
+						"k": 10,
+						"filter": {
+							"bool": {
+								"must_not": {
+									"exists": {"field": "publish_date"}
+								}
+							}
+						}
+					}
+				}`,
+			},
+			{
+				name: "130_nested_query_knn",
+				body: `{
+					"query": {
+						"nested": {
+							"path": "paragraphs",
+							"query": {
+								"knn": {
+									"field": "paragraphs.vector",
+									"query_vector": [1, 2],
+									"num_candidates": 10,
+									"filter": {
+										"bool": {
+											"must_not": {
+												"exists": {"field": "publish_date"}
+											}
+										}
+									}
+								}
+							}
+						}
+					}
+				}`,
+			},
+		} {
+			code, raw := doR66Req(st, http.MethodPost, "/r66_nested_text/_search", tc.body)
+			if code != http.StatusOK {
+				logLiveNestedTextDiagnostics()
+				st.Fatalf("%s failed: status=%d body=%s", tc.name, code, string(raw))
+			}
+			var sr struct {
+				Hits struct {
+					Total struct {
+						Value int `json:"value"`
+					} `json:"total"`
+					Hits []struct {
+						ID string `json:"_id"`
+					} `json:"hits"`
+				} `json:"hits"`
+			}
+			_ = json.Unmarshal(raw, &sr)
+			if sr.Hits.Total.Value != 1 || len(sr.Hits.Hits) != 1 || sr.Hits.Hits[0].ID != "2" {
+				logLiveNestedTextDiagnostics()
+				st.Fatalf("%s expected 1 hit with _id=2, got: %s", tc.name, string(raw))
+			}
+		}
+	})
+
 	t.Run("Round62_SubSecond100ms_And_HalfOpen_DateRange_DateHistogram", func(st *testing.T) {
 		code, raw := doR62Req(st, http.MethodPut, "/r62_date_range", `{
 			"mappings": {

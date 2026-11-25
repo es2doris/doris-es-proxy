@@ -257,6 +257,12 @@ func TestRound65_TSDB_F13a_Validation_And_Identity(t *testing.T) {
 			t.Fatalf("ValidateIndexModeSettings(%q, %+v) = %v, want %q", tc.mode, tc.settings, err, tc.wantSub)
 		}
 	}
+	if err := ValidateIndexModeSettingsUpdate("time_series", map[string]any{"index.mode": "time_series", "index.blocks.write": true}); err != nil {
+		t.Fatalf("expected ValidateIndexModeSettingsUpdate to allow omitted routing_path on backing index, got %v", err)
+	}
+	if err := ValidateIndexModeSettingsUpdate("time_series", map[string]any{"index.mode": "time_series", "index.routing_path": []any{}}); err == nil || !strings.Contains(err.Error(), "requires a non-empty [index.routing_path]") {
+		t.Fatalf("expected ValidateIndexModeSettingsUpdate to reject empty routing_path slice, got %v", err)
+	}
 
 	// 3. ExtractTSDBSettings numeric epoch millis (float64) + negative year `-9999-01-01T00:00:00Z` + ValidateTSDBEndTimeUpdate
 	mode, rp, st, et, err := ExtractTSDBSettings(map[string]any{

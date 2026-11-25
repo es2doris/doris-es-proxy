@@ -4252,20 +4252,23 @@ func buildExactQuantileMetricObjectR61Search(spec esast.AggSpec, vals []float64,
 			comp = *spec.Boxplot.Compression
 		}
 		bp := transpiler.ComputeESBoxplotWithExecutionHint(vals, comp, isES8, spec.Boxplot.ExecutionHint)
-		ptrOrNil := func(p *float64) any {
+		ptrOrEmpty := func(p *float64) any {
 			if p == nil {
+				if isES8 {
+					return "NaN"
+				}
 				return nil
 			}
 			return *p
 		}
 		return map[string]any{
-			"min":   ptrOrNil(bp.Min),
-			"max":   ptrOrNil(bp.Max),
-			"q1":    ptrOrNil(bp.Q1),
-			"q2":    ptrOrNil(bp.Q2),
-			"q3":    ptrOrNil(bp.Q3),
-			"lower": ptrOrNil(bp.Lower),
-			"upper": ptrOrNil(bp.Upper),
+			"min":   ptrOrEmpty(bp.Min),
+			"max":   ptrOrEmpty(bp.Max),
+			"q1":    ptrOrEmpty(bp.Q1),
+			"q2":    ptrOrEmpty(bp.Q2),
+			"q3":    ptrOrEmpty(bp.Q3),
+			"lower": ptrOrEmpty(bp.Lower),
+			"upper": ptrOrEmpty(bp.Upper),
 		}, nil
 
 	case spec.MedianAbsoluteDeviation != nil:

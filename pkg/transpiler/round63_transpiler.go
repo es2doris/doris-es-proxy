@@ -92,14 +92,14 @@ func BuildQuotedDorisJSONPaths(field string) (nestedPath string, dottedLiteralPa
 }
 
 // sqlRuntimeSourceJSONTypeIsArrayExpr returns a Doris 4.1.3 boolean predicate testing whether
-// `field` inside `_source` is a JSON array (`JSON_TYPE(json_extract(_source, path)) = 'ARRAY'`),
+// `field` inside `_source` is a JSON array (`LOWER(JSON_TYPE(TRY_CAST(_source AS JSON), path)) = 'array'`),
 // avoiding `LIKE '[%]'` false positives on scalar strings like `"[WARN] retry [1]"` (`C-08`).
 func sqlRuntimeSourceJSONTypeIsArrayExpr(field string) string {
 	nestedPath, dottedPath, hasDot := BuildQuotedDorisJSONPaths(field)
 	if !hasDot {
-		return fmt.Sprintf("JSON_TYPE(TRY_CAST(`_source` AS JSON), %s) = 'ARRAY'", quoteStr(nestedPath))
+		return fmt.Sprintf("LOWER(JSON_TYPE(TRY_CAST(`_source` AS JSON), %s)) = 'array'", quoteStr(nestedPath))
 	}
-	return fmt.Sprintf("(JSON_TYPE(TRY_CAST(`_source` AS JSON), %s) = 'ARRAY' OR (JSON_TYPE(TRY_CAST(`_source` AS JSON), %s) IS NULL AND JSON_TYPE(TRY_CAST(`_source` AS JSON), %s) = 'ARRAY'))",
+	return fmt.Sprintf("(LOWER(JSON_TYPE(TRY_CAST(`_source` AS JSON), %s)) = 'array' OR (JSON_TYPE(TRY_CAST(`_source` AS JSON), %s) IS NULL AND LOWER(JSON_TYPE(TRY_CAST(`_source` AS JSON), %s)) = 'array'))",
 		quoteStr(nestedPath), quoteStr(nestedPath), quoteStr(dottedPath))
 }
 
@@ -424,6 +424,126 @@ func formatBM25BoostR63(boost float64) string {
 	return FormatSQLFloatR63(boost)
 }
 
+func (t *Transpiler) recordBM25RequirementR66(field, colExpr string, caseSensitive bool, terms []string) {
+	if t == nil || len(terms) == 0 {
+		return
+	}
+	var cleaned []string
+	for _, tk := range terms {
+		s := strings.TrimSpace(tk)
+		if !caseSensitive {
+			s = strings.ToLower(s)
+		}
+		if s != "" {
+			cleaned = append(cleaned, s)
+		}
+	}
+	if len(cleaned) == 0 {
+		return
+	}
+	t.collectedBM25Reqs = append(t.collectedBM25Reqs, BM25QueryRequirement{
+		Field:         field,
+		ColExpr:       colExpr,
+		CaseSensitive: caseSensitive,
+		Terms:         cleaned,
+	})
+}
+
+func (t *Transpiler) lookupBM25FieldStatsR66(colExpr, resolvedField, origField string) *BM25FieldTermStats {
+	if t == nil || len(t.Opts.CorpusBM25Stats) == 0 {
+		return nil
+	}
+	candidates := []string{
+		colExpr,
+		strings.Trim(colExpr, "`"),
+		resolvedField,
+		origField,
+	}
+	for _, k := range candidates {
+		if k == "" {
+			continue
+		}
+		if st, ok := t.Opts.CorpusBM25Stats[k]; ok && st != nil {
+			return st
+		}
+	}
+	return nil
+}
+
+func (t *Transpiler) buildBM25ClauseWithStatsR66(origField, resolvedField, colExpr, patInDblSpace string, caseSensitive bool, k1, bParam, boost float64, safePred string) string {
+	if safePred == "FALSE" || strings.TrimSpace(patInDblSpace) == "" {
+		return "0.0"
+	}
+	if boost == 0 {
+		return fmt.Sprintf("(CASE WHEN %s THEN 0.0000 ELSE 0.0 END)", safePred)
+	}
+	strCol := fmt.Sprintf("COALESCE(CAST(%s AS STRING), '')", colExpr)
+	pat := patInDblSpace
+	if !caseSensitive {
+		strCol = fmt.Sprintf("LOWER(%s)", strCol)
+		pat = strings.ToLower(pat)
+	}
+	// Preserve intra-word apostrophes (e.g. "Al's" as 1 token) while turning edge apostrophes and punctuation into delimiters.
+	stripEdgeApostrophes := fmt.Sprintf("REGEXP_REPLACE(%s, %s, ' ')", strCol, quoteStr(`(^|[^[:alnum:]_])'+|'+([^[:alnum:]_]|$)`))
+	trimOne := fmt.Sprintf("TRIM(REGEXP_REPLACE(%s, %s, ' '))", stripEdgeApostrophes, quoteStr(`[^[:alnum:]_']+`))
+	normDbl := fmt.Sprintf("CONCAT(' ', REPLACE(%s, ' ', '  '), ' ')", trimOne)
+	patLit := quoteStr(pat)
+	patRunes := utf8.RuneCountInString(pat)
+	if patRunes <= 0 {
+		patRunes = 1
+	}
+	tfExpr := fmt.Sprintf(
+		"GREATEST(CAST(CHAR_LENGTH(%s) - CHAR_LENGTH(REPLACE(%s, %s, '')) AS DOUBLE) / %.1f, 1.0)",
+		normDbl, normDbl, patLit, float64(patRunes),
+	)
+	dlExpr := fmt.Sprintf(
+		"GREATEST(CAST(1 + CHAR_LENGTH(%s) - CHAR_LENGTH(REPLACE(%s, ' ', '')) AS DOUBLE), 1.0)",
+		trimOne, trimOne,
+	)
+
+	terms := strings.Fields(pat)
+	st := t.lookupBM25FieldStatsR66(colExpr, resolvedField, origField)
+	avgdl := 2.0
+	idfSum := 1.0
+	if st != nil && st.TotalDocs > 0 {
+		if st.AvgDL > 0 {
+			avgdl = st.AvgDL
+		} else {
+			avgdl = 1.0
+		}
+		if len(terms) > 0 {
+			idfSum = 0.0
+			for _, term := range terms {
+				var df int64
+				if st.TermDocFreq != nil {
+					var ok bool
+					df, ok = st.TermDocFreq[term]
+					if !ok && !caseSensitive {
+						df = st.TermDocFreq[strings.ToLower(term)]
+					}
+				}
+				if df <= 0 {
+					df = 1
+				}
+				if df > st.TotalDocs {
+					df = st.TotalDocs
+				}
+				idfSum += math.Log(1.0 + (float64(st.TotalDocs)-float64(df)+0.5)/(float64(df)+0.5))
+			}
+		}
+	}
+
+	scaleStr := FormatSQLFloatR63(boost * idfSum * (k1 + 1.0))
+	denom := fmt.Sprintf(
+		"((%s) + %s * (%s + %s * (%s) / %s))",
+		tfExpr, FormatSQLFloatR63(k1), FormatSQLFloatR63(1.0-bParam), FormatSQLFloatR63(bParam), dlExpr, FormatSQLFloatR63(avgdl),
+	)
+	return fmt.Sprintf(
+		"(CASE WHEN %s THEN (%s * (%s) / %s) ELSE 0.0 END)",
+		safePred, scaleStr, tfExpr, denom,
+	)
+}
+
 // buildBM25ClauseFromColAndPatternR63 emits pure scalar Apache Doris 4.1.3 SQL computing
 // BM25 TF & field-length saturation for `patInDblSpace` (`" tok "` or `" t1  t2 "`).
 func buildBM25ClauseFromColAndPatternR63(colExpr, patInDblSpace string, caseSensitive bool, k1, bParam, boost float64, safePred string) string {
@@ -478,6 +598,10 @@ func (t *Transpiler) compileBM25SingleTermScoreR63(
 		return "", false
 	}
 	colExpr := t.bm25TextColExprR63(resolvedField, b, nctx)
+	t.recordBM25RequirementR66(resolvedField, colExpr, caseSensitive, []string{tok})
+	if t.Opts.CorpusBM25Stats != nil {
+		return t.buildBM25ClauseWithStatsR66(origField, resolvedField, colExpr, " "+tok+" ", caseSensitive, k1, bParam, boost, safePred), true
+	}
 	return buildBM25ClauseFromColAndPatternR63(colExpr, " "+tok+" ", caseSensitive, k1, bParam, boost, safePred), true
 }
 
@@ -497,10 +621,17 @@ func (t *Transpiler) compileBM25MultiTokenMatchScoreR63(
 	if overallSafePred == "FALSE" {
 		return "0.0", true
 	}
+	colExpr := t.bm25TextColExprR63(resolvedField, b, nctx)
+	t.recordBM25RequirementR66(resolvedField, colExpr, caseSensitive, tokens)
 	if boost == 0 {
 		return fmt.Sprintf("(CASE WHEN %s THEN 0.0000 ELSE 0.0 END)", overallSafePred), true
 	}
-	colExpr := t.bm25TextColExprR63(resolvedField, b, nctx)
+	emitClause := func(pat, pred string) string {
+		if t.Opts.CorpusBM25Stats != nil {
+			return t.buildBM25ClauseWithStatsR66(origField, resolvedField, colExpr, pat, caseSensitive, k1, bParam, boost, pred)
+		}
+		return buildBM25ClauseFromColAndPatternR63(colExpr, pat, caseSensitive, k1, bParam, boost, pred)
+	}
 	var termScores []string
 	for _, tok := range tokens {
 		tokTrim := strings.TrimSpace(tok)
@@ -508,14 +639,14 @@ func (t *Transpiler) compileBM25MultiTokenMatchScoreR63(
 			continue
 		}
 		tokPred := t.singleAnalyzedTokenWhereOnlyR63(resolvedField, b, tokTrim, caseSensitive, nctx)
-		termScores = append(termScores, buildBM25ClauseFromColAndPatternR63(colExpr, " "+tokTrim+" ", caseSensitive, k1, bParam, boost, tokPred))
+		termScores = append(termScores, emitClause(" "+tokTrim+" ", tokPred))
 	}
 	if len(termScores) == 0 {
 		return "", false
 	}
 	if len(termScores) == 1 {
 		// If `overallSafePred` matches broader/identical docs, gate on `overallSafePred`.
-		return buildBM25ClauseFromColAndPatternR63(colExpr, " "+strings.TrimSpace(tokens[0])+" ", caseSensitive, k1, bParam, boost, overallSafePred), true
+		return emitClause(" "+strings.TrimSpace(tokens[0])+" ", overallSafePred), true
 	}
 	return fmt.Sprintf("(CASE WHEN %s THEN (%s) ELSE 0.0 END)", overallSafePred, strings.Join(termScores, " + ")), true
 }
@@ -543,7 +674,11 @@ func (t *Transpiler) compileBM25PhraseScoreR63(
 		return "", false
 	}
 	colExpr := t.bm25TextColExprR63(resolvedField, b, nctx)
+	t.recordBM25RequirementR66(resolvedField, colExpr, caseSensitive, cleaned)
 	pat := " " + strings.Join(cleaned, "  ") + " "
+	if t.Opts.CorpusBM25Stats != nil {
+		return t.buildBM25ClauseWithStatsR66(origField, resolvedField, colExpr, pat, caseSensitive, k1, bParam, boost, safePred), true
+	}
 	return buildBM25ClauseFromColAndPatternR63(colExpr, pat, caseSensitive, k1, bParam, boost, safePred), true
 }
 
@@ -1067,6 +1202,12 @@ func (t *Transpiler) appendTopLevelAggregateMetricDoubleR63(
 			"SELECT %s AS `_agg_name`, %s AS `_bucket_key`, CAST(COALESCE(SUM(%s) / NULLIF(SUM(CAST(%s AS DOUBLE)), 0), 0) AS DOUBLE) AS `_doc_count` FROM `base_matched`%s HAVING SUM(%s) > 0",
 			quoteStr(aggName), quoteStr(bucketKey), sumCol, cntCol, wClause, cntCol,
 		))
+		if bucketKey == "_metric" {
+			*branches = append(*branches, fmt.Sprintf(
+				"SELECT %s AS `_agg_name`, '_avg_weight' AS `_bucket_key`, CAST(COALESCE(SUM(%s), 0) AS DOUBLE) AS `_doc_count` FROM `base_matched`%s HAVING SUM(%s) > 0",
+				quoteStr(aggName), cntCol, wClause, cntCol,
+			))
+		}
 		return true
 	}
 
@@ -1170,6 +1311,12 @@ func (t *Transpiler) appendSubAggregateMetricDoubleR63(
 			"SELECT %s AS `_agg_name`, %s AS `_bucket_key`, CAST(COALESCE(SUM(%s) / NULLIF(SUM(CAST(%s AS DOUBLE)), 0), 0) AS DOUBLE) AS `_doc_count` FROM %s WHERE %s GROUP BY `_bucket_key` HAVING SUM(%s) > 0",
 			quoteStr(subFull), parentBucketExpr, sumCol, cntCol, fromClause, whereClause, cntCol,
 		))
+		if !strings.HasSuffix(subFull, "._stats_avg") {
+			*branches = append(*branches, fmt.Sprintf(
+				"SELECT %s AS `_agg_name`, %s AS `_bucket_key`, CAST(COALESCE(SUM(%s), 0) AS DOUBLE) AS `_doc_count` FROM %s WHERE %s GROUP BY `_bucket_key` HAVING SUM(%s) > 0",
+				quoteStr(subFull+"._avg_weight"), parentBucketExpr, cntCol, fromClause, whereClause, cntCol,
+			))
+		}
 	}
 }
 
@@ -1296,7 +1443,7 @@ func (t *Transpiler) appendRound63GroupedSubAggBranch(
 		elemExpr = fmt.Sprintf("LOWER(CAST(%s AS STRING))", subElemAlias)
 	}
 	childKeyExpr := fmt.Sprintf("CONCAT_WS('\\x1f', CAST(%s AS STRING), CAST(%s AS STRING))", parentBucketExpr, elemExpr)
-	subFrom := fmt.Sprintf("%s LATERAL VIEW EXPLODE(%s) %s AS %s", fromClause, explodeTarget, subTableAlias, subElemAlias)
+	subFrom := appendLateralViewToFromClause(fromClause, fmt.Sprintf("LATERAL VIEW EXPLODE(%s) %s AS %s", explodeTarget, subTableAlias, subElemAlias))
 	subWhere := fmt.Sprintf("(%s) AND %s IS NOT NULL", whereClause, subElemAlias)
 	*subIdx++
 	*branches = append(*branches, fmt.Sprintf(
@@ -1375,7 +1522,7 @@ func buildSingleGeoScalarLatLonSQLR63(rawStrExpr string) (latExpr, lonExpr strin
 	// 1. JSON object `{"lat": ..., "lon": ...}`
 	// 2. GeoJSON `{"type": "...", "coordinates": ...}` (1D `[lon, lat]` or nested `[[lon, lat], ...]`)
 	// 3. WKT `POINT (lon lat)` and `BBOX (minLon, maxLon, maxLat, minLat)`
-	// 4. JSON array `[lon, lat]` (when `JSON_TYPE(...) = 'ARRAY'`)
+	// 4. JSON array `[lon, lat]` (when `LOWER(JSON_TYPE(...)) = 'array'`)
 	// 5. `"lat,lon"` string (when not WKT or JSON)
 	// 6. Fallback first coordinate pair in WKT `POLYGON` / `LINESTRING` / `MULTIPOINT`
 	wktPointLon := fmt.Sprintf("TRY_CAST(REGEXP_EXTRACT(TRIM(%s), '(?i)^POINT[[:space:]]*[(][[:space:]]*([-+0-9.eE]+)[[:space:]]+([-+0-9.eE]+)[[:space:]]*[)]$', 1) AS DOUBLE)", rawStrExpr)
@@ -1391,8 +1538,8 @@ func buildSingleGeoScalarLatLonSQLR63(rawStrExpr string) (latExpr, lonExpr strin
 	geoJSONLat := fmt.Sprintf("COALESCE(CAST(element_at(TRY_CAST(%s AS ARRAY<DOUBLE>), 2) AS DOUBLE), TRY_CAST(REGEXP_EXTRACT(%s, '^[[[:space:]]*([-+0-9.eE]+)[[:space:]]*,[[:space:]]*([-+0-9.eE]+)', 2) AS DOUBLE))", coordsJSON, coordsJSON)
 	objLat := fmt.Sprintf("TRY_CAST(json_extract_string(%s, '$.\"lat\"') AS DOUBLE)", rawStrExpr)
 	objLon := fmt.Sprintf("TRY_CAST(json_extract_string(%s, '$.\"lon\"') AS DOUBLE)", rawStrExpr)
-	arrLon := fmt.Sprintf("CASE WHEN JSON_TYPE(TRY_CAST(%s AS JSON), '$') = 'ARRAY' THEN TRY_CAST(element_at(TRY_CAST(%s AS ARRAY<DOUBLE>), 1) AS DOUBLE) ELSE NULL END", rawStrExpr, rawStrExpr)
-	arrLat := fmt.Sprintf("CASE WHEN JSON_TYPE(TRY_CAST(%s AS JSON), '$') = 'ARRAY' THEN TRY_CAST(element_at(TRY_CAST(%s AS ARRAY<DOUBLE>), 2) AS DOUBLE) ELSE NULL END", rawStrExpr, rawStrExpr)
+	arrLon := fmt.Sprintf("CASE WHEN LOWER(JSON_TYPE(TRY_CAST(%s AS JSON), '$')) = 'array' THEN TRY_CAST(element_at(TRY_CAST(%s AS ARRAY<DOUBLE>), 1) AS DOUBLE) ELSE NULL END", rawStrExpr, rawStrExpr)
+	arrLat := fmt.Sprintf("CASE WHEN LOWER(JSON_TYPE(TRY_CAST(%s AS JSON), '$')) = 'array' THEN TRY_CAST(element_at(TRY_CAST(%s AS ARRAY<DOUBLE>), 2) AS DOUBLE) ELSE NULL END", rawStrExpr, rawStrExpr)
 	csvLat := fmt.Sprintf("CASE WHEN %s NOT LIKE '[%%' AND %s NOT REGEXP '^[[:space:]]*[A-Za-z{]' AND LOCATE(',', %s) > 0 THEN TRY_CAST(SPLIT_PART(%s, ',', 1) AS DOUBLE) ELSE NULL END", rawStrExpr, rawStrExpr, rawStrExpr, rawStrExpr)
 	csvLon := fmt.Sprintf("CASE WHEN %s NOT LIKE '[%%' AND %s NOT REGEXP '^[[:space:]]*[A-Za-z{]' AND LOCATE(',', %s) > 0 THEN TRY_CAST(SPLIT_PART(%s, ',', 2) AS DOUBLE) ELSE NULL END", rawStrExpr, rawStrExpr, rawStrExpr, rawStrExpr)
 	wktAnyLon := fmt.Sprintf("TRY_CAST(REGEXP_EXTRACT(TRIM(%s), '(?i)^[A-Z]+[[:space:]]*[(]+[[:space:]]*([-+0-9.eE]+)[[:space:]]+([-+0-9.eE]+)', 1) AS DOUBLE)", rawStrExpr)
@@ -1826,8 +1973,7 @@ func (t *Transpiler) compileNestedKNNQueryR63(nq *esast.NestedQuery, scoring boo
 				simCond = fmt.Sprintf("(%s >= %s)", ipExpr, strconv.FormatFloat(*kq.Similarity, 'f', -1, 64))
 			}
 		default:
-			baseCond = fmt.Sprintf("(%s IS NOT NULL AND array_size(%s) = %d AND INNER_PRODUCT(%s, %s) > 0)", colExpr, colExpr, dim, colExpr, colExpr)
-			safeCol = fmt.Sprintf("IF(array_size(%s) = %d AND INNER_PRODUCT(%s, %s) > 0, %s, %s)", colExpr, dim, colExpr, colExpr, colExpr, vecLit)
+			baseCond, safeCol = buildCosineSafeExprsR61(colExpr, vecLit, dim)
 			cdExpr := fmt.Sprintf("COSINE_DISTANCE(%s, %s)", safeCol, vecLit)
 			rawScoreExpr = fmt.Sprintf("GREATEST((2.0 - (%s)) / 2.0, 0.0)", cdExpr)
 			if kq.Similarity != nil {
@@ -1916,14 +2062,21 @@ func (t *Transpiler) compileNestedKNNQueryR63(nq *esast.NestedQuery, scoring boo
 			}
 		}
 	}
-	if hasNestedPostFilter {
-		postChildConds = append(postChildConds, fmt.Sprintf("((%s) >= (%s) - 1e-12)", rawScoreExpr, knnBestChildExpr))
-	}
-
 	fullChildElemCond := strings.Join(postChildConds, " AND ")
 	existsFullChild := fmt.Sprintf("array_exists(_nel -> %s, `%s`)", fullChildElemCond, corrCol)
 	conds := []string{fmt.Sprintf("(`%s` IS NOT NULL AND %s)", corrCol, existsFullChild)}
 	safeConds := []string{fmt.Sprintf("(`%s` IS NOT NULL AND %s)", corrCol, existsFullChild)}
+	var postBestChildExpr string
+	if hasNestedPostFilter {
+		// Compare flat sibling `array_map` calls instead of embedding `knnBestChildExpr` inside an
+		// outer lambda; Apache Doris 4.1.3 BE segfaults on nested higher-order lambda expressions.
+		postBestChildExpr = fmt.Sprintf("ARRAY_MAX(array_map(_nel -> IF(%s, %s, NULL), `%s`))",
+			fullChildElemCond, rawScoreExpr, corrCol)
+		winningPostChildCond := fmt.Sprintf("(%s IS NOT NULL AND (%s) >= (%s) - 1e-12)",
+			postBestChildExpr, postBestChildExpr, knnBestChildExpr)
+		conds = append(conds, winningPostChildCond)
+		safeConds = append(safeConds, winningPostChildCond)
+	}
 	conds = append(conds, rootFilterConds...)
 	safeConds = append(safeConds, rootSafeFilterConds...)
 	conds = append(conds, postRootConds...)
@@ -1941,6 +2094,9 @@ func (t *Transpiler) compileNestedKNNQueryR63(nq *esast.NestedQuery, scoring boo
 	}
 	childScoreAggExpr := fmt.Sprintf("COALESCE(%s(array_map(_nel -> IF(%s, %s, NULL), `%s`)), 0.0)",
 		aggFn, fullChildElemCond, rawScoreExpr, corrCol)
+	if hasNestedPostFilter {
+		childScoreAggExpr = fmt.Sprintf("COALESCE(%s, 0.0)", postBestChildExpr)
+	}
 
 	if t.Schema != nil && t.Schema.DorisDB != "" && t.Schema.DorisTable != "" && topLimit > 0 {
 		topSubquery := fmt.Sprintf("`_id` IN (SELECT `_id` FROM (SELECT `_id`, ROW_NUMBER() OVER (ORDER BY %s DESC, `_id` ASC) AS `_rn` FROM `%s`.`%s` WHERE `__DORIS_DELETE_SIGN__` = 0 AND %s) `_knn_top` WHERE `_rn` <= %d)",
@@ -2303,11 +2459,11 @@ func buildDateRangeBucketExplodeSQLR63(fromTable, effLoSQL, effHiSQL string, ivM
 	stepExpr := fmt.Sprintf("GREATEST(%s, ((%s) - (%s)) / 2000.0)", minStepStr, effHiSQL, effLoSQL)
 	// Number of steps = floor((hi - lo) / step) + 2 so the final `_off` clamps cleanly onto `effHiSQL` via `LEAST(...)`.
 	countExpr := fmt.Sprintf(
-		"CAST(LEAST(GREATEST(CAST(FLOOR(((%s) - (%s)) / (%s)) AS BIGINT) + 2, 1), 2005) AS INT)",
+		"CAST(LEAST(GREATEST(TRY_CAST(FLOOR(((%s) - (%s)) / (%s)) AS BIGINT) + 2, 1), 2005) AS INT)",
 		effHiSQL, effLoSQL, stepExpr,
 	)
-	explodeFrom := fmt.Sprintf("%s LATERAL VIEW EXPLODE(ARRAY_RANGE(0, %s)) `_rng_t` AS `_off`", fromTable, countExpr)
-	valExpr := fmt.Sprintf("LEAST((%s) + CAST(`_off` AS DOUBLE) * (%s), (%s))", effLoSQL, stepExpr, effHiSQL)
+	explodeFrom := appendLateralViewToFromClause(fromTable, fmt.Sprintf("LATERAL VIEW EXPLODE(ARRAY_RANGE(0, %s)) `_rng_t` AS `_off`", countExpr))
+	valExpr := fmt.Sprintf("LEAST((%s) + TRY_CAST(`_off` AS DOUBLE) * (%s), (%s))", effLoSQL, stepExpr, effHiSQL)
 	return explodeFrom, valExpr
 }
 

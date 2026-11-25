@@ -1204,11 +1204,13 @@ func (s *Server) getClusterSettingStringLocked(key string) (string, bool) {
 }
 
 // IsStaticOnlyClusterSettingRound62 returns true when `key` is a node-static setting
-// that cannot be updated dynamically via `PUT /_cluster/settings` (`reindex.remote.whitelist`
-// and `reindex.remote.whitelist.*`).
+// that cannot be updated dynamically via `PUT /_cluster/settings` (`reindex.remote.whitelist`,
+// `path.repo`, `repositories.url.allowed_urls`, and any dotted sub-keys).
 func IsStaticOnlyClusterSettingRound62(key string) bool {
 	k := strings.TrimSpace(key)
-	return k == "reindex.remote.whitelist" || strings.HasPrefix(k, "reindex.remote.whitelist.")
+	return k == "reindex.remote.whitelist" || strings.HasPrefix(k, "reindex.remote.whitelist.") ||
+		k == "path.repo" || strings.HasPrefix(k, "path.repo.") ||
+		k == "repositories.url.allowed_urls" || strings.HasPrefix(k, "repositories.url.allowed_urls.")
 }
 
 // ValidateDynamicClusterSettingsSectionRound62 inspects a `transient` or `persistent` cluster

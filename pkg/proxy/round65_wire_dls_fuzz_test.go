@@ -117,19 +117,20 @@ func buildFuzzTermsEnumServerR65() *Server {
 			"privileges": []any{"read"},
 		}},
 	}
-	srv.securityUsers["dls_all_user"] = map[string]any{"roles": []any{"dls_all_role"}, "enabled": true}
-	srv.securityUsers["dls_some_user"] = map[string]any{"roles": []any{"dls_some_role"}, "enabled": true}
-	srv.securityUsers["dls_must_not_user"] = map[string]any{"roles": []any{"dls_must_not_role"}, "enabled": true}
-	srv.securityUsers["fls_user"] = map[string]any{"roles": []any{"fls_except_role"}, "enabled": true}
-	srv.securityUsers["fls_empty_grant_user"] = map[string]any{"roles": []any{"fls_empty_grant_role"}, "enabled": true}
-	srv.securityUsers["cluster_only_user"] = map[string]any{"roles": []any{"cluster_only_role"}, "enabled": true}
-	srv.securityUsers["dls_alias_user"] = map[string]any{"roles": []any{"alias_only_role"}, "enabled": true}
-	srv.securityUsers["disabled_user"] = map[string]any{"roles": []any{"superuser"}, "enabled": false}
-	srv.securityAPIKeys["good_key"] = map[string]any{"id": "good_key", "username": "dls_all_user", "invalidated": false}
-	srv.securityAPIKeys["revoked_key"] = map[string]any{"id": "revoked_key", "username": "elastic", "invalidated": true}
+	srv.securityUsers["dls_all_user"] = map[string]any{"password": "pw", "roles": []any{"dls_all_role"}, "enabled": true}
+	srv.securityUsers["dls_some_user"] = map[string]any{"password": "pw", "roles": []any{"dls_some_role"}, "enabled": true}
+	srv.securityUsers["dls_must_not_user"] = map[string]any{"password": "pw", "roles": []any{"dls_must_not_role"}, "enabled": true}
+	srv.securityUsers["fls_user"] = map[string]any{"password": "pw", "roles": []any{"fls_except_role"}, "enabled": true}
+	srv.securityUsers["fls_empty_grant_user"] = map[string]any{"password": "pw", "roles": []any{"fls_empty_grant_role"}, "enabled": true}
+	srv.securityUsers["cluster_only_user"] = map[string]any{"password": "pw", "roles": []any{"cluster_only_role"}, "enabled": true}
+	srv.securityUsers["dls_alias_user"] = map[string]any{"password": "pw", "roles": []any{"alias_only_role"}, "enabled": true}
+	srv.securityUsers["disabled_user"] = map[string]any{"password": "pw", "roles": []any{"superuser"}, "enabled": false}
+	srv.securityAPIKeys["good_key"] = map[string]any{"id": "good_key", "username": "dls_all_user", "api_key": "sec", "invalidated": false}
+	srv.securityAPIKeys["revoked_key"] = map[string]any{"id": "revoked_key", "username": "elastic", "api_key": "sec", "invalidated": true}
 	srv.securityAPIKeys["cluster_key"] = map[string]any{
 		"id":       "cluster_key",
 		"username": "elastic",
+		"api_key":  "sec",
 		"role_descriptors": map[string]any{
 			"only_cluster": map[string]any{"cluster": []any{"all"}},
 		},
@@ -207,17 +208,18 @@ func FuzzTermsEnumDLSFLS(f *testing.F) {
 			fuzzRole["indices"].([]any)[0].(map[string]any)["field_security"] = fs
 		}
 		users := map[string]map[string]any{
-			"fuzz_user": {"roles": []any{"fuzz_role"}, "enabled": true},
-			"disabled":  {"roles": []any{"superuser"}, "enabled": false},
+			"elastic":   {"password": "pw", "roles": []any{"superuser"}, "enabled": true},
+			"fuzz_user": {"password": "pw", "roles": []any{"fuzz_role"}, "enabled": true},
+			"disabled":  {"password": "pw", "roles": []any{"superuser"}, "enabled": false},
 		}
 		roles := map[string]map[string]any{
 			"fuzz_role":    fuzzRole,
 			"cluster_only": {"cluster": []any{"all"}},
 		}
 		apiKeys := map[string]map[string]any{
-			"revoked": {"username": "elastic", "invalidated": true},
-			"orphan":  {"username": "nonexistent_owner"},
-			"valid":   {"username": "fuzz_user", "invalidated": false},
+			"revoked": {"username": "elastic", "api_key": "sec", "invalidated": true},
+			"orphan":  {"username": "nonexistent_owner", "api_key": "sec"},
+			"valid":   {"username": "fuzz_user", "api_key": "sec", "invalidated": false},
 		}
 
 		// Empty, malformed, Bearer, empty-username, disabled, orphan/revoked keys must ALWAYS fail closed.
@@ -230,7 +232,7 @@ func FuzzTermsEnumDLSFLS(f *testing.F) {
 		if EvaluateTermsEnumSecurityAccessR64(basicHdrR65("", "pass"), users, roles, apiKeys, schemas, []string{"sec_idx"}, fieldName) {
 			t.Fatalf("empty Basic username unexpectedly granted access")
 		}
-		if EvaluateTermsEnumSecurityAccessR64(basicHdrR65("disabled", "pass"), users, roles, apiKeys, schemas, []string{"sec_idx"}, fieldName) {
+		if EvaluateTermsEnumSecurityAccessR64(basicHdrR65("disabled", "pw"), users, roles, apiKeys, schemas, []string{"sec_idx"}, fieldName) {
 			t.Fatalf("disabled user unexpectedly granted access")
 		}
 		if EvaluateTermsEnumSecurityAccessR64("ApiKey "+base64.StdEncoding.EncodeToString([]byte("revoked:sec")), users, roles, apiKeys, schemas, []string{"sec_idx"}, fieldName) {
@@ -238,6 +240,12 @@ func FuzzTermsEnumDLSFLS(f *testing.F) {
 		}
 		if EvaluateTermsEnumSecurityAccessR64("ApiKey "+base64.StdEncoding.EncodeToString([]byte("orphan:sec")), users, roles, apiKeys, schemas, []string{"sec_idx"}, fieldName) {
 			t.Fatalf("orphan API key unexpectedly granted access")
+		}
+		if EvaluateTermsEnumSecurityAccessR64(basicHdrR65("elastic", "wrong-pw"), users, roles, apiKeys, schemas, []string{"sec_idx"}, fieldName) {
+			t.Fatalf("wrong elastic password unexpectedly granted access")
+		}
+		if EvaluateTermsEnumSecurityAccessR64("ApiKey "+base64.StdEncoding.EncodeToString([]byte("valid:wrong-sec")), users, roles, apiKeys, schemas, []string{"sec_idx"}, fieldName) {
+			t.Fatalf("wrong API key secret unexpectedly granted access")
 		}
 
 		// Explicit denied DLS/FLS patterns with fuzzed target field must stay false.

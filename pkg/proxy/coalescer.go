@@ -793,6 +793,10 @@ func queryContainsNow(q *esast.Query) bool {
 }
 
 func buildQueryCacheKey(targets []string, req *esast.SearchRequest) (string, bool) {
+	return buildQueryCacheKeyWithAuth(targets, req, "")
+}
+
+func buildQueryCacheKeyWithAuth(targets []string, req *esast.SearchRequest, authScope string) (string, bool) {
 	if req == nil || req.PIT != nil {
 		return "", false
 	}
@@ -817,7 +821,11 @@ func buildQueryCacheKey(targets []string, req *esast.SearchRequest) (string, boo
 	if strings.TrimSpace(req.Routing) != "" {
 		rtSuffix = "\x00rt:" + strings.TrimSpace(req.Routing)
 	}
-	return strings.Join(targets, ",") + "\x00" + string(reqBytes) + afSuffix + rtSuffix, true
+	var authSuffix string
+	if authScope != "" {
+		authSuffix = "\x00auth:" + authScope
+	}
+	return strings.Join(targets, ",") + "\x00" + string(reqBytes) + afSuffix + rtSuffix + authSuffix, true
 }
 
 // Get looks up a cached search response for `(targets, req)` and returns a fresh unmarshaled copy.
@@ -828,10 +836,15 @@ func (qc *QueryResultCache) Get(targets []string, req *esast.SearchRequest) (map
 
 // GetWithMeta looks up a cached search response and its associated unindexed fields for `(targets, req)`.
 func (qc *QueryResultCache) GetWithMeta(targets []string, req *esast.SearchRequest) (map[string]any, []string, bool) {
+	return qc.GetWithMetaForAuth(targets, req, "")
+}
+
+// GetWithMetaForAuth looks up a cached search response isolated by resolved auth scope.
+func (qc *QueryResultCache) GetWithMetaForAuth(targets []string, req *esast.SearchRequest, authScope string) (map[string]any, []string, bool) {
 	if !qc.Enabled() {
 		return nil, nil, false
 	}
-	key, ok := buildQueryCacheKey(targets, req)
+	key, ok := buildQueryCacheKeyWithAuth(targets, req, authScope)
 	if !ok {
 		return nil, nil, false
 	}
@@ -866,10 +879,15 @@ func (qc *QueryResultCache) Put(targets []string, req *esast.SearchRequest, resp
 
 // PutWithMeta stores a serialized snapshot of `resp` and its unindexed fields in the cache for `(targets, req)`.
 func (qc *QueryResultCache) PutWithMeta(targets []string, req *esast.SearchRequest, resp map[string]any, unindexedFields []string) {
+	qc.PutWithMetaForAuth(targets, req, "", resp, unindexedFields)
+}
+
+// PutWithMetaForAuth stores a serialized snapshot of `resp` isolated by resolved auth scope.
+func (qc *QueryResultCache) PutWithMetaForAuth(targets []string, req *esast.SearchRequest, authScope string, resp map[string]any, unindexedFields []string) {
 	if resp == nil || !qc.Enabled() {
 		return
 	}
-	key, ok := buildQueryCacheKey(targets, req)
+	key, ok := buildQueryCacheKeyWithAuth(targets, req, authScope)
 	if !ok {
 		return
 	}

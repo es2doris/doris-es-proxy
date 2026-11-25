@@ -154,8 +154,8 @@ func TestRound62_F10_RawValuesKNNAndRangeHistogramFixes(t *testing.T) {
 
 	trDynKNN := NewTranspiler(mustCompileTestSchemaR62(t, `{"properties": {"tag": {"type": "keyword"}}}`), TranspilerOptions{})
 	reqDynCos := mustUnmarshalSearchReqR62(t, `{"knn": {"field": "unmapped_vec", "query_vector": [1.0, 0.0], "k": 3, "num_candidates": 5}}`)
-	if planDyn, err := trDynKNN.BuildSearchPlan(reqDynCos); err == nil && !strings.Contains(planDyn.HitsSQL, "INNER_PRODUCT(") {
-		t.Fatalf("expected INNER_PRODUCT zero-norm guard on dynamic cosine knn, got:\n%s", planDyn.HitsSQL)
+	if planDyn, err := trDynKNN.BuildSearchPlan(reqDynCos); err == nil && !strings.Contains(planDyn.HitsSQL, "L2_DISTANCE(") {
+		t.Fatalf("expected L2_DISTANCE zero-norm guard on dynamic cosine knn, got:\n%s", planDyn.HitsSQL)
 	}
 
 	// 3. `*_range` sub-second BIGINT offset explosion, half-open bounds clamping, and `_rn_dedup_` sub-agg deduplication
@@ -491,8 +491,8 @@ func TestRound62_F15_TimeSeriesAndTSID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BuildSearchPlan TSDB failed: %v", err)
 	}
-	if !strings.Contains(planTS.HitsSQL, "`__tsid` ASC") || !strings.Contains(planTS.AggsSQL, "GROUP BY `__tsid`, `__tsid_key`") || !strings.Contains(planTS.AggsSQL, "TRANSLATE(`__tsid`") {
-		t.Fatalf("expected __tsid sort, __tsid/__tsid_key GROUP BY, and TRANSLATE binary sort in SQL:\nhits=%s\naggs=%s", planTS.HitsSQL, planTS.AggsSQL)
+	if !strings.Contains(planTS.HitsSQL, "TRANSLATE(`__tsid`") || !strings.Contains(planTS.AggsSQL, "GROUP BY `__tsid`, `__tsid_key`") || !strings.Contains(planTS.AggsSQL, "TRANSLATE(`__tsid`") {
+		t.Fatalf("expected __tsid TRANSLATE binary sort in HitsSQL and __tsid/__tsid_key GROUP BY + TRANSLATE in AggsSQL:\nhits=%s\naggs=%s", planTS.HitsSQL, planTS.AggsSQL)
 	}
 
 	// Searching _tsid directly must fail with [_tsid] is not searchable
@@ -752,8 +752,8 @@ func TestRound62_F17_MapperExtrasAndF22RuntimeFields(t *testing.T) {
 		"sort": [{"sf": {"order": "asc", "numeric_type": "long"}}],
 		"search_after": [-2]
 	}`))
-	if err != nil || strings.Count(sfPlan.HitsSQL, "CAST(TRUNCATE(`f__sf`, 0) AS BIGINT)") < 2 {
-		t.Fatalf("expected CAST(TRUNCATE(`f__sf`, 0) AS BIGINT) in both ORDER BY and search_after, err=%v sql=%s", err, sfPlan.HitsSQL)
+	if err != nil || strings.Count(sfPlan.HitsSQL, "TRY_CAST(TRUNCATE(`f__sf`, 0) AS BIGINT)") < 2 {
+		t.Fatalf("expected TRY_CAST(TRUNCATE(`f__sf`, 0) AS BIGINT) in both ORDER BY and search_after, err=%v sql=%s", err, sfPlan.HitsSQL)
 	}
 
 	// 5. F22 Scriptless Runtime Fields (index-level & search-request runtime_mappings + composite subfields + dotted keys)

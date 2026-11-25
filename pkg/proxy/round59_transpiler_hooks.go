@@ -1279,6 +1279,22 @@ func parseDateHistogramBoundMsRound59(raw any, spec *esast.DateHistogramAggSpec,
 	return schema.ParseESDateBoundToEpochMillis(fmt.Sprintf("%v", raw), nowUTC, roundUp)
 }
 
+// floorDateHistogramExtendedBoundMillisRound66 floors `extended_bounds` endpoints using the
+// base calendar/fixed boundary before shifting by `offset`, avoiding spurious pre-boundary
+// empty buckets when positive `offset` is set alongside `extended_bounds` (`histogram.yml`).
+func floorDateHistogramExtendedBoundMillisRound66(ms int64, spec *esast.DateHistogramAggSpec) int64 {
+	if spec == nil {
+		return ms
+	}
+	offsetMs := spec.EffectiveOffsetMs()
+	if offsetMs == 0 {
+		return floorDateHistogramBucketMillisRound59(ms, spec)
+	}
+	noOffSpec := *spec
+	noOffSpec.Offset = ""
+	return floorDateHistogramBucketMillisRound59(ms, &noOffSpec) + offsetMs
+}
+
 // synthesizeDateHistogramBucketsRound59 filters `hard_bounds`, enforces `min_doc_count`, and
 // synthesizes empty calendar/fixed `date_histogram` buckets across observed and `extended_bounds`
 // ranges when `min_doc_count == 0` (`F19`).
@@ -1350,7 +1366,7 @@ func synthesizeDateHistogramBucketsRound59(rows []AggRow, spec *esast.DateHistog
 	if spec.ExtendedBounds != nil {
 		if spec.ExtendedBounds.Min != nil {
 			if ms, ok := parseDateHistogramBoundMsRound59(spec.ExtendedBounds.Min, spec, nowUTC, false); ok {
-				extMin := floorDateHistogramBucketMillisRound59(ms, spec)
+				extMin := floorDateHistogramExtendedBoundMillisRound66(ms, spec)
 				if !hasMinKey || extMin < minKey {
 					minKey = extMin
 					hasMinKey = true
@@ -1359,7 +1375,7 @@ func synthesizeDateHistogramBucketsRound59(rows []AggRow, spec *esast.DateHistog
 		}
 		if spec.ExtendedBounds.Max != nil {
 			if ms, ok := parseDateHistogramBoundMsRound59(spec.ExtendedBounds.Max, spec, nowUTC, true); ok {
-				extMax := floorDateHistogramBucketMillisRound59(ms, spec)
+				extMax := floorDateHistogramExtendedBoundMillisRound66(ms, spec)
 				if !hasMaxKey || extMax > maxKey {
 					maxKey = extMax
 					hasMaxKey = true

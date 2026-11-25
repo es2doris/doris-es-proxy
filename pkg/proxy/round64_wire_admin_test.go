@@ -53,11 +53,8 @@ func TestRound64_WireLicenseFeatureUsageAndRepositoryURL(t *testing.T) {
 	defer httpFS.Close()
 
 	filePrefix := "file:///" + strings.TrimPrefix(filepath.ToSlash(fsDir), "/") + "/"
-	settingsPayload := fmt.Sprintf(`{"persistent":{"path.repo":[%q],"repositories.url.allowed_urls":["http://127.0.0.1:*",%q]}}`, filepath.ToSlash(fsDir), filePrefix+"*")
-	rec = doRound63Req(t, h, http.MethodPut, "/_cluster/settings", []byte(settingsPayload), nil)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("put cluster settings failed: %d %s", rec.Code, rec.Body.String())
-	}
+	srv.SetStaticPathRepo([]string{filepath.ToSlash(fsDir)})
+	srv.SetStaticRepositoriesURLAllowedURLs([]string{"http://127.0.0.1:*", filePrefix + "*"})
 
 	rec = doRound63Req(t, h, http.MethodPut, "/_snapshot/r_fs", []byte(fmt.Sprintf(`{"type":"fs","settings":{"location":%q}}`, fsDir)), nil)
 	if rec.Code != http.StatusOK {
@@ -243,8 +240,8 @@ func TestRound64_WireDataStreamsAsyncEnrichESQLTermsEnum(t *testing.T) {
 	rec = doRound63Req(t, h, http.MethodPost, "/_data_stream/_modify", []byte(`{
 		"actions":[{"remove_backing_index":{"data_stream":"logs-r64-app","index":".fs-logs-r64-app-2026.01.02-000002","failure_store":true}}]
 	}`), nil)
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("expected 400 when removing active .fs write index, got %d %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 when removing .fs write index under ES 8.15, got %d %s", rec.Code, rec.Body.String())
 	}
 
 	// 2. Enrich coordinator_stats & elasticsearch_version deprecation warning
