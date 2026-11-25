@@ -5198,7 +5198,7 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 		}
 		return nil
 	}
-	if (strings.HasPrefix(colExpr, "lower(") || strings.HasPrefix(colExpr, "LOWER(")) && strings.HasSuffix(colExpr, ")") {
+	if (strings.HasPrefix(colExpr, "lower(") || strings.HasPrefix(colExpr, "LOWER(")) && strings.HasSuffix(colExpr, ")") && hasMatchingOuterParens(colExpr, len("lower")) {
 		inner := colExpr[len("lower(") : len(colExpr)-1]
 		if v := resolveColumnValue(row, inner); v != nil {
 			switch sliceVal := v.(type) {

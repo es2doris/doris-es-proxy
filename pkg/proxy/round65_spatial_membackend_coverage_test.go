@@ -1275,12 +1275,12 @@ func TestRound65_F27_Round63MemBackend_DeepCoveragePart2(t *testing.T) {
 		t.Fatalf("expected NaN on string bitwise AND, got %v", v)
 	}
 
-	// 2. evalDorisJSONTypeTwoArgR63Mem + evalColumnFuncR63Mem (JSON_TYPE, BIT_LENGTH, CARDINALITY)
+	// 2. evalDorisJSONTypeTwoArgR63Mem + evalColumnFuncR63Mem (JSON_TYPE lowercase Doris 4.1.3 names, BIT_LENGTH, CARDINALITY)
 	for path, want := range map[string]any{
-		"$.nested":     "OBJECT",
-		"$.nested.arr": "ARRAY",
-		"$.nested.n":   "INTEGER",
-		"$.nested.ok":  "BOOLEAN",
+		"$.nested":     "object",
+		"$.nested.arr": "array",
+		"$.nested.n":   "int",
+		"$.nested.ok":  "bool",
 		"$.missing":    nil,
 	} {
 		got := evalDorisJSONTypeTwoArgR63Mem(row, "`_doc`", "'"+path+"'")

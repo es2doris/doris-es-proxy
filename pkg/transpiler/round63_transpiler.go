@@ -92,14 +92,14 @@ func BuildQuotedDorisJSONPaths(field string) (nestedPath string, dottedLiteralPa
 }
 
 // sqlRuntimeSourceJSONTypeIsArrayExpr returns a Doris 4.1.3 boolean predicate testing whether
-// `field` inside `_source` is a JSON array (`JSON_TYPE(json_extract(_source, path)) = 'ARRAY'`),
+// `field` inside `_source` is a JSON array (`LOWER(JSON_TYPE(TRY_CAST(_source AS JSON), path)) = 'array'`),
 // avoiding `LIKE '[%]'` false positives on scalar strings like `"[WARN] retry [1]"` (`C-08`).
 func sqlRuntimeSourceJSONTypeIsArrayExpr(field string) string {
 	nestedPath, dottedPath, hasDot := BuildQuotedDorisJSONPaths(field)
 	if !hasDot {
-		return fmt.Sprintf("JSON_TYPE(TRY_CAST(`_source` AS JSON), %s) = 'ARRAY'", quoteStr(nestedPath))
+		return fmt.Sprintf("LOWER(JSON_TYPE(TRY_CAST(`_source` AS JSON), %s)) = 'array'", quoteStr(nestedPath))
 	}
-	return fmt.Sprintf("(JSON_TYPE(TRY_CAST(`_source` AS JSON), %s) = 'ARRAY' OR (JSON_TYPE(TRY_CAST(`_source` AS JSON), %s) IS NULL AND JSON_TYPE(TRY_CAST(`_source` AS JSON), %s) = 'ARRAY'))",
+	return fmt.Sprintf("(LOWER(JSON_TYPE(TRY_CAST(`_source` AS JSON), %s)) = 'array' OR (JSON_TYPE(TRY_CAST(`_source` AS JSON), %s) IS NULL AND LOWER(JSON_TYPE(TRY_CAST(`_source` AS JSON), %s)) = 'array'))",
 		quoteStr(nestedPath), quoteStr(nestedPath), quoteStr(dottedPath))
 }
 
@@ -1522,7 +1522,7 @@ func buildSingleGeoScalarLatLonSQLR63(rawStrExpr string) (latExpr, lonExpr strin
 	// 1. JSON object `{"lat": ..., "lon": ...}`
 	// 2. GeoJSON `{"type": "...", "coordinates": ...}` (1D `[lon, lat]` or nested `[[lon, lat], ...]`)
 	// 3. WKT `POINT (lon lat)` and `BBOX (minLon, maxLon, maxLat, minLat)`
-	// 4. JSON array `[lon, lat]` (when `JSON_TYPE(...) = 'ARRAY'`)
+	// 4. JSON array `[lon, lat]` (when `LOWER(JSON_TYPE(...)) = 'array'`)
 	// 5. `"lat,lon"` string (when not WKT or JSON)
 	// 6. Fallback first coordinate pair in WKT `POLYGON` / `LINESTRING` / `MULTIPOINT`
 	wktPointLon := fmt.Sprintf("TRY_CAST(REGEXP_EXTRACT(TRIM(%s), '(?i)^POINT[[:space:]]*[(][[:space:]]*([-+0-9.eE]+)[[:space:]]+([-+0-9.eE]+)[[:space:]]*[)]$', 1) AS DOUBLE)", rawStrExpr)
@@ -1538,8 +1538,8 @@ func buildSingleGeoScalarLatLonSQLR63(rawStrExpr string) (latExpr, lonExpr strin
 	geoJSONLat := fmt.Sprintf("COALESCE(CAST(element_at(TRY_CAST(%s AS ARRAY<DOUBLE>), 2) AS DOUBLE), TRY_CAST(REGEXP_EXTRACT(%s, '^[[[:space:]]*([-+0-9.eE]+)[[:space:]]*,[[:space:]]*([-+0-9.eE]+)', 2) AS DOUBLE))", coordsJSON, coordsJSON)
 	objLat := fmt.Sprintf("TRY_CAST(json_extract_string(%s, '$.\"lat\"') AS DOUBLE)", rawStrExpr)
 	objLon := fmt.Sprintf("TRY_CAST(json_extract_string(%s, '$.\"lon\"') AS DOUBLE)", rawStrExpr)
-	arrLon := fmt.Sprintf("CASE WHEN JSON_TYPE(TRY_CAST(%s AS JSON), '$') = 'ARRAY' THEN TRY_CAST(element_at(TRY_CAST(%s AS ARRAY<DOUBLE>), 1) AS DOUBLE) ELSE NULL END", rawStrExpr, rawStrExpr)
-	arrLat := fmt.Sprintf("CASE WHEN JSON_TYPE(TRY_CAST(%s AS JSON), '$') = 'ARRAY' THEN TRY_CAST(element_at(TRY_CAST(%s AS ARRAY<DOUBLE>), 2) AS DOUBLE) ELSE NULL END", rawStrExpr, rawStrExpr)
+	arrLon := fmt.Sprintf("CASE WHEN LOWER(JSON_TYPE(TRY_CAST(%s AS JSON), '$')) = 'array' THEN TRY_CAST(element_at(TRY_CAST(%s AS ARRAY<DOUBLE>), 1) AS DOUBLE) ELSE NULL END", rawStrExpr, rawStrExpr)
+	arrLat := fmt.Sprintf("CASE WHEN LOWER(JSON_TYPE(TRY_CAST(%s AS JSON), '$')) = 'array' THEN TRY_CAST(element_at(TRY_CAST(%s AS ARRAY<DOUBLE>), 2) AS DOUBLE) ELSE NULL END", rawStrExpr, rawStrExpr)
 	csvLat := fmt.Sprintf("CASE WHEN %s NOT LIKE '[%%' AND %s NOT REGEXP '^[[:space:]]*[A-Za-z{]' AND LOCATE(',', %s) > 0 THEN TRY_CAST(SPLIT_PART(%s, ',', 1) AS DOUBLE) ELSE NULL END", rawStrExpr, rawStrExpr, rawStrExpr, rawStrExpr)
 	csvLon := fmt.Sprintf("CASE WHEN %s NOT LIKE '[%%' AND %s NOT REGEXP '^[[:space:]]*[A-Za-z{]' AND LOCATE(',', %s) > 0 THEN TRY_CAST(SPLIT_PART(%s, ',', 2) AS DOUBLE) ELSE NULL END", rawStrExpr, rawStrExpr, rawStrExpr, rawStrExpr)
 	wktAnyLon := fmt.Sprintf("TRY_CAST(REGEXP_EXTRACT(TRIM(%s), '(?i)^[A-Z]+[[:space:]]*[(]+[[:space:]]*([-+0-9.eE]+)[[:space:]]+([-+0-9.eE]+)', 1) AS DOUBLE)", rawStrExpr)

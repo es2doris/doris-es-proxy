@@ -63,21 +63,21 @@ func TestRound63_F10_MemBackendStrictCastJSONTypeAndConv(t *testing.T) {
 		t.Fatalf("expected CAST(CONV(...) AS BIGINT) & mask = 0xFE800000, got ok=%v val=%v", ok, masked)
 	}
 
-	// 2. `JSON_TYPE(doc, path)` enforces strict Doris 4.1.3 2-arg signature and distinguishes `'STRING'` from `'ARRAY'`.
-	if err := checkStrictNereidsSQLTypesR63Mem(`SELECT ` + "`_id`" + ` FROM ` + "`doris_es`.`idx_r63`" + ` WHERE JSON_TYPE(json_extract(` + "`_source`" + `, '$."msg"')) = 'STRING'`); err == nil {
+	// 2. `JSON_TYPE(doc, path)` enforces strict Doris 4.1.3 2-arg signature and returns lowercase Doris 4.1.3 types (`'string'`, `'array'`).
+	if err := checkStrictNereidsSQLTypesR63Mem(`SELECT ` + "`_id`" + ` FROM ` + "`doris_es`.`idx_r63`" + ` WHERE LOWER(JSON_TYPE(json_extract(` + "`_source`" + `, '$."msg"'))) = 'string'`); err == nil {
 		t.Fatalf("expected checkStrictNereidsSQLTypesR63Mem to reject 1-argument JSON_TYPE")
 	}
 	if jtOne := resolveColumnValue(row, `JSON_TYPE(json_extract(`+"`_source`"+`, '$."msg"'))`); jtOne != nil {
 		t.Fatalf("expected 1-argument JSON_TYPE to return nil, got %v", jtOne)
 	}
-	if jtMsg := resolveColumnValue(row, `JSON_TYPE(TRY_CAST(`+"`_source`"+` AS JSON), '$."msg"')`); jtMsg != "STRING" {
-		t.Fatalf("expected 2-arg JSON_TYPE msg = STRING, got %v", jtMsg)
+	if jtMsg := resolveColumnValue(row, `JSON_TYPE(TRY_CAST(`+"`_source`"+` AS JSON), '$."msg"')`); jtMsg != "string" {
+		t.Fatalf("expected 2-arg JSON_TYPE msg = string, got %v", jtMsg)
 	}
-	if jtTags := resolveColumnValue(row, `JSON_TYPE(TRY_CAST(`+"`_source`"+` AS JSON), '$."tags"')`); jtTags != "ARRAY" {
-		t.Fatalf("expected 2-arg JSON_TYPE tags = ARRAY, got %v", jtTags)
+	if jtTags := resolveColumnValue(row, `JSON_TYPE(TRY_CAST(`+"`_source`"+` AS JSON), '$."tags"')`); jtTags != "array" {
+		t.Fatalf("expected 2-arg JSON_TYPE tags = array, got %v", jtTags)
 	}
-	if jtRawArr := resolveColumnValue(row, `JSON_TYPE(TRY_CAST('[1.5, 2.5]' AS JSON), '$')`); jtRawArr != "ARRAY" {
-		t.Fatalf("expected 2-arg JSON_TYPE root ARRAY literal = ARRAY, got %v", jtRawArr)
+	if jtRawArr := resolveColumnValue(row, `LOWER(JSON_TYPE(TRY_CAST('[1.5, 2.5]' AS JSON), '$'))`); jtRawArr != "array" {
+		t.Fatalf("expected 2-arg LOWER(JSON_TYPE root ARRAY literal) = array, got %v", jtRawArr)
 	}
 	if jtBadJSON := resolveColumnValue(row, `JSON_TYPE(TRY_CAST('37.7,-122.4' AS JSON), '$')`); jtBadJSON != nil {
 		t.Fatalf("expected 2-arg JSON_TYPE on non-JSON string via TRY_CAST AS JSON to return nil, got %v", jtBadJSON)

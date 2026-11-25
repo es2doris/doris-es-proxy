@@ -2313,7 +2313,7 @@ func (t *Transpiler) compileBool(b *esast.BoolQuery, scoring bool, nctx *nestedC
 		} else if c.WhereSQL == "FALSE" || c.WhereSQL == "(FALSE)" {
 			negW = "TRUE"
 		} else {
-			negW = fmt.Sprintf("NOT COALESCE(%s, FALSE)", c.WhereSQL)
+			negW = negateBoolClauseSQLR66(c.WhereSQL)
 		}
 		if negW == "FALSE" || negW == "(FALSE)" {
 			hasNegFalse = true
@@ -2327,7 +2327,7 @@ func (t *Transpiler) compileBool(b *esast.BoolQuery, scoring bool, nctx *nestedC
 		} else if sw == "FALSE" || sw == "(FALSE)" {
 			safeConjuncts = append(safeConjuncts, "TRUE")
 		} else {
-			safeConjuncts = append(safeConjuncts, fmt.Sprintf("NOT COALESCE(%s, FALSE)", sw))
+			safeConjuncts = append(safeConjuncts, negateBoolClauseSQLR66(sw))
 		}
 	}
 	minShould := 0
@@ -3929,6 +3929,23 @@ func (t *Transpiler) compileCombinedFields(cf *esast.CombinedFieldsQuery, scorin
 	}, scoring, nctx)
 }
 
+// negateBoolClauseSQLR66 negates a compiled boolean predicate for bool must_not and Painless empty checks.
+// Single-column `col IS NOT NULL` checks compile directly to `col IS NULL` so Doris 4.1.3 evaluates
+// null-bitmap predicates natively without `NOT COALESCE(..., FALSE)` wrapper indirection.
+func negateBoolClauseSQLR66(expr string) string {
+	trimmed := unwrapOuterBalancedSQLParens(expr)
+	if strings.HasSuffix(trimmed, " IS NOT NULL") {
+		colExpr := strings.TrimSpace(strings.TrimSuffix(trimmed, " IS NOT NULL"))
+		if len(colExpr) >= 3 && strings.HasPrefix(colExpr, "`") && strings.HasSuffix(colExpr, "`") {
+			inner := colExpr[1 : len(colExpr)-1]
+			if !strings.ContainsAny(inner, "` \t\r\n") {
+				return colExpr + " IS NULL"
+			}
+		}
+	}
+	return fmt.Sprintf("NOT COALESCE(%s, FALSE)", expr)
+}
+
 func unwrapOuterBalancedSQLParens(s string) string {
 	s = strings.TrimSpace(s)
 	for len(s) >= 2 && s[0] == '(' && s[len(s)-1] == ')' {
@@ -4769,7 +4786,7 @@ func (t *Transpiler) parseBooleanScriptCond(s string, params map[string]any, nct
 	if field, tail, ok := parseDocFieldAccess(s); ok && tail == ".empty" {
 		resolved, b := t.resolveFieldInNestedCtx(field, true, nctx)
 		t.checkFieldDocValues(resolved, b)
-		return fmt.Sprintf("NOT COALESCE(%s, FALSE)", t.compileExistsPredicate(field, nctx)), true
+		return negateBoolClauseSQLR66(t.compileExistsPredicate(field, nctx)), true
 	}
 	resolveBoolLit := func(raw string) (bool, bool) {
 		if raw == "true" {
@@ -7664,7 +7681,7 @@ func (t *Transpiler) compileExistsPredicate(field string, nctx *nestedCtx) strin
 		nestedPath, dottedPath, hasDot := BuildQuotedDorisJSONPaths(pathField)
 		jsonTypeExists := func(jp string) string {
 			ql := quoteStr(jp)
-			return fmt.Sprintf("(JSON_TYPE(TRY_CAST(`_source` AS JSON), %s) IS NOT NULL AND JSON_TYPE(TRY_CAST(`_source` AS JSON), %s) != 'NULL' AND (JSON_TYPE(TRY_CAST(`_source` AS JSON), %s) != 'ARRAY' OR JSON_LENGTH(TRY_CAST(`_source` AS JSON), %s) > 0))", ql, ql, ql, ql)
+			return fmt.Sprintf("(JSON_TYPE(TRY_CAST(`_source` AS JSON), %s) IS NOT NULL AND LOWER(JSON_TYPE(TRY_CAST(`_source` AS JSON), %s)) != 'null' AND (LOWER(JSON_TYPE(TRY_CAST(`_source` AS JSON), %s)) != 'array' OR JSON_LENGTH(TRY_CAST(`_source` AS JSON), %s) > 0))", ql, ql, ql, ql)
 		}
 		if !hasDot {
 			basePred = jsonTypeExists(nestedPath)

@@ -394,18 +394,19 @@ func TestRound66_Task2_BM25CorpusStatsAndVariantExists(t *testing.T) {
 		t.Fatalf("expected summed phrase IDF*(k1+1) scales (~1.22579671019987 and ~2.15782435662579), got:\n%s", phrPlan.HitsSQL)
 	}
 
-	// 5. Dynamic VARIANT exists emits 2-arg JSON_TYPE(... != 'NULL') while preserving flattened/promoted/nested
+	// 5. Dynamic VARIANT exists emits 2-arg LOWER(JSON_TYPE(...)) != 'null' / 'array' while preserving flattened/promoted/nested
 	tr := NewTranspiler(sch, TranspilerOptions{AnalysisConfig: anCfg})
 	var dynQ, knnFiltQ, flatQ, nestedQ esast.Query
 	_ = json.Unmarshal([]byte(`{"exists":{"field":"dyn.extra"}}`), &dynQ)
 	wDyn := tr.CompileQuery(&dynQ, false, nil).WhereSQL
 	if !strings.Contains(wDyn, "JSON_TYPE(TRY_CAST(`_source` AS JSON), '$.\"dyn\".\"extra\"') IS NOT NULL") ||
-		!strings.Contains(wDyn, "JSON_TYPE(TRY_CAST(`_source` AS JSON), '$.\"dyn\".\"extra\"') != 'NULL'") {
+		!strings.Contains(wDyn, "LOWER(JSON_TYPE(TRY_CAST(`_source` AS JSON), '$.\"dyn\".\"extra\"')) != 'null'") ||
+		!strings.Contains(wDyn, "LOWER(JSON_TYPE(TRY_CAST(`_source` AS JSON), '$.\"dyn\".\"extra\"')) != 'array'") {
 		t.Fatalf("unexpected dynamic VARIANT exists SQL: %s", wDyn)
 	}
 	_ = json.Unmarshal([]byte(`{"knn":{"field":"vec","query_vector":[1,0,0,0],"k":2,"filter":[{"exists":{"field":"dyn_root"}}]}}`), &knnFiltQ)
 	wKnn := tr.CompileQuery(&knnFiltQ, true, nil).WhereSQL
-	if !strings.Contains(wKnn, "JSON_TYPE(TRY_CAST(`_source` AS JSON), '$.\"dyn_root\"') != 'NULL'") {
+	if !strings.Contains(wKnn, "LOWER(JSON_TYPE(TRY_CAST(`_source` AS JSON), '$.\"dyn_root\"')) != 'null'") {
 		t.Fatalf("unexpected knn.filter dynamic VARIANT exists SQL: %s", wKnn)
 	}
 	_ = json.Unmarshal([]byte(`{"exists":{"field":"labels"}}`), &flatQ)

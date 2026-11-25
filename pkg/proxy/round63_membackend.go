@@ -1169,36 +1169,36 @@ func extractJSONTypedValueFromStrR63Mem(rawJSON string, segs []string) (any, boo
 	return curr, true
 }
 
-// dorisJSONTypeNameR63Mem returns Doris 4.1.3 `JSON_TYPE(val)` string (`'ARRAY'`, `'OBJECT'`,
-// `'STRING'`, `'INTEGER'`, `'DOUBLE'`, `'BOOLEAN'`, `'NULL'`), or `nil` when SQL input is `NULL`.
+// dorisJSONTypeNameR63Mem returns Apache Doris 4.1.3 `JSON_TYPE(doc, path)` lowercase string
+// (`'array'`, `'object'`, `'string'`, `'int'`, `'double'`, `'bool'`, `'null'`), or `nil` when SQL input is `NULL`.
 func dorisJSONTypeNameR63Mem(v any, exists bool) any {
 	if !exists {
 		return nil
 	}
 	if v == nil {
-		return "NULL"
+		return "null"
 	}
 	switch tv := v.(type) {
 	case []any, []string, []float64:
-		return "ARRAY"
+		return "array"
 	case map[string]any:
-		return "OBJECT"
+		return "object"
 	case bool:
-		return "BOOLEAN"
+		return "bool"
 	case int, int32, int64, uint64:
-		return "INTEGER"
+		return "int"
 	case float64:
-		return "DOUBLE"
+		return "double"
 	case json.Number:
 		raw := tv.String()
 		if strings.ContainsAny(raw, ".eE") {
-			return "DOUBLE"
+			return "double"
 		}
-		return "INTEGER"
+		return "int"
 	case string:
-		return "STRING"
+		return "string"
 	default:
-		return "STRING"
+		return "string"
 	}
 }
 

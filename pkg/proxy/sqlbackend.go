@@ -150,14 +150,21 @@ func (b *DorisSQLBackend) ExecDDL(ctx context.Context, ddl string) error {
 	if b.db == nil {
 		return nil
 	}
+	logDDLErr := func(err error) error {
+		if err != nil && b.logSQL.Load() {
+			// #nosec G706 -- sanitized DDL statement logged only when --log-sql is enabled
+			log.Printf("[Doris DDL Error] %v\n%s", err, ddl)
+		}
+		return err
+	}
 	var lastErr error
-	const maxAttempts = 8
+	const maxAttempts = 20
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		if err := ctx.Err(); err != nil {
 			if lastErr != nil {
-				return lastErr
+				return logDDLErr(lastErr)
 			}
-			return err
+			return logDDLErr(err)
 		}
 		_, err := b.db.ExecContext(ctx, ddl)
 		if err == nil {
@@ -165,21 +172,19 @@ func (b *DorisSQLBackend) ExecDDL(ctx context.Context, ddl string) error {
 		}
 		lastErr = err
 		if !isDorisSchemaChangeRetryableError(err) || attempt == maxAttempts-1 {
-			return err
+			return logDDLErr(err)
 		}
-		backoff := time.Duration(50<<uint(attempt)) * time.Millisecond
-		if backoff > 500*time.Millisecond {
-			backoff = 500 * time.Millisecond
-		}
+		shift := min(attempt, 4)
+		backoff := min((50*time.Millisecond)<<shift, 500*time.Millisecond)
 		timer := time.NewTimer(backoff)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return lastErr
+			return logDDLErr(lastErr)
 		case <-timer.C:
 		}
 	}
-	return lastErr
+	return logDDLErr(lastErr)
 }
 
 // NormalizeDorisSQL rewrites internal transpiler markers (`__DORIS_DELETE_SIGN__`, `'\x1f'`,

@@ -146,6 +146,12 @@ func TestRound66FlatNestedKNNAndCosineL2GuardSQL(t *testing.T) {
 	if strings.Contains(planRoot.HitsSQL, "INNER_PRODUCT(") {
 		t.Fatalf("unexpected INNER_PRODUCT in cosine nested kNN SQL:\n%s", planRoot.HitsSQL)
 	}
+	if !strings.Contains(planRoot.HitsSQL, "`f__publish_date` IS NULL") {
+		t.Fatalf("expected direct `f__publish_date` IS NULL negation in SQL:\n%s", planRoot.HitsSQL)
+	}
+	if strings.Contains(planRoot.HitsSQL, "NOT COALESCE(`f__publish_date` IS NOT NULL, FALSE)") {
+		t.Fatalf("unexpected NOT COALESCE wrapper around single-column IS NOT NULL in SQL:\n%s", planRoot.HitsSQL)
+	}
 }
 
 func TestRound66FlatMultiLevelNestedAndSortSQL(t *testing.T) {
@@ -406,5 +412,53 @@ func TestRound66EmptyNestedAggAvgWeightCastAndTSIDSort(t *testing.T) {
 	wantTranslated := TranslateBase64URLOrderR63("AbC-9_")
 	if !strings.Contains(planTSID.HitsSQL, wantTranslated) {
 		t.Fatalf("expected translated _tsid search_after literal %q in SQL:\n%s", wantTranslated, planTSID.HitsSQL)
+	}
+}
+
+func TestRound66LowerJSONTypeAndIsNullNegationSQL(t *testing.T) {
+	sch := mustCompileTestSchemaR62(t, `{
+		"properties": {
+			"publish_date": {"type": "keyword"},
+			"tags": {"type": "keyword", "multi_valued": true},
+			"ml.tokens": {"type": "sparse_vector"}
+		}
+	}`)
+	tr := NewTranspiler(sch, TranspilerOptions{})
+
+	// 1. sparse_vector / dynamic VARIANT exists uses LOWER(JSON_TYPE(...)) against Doris 4.1.3 lowercase 'null'/'array'.
+	existsSparse := mustUnmarshalSearchReqR62(t, `{"query": {"exists": {"field": "ml.tokens"}}}`)
+	planSparse, err := tr.BuildSearchPlan(existsSparse)
+	if err != nil {
+		t.Fatalf("BuildSearchPlan sparse exists failed: %v", err)
+	}
+	if !strings.Contains(planSparse.HitsSQL, "LOWER(JSON_TYPE(TRY_CAST(`_source` AS JSON),") ||
+		!strings.Contains(planSparse.HitsSQL, "!= 'null'") ||
+		!strings.Contains(planSparse.HitsSQL, "!= 'array'") {
+		t.Fatalf("expected LOWER(JSON_TYPE(...)) != 'null'/'array' in sparse_vector exists SQL:\n%s", planSparse.HitsSQL)
+	}
+
+	// 2. Runtime JSON array and geo_point array checks use LOWER(JSON_TYPE(...)) = 'array'.
+	if arrExpr := sqlRuntimeSourceJSONTypeIsArrayExpr("dyn.arr"); !strings.Contains(arrExpr, "LOWER(JSON_TYPE(TRY_CAST(`_source` AS JSON),") || !strings.Contains(arrExpr, "= 'array'") {
+		t.Fatalf("expected LOWER(JSON_TYPE(...)) = 'array' in sqlRuntimeSourceJSONTypeIsArrayExpr, got: %s", arrExpr)
+	}
+	_, lonExpr := buildSingleGeoScalarLatLonSQLR63("`f__loc`")
+	if !strings.Contains(lonExpr, "LOWER(JSON_TYPE(TRY_CAST(`f__loc` AS JSON), '$')) = 'array'") {
+		t.Fatalf("expected LOWER(JSON_TYPE(...)) = 'array' in geo_point lon expr, got: %s", lonExpr)
+	}
+
+	// 3. Single-column IS NOT NULL must_not simplifies to IS NULL; compound must_not keeps NOT COALESCE(..., FALSE).
+	if got := negateBoolClauseSQLR66("(`f__publish_date` IS NOT NULL)"); got != "`f__publish_date` IS NULL" {
+		t.Fatalf("expected `f__publish_date` IS NULL, got %q", got)
+	}
+	if got := negateBoolClauseSQLR66("`f__a` IS NOT NULL AND `f__b` IS NOT NULL"); got != "NOT COALESCE(`f__a` IS NOT NULL AND `f__b` IS NOT NULL, FALSE)" {
+		t.Fatalf("compound IS NOT NULL must keep NOT COALESCE, got %q", got)
+	}
+	reqTermNeg := mustUnmarshalSearchReqR62(t, `{"query": {"bool": {"must_not": [{"term": {"publish_date": "1"}}, {"exists": {"field": "tags"}}, {"exists": {"field": "ml.tokens"}}]}}}`)
+	planNeg, err := tr.BuildSearchPlan(reqTermNeg)
+	if err != nil {
+		t.Fatalf("BuildSearchPlan compound must_not failed: %v", err)
+	}
+	if !strings.Contains(planNeg.HitsSQL, "NOT COALESCE(") {
+		t.Fatalf("expected NOT COALESCE for non-scalar must_not clauses, got:\n%s", planNeg.HitsSQL)
 	}
 }

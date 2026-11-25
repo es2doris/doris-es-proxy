@@ -441,57 +441,185 @@ func TestRound66NestedKNN100YMLSection7NestedTextE2E(t *testing.T) {
 		}
 	}
 
-	// Inspect normalized Doris SQL for exact Section 7 kNN query.
-	knnQuery := `{
-		"knn": {
-			"field": "paragraphs.vector",
-			"query_vector": [1, 2],
-			"num_candidates": 10,
-			"k": 10,
-			"filter": {
-				"bool": {
-					"must_not": {
-						"exists": {"field": "publish_date"}
+	// Inspect normalized Doris SQL for both 100 (top-level knn) and 130 (query.nested.query.knn) Section 7 queries.
+	knnQueries := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "100_top_level_knn",
+			body: `{
+				"knn": {
+					"field": "paragraphs.vector",
+					"query_vector": [1, 2],
+					"num_candidates": 10,
+					"k": 10,
+					"filter": {
+						"bool": {
+							"must_not": {
+								"exists": {"field": "publish_date"}
+							}
+						}
 					}
 				}
+			}`,
+		},
+		{
+			name: "130_nested_query_knn",
+			body: `{
+				"query": {
+					"nested": {
+						"path": "paragraphs",
+						"query": {
+							"knn": {
+								"field": "paragraphs.vector",
+								"query_vector": [1, 2],
+								"num_candidates": 10,
+								"filter": {
+									"bool": {
+										"must_not": {
+											"exists": {"field": "publish_date"}
+										}
+									}
+								}
+							}
+						}
+					}
+				}
+			}`,
+		},
+	}
+
+	for _, tc := range knnQueries {
+		var parsedReq esast.SearchRequest
+		if err := json.Unmarshal([]byte(tc.body), &parsedReq); err != nil {
+			t.Fatalf("%s unmarshal knn query failed: %v", tc.name, err)
+		}
+		plan, err := transpiler.NewTranspiler(idxSchema, transpiler.TranspilerOptions{}).BuildSearchPlan(&parsedReq)
+		if err != nil {
+			t.Fatalf("%s BuildSearchPlan failed: %v", tc.name, err)
+		}
+		normSQL := NormalizeDorisSQL(plan.HitsSQL)
+		if err := checkStrictNereidsSQLTypesR63Mem(normSQL); err != nil {
+			t.Fatalf("%s strict Nereids check failed on normalized SQL: %v\nSQL:\n%s", tc.name, err, normSQL)
+		}
+		if strings.Contains(normSQL, "INNER_PRODUCT(") {
+			t.Fatalf("%s normalized SQL must not contain INNER_PRODUCT on cosine kNN:\n%s", tc.name, normSQL)
+		}
+		if !strings.Contains(normSQL, "`f__publish_date` IS NULL") {
+			t.Fatalf("%s normalized SQL must negate scalar exists directly to `f__publish_date` IS NULL:\n%s", tc.name, normSQL)
+		}
+		if strings.Contains(normSQL, "NOT COALESCE(`f__publish_date` IS NOT NULL, FALSE)") {
+			t.Fatalf("%s normalized SQL must not wrap `f__publish_date` IS NOT NULL in NOT COALESCE:\n%s", tc.name, normSQL)
+		}
+
+		// Execute live Server + MemoryBackend search and verify hit _id == "2".
+		recSearch := doRound65Req(t, h, http.MethodPost, "/nested_text/_search", tc.body, nil)
+		if recSearch.Code != http.StatusOK {
+			t.Fatalf("%s search nested_text failed: %d %s", tc.name, recSearch.Code, recSearch.Body.String())
+		}
+		var sr struct {
+			Hits struct {
+				Total struct {
+					Value int `json:"value"`
+				} `json:"total"`
+				Hits []struct {
+					ID string `json:"_id"`
+				} `json:"hits"`
+			} `json:"hits"`
+		}
+		if err := json.Unmarshal(recSearch.Body.Bytes(), &sr); err != nil {
+			t.Fatalf("%s unmarshal search response failed: %v", tc.name, err)
+		}
+		if sr.Hits.Total.Value != 1 || len(sr.Hits.Hits) != 1 || sr.Hits.Hits[0].ID != "2" {
+			t.Fatalf("%s unexpected search hits for Section 7 nested_text: %s", tc.name, recSearch.Body.String())
+		}
+	}
+}
+
+func TestRound66SparseVectorExistsEmptyArrayVsEmptyObjectE2E(t *testing.T) {
+	srv := newRound65Server("8.15.5")
+	h := srv.Handler()
+
+	// Exact mapping and documents from search.vectors/90_sparse_vector.yml multi-value section.
+	createBody := `{
+		"mappings": {
+			"properties": {
+				"text": {"type": "text"},
+				"ml.tokens": {"type": "sparse_vector"},
+				"embeddings": {"type": "sparse_vector"}
 			}
 		}
 	}`
-	var parsedReq esast.SearchRequest
-	if err := json.Unmarshal([]byte(knnQuery), &parsedReq); err != nil {
-		t.Fatalf("unmarshal knn query failed: %v", err)
+	if rec := doRound65Req(t, h, http.MethodPut, "/test", createBody, nil); rec.Code != http.StatusOK {
+		t.Fatalf("create test failed: %d %s", rec.Code, rec.Body.String())
 	}
-	plan, err := transpiler.NewTranspiler(idxSchema, transpiler.TranspilerOptions{}).BuildSearchPlan(&parsedReq)
-	if err != nil {
-		t.Fatalf("BuildSearchPlan failed: %v", err)
+	docs := []struct {
+		id   string
+		body string
+	}{
+		{"1", `{"text":"running is good for you","ml":{"tokens":[{"running":2.4,"good":2.1},{"race":1.4}]}}`},
+		{"2", `{"text":"walking is a healthy exercise","ml":{"tokens":{"walking":2.4,"exercise":2.0}}}`},
+		{"3", `{"text":"empty array with no values - should not be retrieved in exists queries","ml":{"tokens":[]}}`},
+		{"4", `{"text":"should still respond to exists queries if when empty","ml":{"tokens":{}}}`},
+		{"5", `{"text":"other embeddings available only","embeddings":{"aardvark":0.5}}`},
 	}
-	normSQL := NormalizeDorisSQL(plan.HitsSQL)
-	if err := checkStrictNereidsSQLTypesR63Mem(normSQL); err != nil {
-		t.Fatalf("strict Nereids check failed on normalized SQL: %v\nSQL:\n%s", err, normSQL)
+	for _, d := range docs {
+		if rec := doRound65Req(t, h, http.MethodPut, "/test/_doc/"+d.id, d.body, nil); rec.Code >= 300 {
+			t.Fatalf("index doc %s failed: %d %s", d.id, rec.Code, rec.Body.String())
+		}
 	}
-	if strings.Contains(normSQL, "INNER_PRODUCT(") {
-		t.Fatalf("normalized SQL must not contain INNER_PRODUCT on cosine kNN:\n%s", normSQL)
+	if rec := doRound65Req(t, h, http.MethodPost, "/test/_refresh", "", nil); rec.Code != http.StatusOK {
+		t.Fatalf("refresh failed: %d %s", rec.Code, rec.Body.String())
 	}
 
-	// Execute live Server + MemoryBackend search and verify hit _id == "2".
-	recSearch := doRound65Req(t, h, http.MethodPost, "/nested_text/_search", knnQuery, nil)
+	recSearch := doRound65Req(t, h, http.MethodPost, "/test/_search?rest_total_hits_as_int=true", `{"query":{"exists":{"field":"ml.tokens"}}}`, nil)
 	if recSearch.Code != http.StatusOK {
-		t.Fatalf("search nested_text failed: %d %s", recSearch.Code, recSearch.Body.String())
+		t.Fatalf("exists search failed: %d %s", recSearch.Code, recSearch.Body.String())
 	}
 	var sr struct {
 		Hits struct {
-			Total struct {
-				Value int `json:"value"`
-			} `json:"total"`
-			Hits []struct {
+			Total int `json:"total"`
+			Hits  []struct {
 				ID string `json:"_id"`
 			} `json:"hits"`
 		} `json:"hits"`
 	}
 	if err := json.Unmarshal(recSearch.Body.Bytes(), &sr); err != nil {
-		t.Fatalf("unmarshal search response failed: %v", err)
+		t.Fatalf("unmarshal sparse exists response failed: %v", err)
 	}
-	if sr.Hits.Total.Value != 1 || len(sr.Hits.Hits) != 1 || sr.Hits.Hits[0].ID != "2" {
-		t.Fatalf("unexpected search hits for Section 7 nested_text: %s", recSearch.Body.String())
+	if sr.Hits.Total != 3 || len(sr.Hits.Hits) != 3 {
+		t.Fatalf("expected 3 hits (docs 1, 2, 4; not empty array doc 3), got: %s", recSearch.Body.String())
+	}
+	for _, hit := range sr.Hits.Hits {
+		if hit.ID == "3" || hit.ID == "5" {
+			t.Fatalf("doc %s must not match exists on ml.tokens: %s", hit.ID, recSearch.Body.String())
+		}
+	}
+}
+
+func TestRound66IsTableNotFoundErrorPrecision(t *testing.T) {
+	positives := []error{
+		errors.New("errCode = 2, detailMessage = Unknown table 't'"),
+		errors.New("Unknown database 'es_db'"),
+		errors.New("Table 'db.t' doesn't exist"),
+		errors.New("Table 'db.t' does not exist"),
+		errors.New("Database [es_db] does not exist"),
+	}
+	for _, err := range positives {
+		if !isTableNotFoundError(err) {
+			t.Fatalf("expected isTableNotFoundError(%v) == true", err)
+		}
+	}
+	negatives := []error{
+		nil,
+		errors.New("Column 'f__publish_date' does not exist"),
+		errors.New("Function 'custom_fn' does not exist"),
+		errors.New("Unknown column 'f__publish_date' in 'table list'"),
+	}
+	for _, err := range negatives {
+		if isTableNotFoundError(err) {
+			t.Fatalf("expected isTableNotFoundError(%v) == false", err)
+		}
 	}
 }

@@ -10715,8 +10715,14 @@ func isTableNotFoundError(err error) bool {
 	if err == nil {
 		return false
 	}
-	msg := err.Error()
-	return strings.Contains(msg, "does not exist") || strings.Contains(msg, "doesn't exist") || strings.Contains(msg, "Unknown table")
+	lower := strings.ToLower(err.Error())
+	if strings.Contains(lower, "unknown table") || strings.Contains(lower, "unknown database") || strings.Contains(lower, "doesn't exist") {
+		return true
+	}
+	if strings.Contains(lower, "does not exist") {
+		return strings.Contains(lower, "table") || strings.Contains(lower, "database")
+	}
+	return false
 }
 
 func convertInnerHitsTotalToInt(rawHits any) {
