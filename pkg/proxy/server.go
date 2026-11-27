@@ -21792,6 +21792,19 @@ func synthesizeHistogramBuckets(rows []AggRow, spec *esast.HistogramAggSpec) []A
 	return synthesizeHistogramBucketsWithBudgetR67(rows, spec, nil)
 }
 
+func clampFloatToInt64StepR67(v float64) int64 {
+	if math.IsNaN(v) {
+		return 0
+	}
+	if v >= float64(math.MaxInt64) {
+		return math.MaxInt64
+	}
+	if v <= float64(math.MinInt64) {
+		return math.MinInt64
+	}
+	return int64(v)
+}
+
 func synthesizeHistogramBucketsWithBudgetR67(rows []AggRow, spec *esast.HistogramAggSpec, budget *histBucketBudgetR67) []AggRow {
 	if spec == nil {
 		return rows
@@ -21881,7 +21894,7 @@ func synthesizeHistogramBucketsWithBudgetR67(rows []AggRow, spec *esast.Histogra
 				r.BucketKey = normKey
 			}
 			byKey[normKey] = r
-			step := int64(math.Round((k - offset) / interval))
+			step := clampFloatToInt64StepR67(math.Round((k - offset) / interval))
 			if bigInterval != nil && bigOffset != nil && isExactLargeHistIntR65(r.BucketKey) && interval < 9007199254740992 {
 				if bkBig, okBK := new(big.Int).SetString(strings.TrimSpace(r.BucketKey), 10); okBK {
 					num := new(big.Int).Sub(bkBig, bigOffset)
@@ -21944,8 +21957,8 @@ func synthesizeHistogramBucketsWithBudgetR67(rows []AggRow, spec *esast.Histogra
 		return rows
 	}
 
-	startStep := int64(math.Round((minKey - offset) / interval))
-	endStep := int64(math.Round((maxKey - offset) / interval))
+	startStep := clampFloatToInt64StepR67(math.Round((minKey - offset) / interval))
+	endStep := clampFloatToInt64StepR67(math.Round((maxKey - offset) / interval))
 	if hasExactSteps {
 		if exactMinStep < startStep {
 			startStep = exactMinStep

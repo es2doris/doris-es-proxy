@@ -171,7 +171,9 @@ func TestRound67TopUpFeat_CoalescerAndQueryCache(t *testing.T) {
 		t.Fatalf("FlushTableIfDocPending dup1: %v", err)
 	}
 	cancelB()
-	<-errChB
+	if err := <-errChB; err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected errChB nil or context.Canceled, got %v", err)
+	}
 
 	// Inflight FlushTableIfDocPending & FlushTable waitBatches
 	errBlock := make(chan error, 1)

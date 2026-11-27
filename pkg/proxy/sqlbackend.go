@@ -1915,7 +1915,7 @@ func (b *DorisSQLBackend) InitCatalog(ctx context.Context, dbName string) error 
 		`  "enable_unique_key_merge_on_write" = "true"`,
 		`  "store_row_column" = "true"`,
 		`  "compression" = "zstd"`,
-		`  "function_column.sequence_col" = "_version"`,
+		`  "function_column.sequence_col" = "updated_epoch_ms"`,
 	)
 	ddl := fmt.Sprintf(
 		"CREATE TABLE IF NOT EXISTS `%s`.`_es_catalog` (\n"+

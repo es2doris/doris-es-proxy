@@ -851,9 +851,9 @@ func TestRound67_DorisSQLBackend_CatalogHealthVersionDDLAndErrorGates(t *testing
 		t.Fatalf("CheckClusterHealth(fe down) = (%d, %v, %v), want (1, false, nil)", aliveBEs, feOK, err)
 	}
 
-	// Verify InitCatalog honors SetDDLOptions while defaulting to replication_num=1.
-	if err := b.InitCatalog(ctx, "es_compat"); err != nil || !strings.Contains(capturedDDL, `"replication_num" = "1"`) {
-		t.Fatalf("default InitCatalog DDL missing replication_num=1: err=%v ddl=%s", err, capturedDDL)
+	// Verify InitCatalog honors SetDDLOptions while defaulting to replication_num=1 and sequence_col=updated_epoch_ms.
+	if err := b.InitCatalog(ctx, "es_compat"); err != nil || !strings.Contains(capturedDDL, `"replication_num" = "1"`) || !strings.Contains(capturedDDL, `"function_column.sequence_col" = "updated_epoch_ms"`) || strings.Contains(capturedDDL, `"_version"`) {
+		t.Fatalf("default InitCatalog DDL mismatch: err=%v ddl=%s", err, capturedDDL)
 	}
 	b.SetDDLOptions(schema.DorisDDLOptions{ReplicationNum: 3})
 	if err := b.InitCatalog(ctx, "es_compat"); err != nil || !strings.Contains(capturedDDL, `"replication_num" = "3"`) {

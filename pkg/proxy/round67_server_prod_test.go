@@ -912,6 +912,20 @@ func TestRound67_ErrorPrecisionUnmergedCapsHistogramBudgetMSearchAndRegex(t *tes
 	if len(maxIntRows) != 1 {
 		t.Fatalf("expected 1 safe row at MaxInt64 without overflow loop, got %d", len(maxIntRows))
 	}
+	for _, tc := range []struct {
+		in   float64
+		want int64
+	}{
+		{math.NaN(), 0},
+		{math.Inf(1), math.MaxInt64},
+		{math.Inf(-1), math.MinInt64},
+		{float64(math.MaxInt64), math.MaxInt64},
+		{float64(math.MinInt64), math.MinInt64},
+	} {
+		if got := clampFloatToInt64StepR67(tc.in); got != tc.want {
+			t.Fatalf("clampFloatToInt64StepR67(%v) = %d, want %d", tc.in, got, tc.want)
+		}
+	}
 
 	// 4. _msearch capped at 1024 NDJSON sub-requests.
 	var msBuf strings.Builder
