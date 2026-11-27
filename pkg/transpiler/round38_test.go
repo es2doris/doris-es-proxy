@@ -164,7 +164,7 @@ func TestRound38_F9_F10_NestedRangeAggMultiLevelSortAndScaledFloatSearchAfter(t 
 	if !strings.Contains(plan.AggsSQL, "array_exists") {
 		t.Fatalf("expected nested range/date_range sub-aggs to use array_exists, got: %s", plan.AggsSQL)
 	}
-	if !strings.Contains(plan.HitsSQL, "$.qty") || !strings.Contains(plan.HitsSQL, "$.weight") {
+	if !strings.Contains(plan.HitsSQL, `$."qty"`) || !strings.Contains(plan.HitsSQL, `$."weight"`) {
 		t.Fatalf("expected multi-level nested sort filter conditions in HitsSQL, got: %s", plan.HitsSQL)
 	}
 

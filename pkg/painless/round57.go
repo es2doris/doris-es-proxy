@@ -1615,6 +1615,9 @@ func compileJavaSplitOrReplaceRegexRound57(patStr string) (*regexp.Regexp, error
 	norm := normalizeJavaNamedGroupsPainless(patStr)
 	re, err := compilePainlessRegexp(norm)
 	if err != nil {
+		if pe, ok := err.(*painlessExceptionError); ok {
+			return nil, pe
+		}
 		return nil, &painlessExceptionError{
 			exType:  "PatternSyntaxException",
 			message: err.Error(),

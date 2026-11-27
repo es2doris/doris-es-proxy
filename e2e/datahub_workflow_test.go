@@ -1003,7 +1003,47 @@ func TestSDKWireCompatDynamicMappingAutoPromoteAndPIT_E2E(t *testing.T) {
 	}
 
 	// 4. Test Auto-Promote Threshold (`srv.SetAutoPromoteThreshold(2)`):
-	// Querying a brand-new field `late_added_tag` twice automatically promotes it to `f__late_added_tag`!
+	// Disable write-time dynamic mapping so `late_added_tag` stays unindexed in `_doc`,
+	// index a document containing `late_added_tag`, then query it twice to trigger auto-promote.
+	dynFalseReq, err := http.NewRequest(http.MethodPut, ts.URL+"/schemaless_events/_mapping", strings.NewReader(`{"dynamic":false}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dynFalseReq.Header.Set("Content-Type", "application/json")
+	dynFalseResp, err := http.DefaultClient.Do(dynFalseReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = dynFalseResp.Body.Close()
+	if dynFalseResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK disabling dynamic mapping, got %d", dynFalseResp.StatusCode)
+	}
+	ev3Req, err := http.NewRequest(http.MethodPut, ts.URL+"/schemaless_events/_doc/ev-3?refresh=true", strings.NewReader(`{"service":"search","late_added_tag":"hot"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ev3Req.Header.Set("Content-Type", "application/json")
+	ev3Resp, err := http.DefaultClient.Do(ev3Req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = ev3Resp.Body.Close()
+	if ev3Resp.StatusCode != http.StatusOK && ev3Resp.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 200/201 indexing ev-3, got %d", ev3Resp.StatusCode)
+	}
+	dynTrueReq, err := http.NewRequest(http.MethodPut, ts.URL+"/schemaless_events/_mapping", strings.NewReader(`{"dynamic":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dynTrueReq.Header.Set("Content-Type", "application/json")
+	dynTrueResp, err := http.DefaultClient.Do(dynTrueReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = dynTrueResp.Body.Close()
+	if dynTrueResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK re-enabling dynamic mapping, got %d", dynTrueResp.StatusCode)
+	}
 	for i := 0; i < 2; i++ {
 		r, err := http.Post(ts.URL+"/schemaless_events/_search", "application/json", strings.NewReader(`{"query":{"term":{"late_added_tag":"hot"}}}`))
 		if err != nil {

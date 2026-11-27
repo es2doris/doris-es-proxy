@@ -1306,7 +1306,11 @@ func (s *Server) validateReindexRemoteWhitelistRound60(remoteObj map[string]any)
 // launchAsyncTaskRound60 spawns a background task for wait_for_completion=false on _reindex,
 // _update_by_query, or _delete_by_query after synchronous pre-flight validation has passed.
 func (s *Server) launchAsyncTaskRound60(w http.ResponseWriter, r *http.Request, bodyBytes []byte, action, description string, rps float64, execSync func(http.ResponseWriter, *http.Request)) {
-	bgCtx, cancel := context.WithCancel(context.Background())
+	if !s.acquireAsyncTaskSlot() {
+		writeESError(w, http.StatusTooManyRequests, "es_rejected_execution_exception", "rejected execution of async task: maximum concurrent async tasks reached")
+		return
+	}
+	bgCtx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	if meta, ok := TraceMetaFromContext(r.Context()); ok {
 		bgCtx = WithTraceMeta(bgCtx, meta)
 	}
@@ -1324,6 +1328,7 @@ func (s *Server) launchAsyncTaskRound60(w http.ResponseWriter, r *http.Request, 
 	clonedReq.ContentLength = int64(len(bodyBytes))
 
 	go func() {
+		defer s.releaseAsyncTaskSlot()
 		defer cancel()
 		defer func() {
 			if recErr := recover(); recErr != nil {

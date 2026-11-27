@@ -11,7 +11,12 @@ fullnameOverride: ""
 doris:
   feHost: "doris-fe"
   mysqlPort: 9030
+  httpScheme: "http"
   httpPort: 8030
+  # Optional full comma-separated Doris FE HTTP/HTTPS endpoints (overrides httpScheme/feHost/httpPort), e.g. "https://fe1:8030,https://fe2:8030"
+  httpEndpoint: ""
+  # Optional extra MySQL DSN query parameters, e.g. "tls=true"
+  dsnParams: ""
   database: "es_compat"
   user: "root"
   password: ""
@@ -23,12 +28,35 @@ doris:
   bulkCoalesceBytes: 8388608
   queryCacheTTL: "0s"
   logSQL: false
+  replicationNum: 1
+  replicationAllocation: ""
+  cloudMode: false
+  bucketsAuto: false
+  storeRowColumn: true
+  vectorANN: "off"
+  maxOpenConns: 50
+  maxIdleConns: 10
+  connMaxLifetime: "5m"
+
+bm25:
+  mode: "auto"
+  maxRows: 50000
+
+catalogSync:
+  interval: "5s"
+
+logging:
+  format: "json"
+  level: "info"
 
 auth:
   basicAuthUser: ""
   basicAuthPass: ""
   apiKey: ""
   existingSecret: ""
+  existingSecretBasicAuthUserKey: ""
+  existingSecretBasicAuthPassKey: ""
+  existingSecretApiKeyKey: ""
 
 tls:
   enabled: false
@@ -70,6 +98,18 @@ serviceMonitor:
 
 podAnnotations: {}
 podLabels: {}
+
+terminationGracePeriodSeconds: 30
+
+lifecycle:
+  preStopSleepSeconds: 5
+
+startupProbe:
+  enabled: true
+  initialDelaySeconds: 2
+  periodSeconds: 3
+  timeoutSeconds: 3
+  failureThreshold: 20
 
 nodeSelector: {}
 tolerations: []

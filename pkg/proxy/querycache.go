@@ -266,15 +266,18 @@ func (s *Server) buildShardRequestCacheKeyR63(
 			}
 		}
 		fieldsCount := 0
-		var rawMapBytes []byte
+		var mappingDigest string
 		if sc != nil {
 			fieldsCount = len(sc.Fields)
-			if sc.RawMapping != nil {
-				rawMapBytes, _ = json.Marshal(sc.RawMapping)
+			mappingDigest = sc.MappingHash
+			if mappingDigest == "" && sc.RawMapping != nil {
+				if rawMapBytes, mErr := json.Marshal(sc.RawMapping); mErr == nil {
+					mappingDigest = string(rawMapBytes)
+				}
 			}
 		}
 		_, _ = fmt.Fprintf(h, "idx=%s|fc=%d|seq=%d|ur=%d|", t, fieldsCount, seq, unrefCount)
-		_, _ = h.Write(rawMapBytes)
+		_, _ = h.Write([]byte(mappingDigest))
 		_, _ = h.Write([]byte{';'})
 	}
 	s.appendAuthPrincipalToCacheKeyLockedR65(h, httpReq)
@@ -282,10 +285,13 @@ func (s *Server) buildShardRequestCacheKeyR63(
 
 	if httpReq != nil && httpReq.URL != nil {
 		q := httpReq.URL.Query()
-		for _, k := range []string{"q", "df", "analyzer", "default_operator", "lenient", "routing", "preference", "search_type", "typed_keys", "rest_total_hits_as_int"} {
-			if v := q.Get(k); v != "" {
-				_, _ = fmt.Fprintf(h, "qp:%s=%s;", k, v)
+		for _, k := range []string{"q", "df", "analyzer", "default_operator", "lenient", "routing"} {
+			if vals, has := q[k]; has {
+				_, _ = fmt.Fprintf(h, "qp:%s=%s;", k, strings.Join(vals, "\x1f"))
 			}
+		}
+		if rsp := formatResponseShapingQueryParamsForCacheR67(q); rsp != "" {
+			_, _ = h.Write([]byte(rsp))
 		}
 	}
 	if len(bytes.TrimSpace(rawBody)) > 0 {
@@ -337,7 +343,15 @@ func (s *Server) appendUserAndRolesToCacheKeyLockedR65(h hash.Hash, label, usern
 	}
 }
 
+func decodeAuthCacheTokenB64R67(token string) ([]byte, error) {
+	if decoded, err := base64.StdEncoding.DecodeString(token); err == nil {
+		return decoded, nil
+	}
+	return base64.RawStdEncoding.DecodeString(token)
+}
+
 func (s *Server) appendAuthPrincipalToCacheKeyLockedR65(h hash.Hash, httpReq *http.Request) {
+	_, _ = fmt.Fprintf(h, "se=%d|", s.SecurityEpoch())
 	if httpReq == nil {
 		_, _ = h.Write([]byte("auth:nil;"))
 		return
@@ -357,14 +371,14 @@ func (s *Server) appendAuthPrincipalToCacheKeyLockedR65(h hash.Hash, httpReq *ht
 			token := strings.TrimSpace(parts[1])
 			switch scheme {
 			case "basic":
-				if decoded, err := base64.StdEncoding.DecodeString(token); err == nil {
+				if decoded, err := decodeAuthCacheTokenB64R67(token); err == nil {
 					cred := string(decoded)
 					if colon := strings.IndexByte(cred, ':'); colon >= 0 {
 						s.appendUserAndRolesToCacheKeyLockedR65(h, "user", cred[:colon])
 					}
 				}
 			case "apikey":
-				if decoded, err := base64.StdEncoding.DecodeString(token); err == nil {
+				if decoded, err := decodeAuthCacheTokenB64R67(token); err == nil {
 					cred := string(decoded)
 					if colon := strings.IndexByte(cred, ':'); colon > 0 {
 						keyID := cred[:colon]
@@ -397,6 +411,11 @@ func (s *Server) buildQueryCacheAuthScopeR66(httpReq *http.Request) string {
 	s.mu.RLock()
 	s.appendAuthPrincipalToCacheKeyLockedR65(h, httpReq)
 	s.mu.RUnlock()
+	if httpReq != nil && httpReq.URL != nil {
+		if rsp := formatResponseShapingQueryParamsForCacheR67(httpReq.URL.Query()); rsp != "" {
+			_, _ = h.Write([]byte(rsp))
+		}
+	}
 	return hex.EncodeToString(h.Sum(nil))
 }
 

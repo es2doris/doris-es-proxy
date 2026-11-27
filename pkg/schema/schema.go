@@ -19,6 +19,8 @@ package schema
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
@@ -247,6 +249,14 @@ type IndexSchema struct {
 	IsRuntimeEvalSchema      bool
 	NestedEvalRoot           string
 	AnalysisConfig           *analysis.IndexAnalysisConfig
+	MappingHash              string
+	AliasFieldKeys           []string
+	FlattenedFieldKeys       []string
+	SparseFieldKeys          []string
+	histogramFieldKeys       []string
+	rangeFieldKeys           []string
+	extraCopyToKeys          []string
+	enabledFalsePaths        [][]string
 	passthroughNodes         []passthroughNodeSpec
 }
 
@@ -362,6 +372,7 @@ func (s *IndexSchema) CopyIndexMappingSettingsFrom(src *IndexSchema) {
 			}
 		}
 	}
+	s.recomputePrecomputedSlices()
 }
 
 // EffectiveCoerce returns the field-level `coerce` flag if explicitly set, otherwise the index-level default (true).
@@ -526,6 +537,7 @@ func (s *IndexSchema) SetAnalysisSettings(settings map[string]any) error {
 	}
 	s.AnalysisConfig = cfg
 	s.refreshNormalizerFlags()
+	s.recomputePrecomputedSlices()
 	return nil
 }
 
@@ -871,6 +883,168 @@ func (s *IndexSchema) finalizeCompiledSlices() {
 			PathParts:  parts,
 		})
 	}
+	s.recomputePrecomputedSlices()
+}
+
+func (s *IndexSchema) recomputePrecomputedSlices() {
+	if s == nil {
+		return
+	}
+	fieldKeys := make([]string, 0, len(s.Fields))
+	for k := range s.Fields {
+		fieldKeys = append(fieldKeys, k)
+	}
+	sort.Strings(fieldKeys)
+
+	orderedPaths := make(map[string]bool, len(s.OrderedFields))
+	for _, ob := range s.OrderedFields {
+		orderedPaths[ob.ESFieldPath] = true
+	}
+
+	s.AliasFieldKeys = make([]string, 0)
+	s.FlattenedFieldKeys = make([]string, 0)
+	s.SparseFieldKeys = make([]string, 0)
+	s.histogramFieldKeys = make([]string, 0)
+	s.rangeFieldKeys = make([]string, 0)
+	s.extraCopyToKeys = make([]string, 0)
+	s.enabledFalsePaths = make([][]string, 0)
+
+	for _, k := range fieldKeys {
+		b := s.Fields[k]
+		if b.EnabledFalse && len(b.SourceJSONPath) > 0 {
+			s.enabledFalsePaths = append(s.enabledFalsePaths, b.SourceJSONPath)
+		}
+		if b.AliasTarget != "" {
+			if !b.IsPassthroughAlias && b.ESFieldPath != "" {
+				s.AliasFieldKeys = append(s.AliasFieldKeys, k)
+			}
+			continue
+		}
+		if !orderedPaths[k] && !orderedPaths[b.ESFieldPath] && !b.EnabledFalse && len(b.CopyTo) > 0 {
+			s.extraCopyToKeys = append(s.extraCopyToKeys, k)
+		}
+		if b.EnabledFalse {
+			continue
+		}
+		switch {
+		case b.ESType == "flattened":
+			s.FlattenedFieldKeys = append(s.FlattenedFieldKeys, k)
+		case b.ESType == "sparse_vector" || b.ESType == "rank_features":
+			s.SparseFieldKeys = append(s.SparseFieldKeys, k)
+		case b.ESType == "histogram":
+			s.histogramFieldKeys = append(s.histogramFieldKeys, k)
+		case IsRangeFieldType(b.ESType):
+			s.rangeFieldKeys = append(s.rangeFieldKeys, k)
+		}
+	}
+	s.RefreshMappingHash()
+}
+
+// RefreshMappingHash computes a deterministic SHA-256 hex digest over the schema's
+// canonical mapping, settings, mode, nested roots, and compiled fields.
+func (s *IndexSchema) RefreshMappingHash() string {
+	if s == nil {
+		return ""
+	}
+	h := sha256.New()
+	writeCanonicalValue := func(label string, v any) {
+		_, _ = fmt.Fprintf(h, "%s:", label)
+		if b, err := json.Marshal(v); err == nil {
+			_, _ = h.Write(b)
+		} else {
+			_, _ = fmt.Fprintf(h, "%#v", v)
+		}
+		_, _ = h.Write([]byte{'\n'})
+	}
+
+	writeCanonicalValue("meta", struct {
+		IndexName                string
+		DorisDB                  string
+		DorisTable               string
+		Buckets                  int
+		MaxTotalFields           int
+		MaxNestedFields          int
+		HasExplicitNestedLimit   bool
+		MaxNestedObjects         int
+		MaxDepth                 int
+		MaxFieldNameLength       int
+		MaxTermsCount            int
+		MaxResultWindow          int
+		MaxDocvalueFieldsSearch  int
+		MaxScriptFields          int
+		MaxRegexLength           int
+		DefaultCoerce            *bool
+		DefaultIgnoreMalformed   *bool
+		SourceMode               string
+		SyntheticSource          bool
+		SourceConfig             *SourceConfig
+		LegacyTypeName           string
+		ES8Mode                  bool
+		IndexMode                string
+		RoutingPath              []string
+		TimeSeriesStartTime      string
+		TimeSeriesEndTime        string
+		IgnoreDynamicBeyondLimit bool
+		IsRuntimeEvalSchema      bool
+		NestedEvalRoot           string
+		AnalysisConfig           *analysis.IndexAnalysisConfig
+	}{
+		IndexName:                s.IndexName,
+		DorisDB:                  s.DorisDB,
+		DorisTable:               s.DorisTable,
+		Buckets:                  s.Buckets,
+		MaxTotalFields:           s.MaxTotalFields,
+		MaxNestedFields:          s.MaxNestedFields,
+		HasExplicitNestedLimit:   s.HasExplicitNestedLimit,
+		MaxNestedObjects:         s.MaxNestedObjects,
+		MaxDepth:                 s.MaxDepth,
+		MaxFieldNameLength:       s.MaxFieldNameLength,
+		MaxTermsCount:            s.MaxTermsCount,
+		MaxResultWindow:          s.MaxResultWindow,
+		MaxDocvalueFieldsSearch:  s.MaxDocvalueFieldsSearch,
+		MaxScriptFields:          s.MaxScriptFields,
+		MaxRegexLength:           s.MaxRegexLength,
+		DefaultCoerce:            s.DefaultCoerce,
+		DefaultIgnoreMalformed:   s.DefaultIgnoreMalformed,
+		SourceMode:               s.SourceMode,
+		SyntheticSource:          s.SyntheticSource,
+		SourceConfig:             s.SourceConfig,
+		LegacyTypeName:           s.LegacyTypeName,
+		ES8Mode:                  s.ES8Mode,
+		IndexMode:                s.IndexMode,
+		RoutingPath:              s.RoutingPath,
+		TimeSeriesStartTime:      s.TimeSeriesStartTime,
+		TimeSeriesEndTime:        s.TimeSeriesEndTime,
+		IgnoreDynamicBeyondLimit: s.IgnoreDynamicBeyondLimit,
+		IsRuntimeEvalSchema:      s.IsRuntimeEvalSchema,
+		NestedEvalRoot:           s.NestedEvalRoot,
+		AnalysisConfig:           s.AnalysisConfig,
+	})
+
+	nestedKeys := make([]string, 0, len(s.NestedRoots))
+	for k := range s.NestedRoots {
+		nestedKeys = append(nestedKeys, k)
+	}
+	sort.Strings(nestedKeys)
+	for _, k := range nestedKeys {
+		writeCanonicalValue("nested:"+k, s.NestedRoots[k])
+	}
+
+	fieldKeys := make([]string, 0, len(s.Fields))
+	for k := range s.Fields {
+		fieldKeys = append(fieldKeys, k)
+	}
+	sort.Strings(fieldKeys)
+	for _, k := range fieldKeys {
+		writeCanonicalValue("field:"+k, s.Fields[k])
+	}
+
+	if s.RawMapping != nil {
+		writeCanonicalValue("raw_mapping", s.RawMapping)
+	}
+
+	s.MappingHash = hex.EncodeToString(h.Sum(nil))
+	return s.MappingHash
 }
 
 // MergeMappingSpecs deep-merges two Elasticsearch MappingSpecs without losing existing properties or sub-fields.

@@ -363,6 +363,7 @@ func TestRound61_CapabilitiesFeatureAndProbing(t *testing.T) {
 func TestRound61_TargetESVersionThreadingAndMaxFailureSamples(t *testing.T) {
 	// Not parallel because t.Setenv mutates process environment.
 	srv := proxy.NewServer("es_compat", proxy.NewMemoryBackend(false), transpiler.TranspilerOptions{})
+	srv.SetAllowTestFixtureAuth(true)
 	srv.SetTargetESVersion("8.15.5")
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
@@ -456,6 +457,7 @@ func TestRound61_SpecSchemaValidator_MatchEndpointAndHTTPResponse(t *testing.T) 
 	}
 
 	srv := proxy.NewServer("es_compat", proxy.NewMemoryBackend(false), transpiler.TranspilerOptions{})
+	srv.SetAllowTestFixtureAuth(true)
 	srv.SetTargetESVersion("8.15.5")
 	h := srv.Handler()
 

@@ -253,6 +253,276 @@
       ],
       "title": "Stream Load Group-Commit Coalescer Throughput",
       "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 },
+      "id": 8,
+      "options": {
+        "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom" },
+        "tooltip": { "mode": "multi" }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(doris_es_proxy_http_request_duration_seconds_bucket[5m])) by (le))",
+          "legendFormat": "HTTP p95",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(doris_es_proxy_http_request_duration_seconds_bucket[5m])) by (le))",
+          "legendFormat": "HTTP p99",
+          "refId": "B"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(doris_es_proxy_doris_sql_duration_seconds_bucket[5m])) by (le))",
+          "legendFormat": "Doris SQL p95",
+          "refId": "C"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(doris_es_proxy_doris_sql_duration_seconds_bucket[5m])) by (le))",
+          "legendFormat": "Doris SQL p99",
+          "refId": "D"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(doris_es_proxy_stream_load_duration_seconds_bucket[5m])) by (le))",
+          "legendFormat": "Stream Load p95",
+          "refId": "E"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(doris_es_proxy_stream_load_duration_seconds_bucket[5m])) by (le))",
+          "legendFormat": "Stream Load p99",
+          "refId": "F"
+        }
+      ],
+      "title": "HTTP, Doris SQL & Stream Load Latency (p95 / p99)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 24 },
+      "id": 9,
+      "options": {
+        "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom" },
+        "tooltip": { "mode": "multi" }
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(doris_es_proxy_http_requests_by_route_total[5m])) by (route, status_class)",
+          "legendFormat": "{{route}} ({{status_class}})",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(doris_es_proxy_http_requests_by_route_total{status_class=\"5xx\"}[5m]))",
+          "legendFormat": "5xx Total/s",
+          "refId": "B"
+        }
+      ],
+      "title": "HTTP Requests by Route & Status Class",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 32 },
+      "id": 10,
+      "options": {
+        "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom" },
+        "tooltip": { "mode": "multi" }
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(doris_es_proxy_stream_load_retries_total[5m]))",
+          "legendFormat": "Stream Load Retries/s",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(doris_es_proxy_stream_load_errors_total[5m]))",
+          "legendFormat": "Stream Load Errors/s (incl. filtered rows)",
+          "refId": "B"
+        },
+        {
+          "expr": "sum(rate(doris_es_proxy_doris_sql_errors_total[5m]))",
+          "legendFormat": "Doris SQL Errors/s",
+          "refId": "C"
+        }
+      ],
+      "title": "Stream Load Retries, Errors & Doris SQL Errors",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "unit": "Bps"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 32 },
+      "id": 11,
+      "options": {
+        "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom" },
+        "tooltip": { "mode": "multi" }
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(doris_es_proxy_stream_load_bytes_total[5m]))",
+          "legendFormat": "Stream Load Bytes/s",
+          "refId": "A"
+        }
+      ],
+      "title": "Stream Load Ingestion Throughput",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 40 },
+      "id": 12,
+      "options": {
+        "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom" },
+        "tooltip": { "mode": "multi" }
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(doris_es_proxy_bm25_corpus_scans_total[5m])) by (outcome)",
+          "legendFormat": "BM25 {{outcome}}",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(doris_es_proxy_catalog_syncs_total[5m])) by (outcome)",
+          "legendFormat": "Catalog Sync {{outcome}}",
+          "refId": "B"
+        }
+      ],
+      "title": "BM25 Corpus Scans & Catalog Sync Outcomes",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 40 },
+      "id": 13,
+      "options": {
+        "legend": { "calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom" },
+        "tooltip": { "mode": "multi" }
+      },
+      "targets": [
+        {
+          "expr": "sum(doris_es_proxy_db_pool_connections{state=\"open\"})",
+          "legendFormat": "Open",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(doris_es_proxy_db_pool_connections{state=\"in_use\"})",
+          "legendFormat": "In Use",
+          "refId": "B"
+        },
+        {
+          "expr": "sum(doris_es_proxy_db_pool_connections{state=\"idle\"})",
+          "legendFormat": "Idle",
+          "refId": "C"
+        },
+        {
+          "expr": "sum(rate(doris_es_proxy_db_pool_connections{state=\"wait_count\"}[5m]))",
+          "legendFormat": "Wait Count/s",
+          "refId": "D"
+        },
+        {
+          "expr": "sum(rate(doris_es_proxy_db_pool_connections{state=\"wait_duration_seconds\"}[5m]))",
+          "legendFormat": "Wait Duration s/s",
+          "refId": "E"
+        }
+      ],
+      "title": "Doris MySQL Connection Pool (sql.DBStats)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 48 },
+      "id": 14,
+      "options": {
+        "legend": { "calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom" },
+        "tooltip": { "mode": "multi" }
+      },
+      "targets": [
+        {
+          "expr": "sum(doris_es_proxy_go_mem_heap_inuse_bytes)",
+          "legendFormat": "Heap In-Use Bytes",
+          "refId": "A"
+        }
+      ],
+      "title": "Go Runtime Heap Memory In-Use",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 48 },
+      "id": 15,
+      "options": {
+        "legend": { "calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom" },
+        "tooltip": { "mode": "multi" }
+      },
+      "targets": [
+        {
+          "expr": "sum(doris_es_proxy_go_goroutines)",
+          "legendFormat": "Goroutines",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(doris_es_proxy_go_gc_pause_total_seconds[5m]))",
+          "legendFormat": "GC Pause s/s",
+          "refId": "B"
+        }
+      ],
+      "title": "Go Runtime Goroutines & GC Pause Rate",
+      "type": "timeseries"
     }
   ],
   "refresh": "10s",
@@ -263,5 +533,5 @@
   "timezone": "utc",
   "title": "doris-es-proxy Overview & Shadow Parity",
   "uid": "doris-es-proxy-overview",
-  "version": 1
+  "version": 2
 }

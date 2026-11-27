@@ -600,6 +600,7 @@ func runRound65SDKConformanceSubtests(
 	t.Run("Round65_08_RollupLifecycleAndSearch", func(t *testing.T) {
 		ruSrc := "sdk_r65_ru_src"
 		ruDst := "sdk_r65_ru_dst"
+		ruSeed := "sdk-r65-rollup-usage-seed"
 		ruID := "r65_ru_1"
 		t.Cleanup(func() {
 			if r, e := (esapi.RollupStopJobRequest{JobID: ruID}).Do(ctx, esClient); r != nil {
@@ -610,7 +611,7 @@ func runRound65SDKConformanceSubtests(
 				_ = r.Body.Close()
 				_ = e
 			}
-			for _, name := range []string{ruSrc, ruDst} {
+			for _, name := range []string{ruSrc, ruDst, ruSeed} {
 				if r, e := (esapi.IndicesDeleteRequest{Index: []string{name}}).Do(ctx, esClient); r != nil {
 					_ = r.Body.Close()
 					_ = e
@@ -618,6 +619,14 @@ func runRound65SDKConformanceSubtests(
 			}
 		})
 
+		if r, e := (esapi.IndicesDeleteRequest{Index: []string{ruSeed}}).Do(ctx, esClient); r != nil {
+			_ = r.Body.Close()
+			_ = e
+		}
+		doJSONR64(t, ctx, esClient, "indices.create("+ruSeed+")", esapi.IndicesCreateRequest{
+			Index: ruSeed,
+			Body:  strings.NewReader(`{"mappings":{"_meta":{"_rollup":{"ver":1}}}}`),
+		})
 		doJSONR64(t, ctx, esClient, "indices.create("+ruSrc+")", esapi.IndicesCreateRequest{
 			Index: ruSrc,
 			Body:  strings.NewReader(`{"mappings":{"properties":{"@timestamp":{"type":"date"},"category":{"type":"keyword"},"amount":{"type":"double"}}}}`),
@@ -680,6 +689,10 @@ func runRound65SDKConformanceSubtests(
 
 		doJSONR64(t, ctx, esClient, "rollup.delete_job", esapi.RollupDeleteJobRequest{
 			JobID: ruID,
+		}, http.StatusOK)
+
+		doJSONR64(t, ctx, esClient, "indices.delete("+ruSeed+")", esapi.IndicesDeleteRequest{
+			Index: []string{ruSeed},
 		}, http.StatusOK)
 
 		wireTransport.assertNoViolations(t, "Round65_08_RollupLifecycleAndSearch")

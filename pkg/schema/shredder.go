@@ -92,11 +92,7 @@ func ShredDocumentWithNow(
 	}
 	var origDocForSynthetic map[string]any
 	isImplicitSynthMode := strings.EqualFold(s.IndexMode, "time_series") || strings.EqualFold(s.IndexMode, "logsdb")
-	if (s.SyntheticSource || isImplicitSynthMode) && !s.SourceDisabled() && !strings.EqualFold(s.SourceMode, "stored") {
-		decOrig := json.NewDecoder(bytes.NewReader(trimmed))
-		decOrig.UseNumber()
-		_ = decOrig.Decode(&origDocForSynthetic)
-	}
+	needsSyntheticSource := (s.SyntheticSource || isImplicitSynthMode) && !s.SourceDisabled() && !strings.EqualFold(s.SourceMode, "stored")
 	prunedDynamic := false
 	if err := validateDocumentNestingDepth(parsedDoc, 1, maxVariantNormalizeDepth); err != nil {
 		return nil, err
@@ -123,6 +119,9 @@ func ShredDocumentWithNow(
 		if totalNestedObjs > s.MaxNestedObjects {
 			return nil, esWireError(fmt.Sprintf("illegal_argument_exception: The number of nested documents has exceeded the allowed limit of [%d]. This limit can be set by changing the [index.mapping.nested_objects.limit] index level setting.", s.MaxNestedObjects))
 		}
+	}
+	if needsSyntheticSource {
+		origDocForSynthetic = cloneNestedMap(parsedDoc)
 	}
 	if s.RawMapping != nil && !s.IsRuntimeEvalSchema {
 		var err error
@@ -222,14 +221,17 @@ func ShredDocumentWithNow(
 		})
 	}
 	if s != nil && len(s.Fields) > 0 {
-		aliasFieldKeys := make([]string, 0)
-		for k, b := range s.Fields {
-			if b.AliasTarget != "" && !b.IsPassthroughAlias && b.ESFieldPath != "" {
-				aliasFieldKeys = append(aliasFieldKeys, k)
+		aliasFieldKeys := s.AliasFieldKeys
+		if aliasFieldKeys == nil {
+			aliasFieldKeys = make([]string, 0)
+			for k, b := range s.Fields {
+				if b.AliasTarget != "" && !b.IsPassthroughAlias && b.ESFieldPath != "" {
+					aliasFieldKeys = append(aliasFieldKeys, k)
+				}
 			}
+			sort.Strings(aliasFieldKeys)
 		}
 		if len(aliasFieldKeys) > 0 {
-			sort.Strings(aliasFieldKeys)
 			for _, k := range aliasFieldKeys {
 				b := s.Fields[k]
 				if docHasExplicitFieldPath(parsedDoc, strings.Split(b.ESFieldPath, ".")) {
@@ -237,13 +239,16 @@ func ShredDocumentWithNow(
 				}
 			}
 		}
-		flattenedFieldKeys := make([]string, 0)
-		for k, b := range s.Fields {
-			if b.ESType == "flattened" && b.AliasTarget == "" && !b.EnabledFalse {
-				flattenedFieldKeys = append(flattenedFieldKeys, k)
+		flattenedFieldKeys := s.FlattenedFieldKeys
+		if flattenedFieldKeys == nil {
+			flattenedFieldKeys = make([]string, 0)
+			for k, b := range s.Fields {
+				if b.ESType == "flattened" && b.AliasTarget == "" && !b.EnabledFalse {
+					flattenedFieldKeys = append(flattenedFieldKeys, k)
+				}
 			}
+			sort.Strings(flattenedFieldKeys)
 		}
-		sort.Strings(flattenedFieldKeys)
 		for _, k := range flattenedFieldKeys {
 			b := s.withEffectiveDefaults(s.Fields[k])
 			modified, err := validateAndNormalizeFlattenedFieldInDocWithSchema(parsedDoc, b.SourceJSONPath, b, recordIgnored, s)
@@ -261,13 +266,16 @@ func ShredDocumentWithNow(
 				prunedDynamic = true
 			}
 		}
-		sparseFieldKeys := make([]string, 0)
-		for k, b := range s.Fields {
-			if (b.ESType == "sparse_vector" || b.ESType == "rank_features") && b.AliasTarget == "" && !b.EnabledFalse {
-				sparseFieldKeys = append(sparseFieldKeys, k)
+		sparseFieldKeys := s.SparseFieldKeys
+		if sparseFieldKeys == nil {
+			sparseFieldKeys = make([]string, 0)
+			for k, b := range s.Fields {
+				if (b.ESType == "sparse_vector" || b.ESType == "rank_features") && b.AliasTarget == "" && !b.EnabledFalse {
+					sparseFieldKeys = append(sparseFieldKeys, k)
+				}
 			}
+			sort.Strings(sparseFieldKeys)
 		}
-		sort.Strings(sparseFieldKeys)
 		for _, k := range sparseFieldKeys {
 			b := s.withEffectiveDefaults(s.Fields[k])
 			modified, err := validateAndNormalizeSparseVectorFieldInDoc(parsedDoc, b.SourceJSONPath, b)
@@ -285,13 +293,16 @@ func ShredDocumentWithNow(
 				prunedDynamic = true
 			}
 		}
-		histogramFieldKeys := make([]string, 0)
-		for k, b := range s.Fields {
-			if b.ESType == "histogram" && b.AliasTarget == "" && !b.EnabledFalse {
-				histogramFieldKeys = append(histogramFieldKeys, k)
+		histogramFieldKeys := s.histogramFieldKeys
+		if histogramFieldKeys == nil {
+			histogramFieldKeys = make([]string, 0)
+			for k, b := range s.Fields {
+				if b.ESType == "histogram" && b.AliasTarget == "" && !b.EnabledFalse {
+					histogramFieldKeys = append(histogramFieldKeys, k)
+				}
 			}
+			sort.Strings(histogramFieldKeys)
 		}
-		sort.Strings(histogramFieldKeys)
 		for _, k := range histogramFieldKeys {
 			b := s.withEffectiveDefaults(s.Fields[k])
 			modified, err := validateAndNormalizeHistogramFieldInDocWithIgnored(parsedDoc, b.SourceJSONPath, b, recordIgnored)
@@ -868,13 +879,16 @@ func ShredDocumentWithNow(
 	}
 
 	if s != nil && len(s.Fields) > 0 {
-		rangeFieldKeys := make([]string, 0)
-		for k, b := range s.Fields {
-			if IsRangeFieldType(b.ESType) && b.AliasTarget == "" && !b.EnabledFalse {
-				rangeFieldKeys = append(rangeFieldKeys, k)
+		rangeFieldKeys := s.rangeFieldKeys
+		if rangeFieldKeys == nil {
+			rangeFieldKeys = make([]string, 0)
+			for k, b := range s.Fields {
+				if IsRangeFieldType(b.ESType) && b.AliasTarget == "" && !b.EnabledFalse {
+					rangeFieldKeys = append(rangeFieldKeys, k)
+				}
 			}
+			sort.Strings(rangeFieldKeys)
 		}
-		sort.Strings(rangeFieldKeys)
 		for _, k := range rangeFieldKeys {
 			b := s.withEffectiveDefaults(s.Fields[k])
 			modified, err := validateAndNormalizeRangeFieldInDoc(parsedDoc, b.SourceJSONPath, b, getNow)
@@ -897,18 +911,24 @@ func ShredDocumentWithNow(
 	// Propagate `copy_to` field values to target bindings (supporting transitive A -> B -> C chains)
 	copyToFields := fieldsToVisit
 	if s != nil && len(s.Fields) > 0 {
-		visitedPaths := make(map[string]bool, len(fieldsToVisit))
-		for _, b := range fieldsToVisit {
-			visitedPaths[b.ESFieldPath] = true
-		}
 		var extraCopyToKeys []string
-		for k, b := range s.Fields {
-			if !visitedPaths[k] && b.AliasTarget == "" && !b.EnabledFalse && len(b.CopyTo) > 0 {
-				extraCopyToKeys = append(extraCopyToKeys, k)
+		if s.extraCopyToKeys != nil && len(s.OrderedFields) > 0 {
+			extraCopyToKeys = s.extraCopyToKeys
+		} else {
+			visitedPaths := make(map[string]bool, len(fieldsToVisit))
+			for _, b := range fieldsToVisit {
+				visitedPaths[b.ESFieldPath] = true
+			}
+			for k, b := range s.Fields {
+				if !visitedPaths[k] && b.AliasTarget == "" && !b.EnabledFalse && len(b.CopyTo) > 0 {
+					extraCopyToKeys = append(extraCopyToKeys, k)
+				}
+			}
+			if len(extraCopyToKeys) > 0 {
+				sort.Strings(extraCopyToKeys)
 			}
 		}
 		if len(extraCopyToKeys) > 0 {
-			sort.Strings(extraCopyToKeys)
 			copyToFields = make([]FieldBinding, 0, len(fieldsToVisit)+len(extraCopyToKeys))
 			copyToFields = append(copyToFields, fieldsToVisit...)
 			for _, k := range extraCopyToKeys {
@@ -1259,12 +1279,12 @@ func ShredDocumentWithNow(
 			prunedDynamic = true
 		}
 	}
-	variantDoc, err := buildVariantDocPayloadWithError(trimmed, parsedDoc, prunedDynamic, s)
+	variantDoc, err := buildVariantDocPayloadInternal(trimmed, parsedDoc, prunedDynamic, s, true)
 	if err != nil {
 		return nil, err
 	}
 	row["_doc"] = variantDoc
-	if (s.SyntheticSource || isImplicitSynthMode) && !s.SourceDisabled() && !strings.EqualFold(s.SourceMode, "stored") {
+	if needsSyntheticSource {
 		srcInput := origDocForSynthetic
 		if srcInput == nil {
 			srcInput = parsedDoc
@@ -4458,14 +4478,22 @@ func propagateCopyToCustomMultiFields(s *IndexSchema, row map[string]any, target
 }
 
 func buildVariantDocPayloadWithError(trimmed []byte, parsedDoc map[string]any, prunedDynamic bool, s *IndexSchema) (json.RawMessage, error) {
+	return buildVariantDocPayloadInternal(trimmed, parsedDoc, prunedDynamic, s, false)
+}
+
+func buildVariantDocPayloadInternal(trimmed []byte, parsedDoc map[string]any, prunedDynamic bool, s *IndexSchema, allowInPlace bool) (json.RawMessage, error) {
 	if err := validateDocumentNestingDepth(parsedDoc, 1, maxVariantNormalizeDepth); err != nil {
 		return nil, err
 	}
 	var enabledFalsePaths [][]string
 	if s != nil {
-		for _, b := range s.Fields {
-			if b.EnabledFalse && len(b.SourceJSONPath) > 0 {
-				enabledFalsePaths = append(enabledFalsePaths, b.SourceJSONPath)
+		if s.enabledFalsePaths != nil {
+			enabledFalsePaths = s.enabledFalsePaths
+		} else {
+			for _, b := range s.Fields {
+				if b.EnabledFalse && len(b.SourceJSONPath) > 0 {
+					enabledFalsePaths = append(enabledFalsePaths, b.SourceJSONPath)
+				}
 			}
 		}
 	}
@@ -4473,16 +4501,25 @@ func buildVariantDocPayloadWithError(trimmed []byte, parsedDoc map[string]any, p
 	if !prunedDynamic && len(enabledFalsePaths) == 0 && !hasDotted {
 		return json.RawMessage(trimmed), nil
 	}
-	if prunedDynamic && parsedDoc != nil {
+	if (prunedDynamic || allowInPlace) && parsedDoc != nil {
+		modified := prunedDynamic
 		for _, p := range enabledFalsePaths {
-			deletePathInMap(parsedDoc, p)
+			if deletePathInMap(parsedDoc, p) {
+				modified = true
+			}
 		}
-		normDoc, _, err := normalizeVariantDocMapWithDepth(parsedDoc, s, "", 1, maxVariantNormalizeDepth)
+		normDoc, normMod, err := normalizeVariantDocMapWithDepth(parsedDoc, s, "", 1, maxVariantNormalizeDepth)
 		if err != nil {
 			return nil, err
 		}
-		if normDoc != nil {
+		if normMod && normDoc != nil {
 			parsedDoc = normDoc
+			modified = true
+		} else if prunedDynamic && normDoc != nil {
+			parsedDoc = normDoc
+		}
+		if !modified {
+			return json.RawMessage(trimmed), nil
 		}
 		b, err := json.Marshal(parsedDoc)
 		if err != nil {
@@ -5536,28 +5573,28 @@ func extractAndValidateVectorValues(node any, path []string, dims int) ([]float6
 	return nil, false, true
 }
 
+func cloneNestedValue(v any) any {
+	switch tv := v.(type) {
+	case map[string]any:
+		return cloneNestedMap(tv)
+	case []any:
+		s := make([]any, len(tv))
+		for i, item := range tv {
+			s[i] = cloneNestedValue(item)
+		}
+		return s
+	default:
+		return v
+	}
+}
+
 func cloneNestedMap(m map[string]any) map[string]any {
 	if m == nil {
 		return nil
 	}
 	out := make(map[string]any, len(m))
 	for k, v := range m {
-		switch tv := v.(type) {
-		case map[string]any:
-			out[k] = cloneNestedMap(tv)
-		case []any:
-			s := make([]any, len(tv))
-			for i, item := range tv {
-				if subM, ok := item.(map[string]any); ok {
-					s[i] = cloneNestedMap(subM)
-				} else {
-					s[i] = item
-				}
-			}
-			out[k] = s
-		default:
-			out[k] = v
-		}
+		out[k] = cloneNestedValue(v)
 	}
 	return out
 }

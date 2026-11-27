@@ -1,8 +1,11 @@
 package proxy
 
 import (
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 )
@@ -1985,30 +1988,77 @@ func TestRound53_ProxyAndIngestFeatures(t *testing.T) {
 	}
 
 	// 7. F8: Security Management API & Logstash Pipeline API
+	doAuthReq := func(method, path, body, user, pass string) (int, map[string]any, string) {
+		t.Helper()
+		req := httptest.NewRequest(method, path, strings.NewReader(body))
+		if body != "" {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		if user != "" {
+			req.Header.Set("Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(user+":"+pass)))
+		}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		var parsed map[string]any
+		_ = json.Unmarshal(rec.Body.Bytes(), &parsed)
+		return rec.Code, parsed, rec.Body.String()
+	}
 	if c, _, _ := doRound48Req(t, handler, http.MethodPut, "/_security/user/alice", `{"password":"secret","roles":["admin"]}`); c != http.StatusOK {
 		t.Fatalf("expected 200 on PUT /_security/user/alice, got %d", c)
 	}
-	if c, _, _ := doRound48Req(t, handler, http.MethodGet, "/_security/user/alice", ``); c != http.StatusOK {
+	if c, _, _ := doAuthReq(http.MethodGet, "/_security/user/alice", ``, "alice", "secret"); c != http.StatusOK {
 		t.Fatalf("expected 200 on GET /_security/user/alice, got %d", c)
 	}
-	if c, _, _ := doRound48Req(t, handler, http.MethodGet, "/_security/user", ``); c != http.StatusOK {
+	if c, _, _ := doAuthReq(http.MethodGet, "/_security/user", ``, "alice", "secret"); c != http.StatusOK {
 		t.Fatalf("expected 200 on GET /_security/user, got %d", c)
 	}
-	if c, _, _ := doRound48Req(t, handler, http.MethodPut, "/_security/user/alice/_disable", ``); c != http.StatusOK {
-		t.Fatalf("expected 200 on PUT /_security/user/alice/_disable, got %d", c)
-	}
-	if c, _, _ := doRound48Req(t, handler, http.MethodPut, "/_security/user/alice/_enable", ``); c != http.StatusOK {
-		t.Fatalf("expected 200 on PUT /_security/user/alice/_enable, got %d", c)
-	}
-	if c, _, _ := doRound48Req(t, handler, http.MethodPost, "/_security/user/alice/_password", `{"password":"newsecret"}`); c != http.StatusOK {
+	if c, _, _ := doAuthReq(http.MethodPost, "/_security/user/alice/_password", `{"password":"newsecret"}`, "alice", "secret"); c != http.StatusOK {
 		t.Fatalf("expected 200 on POST /_security/user/alice/_password, got %d", c)
 	}
-	if c, m, _ := doRound48Req(t, handler, http.MethodPost, "/_security/user/_has_privileges", `{"cluster":["monitor"],"index":[{"names":["r53_idx"],"privileges":["read"]}]}`); c != http.StatusOK || m["has_all_requested"] != true {
+	if c, m, _ := doAuthReq(http.MethodPost, "/_security/user/_has_privileges", `{"cluster":["monitor"],"index":[{"names":["r53_idx"],"privileges":["read"]}]}`, "alice", "newsecret"); c != http.StatusOK || m["has_all_requested"] != true {
 		t.Fatalf("expected 200 on _has_privileges, got %d (%v)", c, m)
 	}
-	if c, _, _ := doRound48Req(t, handler, http.MethodDelete, "/_security/user/alice", ``); c != http.StatusOK {
-		t.Fatalf("expected 200 on DELETE /_security/user/alice, got %d", c)
+	if c, _, _ := doAuthReq(http.MethodPut, "/_security/user/alice/_disable", ``, "alice", "newsecret"); c != http.StatusOK {
+		t.Fatalf("expected 200 on PUT /_security/user/alice/_disable, got %d", c)
 	}
+	// Disabled user cannot re-enable itself via Basic auth; re-enable cleanly via another admin user created while using static auth isn't needed if checked before delete, or put secadmin temporarily.
+	if c, _, _ := doAuthReq(http.MethodGet, "/_security/user/alice", ``, "alice", "newsecret"); c != http.StatusUnauthorized {
+		t.Fatalf("expected 401 when disabled alice attempts GET /_security/user/alice, got %d", c)
+	}
+	// Remove dynamic users cleanly so remaining open-cluster checks below run unauthenticated.
+	// Reset via Delete on direct handler after enabling or deleting alice with a static admin credential:
+	_, _, _ = doAuthReq(http.MethodDelete, "/_security/user/alice", ``, "alice", "newsecret")
+	// Since disabled alice receives 401 over HTTP middleware, use a temporary secadmin or test _disable/_enable on secSrv.
+	_, secAdminH := newTestServerWithMock(t)
+	doR49Sec := func(method, path, body, user, pass string) (int, map[string]any, string) {
+		t.Helper()
+		req := httptest.NewRequest(method, path, strings.NewReader(body))
+		if body != "" {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		if user != "" {
+			req.Header.Set("Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(user+":"+pass)))
+		}
+		rec := httptest.NewRecorder()
+		secAdminH.ServeHTTP(rec, req)
+		var parsed map[string]any
+		_ = json.Unmarshal(rec.Body.Bytes(), &parsed)
+		return rec.Code, parsed, rec.Body.String()
+	}
+	_, _, _ = doR49Sec(http.MethodPut, "/_security/user/secadmin", `{"password":"apw","roles":["superuser"]}`, "", "")
+	_, _, _ = doR49Sec(http.MethodPut, "/_security/user/alice2", `{"password":"pw","roles":["admin"]}`, "secadmin", "apw")
+	if c, _, _ := doR49Sec(http.MethodPut, "/_security/user/alice2/_disable", ``, "secadmin", "apw"); c != http.StatusOK {
+		t.Fatalf("expected 200 on PUT /_security/user/alice2/_disable, got %d", c)
+	}
+	if c, _, _ := doR49Sec(http.MethodPut, "/_security/user/alice2/_enable", ``, "secadmin", "apw"); c != http.StatusOK {
+		t.Fatalf("expected 200 on PUT /_security/user/alice2/_enable, got %d", c)
+	}
+	if c, _, _ := doR49Sec(http.MethodDelete, "/_security/user/alice2", ``, "secadmin", "apw"); c != http.StatusOK {
+		t.Fatalf("expected 200 on DELETE /_security/user/alice2, got %d", c)
+	}
+	// Reset original server back to open-cluster by deleting alice via direct internal test setup not needed if alice is enabled & deleted, so use a fresh server or re-test on secH; even simpler: start open-cluster check for roles on new server or keep handler clean!
+	_, handler = newTestServerWithMock(t)
+	_, _, _ = doRound48Req(t, handler, http.MethodPut, "/r53_idx", `{"mappings":{"properties":{"f":{"type":"keyword"}}}}`)
 	if c, _, _ := doRound48Req(t, handler, http.MethodPut, "/_security/role/analyst", `{"cluster":["monitor"],"indices":[{"names":["*"],"privileges":["read"]}]}`); c != http.StatusOK {
 		t.Fatalf("expected 200 on PUT /_security/role/analyst, got %d", c)
 	}
@@ -2036,34 +2086,49 @@ func TestRound53_ProxyAndIngestFeatures(t *testing.T) {
 	if c, _, _ := doRound48Req(t, handler, http.MethodDelete, "/_security/privilege/myapp/read", ``); c != http.StatusOK {
 		t.Fatalf("expected 200 on DELETE /_security/privilege/myapp/read, got %d", c)
 	}
-	if c, m, _ := doRound48Req(t, handler, http.MethodPost, "/_security/api_key", `{"name":"my-key"}`); c != http.StatusOK || m["id"] == nil {
+	akSrv, akHandler := newTestServerWithMock(t)
+	akSrv.SetAuth("elastic", "r49-sec", "")
+	doAKReq := func(method, path, body string) (int, map[string]any, string) {
+		t.Helper()
+		req := httptest.NewRequest(method, path, strings.NewReader(body))
+		if body != "" {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		req.Header.Set("Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte("elastic:r49-sec")))
+		rec := httptest.NewRecorder()
+		akHandler.ServeHTTP(rec, req)
+		var parsed map[string]any
+		_ = json.Unmarshal(rec.Body.Bytes(), &parsed)
+		return rec.Code, parsed, rec.Body.String()
+	}
+	if c, m, _ := doAKReq(http.MethodPost, "/_security/api_key", `{"name":"my-key"}`); c != http.StatusOK || m["id"] == nil {
 		t.Fatalf("expected 200 on POST /_security/api_key, got %d (%v)", c, m)
 	}
-	if c, _, _ := doRound48Req(t, handler, http.MethodGet, "/_security/api_key?name=my-key", ``); c != http.StatusOK {
+	if c, _, _ := doAKReq(http.MethodGet, "/_security/api_key?name=my-key", ``); c != http.StatusOK {
 		t.Fatalf("expected 200 on GET /_security/api_key, got %d", c)
 	}
-	if c, _, _ := doRound48Req(t, handler, http.MethodPost, "/_security/_query/api_key", `{}`); c != http.StatusOK {
+	if c, _, _ := doAKReq(http.MethodPost, "/_security/_query/api_key", `{}`); c != http.StatusOK {
 		t.Fatalf("expected 200 on POST /_security/_query/api_key, got %d", c)
 	}
-	if c, _, _ := doRound48Req(t, handler, http.MethodDelete, "/_security/api_key", `{"name":"my-key"}`); c != http.StatusOK {
+	if c, _, _ := doAKReq(http.MethodDelete, "/_security/api_key", `{"name":"my-key"}`); c != http.StatusOK {
 		t.Fatalf("expected 200 on DELETE /_security/api_key, got %d", c)
 	}
-	if c, _, _ := doRound48Req(t, handler, http.MethodPost, "/_security/oauth2/token", `{"grant_type":"client_credentials"}`); c != http.StatusOK {
+	if c, _, _ := doAKReq(http.MethodPost, "/_security/oauth2/token", `{"grant_type":"client_credentials"}`); c != http.StatusOK {
 		t.Fatalf("expected 200 on POST /_security/oauth2/token, got %d", c)
 	}
-	if c, _, _ := doRound48Req(t, handler, http.MethodDelete, "/_security/oauth2/token", `{"token":"doris-oauth2-access-token"}`); c != http.StatusOK {
+	if c, _, _ := doAKReq(http.MethodDelete, "/_security/oauth2/token", `{"token":"doris-oauth2-access-token"}`); c != http.StatusOK {
 		t.Fatalf("expected 200 on DELETE /_security/oauth2/token, got %d", c)
 	}
-	if c, _, _ := doRound48Req(t, handler, http.MethodGet, "/_security/service", ``); c != http.StatusOK {
+	if c, _, _ := doAKReq(http.MethodGet, "/_security/service", ``); c != http.StatusOK {
 		t.Fatalf("expected 200 on GET /_security/service, got %d", c)
 	}
-	if c, _, _ := doRound48Req(t, handler, http.MethodPost, "/_security/service/elastic/kibana/credential/token/t1", ``); c != http.StatusOK {
+	if c, _, _ := doAKReq(http.MethodPost, "/_security/service/elastic/kibana/credential/token/t1", ``); c != http.StatusOK {
 		t.Fatalf("expected 200 on POST service token, got %d", c)
 	}
-	if c, _, _ := doRound48Req(t, handler, http.MethodGet, "/_security/service/elastic/kibana/credential/token", ``); c != http.StatusOK {
+	if c, _, _ := doAKReq(http.MethodGet, "/_security/service/elastic/kibana/credential/token", ``); c != http.StatusOK {
 		t.Fatalf("expected 200 on GET service tokens, got %d", c)
 	}
-	if c, _, _ := doRound48Req(t, handler, http.MethodDelete, "/_security/service/elastic/kibana/credential/token/t1", ``); c != http.StatusOK {
+	if c, _, _ := doAKReq(http.MethodDelete, "/_security/service/elastic/kibana/credential/token/t1", ``); c != http.StatusOK {
 		t.Fatalf("expected 200 on DELETE service token, got %d", c)
 	}
 	// Logstash

@@ -152,7 +152,8 @@ func TestRound65_DLS_TermsEnumFailClosedAndFeatures(t *testing.T) {
 	srv.mu.Lock()
 	srv.securityRoles["dls_all_role"] = map[string]any{
 		"indices": []any{map[string]any{
-			"names": []any{"te_idx"},
+			"names":      []any{"te_idx"},
+			"privileges": []any{"read"},
 			"query": map[string]any{
 				"bool": map[string]any{
 					"must":   []any{map[string]any{"match_all": map[string]any{}}},
@@ -163,7 +164,8 @@ func TestRound65_DLS_TermsEnumFailClosedAndFeatures(t *testing.T) {
 	}
 	srv.securityRoles["dls_should_matchall"] = map[string]any{
 		"indices": []any{map[string]any{
-			"names": []any{"te_idx"},
+			"names":      []any{"te_idx"},
+			"privileges": []any{"read"},
 			"query": map[string]any{
 				"bool": map[string]any{
 					"should":               []any{map[string]any{"match_all": map[string]any{}}, map[string]any{"term": map[string]any{"tag": "alpha"}}},
@@ -174,7 +176,8 @@ func TestRound65_DLS_TermsEnumFailClosedAndFeatures(t *testing.T) {
 	}
 	srv.securityRoles["dls_must_not_role"] = map[string]any{
 		"indices": []any{map[string]any{
-			"names": []any{"te_idx"},
+			"names":      []any{"te_idx"},
+			"privileges": []any{"read"},
 			"query": map[string]any{
 				"bool": map[string]any{
 					"must":     []any{map[string]any{"match_all": map[string]any{}}},
@@ -185,7 +188,8 @@ func TestRound65_DLS_TermsEnumFailClosedAndFeatures(t *testing.T) {
 	}
 	srv.securityRoles["dls_nonslice_role"] = map[string]any{
 		"indices": []any{map[string]any{
-			"names": []any{"te_idx"},
+			"names":      []any{"te_idx"},
+			"privileges": []any{"read"},
 			"query": map[string]any{
 				"bool": map[string]any{
 					"must": "not_a_clause",
@@ -205,6 +209,7 @@ func TestRound65_DLS_TermsEnumFailClosedAndFeatures(t *testing.T) {
 	srv.securityRoles["fls_empty_grant"] = map[string]any{
 		"indices": []any{map[string]any{
 			"names":          []any{"te_idx"},
+			"privileges":     []any{"read"},
 			"field_security": map[string]any{"grant": []any{}},
 		}},
 	}
@@ -236,12 +241,19 @@ func TestRound65_DLS_TermsEnumFailClosedAndFeatures(t *testing.T) {
 	srv.basicAuthUser = ""
 	srv.authMu.Unlock()
 
-	// test_admin fixture passes when not overridden & basicAuthUser=="".
+	// test_admin fixture is denied by default when AllowTestFixtureAuth is false, and passes once enabled.
+	if recDeny := doRound65Req(t, h, http.MethodPost, "/te_idx/_terms_enum", `{"field":"tag"}`, map[string]string{
+		"Authorization": basicHdrR65("test_admin", "x-pack-test-password"),
+	}); recDeny.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for test_admin when AllowTestFixtureAuth=false, got %d %s", recDeny.Code, recDeny.Body.String())
+	}
+	srv.SetAllowTestFixtureAuth(true)
+	t.Cleanup(func() { srv.SetAllowTestFixtureAuth(false) })
 	taRes := mustDecodeJSONMapR65(t, doRound65Req(t, h, http.MethodPost, "/te_idx/_terms_enum", `{"field":"tag"}`, map[string]string{
 		"Authorization": basicHdrR65("test_admin", "x-pack-test-password"),
 	}))
 	if terms, _ := taRes["terms"].([]any); len(terms) != 3 {
-		t.Fatalf("expected 3 terms for test_admin fixture, got %+v", taRes)
+		t.Fatalf("expected 3 terms for test_admin fixture when enabled, got %+v", taRes)
 	}
 
 	// Allowed user with bool(must match_all + filter terms ck=fixed).

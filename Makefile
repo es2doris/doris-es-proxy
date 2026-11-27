@@ -44,11 +44,13 @@ fuzz:
 	go test -fuzz='^FuzzSpatialH3PolyfillAndGridDisk$$' -fuzztime=$(FUZZTIME) ./pkg/spatial
 	go test -fuzz='^FuzzEvalPainless$$' -fuzztime=$(FUZZTIME) ./pkg/painless
 	go test -fuzz='^FuzzPainlessEval$$' -fuzztime=$(FUZZTIME) ./pkg/painless
+	go test -fuzz='^FuzzPainlessBuiltinsAndRegexBombs$$' -fuzztime=$(FUZZTIME) ./pkg/painless
 	go test -fuzz='^FuzzParseESDateMath$$' -fuzztime=$(FUZZTIME) ./pkg/schema
 	go test -fuzz='^FuzzInferAndShredDocument$$' -fuzztime=$(FUZZTIME) ./pkg/schema
 	go test -fuzz='^FuzzValidateTSDBSettingsAndMappings$$' -fuzztime=$(FUZZTIME) ./pkg/schema
 	go test -fuzz='^FuzzShredVariantAndHistogram$$' -fuzztime=$(FUZZTIME) ./pkg/schema
 	go test -fuzz='^FuzzShredDocument$$' -fuzztime=$(FUZZTIME) ./pkg/schema
+	go test -fuzz='^FuzzVectorAndFlattenedShredder$$' -fuzztime=$(FUZZTIME) ./pkg/schema
 	go test -fuzz='^FuzzBulkNDJSONInvariants$$' -fuzztime=$(FUZZTIME) ./pkg/esast
 	go test -fuzz='^FuzzUnmarshalSearchRequest$$' -fuzztime=$(FUZZTIME) ./pkg/esast
 	go test -fuzz='^FuzzParseBulkNDJSON$$' -fuzztime=$(FUZZTIME) ./pkg/esast
@@ -57,6 +59,7 @@ fuzz:
 	go test -fuzz='^FuzzParseLuceneQueryString$$' -fuzztime=$(FUZZTIME) ./pkg/transpiler
 	go test -fuzz='^FuzzBuildSearchPlan$$' -fuzztime=$(FUZZTIME) ./pkg/transpiler
 	go test -fuzz='^FuzzNormalizeDorisSQL$$' -fuzztime=$(FUZZTIME) ./pkg/transpiler
+	go test -fuzz='^FuzzJSONPathAndNestedSQLSafety$$' -fuzztime=$(FUZZTIME) ./pkg/transpiler
 	go test -fuzz='^FuzzCompileGrokAndDissect$$' -fuzztime=$(FUZZTIME) ./pkg/proxy
 	go test -fuzz='^FuzzRenderMustacheTemplate$$' -fuzztime=$(FUZZTIME) ./pkg/proxy
 	go test -fuzz='^FuzzDecompressRequestBody$$' -fuzztime=$(FUZZTIME) ./pkg/proxy
@@ -73,6 +76,12 @@ fuzz:
 	go test -fuzz='^FuzzHistogramBoundsAndSQL$$' -fuzztime=$(FUZZTIME) ./pkg/proxy
 	go test -fuzz='^FuzzMonitoringBulkNDJSON$$' -fuzztime=$(FUZZTIME) ./pkg/proxy
 	go test -fuzz='^FuzzAutoscalingByteSize$$' -fuzztime=$(FUZZTIME) ./pkg/proxy
+	go test -fuzz='^FuzzSQLAndFullESQLEQLEval$$' -fuzztime=$(FUZZTIME) ./pkg/proxy
+	go test -fuzz='^FuzzHistogramGapFillAndTimeZones$$' -fuzztime=$(FUZZTIME) ./pkg/proxy
+	go test -fuzz='^FuzzQueryAndShardCacheKeyIsolation$$' -fuzztime=$(FUZZTIME) ./pkg/proxy
+	go test -fuzz='^FuzzStreamLoadChunkingHeadersAndErrorURL$$' -fuzztime=$(FUZZTIME) ./pkg/proxy
+	go test -fuzz='^FuzzRound66SecurityConnectorInferenceHandlers$$' -fuzztime=$(FUZZTIME) ./pkg/proxy
+	go test -fuzz='^FuzzFilterPathGlobAndSourceQueryParam$$' -fuzztime=$(FUZZTIME) ./pkg/proxy
 
 test-e2e:
 	DORIS_E2E_DSN="$(DORIS_E2E_DSN)" DORIS_E2E_HTTP="$(DORIS_E2E_HTTP)" go test -race -count=1 -v ./e2e -run TestLiveApacheDoris_E2E
@@ -85,7 +94,7 @@ test-sdk-conformance:
 
 test-conformance:
 	bash scripts/fetch-conformance-specs.sh
-	CONFORMANCE_REQUIRE_UPSTREAM=1 CONFORMANCE_MIN_V7_PASSED=1980 CONFORMANCE_MIN_V8_PASSED=4600 go test -race -count=1 -v ./pkg/compliance -run 'TestUpstream|TestSpecSchemaValidatorLiveUpstreamSchema'
+	CONFORMANCE_REQUIRE_UPSTREAM=1 CONFORMANCE_MIN_V7_PASSED=1995 CONFORMANCE_MIN_V8_PASSED=4675 go test -race -count=1 -v ./pkg/compliance -run 'TestUpstream|TestSpecSchemaValidatorLiveUpstreamSchema'
 	go -C e2e/sdkconformance test -race -count=1 -v ./...
 
 lint:

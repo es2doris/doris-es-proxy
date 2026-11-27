@@ -34,8 +34,8 @@ import (
 )
 
 const (
-	expectedUpstreamV7YAMLCount          = 587
-	expectedUpstreamV8YAMLCount          = 970
+	expectedUpstreamV7YAMLCount          = 593
+	expectedUpstreamV8YAMLCount          = 971
 	defaultRemoteReindexWhitelistForTest = "127.0.0.1:*,[::1]:*,localhost:*,conformance.local:*"
 )
 
@@ -127,6 +127,7 @@ func newConformanceProxyHandler(targetESVersion string) http.Handler {
 
 func newConformanceProxySectionHandler(targetESVersion string) (http.Handler, func()) {
 	srv := proxy.NewServer("es_compat", proxy.NewMemoryBackend(false), transpiler.TranspilerOptions{})
+	srv.SetAllowTestFixtureAuth(true)
 	if targetESVersion != "" {
 		if cfg, ok := any(srv).(interface{ SetTargetESVersion(string) }); ok {
 			cfg.SetTargetESVersion(targetESVersion)
@@ -268,9 +269,11 @@ func TestUpstreamElasticConformanceScorecard(t *testing.T) {
 
 	if hasV7 {
 		v7Card, err := ScoreDirectories(SuiteOptions{
-			CorpusName:    "elasticsearch-v7.10.2",
-			TargetVersion: "7.10.2",
-			Categories:    filterCategories,
+			CorpusName:      "elasticsearch-v7.10.2",
+			TargetVersion:   "7.10.2",
+			DefaultAuthUser: DefaultFixtureAuthUser,
+			DefaultAuthPass: DefaultFixtureAuthPass,
+			Categories:      filterCategories,
 			NewSectionHandler: func() (http.Handler, func()) {
 				return newConformanceProxySectionHandler("7.10.2")
 			},
@@ -308,9 +311,11 @@ func TestUpstreamElasticConformanceScorecard(t *testing.T) {
 
 	if hasV8 {
 		v8Card, err := ScoreDirectories(SuiteOptions{
-			CorpusName:    "elasticsearch-v8.15.5",
-			TargetVersion: "8.15.5",
-			Categories:    filterCategories,
+			CorpusName:      "elasticsearch-v8.15.5",
+			TargetVersion:   "8.15.5",
+			DefaultAuthUser: DefaultFixtureAuthUser,
+			DefaultAuthPass: DefaultFixtureAuthPass,
+			Categories:      filterCategories,
 			NewSectionHandler: func() (http.Handler, func()) {
 				return newConformanceProxySectionHandler("8.15.5")
 			},

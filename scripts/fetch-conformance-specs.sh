@@ -48,6 +48,7 @@ COMMON_ES_MODULE_TEST_PATHS=(
 )
 
 V7_EXTRA_MODULE_TEST_PATHS=(
+  "qa/smoke-test-ingest-with-all-dependencies/src/test/resources/rest-api-spec/test"
   "modules/analysis-common/src/yamlRestTest"
   "modules/mapper-extras/src/yamlRestTest"
   "modules/parent-join/src/yamlRestTest"
@@ -140,6 +141,7 @@ ES8_EXTRA_MODULE_TEST_PATHS=(
   "x-pack/plugin/src/yamlRestTest/resources/rest-api-spec/test/redact"
   "x-pack/plugin/src/yamlRestTest/resources/rest-api-spec/test/profiling"
   "x-pack/plugin/src/yamlRestTest/resources/rest-api-spec/test/inference"
+  "x-pack/qa/xpack-prefix-rest-compat/src/yamlRestTestV7Compat/resources/rest-api-spec/test"
 )
 
 sparse_clone_or_reuse() {
@@ -162,7 +164,11 @@ sparse_clone_or_reuse() {
         break
       fi
     done
-    if [[ "${all_present}" -eq 1 ]]; then
+    local existing_count=0
+    if [[ -n "${existing_sparse}" ]]; then
+      existing_count="$(printf '%s\n' "${existing_sparse}" | sed '/^$/d' | wc -l | tr -d '[:space:]')"
+    fi
+    if [[ "${all_present}" -eq 1 && "${existing_count}" -eq "${#sparse_paths[@]}" ]]; then
       echo "[fetch-conformance-specs] Reusing cached ${name} (${branch}) at ${target_dir}"
       return 0
     fi

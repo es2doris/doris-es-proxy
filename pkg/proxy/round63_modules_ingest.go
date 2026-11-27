@@ -4720,7 +4720,7 @@ func parseSingleWeekDatePatternRound63(input, pat string, defaultLoc *time.Locat
 	}
 	regexBuf.WriteByte('$')
 
-	re, err := regexp.Compile(regexBuf.String())
+	re, err := painless.CompileBoundedRawRegex(regexBuf.String())
 	if err != nil {
 		return time.Time{}, false
 	}
@@ -6658,12 +6658,16 @@ func cloneAliasFiltersMapR66(in map[string]*esast.Query) map[string]*esast.Query
 }
 
 func (s *Server) matchesTestFixtureAdminLockedR66(cred, basicAuthUser, proxyAPIKey string) bool {
-	if s == nil || basicAuthUser != "" || proxyAPIKey != "" || s.securityUsers["test_admin"] != nil {
+	if s == nil || !s.AllowTestFixtureAuth() || basicAuthUser != "" || proxyAPIKey != "" {
 		return false
 	}
-	// #nosec G101 -- Elasticsearch upstream YAML test fixture credential, permitted only when proxy auth is disabled and test_admin is unconfigured
-	const fixtureCred = "test_admin:x-pack-test-password"
-	return len(cred) == len(fixtureCred) && subtle.ConstantTimeCompare([]byte(cred), []byte(fixtureCred)) == 1
+	u, p, okCut := strings.Cut(cred, ":")
+	if !okCut || (u != "test_admin" && u != "x_pack_rest_user") || s.securityUsers[u] != nil {
+		return false
+	}
+	// #nosec G101 -- Elasticsearch upstream YAML test fixture credential, permitted only when test fixture auth is explicitly enabled and proxy auth/user are unconfigured
+	const fixturePass = "x-pack-test-password"
+	return len(p) == len(fixturePass) && subtle.ConstantTimeCompare([]byte(p), []byte(fixturePass)) == 1
 }
 
 func (s *Server) resolveAuthorizedTermsEnumTargetsAndFiltersR66(r *http.Request, rawIndex string, targets []string, aliasFilters map[string]*esast.Query, fieldName string) ([]string, map[string]*esast.Query) {
@@ -6681,7 +6685,8 @@ func (s *Server) resolveAuthorizedTermsEnumTargetsAndFiltersR66(r *http.Request,
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	hasInboundProxyAuth := basicAuthUser != "" || proxyAPIKey != ""
+	hasInboundProxyAuth := basicAuthUser != "" || proxyAPIKey != "" ||
+		len(s.securityUsers) > 0 || len(s.securityAPIKeys) > 0 || len(s.securityServiceTokens) > 0
 	if authHeader == "" {
 		if hasInboundProxyAuth {
 			return nil, nil
@@ -7077,7 +7082,7 @@ func extractTermsEnumRoleStringSliceR65(raw any) ([]string, bool) {
 func entryPrivilegesAllowTermsEnumR65(ent map[string]any) bool {
 	rawPriv, hasPriv := ent["privileges"]
 	if !hasPriv || rawPriv == nil {
-		return true
+		return false
 	}
 	privs, ok := extractTermsEnumRoleStringSliceR65(rawPriv)
 	if !ok || len(privs) == 0 {
@@ -7209,7 +7214,7 @@ func verifyStoredSecretHashOrPlainR66(rec map[string]any, hashField string, plai
 }
 
 func verifySecurityUserPasswordR66(uObj map[string]any, pass string) bool {
-	return verifyStoredSecretHashOrPlainR66(uObj, "__password_sha256", []string{"password"}, pass)
+	return verifyStoredSecretR67(uObj, "__password_pbkdf2", "__password_sha256", []string{"password"}, pass)
 }
 
 func verifySecurityAPIKeySecretAndExpiryR66(kObj map[string]any, secret string, now time.Time) bool {
@@ -7225,7 +7230,7 @@ func verifySecurityAPIKeySecretAndExpiryR66(kObj map[string]any, secret string, 
 			return false
 		}
 	}
-	return verifyStoredSecretHashOrPlainR66(kObj, "__secret_sha256", []string{"api_key", "secret"}, secret)
+	return verifyStoredSecretR67(kObj, "__secret_pbkdf2", "__secret_sha256", []string{"api_key", "secret"}, secret)
 }
 
 func resolveRolesForSecurityUserR64(username string, users, roles map[string]map[string]any) (isSuper bool, exists bool, roleObjs []map[string]any) {

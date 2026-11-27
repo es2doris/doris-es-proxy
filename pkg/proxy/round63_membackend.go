@@ -30,6 +30,8 @@ import (
 	"time"
 	"unicode"
 	"unicode/utf8"
+
+	"github.com/es2doris/doris-es-proxy/pkg/painless"
 )
 
 // ----------------------------------------------------------------------------
@@ -1320,7 +1322,7 @@ func evalColumnFuncR63Mem(row map[string]any, colExpr string) (any, bool) {
 			}
 			pat := unquoteSQLLiteral(strings.TrimSpace(args[1]))
 			grpIdx := int(evalNumericExpr(row, strings.TrimSpace(args[2])))
-			re, err := regexp.Compile(pat)
+			re, err := painless.CompileBoundedRawRegex(pat)
 			if err != nil {
 				return "", true
 			}
@@ -1343,7 +1345,7 @@ func evalColumnFuncR63Mem(row map[string]any, colExpr string) (any, bool) {
 			}
 			pat := unquoteSQLLiteral(strings.TrimSpace(args[1]))
 			repl := unquoteSQLLiteral(strings.TrimSpace(args[2]))
-			re, err := regexp.Compile(pat)
+			re, err := painless.CompileBoundedRawRegex(pat)
 			if err != nil {
 				return fmt.Sprintf("%v", sv), true
 			}

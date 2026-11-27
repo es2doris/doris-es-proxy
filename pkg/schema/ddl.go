@@ -26,8 +26,68 @@ import (
 	"github.com/es2doris/doris-es-proxy/pkg/esast"
 )
 
-// GenerateCreateTableDDL produces the Apache Doris `CREATE TABLE` DDL for an `IndexSchema`.
+// DorisDDLOptions configures Apache Doris CREATE TABLE DDL properties, distribution,
+// key model, and capability-gated vector ANN index pushdown.
+type DorisDDLOptions struct {
+	ReplicationNum        int
+	ReplicationAllocation string
+	CloudMode             bool
+	BucketsAuto           bool
+	StoreRowColumn        *bool  // nil -> true (existing default)
+	VectorANNMode         string // "", "off", "hnsw", "ivf"
+	TableKeyModel         string // "", "unique", "duplicate"
+	AllowUniqueKeyANN     bool   // true only on Doris >= 4.1.4
+}
+
+func escapeDorisDDLString(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		switch r {
+		case '\\':
+			b.WriteString(`\\`)
+		case '"':
+			b.WriteString(`\"`)
+		case '\n', '\r', '\x00':
+			continue
+		default:
+			if r < 0x20 || r == 0x7f {
+				continue
+			}
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+// FormatReplicationPropertyLines formats Doris replication properties (unindented `"key" = "val"` entries)
+// according to opts. When opts.CloudMode is true, replication properties are omitted.
+func FormatReplicationPropertyLines(opts DorisDDLOptions) []string {
+	if opts.CloudMode {
+		return nil
+	}
+	if alloc := strings.TrimSpace(opts.ReplicationAllocation); alloc != "" {
+		return []string{fmt.Sprintf(`"replication_allocation" = "%s"`, escapeDorisDDLString(alloc))}
+	}
+	repNum := opts.ReplicationNum
+	if repNum <= 0 {
+		repNum = 1
+	}
+	return []string{fmt.Sprintf(`"replication_num" = "%d"`, repNum)}
+}
+
+// GenerateCreateTableDDL produces the Apache Doris `CREATE TABLE` DDL for an `IndexSchema`
+// using legacy default table properties.
 func GenerateCreateTableDDL(s *IndexSchema) string {
+	return GenerateCreateTableDDLWithOptions(s, DorisDDLOptions{})
+}
+
+// GenerateCreateTableDDLWithOptions produces the Apache Doris `CREATE TABLE` DDL for an `IndexSchema`
+// with configurable replication, bucket, key-model, row-store, and ANN vector index options.
+func GenerateCreateTableDDLWithOptions(s *IndexSchema, opts DorisDDLOptions) string {
+	if s == nil {
+		return ""
+	}
 	var cols []string
 	var idxs []string
 
@@ -74,7 +134,7 @@ func GenerateCreateTableDDL(s *IndexSchema) string {
 			continue
 		}
 		seenCols[b.ColumnName] = true
-		colDef, idxDef := buildColumnAndIndexDDL(b)
+		colDef, idxDef := buildColumnAndIndexDDLWithOptions(b, opts)
 		cols = append(cols, "    "+colDef)
 		if idxDef != "" {
 			idxs = append(idxs, "    "+idxDef)
@@ -84,7 +144,7 @@ func GenerateCreateTableDDL(s *IndexSchema) string {
 				continue
 			}
 			seenCols[subB.ColumnName] = true
-			sCol, sIdx := buildColumnAndIndexDDL(subB)
+			sCol, sIdx := buildColumnAndIndexDDLWithOptions(subB, opts)
 			cols = append(cols, "    "+sCol)
 			if sIdx != "" {
 				idxs = append(idxs, "    "+sIdx)
@@ -107,27 +167,55 @@ func GenerateCreateTableDDL(s *IndexSchema) string {
 	}
 
 	allDefs := append(cols, idxs...)
-	buckets := s.Buckets
-	if buckets <= 0 {
-		buckets = 8
+
+	keyModel := strings.ToLower(strings.TrimSpace(opts.TableKeyModel))
+	keyClause := "UNIQUE KEY(`_id`)"
+	if keyModel == "duplicate" {
+		keyClause = "DUPLICATE KEY(`_id`)"
+	}
+
+	var bucketClause string
+	if opts.BucketsAuto && s.Buckets <= 0 {
+		bucketClause = "DISTRIBUTED BY HASH(`_id`) BUCKETS AUTO"
+	} else {
+		buckets := s.Buckets
+		if buckets <= 0 {
+			buckets = 8
+		}
+		bucketClause = fmt.Sprintf("DISTRIBUTED BY HASH(`_id`) BUCKETS %d", buckets)
+	}
+
+	var props []string
+	for _, repProp := range FormatReplicationPropertyLines(opts) {
+		props = append(props, "    "+repProp)
+	}
+	if keyModel != "duplicate" {
+		props = append(props, `    "enable_unique_key_merge_on_write" = "true"`)
+	}
+	storeRowCol := "true"
+	if opts.StoreRowColumn != nil && !*opts.StoreRowColumn {
+		storeRowCol = "false"
+	}
+	props = append(props, fmt.Sprintf(`    "store_row_column" = "%s"`, storeRowCol))
+	props = append(props, `    "compression" = "zstd"`)
+	if keyModel != "duplicate" {
+		props = append(props, `    "function_column.sequence_col" = "_version"`)
 	}
 
 	return fmt.Sprintf(
 		"CREATE TABLE IF NOT EXISTS `%s`.`%s` (\n%s\n)\n"+
 			"ENGINE = OLAP\n"+
-			"UNIQUE KEY(`_id`)\n"+
-			"DISTRIBUTED BY HASH(`_id`) BUCKETS %d\n"+
+			"%s\n"+
+			"%s\n"+
 			"PROPERTIES (\n"+
-			"    \"replication_num\" = \"1\",\n"+
-			"    \"enable_unique_key_merge_on_write\" = \"true\",\n"+
-			"    \"store_row_column\" = \"true\",\n"+
-			"    \"compression\" = \"zstd\",\n"+
-			"    \"function_column.sequence_col\" = \"_version\"\n"+
+			"%s\n"+
 			");",
 		escapeDorisBacktickIdent(s.DorisDB),
 		escapeDorisBacktickIdent(s.DorisTable),
 		strings.Join(allDefs, ",\n"),
-		buckets,
+		keyClause,
+		bucketClause,
+		strings.Join(props, ",\n"),
 	)
 }
 
@@ -178,6 +266,7 @@ func GenerateAlterTableDDL(oldSchema, newSchema *IndexSchema) []string {
 		}
 	}
 
+	upgradedRawMapping := false
 	for _, k := range newKeys {
 		b := newSchema.Fields[k]
 		if oldSchema != nil {
@@ -188,6 +277,7 @@ func GenerateAlterTableDDL(oldSchema, newSchema *IndexSchema) []string {
 				b.ColumnName = "f__arr__" + SanitizeDorisIdentifier(k)
 				newSchema.Fields[k] = b
 				markRawMappingUpgradedArray(newSchema.RawMapping, k, b.SourceJSONPath)
+				upgradedRawMapping = true
 				baseName := strings.TrimSuffix(k, ".keyword")
 				if strings.HasSuffix(k, ".keyword") {
 					if baseB, ok := newSchema.Fields[baseName]; ok && baseB.KeywordCompanion == oldB.ColumnName {
@@ -290,6 +380,10 @@ func GenerateAlterTableDDL(oldSchema, newSchema *IndexSchema) []string {
 			"ALTER TABLE `%s`.`%s` ADD COLUMN `%s` ARRAY<STRING> NULL COMMENT 'Correlated nested JSON elements for %s';",
 			newDBIdent, newTblIdent, corrCol, escapeDDLComment(np),
 		))
+	}
+
+	if upgradedRawMapping {
+		newSchema.RefreshMappingHash()
 	}
 
 	return partitionAlterDDLColumnsBeforeIndexes(stmts)
@@ -450,6 +544,7 @@ func GeneratePromoteVariantFieldDDL(s *IndexSchema, esFieldPath string, esType s
 			}
 		}
 	}
+
 	return partitionAlterDDLColumnsBeforeIndexes(stmts)
 }
 
@@ -469,11 +564,46 @@ func invertedIndexNameForColumn(colName string) string {
 	return idxName
 }
 
+func annIndexNameForColumn(colName string) string {
+	idxName := "idx_ann_" + colName
+	if len(idxName) > 64 {
+		h := fnv.New32a()
+		_, _ = h.Write([]byte(colName))
+		idxName = fmt.Sprintf("%s_%08x", idxName[:55], h.Sum32())
+	}
+	return idxName
+}
+
 func buildColumnAndIndexDDL(b FieldBinding) (string, string) {
+	return buildColumnAndIndexDDLWithOptions(b, DorisDDLOptions{})
+}
+
+func buildColumnAndIndexDDLWithOptions(b FieldBinding, opts DorisDDLOptions) (string, string) {
 	idxName := invertedIndexNameForColumn(b.ColumnName)
 
 	switch b.Kind {
 	case StoragePromotedVector:
+		annMode := strings.ToLower(strings.TrimSpace(opts.VectorANNMode))
+		keyModel := strings.ToLower(strings.TrimSpace(opts.TableKeyModel))
+		annActive := (annMode == "hnsw" || annMode == "ivf") && (keyModel == "duplicate" || opts.AllowUniqueKeyANN)
+		elemType := strings.ToLower(strings.TrimSpace(b.VectorElementType))
+		isFloatVector := elemType == "" || elemType == "float"
+		if annActive && !b.NotIndexed && isFloatVector && b.VectorDims > 0 {
+			colDef := fmt.Sprintf("`%s` ARRAY<FLOAT> NOT NULL", b.ColumnName)
+			metricType := "inner_product"
+			switch strings.ToLower(strings.TrimSpace(b.VectorMetric)) {
+			case "l2_norm", "l2_distance":
+				metricType = "l2_distance"
+			case "dot_product", "cosine", "max_inner_product", "":
+				metricType = "inner_product"
+			}
+			annIdxName := annIndexNameForColumn(b.ColumnName)
+			idxDef := fmt.Sprintf(
+				"INDEX `%s` (`%s`) USING ANN PROPERTIES(\"index_type\" = \"%s\", \"metric_type\" = \"%s\", \"dim\" = \"%d\")",
+				annIdxName, b.ColumnName, annMode, metricType, b.VectorDims,
+			)
+			return colDef, idxDef
+		}
 		colDef := fmt.Sprintf("`%s` ARRAY<FLOAT> NULL", b.ColumnName)
 		return colDef, ""
 

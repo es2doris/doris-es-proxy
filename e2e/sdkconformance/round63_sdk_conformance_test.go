@@ -78,7 +78,7 @@ func mustOKCallR63(t *testing.T, label string, fn func() (*esapi.Response, error
 func runRound63SDKConformanceSubtests(
 	t *testing.T,
 	ctx context.Context,
-	targetURL string,
+	baseCfg elasticsearch.Config,
 	idx string,
 	aliasName string,
 	esClient *elasticsearch.Client,
@@ -575,11 +575,10 @@ func runRound63SDKConformanceSubtests(
 		spy := &requestHeaderSpyTransportR63{base: wireTransport}
 
 		// 1. CompressRequestBody: true -> gzipped /_bulk + /_search
-		compClient, err := elasticsearch.NewClient(elasticsearch.Config{
-			Addresses:           []string{targetURL},
-			CompressRequestBody: true,
-			Transport:           spy,
-		})
+		compCfg := baseCfg
+		compCfg.CompressRequestBody = true
+		compCfg.Transport = spy
+		compClient, err := elasticsearch.NewClient(compCfg)
 		if err != nil {
 			t.Fatalf("NewClient(CompressRequestBody:true) failed: %v", err)
 		}
@@ -611,11 +610,10 @@ func runRound63SDKConformanceSubtests(
 
 		// 2. DiscoverNodesOnStart: true live node sniffing against ephemeral httptest.Server port
 		sniffSpy := &requestHeaderSpyTransportR63{base: wireTransport}
-		sniffClient, err := elasticsearch.NewClient(elasticsearch.Config{
-			Addresses:            []string{targetURL},
-			DiscoverNodesOnStart: true,
-			Transport:            sniffSpy,
-		})
+		sniffCfg := baseCfg
+		sniffCfg.DiscoverNodesOnStart = true
+		sniffCfg.Transport = sniffSpy
+		sniffClient, err := elasticsearch.NewClient(sniffCfg)
 		if err != nil {
 			t.Fatalf("NewClient(DiscoverNodesOnStart:true) failed: %v", err)
 		}

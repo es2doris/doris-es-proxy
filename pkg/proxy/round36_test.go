@@ -243,8 +243,8 @@ func TestRound36_F5_F6_F7_F8_F9_F10_TranspilerAndLuceneHardening(t *testing.T) {
 	if !strings.Contains(nPlan.HitsSQL, "12.35") {
 		t.Fatalf("expected scaled_float nested prefilter/predicate to round 12.346 to 12.35, got: %s", nPlan.HitsSQL)
 	}
-	if !strings.Contains(nPlan.HitsSQL, "CAST(json_extract_string(_el, '$.score') AS DOUBLE) = 10.5") {
-		t.Fatalf("expected single-valued double nested subfield to cast to DOUBLE for numeric string term, got: %s", nPlan.HitsSQL)
+	if !strings.Contains(nPlan.HitsSQL, "TRY_CAST(json_extract_string(_el, '$.\"score\"') AS DOUBLE) = 10.5") {
+		t.Fatalf("expected single-valued double nested subfield to cast to DOUBLE with TRY_CAST for numeric string term, got: %s", nPlan.HitsSQL)
 	}
 
 	// F9: invalid boolean term returns FALSE, and invalid boolean in terms is skipped.

@@ -363,25 +363,32 @@ func TestRound66Track4_MLEndpoints(t *testing.T) {
 }
 
 func TestRound66Track4_Security9Endpoints(t *testing.T) {
-	_, h := newR66Track4Server(t, "8.15.5")
+	srv, h := newR66Track4Server(t, "8.15.5")
+	srv.SetAuth("elastic", "r66-pass", "")
+	adminHdr := map[string]string{
+		"Authorization": "Basic " + base64.StdEncoding.EncodeToString([]byte("elastic:r66-pass")),
+	}
 
 	// 1 & 2. bulk_put_role / bulk_delete_role
-	cBP, _, mBP, rawBP := doR66Track4Req(t, h, http.MethodPost, "/_security/role", `{"roles":{"r66_a":{"cluster":["monitor"]},"r66_b":{"cluster":["all"]}}}`, nil)
+	cBP, _, mBP, rawBP := doR66Track4Req(t, h, http.MethodPost, "/_security/role", `{"roles":{"r66_a":{"cluster":["monitor"]},"r66_b":{"cluster":["all"]}}}`, adminHdr)
 	if cBP != http.StatusOK || len(mBP["created"].([]any)) != 2 {
 		t.Fatalf("bulk_put_role failed: %d %s", cBP, rawBP)
 	}
-	cBP2, _, mBP2, rawBP2 := doR66Track4Req(t, h, http.MethodPost, "/_security/role", `{"roles":{"r66_a":{"cluster":["all"]},"r66_b":{"cluster":["all"]}}}`, nil)
+	cBP2, _, mBP2, rawBP2 := doR66Track4Req(t, h, http.MethodPost, "/_security/role", `{"roles":{"r66_a":{"cluster":["all"]},"r66_b":{"cluster":["all"]}}}`, adminHdr)
 	if cBP2 != http.StatusOK || len(mBP2["updated"].([]any)) != 1 || len(mBP2["noop"].([]any)) != 1 {
 		t.Fatalf("bulk_put_role update/noop failed: %d %s", cBP2, rawBP2)
 	}
-	cBD, _, mBD, rawBD := doR66Track4Req(t, h, http.MethodDelete, "/_security/role", `{"names":["r66_a","r66_missing"]}`, nil)
+	cBD, _, mBD, rawBD := doR66Track4Req(t, h, http.MethodDelete, "/_security/role", `{"names":["r66_a","r66_missing"]}`, adminHdr)
 	if cBD != http.StatusOK || len(mBD["deleted"].([]any)) != 1 || len(mBD["not_found"].([]any)) != 1 {
 		t.Fatalf("bulk_delete_role failed: %d %s", cBD, rawBD)
 	}
-	cBDQ, _, mBDQ, rawBDQ := doR66Track4Req(t, h, http.MethodDelete, "/_security/role?names=r66_b", "", nil)
+	cBDQ, _, mBDQ, rawBDQ := doR66Track4Req(t, h, http.MethodDelete, "/_security/role?names=r66_b", "", adminHdr)
 	if cBDQ != http.StatusOK || len(mBDQ["deleted"].([]any)) != 1 {
 		t.Fatalf("bulk_delete_role query names failed: %d %s", cBDQ, rawBDQ)
 	}
+
+	// Seed alice_r66 so grant_api_key verifies real user credentials.
+	doR66Track4Req(t, h, http.MethodPut, "/_security/user/alice_r66", `{"roles":["superuser"],"password":"secret-password"}`, adminHdr)
 
 	// 3 & 4. grant_api_key & clear_api_key_cache
 	cGrant, _, mGrant, rawGrant := doR66Track4Req(t, h, http.MethodPost, "/_security/api_key/grant", `{
@@ -389,26 +396,26 @@ func TestRound66Track4_Security9Endpoints(t *testing.T) {
 		"username": "alice_r66",
 		"password": "secret-password",
 		"api_key": {"name": "r66_granted_key", "expiration": "1h"}
-	}`, nil)
+	}`, adminHdr)
 	if cGrant != http.StatusOK || mGrant["id"] == nil || mGrant["api_key"] == nil || mGrant["encoded"] == nil {
 		t.Fatalf("grant_api_key failed: %d %s", cGrant, rawGrant)
 	}
 	keyID := mGrant["id"].(string)
-	_, _, mKeyGet, rawKeyGet := doR66Track4Req(t, h, http.MethodGet, "/_security/api_key?id="+keyID, "", nil)
+	_, _, mKeyGet, rawKeyGet := doR66Track4Req(t, h, http.MethodGet, "/_security/api_key?id="+keyID, "", adminHdr)
 	if len(mKeyGet["api_keys"].([]any)) != 1 || mKeyGet["api_keys"].([]any)[0].(map[string]any)["username"] != "alice_r66" {
 		t.Fatalf("unexpected granted api_key metadata: %s", rawKeyGet)
 	}
-	if cBadGT, _, _, _ := doR66Track4Req(t, h, http.MethodPost, "/_security/api_key/grant", `{"grant_type":"invalid","api_key":{"name":"x"}}`, nil); cBadGT != http.StatusBadRequest {
+	if cBadGT, _, _, _ := doR66Track4Req(t, h, http.MethodPost, "/_security/api_key/grant", `{"grant_type":"invalid","api_key":{"name":"x"}}`, adminHdr); cBadGT != http.StatusBadRequest {
 		t.Fatalf("expected 400 on invalid grant_type, got %d", cBadGT)
 	}
-	cClearAK, _, mClearAK, rawClearAK := doR66Track4Req(t, h, http.MethodPost, "/_security/api_key/"+keyID+"/_clear_cache", "", nil)
+	cClearAK, _, mClearAK, rawClearAK := doR66Track4Req(t, h, http.MethodPost, "/_security/api_key/"+keyID+"/_clear_cache", "", adminHdr)
 	if cClearAK != http.StatusOK || mClearAK["_nodes"] == nil || mClearAK["cluster_name"] == nil || mClearAK["nodes"] == nil {
 		t.Fatalf("clear_api_key_cache failed: %d %s", cClearAK, rawClearAK)
 	}
 
 	// 5 & 6. enroll_kibana & enroll_node (GET schema + POST backwards compat)
 	for _, method := range []string{http.MethodGet, http.MethodPost} {
-		cEK, _, mEK, rawEK := doR66Track4Req(t, h, method, "/_security/enroll/kibana", "", nil)
+		cEK, _, mEK, rawEK := doR66Track4Req(t, h, method, "/_security/enroll/kibana", "", adminHdr)
 		if cEK != http.StatusOK {
 			t.Fatalf("%s enroll/kibana failed: %d %s", method, cEK, rawEK)
 		}
@@ -416,7 +423,7 @@ func TestRound66Track4_Security9Endpoints(t *testing.T) {
 		if !okT || tok["name"] == nil || tok["value"] == nil || mEK["http_ca"] == nil {
 			t.Fatalf("enroll/kibana schema mismatch: %s", rawEK)
 		}
-		cEN, _, mEN, rawEN := doR66Track4Req(t, h, method, "/_security/enroll/node", "", nil)
+		cEN, _, mEN, rawEN := doR66Track4Req(t, h, method, "/_security/enroll/node", "", adminHdr)
 		if cEN != http.StatusOK {
 			t.Fatalf("%s enroll/node failed: %d %s", method, cEN, rawEN)
 		}
@@ -428,8 +435,8 @@ func TestRound66Track4_Security9Endpoints(t *testing.T) {
 	}
 
 	// 7. get_service_credentials
-	doR66Track4Req(t, h, http.MethodPost, "/_security/service/elastic/fleet-server/credential/token/r66_tok", "", nil)
-	cSC, _, mSC, rawSC := doR66Track4Req(t, h, http.MethodGet, "/_security/service/elastic/fleet-server/credential", "", nil)
+	doR66Track4Req(t, h, http.MethodPost, "/_security/service/elastic/fleet-server/credential/token/r66_tok", "", adminHdr)
+	cSC, _, mSC, rawSC := doR66Track4Req(t, h, http.MethodGet, "/_security/service/elastic/fleet-server/credential", "", adminHdr)
 	if cSC != http.StatusOK || mSC["service_account"] != "elastic/fleet-server" || mSC["count"].(float64) != 1 || mSC["nodes_credentials"] == nil {
 		t.Fatalf("get_service_credentials failed: %d %s", cSC, rawSC)
 	}
@@ -438,14 +445,15 @@ func TestRound66Track4_Security9Endpoints(t *testing.T) {
 	}
 
 	// 8 & 9. has_privileges_user_profile & suggest_user_profiles
-	_, _, prof1, _ := doR66Track4Req(t, h, http.MethodPost, "/_security/profile/_activate", `{"grant":{"user":{"username":"alice_p1","roles":["analyst"]}}}`, nil)
-	_, _, prof2, _ := doR66Track4Req(t, h, http.MethodPost, "/_security/profile/_activate", `{"grant":{"user":{"username":"bob_p2","roles":["viewer"]}}}`, nil)
+	doR66Track4Req(t, h, http.MethodPut, "/_security/role/analyst", `{"cluster":["monitor"]}`, adminHdr)
+	_, _, prof1, _ := doR66Track4Req(t, h, http.MethodPost, "/_security/profile/_activate", `{"grant":{"user":{"username":"alice_p1","roles":["analyst"]}}}`, adminHdr)
+	_, _, prof2, _ := doR66Track4Req(t, h, http.MethodPost, "/_security/profile/_activate", `{"grant":{"user":{"username":"bob_p2","roles":["viewer"]}}}`, adminHdr)
 	uid1 := prof1["uid"].(string)
 	uid2 := prof2["uid"].(string)
-	doR66Track4Req(t, h, http.MethodPut, "/_security/profile/"+uid1+"/_data", `{"labels":{"env":"prod"}}`, nil)
-	doR66Track4Req(t, h, http.MethodPut, "/_security/profile/"+uid2+"/_disable", `{}`, nil)
+	doR66Track4Req(t, h, http.MethodPut, "/_security/profile/"+uid1+"/_data", `{"labels":{"env":"prod"}}`, adminHdr)
+	doR66Track4Req(t, h, http.MethodPut, "/_security/profile/"+uid2+"/_disable", `{}`, adminHdr)
 
-	cHP, _, mHP, rawHP := doR66Track4Req(t, h, http.MethodPost, "/_security/profile/_has_privileges", `{"uids":["`+uid1+`","`+uid2+`","missing_uid"],"privileges":{"cluster":["monitor"]}}`, nil)
+	cHP, _, mHP, rawHP := doR66Track4Req(t, h, http.MethodPost, "/_security/profile/_has_privileges", `{"uids":["`+uid1+`","`+uid2+`","missing_uid"],"privileges":{"cluster":["monitor"]}}`, adminHdr)
 	if cHP != http.StatusOK {
 		t.Fatalf("has_privileges_user_profile failed: %d %s", cHP, rawHP)
 	}
@@ -455,7 +463,7 @@ func TestRound66Track4_Security9Endpoints(t *testing.T) {
 	}
 
 	for _, method := range []string{http.MethodPost, http.MethodGet} {
-		cSug, _, mSug, rawSug := doR66Track4Req(t, h, method, "/_security/profile/_suggest", `{"hint":{"text":"alice","labels":{"env":"prod"}},"size":5}`, nil)
+		cSug, _, mSug, rawSug := doR66Track4Req(t, h, method, "/_security/profile/_suggest", `{"hint":{"text":"alice","labels":{"env":"prod"}},"size":5}`, adminHdr)
 		if cSug != http.StatusOK || mSug["took"] == nil {
 			t.Fatalf("%s profile/_suggest failed: %d %s", method, cSug, rawSug)
 		}
@@ -471,15 +479,15 @@ func TestRound66Track4_Security9Endpoints(t *testing.T) {
 	}
 
 	// Extra schema checks: put_user created, oauth2 token authentication, text_structure sample_start
-	cPU, _, mPU, rawPU := doR66Track4Req(t, h, http.MethodPut, "/_security/user/r66_u1", `{"roles":["viewer"],"password":"secret"}`, nil)
+	cPU, _, mPU, rawPU := doR66Track4Req(t, h, http.MethodPut, "/_security/user/r66_u1", `{"roles":["viewer"],"password":"secret"}`, adminHdr)
 	if cPU != http.StatusOK || mPU["created"] != true {
 		t.Fatalf("expected created=true on put_user, got %d %s", cPU, rawPU)
 	}
-	cOA, _, mOA, rawOA := doR66Track4Req(t, h, http.MethodPost, "/_security/oauth2/token", `{"grant_type":"client_credentials"}`, nil)
+	cOA, _, mOA, rawOA := doR66Track4Req(t, h, http.MethodPost, "/_security/oauth2/token", `{"grant_type":"client_credentials"}`, adminHdr)
 	if cOA != http.StatusOK || mOA["authentication"] == nil {
 		t.Fatalf("expected authentication in oauth2 token response, got %d %s", cOA, rawOA)
 	}
-	cTS, _, mTS, rawTS := doR66Track4Req(t, h, http.MethodPost, "/_text_structure/find_structure", "2026-01-01T00:00:00Z hello\n", nil)
+	cTS, _, mTS, rawTS := doR66Track4Req(t, h, http.MethodPost, "/_text_structure/find_structure", "2026-01-01T00:00:00Z hello\n", adminHdr)
 	if cTS != http.StatusOK || mTS["sample_start"] == nil {
 		t.Fatalf("expected sample_start in find_structure response, got %d %s", cTS, rawTS)
 	}
@@ -536,8 +544,8 @@ func TestRound66Track4_ConnectorHandlersAndReset(t *testing.T) {
 		t.Fatalf("PUT /_connector/_secret/sec_named update failed: %d %s", cSecPutUpd, rawSecPutUpd)
 	}
 	cSecGet, _, mSecGet, rawSecGet := doR66Track4Req(t, h, http.MethodGet, "/_connector/_secret/sec_named", "", nil)
-	if cSecGet != http.StatusOK || mSecGet["value"] != "api-token-2" || mSecGet["id"] != "sec_named" {
-		t.Fatalf("GET /_connector/_secret/sec_named failed: %d %s", cSecGet, rawSecGet)
+	if cSecGet != http.StatusOK || mSecGet["value"] != nil || mSecGet["has_value"] != true || mSecGet["id"] != "sec_named" {
+		t.Fatalf("GET /_connector/_secret/sec_named failed redaction check: %d %s", cSecGet, rawSecGet)
 	}
 	if cHead, _, _, _ := doR66Track4Req(t, h, http.MethodHead, "/_connector/_secret/"+secID, "", nil); cHead != http.StatusOK {
 		t.Fatalf("HEAD /_connector/_secret/%s expected 200, got %d", secID, cHead)

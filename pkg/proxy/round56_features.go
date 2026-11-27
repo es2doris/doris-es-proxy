@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -18,6 +19,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/es2doris/doris-es-proxy/pkg/esast"
+	"github.com/es2doris/doris-es-proxy/pkg/painless"
 	"github.com/es2doris/doris-es-proxy/pkg/schema"
 )
 
@@ -2457,6 +2459,11 @@ func (s *Server) handleSecurityRound56(w http.ResponseWriter, r *http.Request, s
 			nowMS := time.Now().UTC().UnixMilli()
 			var prof map[string]any
 			if isNew || existing == nil {
+				if !exists && len(s.securityProfiles) >= maxAdminStoreEntriesR67 {
+					s.mu.Unlock()
+					writeESError(w, http.StatusTooManyRequests, "es_rejected_execution_exception", "security profile store limit reached")
+					return true
+				}
 				prof = map[string]any{
 					"uid":               uid,
 					"enabled":           true,
@@ -2494,6 +2501,7 @@ func (s *Server) handleSecurityRound56(w http.ResponseWriter, r *http.Request, s
 				"_doc":              deepCloneDocMap(prof["_doc"].(map[string]any)),
 			}
 			s.mu.Unlock()
+			s.bumpSecurityEpoch()
 			writeJSON(w, http.StatusOK, resp)
 			return true
 		}
@@ -2603,6 +2611,7 @@ func (s *Server) handleSecurityRound56(w http.ResponseWriter, r *http.Request, s
 				}
 				prof["data"] = dataMap
 				s.mu.Unlock()
+				s.bumpSecurityEpoch()
 				writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
 				return true
 
@@ -2620,6 +2629,7 @@ func (s *Server) handleSecurityRound56(w http.ResponseWriter, r *http.Request, s
 				}
 				prof["enabled"] = (action == "_enable")
 				s.mu.Unlock()
+				s.bumpSecurityEpoch()
 				writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
 				return true
 
@@ -2632,6 +2642,14 @@ func (s *Server) handleSecurityRound56(w http.ResponseWriter, r *http.Request, s
 				if !ok {
 					return true
 				}
+				if body == nil {
+					body = map[string]any{}
+				}
+				s.authMu.RLock()
+				basicUser := strings.TrimSpace(s.basicAuthUser)
+				proxyAPIKey := strings.TrimSpace(s.apiKey)
+				s.authMu.RUnlock()
+
 				s.mu.RLock()
 				prof, exists := s.securityProfiles[uid]
 				if !exists || prof == nil {
@@ -2642,54 +2660,27 @@ func (s *Server) handleSecurityRound56(w http.ResponseWriter, r *http.Request, s
 				enabled, _ := prof["enabled"].(bool)
 				uMap, _ := prof["user"].(map[string]any)
 				username, _ := uMap["username"].(string)
+				profRoles := extractRolesListFromAnyR67(uMap["roles"])
+				userEnabled := enabled
+				if uObj := s.securityUsers[username]; uObj != nil {
+					if enU, hasEnU := uObj["enabled"].(bool); hasEnU && !enU {
+						userEnabled = false
+					}
+					profRoles = extractRolesListFromAnyR67(uObj["roles"])
+				}
+				configured := basicUser != "" || proxyAPIKey != "" ||
+					len(s.securityUsers) > 0 || len(s.securityAPIKeys) > 0 || len(s.securityServiceTokens) > 0
+				var evalP *securityPrincipalR67
+				if userEnabled {
+					evalP = &securityPrincipalR67{
+						username: username,
+						roles:    profRoles,
+					}
+				}
+				allowOpenDefault := userEnabled && !configured && len(s.securityRoles) == 0 && len(s.securityPrivileges) == 0
+				hasAll, clusterRes, indexRes, appRes := s.evaluatePrincipalPrivilegesLockedR67(evalP, allowOpenDefault, body)
 				s.mu.RUnlock()
 
-				allowed := enabled
-				hasAll := enabled
-				clusterRes := make(map[string]any)
-				if cList, okC := body["cluster"].([]any); okC {
-					for _, item := range cList {
-						clusterRes[fmt.Sprintf("%v", item)] = allowed
-					}
-				}
-				indexRes := make(map[string]any)
-				if iList, okI := body["index"].([]any); okI {
-					for _, item := range iList {
-						if im, okM := item.(map[string]any); okM {
-							names, _ := im["names"].([]any)
-							privs, _ := im["privileges"].([]any)
-							pm := make(map[string]any, len(privs))
-							for _, p := range privs {
-								pm[fmt.Sprintf("%v", p)] = allowed
-							}
-							for _, n := range names {
-								indexRes[fmt.Sprintf("%v", n)] = pm
-							}
-						}
-					}
-				}
-				appRes := make(map[string]any)
-				if aList, okA := body["application"].([]any); okA {
-					for _, item := range aList {
-						if am, okM := item.(map[string]any); okM {
-							appName := fmt.Sprintf("%v", am["application"])
-							privs, _ := am["privileges"].([]any)
-							resList, _ := am["resources"].([]any)
-							if len(resList) == 0 {
-								resList = []any{"*"}
-							}
-							pm := make(map[string]any, len(privs))
-							for _, p := range privs {
-								pm[fmt.Sprintf("%v", p)] = allowed
-							}
-							rm := make(map[string]any, len(resList))
-							for _, rn := range resList {
-								rm[fmt.Sprintf("%v", rn)] = pm
-							}
-							appRes[appName] = rm
-						}
-					}
-				}
 				writeJSON(w, http.StatusOK, map[string]any{
 					"username":          username,
 					"uid":               uid,
@@ -2746,6 +2737,7 @@ func (s *Server) handleSecurityRound56(w http.ResponseWriter, r *http.Request, s
 					}
 				}
 				s.mu.Unlock()
+				s.bumpSecurityEpoch()
 				writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
 				return true
 			default:
@@ -2756,6 +2748,11 @@ func (s *Server) handleSecurityRound56(w http.ResponseWriter, r *http.Request, s
 
 	case "cross_cluster":
 		if len(segs) >= 3 && segs[2] == "api_key" {
+			callerP, configured, authSt, authReason := s.requestPrincipalAndConfiguredR67(r)
+			if configured && callerP == nil {
+				writeESError(w, authSt, "security_exception", authReason)
+				return true
+			}
 			if len(segs) == 3 && (r.Method == http.MethodPost || r.Method == http.MethodPut) {
 				body, ok := parseJSONBody(w, r)
 				if !ok {
@@ -2787,24 +2784,43 @@ func (s *Server) handleSecurityRound56(w http.ResponseWriter, r *http.Request, s
 					meta = map[string]any{}
 				}
 				s.mu.Lock()
+				if configured && !s.principalHasClusterPrivLockedR67(callerP, "manage_security", "manage") {
+					s.mu.Unlock()
+					writeESError(w, http.StatusForbidden, "security_exception", fmt.Sprintf("action [cluster:admin/xpack/security/cross_cluster/api_key/create] is unauthorized for user [%s]", callerP.username))
+					return true
+				}
 				if s.securityAPIKeys == nil {
 					s.securityAPIKeys = make(map[string]map[string]any)
 				}
-				id := fmt.Sprintf("cck_%d_%d", nowMS, len(s.securityAPIKeys)+1)
-				secret := fmt.Sprintf("ccsec_%s_%d", name, nowMS)
-				encoded := base64EncodeStr(id + ":" + secret)
+				if len(s.securityAPIKeys) >= maxAdminStoreEntriesR67 {
+					s.mu.Unlock()
+					writeESError(w, http.StatusTooManyRequests, "es_rejected_execution_exception", "api_key store limit reached")
+					return true
+				}
+				id := "cck_" + randomCryptoTokenB64R67(16)
+				for s.securityAPIKeys[id] != nil {
+					id = "cck_" + randomCryptoTokenB64R67(16)
+				}
+				secret := randomCryptoTokenB64R67(32)
+				encoded := base64.StdEncoding.EncodeToString([]byte(id + ":" + secret))
+				ownerName := "elastic"
+				if callerP != nil && callerP.username != "" {
+					ownerName = callerP.username
+				}
 				s.securityAPIKeys[id] = map[string]any{
-					"id":          id,
-					"name":        name,
-					"type":        "cross_cluster",
-					"access":      deepCloneDocMap(access),
-					"metadata":    deepCloneDocMap(meta),
-					"creation":    nowMS,
-					"expiration":  expVal,
-					"invalidated": false,
-					"api_key":     secret,
+					"id":              id,
+					"name":            name,
+					"username":        ownerName,
+					"type":            "cross_cluster",
+					"access":          deepCloneDocMap(access),
+					"metadata":        deepCloneDocMap(meta),
+					"creation":        nowMS,
+					"expiration":      expVal,
+					"invalidated":     false,
+					"__secret_pbkdf2": hashSecuritySecretPBKDF2R67(secret),
 				}
 				s.mu.Unlock()
+				s.bumpSecurityEpoch()
 				writeJSON(w, http.StatusOK, map[string]any{
 					"id":         id,
 					"name":       name,
@@ -2821,6 +2837,11 @@ func (s *Server) handleSecurityRound56(w http.ResponseWriter, r *http.Request, s
 					return true
 				}
 				s.mu.Lock()
+				if configured && !s.principalHasClusterPrivLockedR67(callerP, "manage_security", "manage") {
+					s.mu.Unlock()
+					writeESError(w, http.StatusForbidden, "security_exception", fmt.Sprintf("action [cluster:admin/xpack/security/cross_cluster/api_key/update] is unauthorized for user [%s]", callerP.username))
+					return true
+				}
 				keyObj, exists := s.securityAPIKeys[keyID]
 				isCC := keyObj != nil && keyObj["type"] == "cross_cluster"
 				isInv, _ := keyObj["invalidated"].(bool)
@@ -2845,6 +2866,7 @@ func (s *Server) handleSecurityRound56(w http.ResponseWriter, r *http.Request, s
 					keyObj["expiration"] = time.Now().UTC().UnixMilli() + durMS
 				}
 				s.mu.Unlock()
+				s.bumpSecurityEpoch()
 				writeJSON(w, http.StatusOK, map[string]any{"updated": true})
 				return true
 			}
@@ -2941,7 +2963,15 @@ func (s *Server) handleSecurityHasPrivilegesUserProfilesR66(w http.ResponseWrite
 
 	hasPrivUIDs := make([]string, 0, len(uids))
 	errDetails := make(map[string]any)
+	privBody, _ := body["privileges"].(map[string]any)
+	s.authMu.RLock()
+	basicUser := strings.TrimSpace(s.basicAuthUser)
+	proxyAPIKey := strings.TrimSpace(s.apiKey)
+	s.authMu.RUnlock()
+
 	s.mu.RLock()
+	configured := basicUser != "" || proxyAPIKey != "" ||
+		len(s.securityUsers) > 0 || len(s.securityAPIKeys) > 0 || len(s.securityServiceTokens) > 0
 	for _, u := range uids {
 		prof, exists := s.securityProfiles[u]
 		if !exists || prof == nil {
@@ -2951,9 +2981,35 @@ func (s *Server) handleSecurityHasPrivilegesUserProfilesR66(w http.ResponseWrite
 			}
 			continue
 		}
-		if en, _ := prof["enabled"].(bool); en {
-			hasPrivUIDs = append(hasPrivUIDs, u)
+		en, _ := prof["enabled"].(bool)
+		if !en {
+			continue
 		}
+		uMap, _ := prof["user"].(map[string]any)
+		username, _ := uMap["username"].(string)
+		profRoles := extractRolesListFromAnyR67(uMap["roles"])
+		userEnabled := true
+		if uObj := s.securityUsers[username]; uObj != nil {
+			if enU, hasEnU := uObj["enabled"].(bool); hasEnU && !enU {
+				userEnabled = false
+			}
+			profRoles = extractRolesListFromAnyR67(uObj["roles"])
+		}
+		if !userEnabled {
+			continue
+		}
+		if len(privBody) > 0 {
+			allowOpenDefault := !configured && len(s.securityRoles) == 0 && len(s.securityPrivileges) == 0
+			evalP := &securityPrincipalR67{
+				username: username,
+				roles:    profRoles,
+			}
+			hasAll, _, _, _ := s.evaluatePrincipalPrivilegesLockedR67(evalP, allowOpenDefault, privBody)
+			if !hasAll {
+				continue
+			}
+		}
+		hasPrivUIDs = append(hasPrivUIDs, u)
 	}
 	s.mu.RUnlock()
 
@@ -3728,7 +3784,7 @@ func (p *esqlParser) parseComparison() any {
 			if left == nil || pat == nil {
 				return false
 			}
-			re, err := regexp.Compile(fmt.Sprintf("%v", pat))
+			re, err := painless.CompileBoundedRawRegex(fmt.Sprintf("%v", pat))
 			return err == nil && !re.MatchString(fmt.Sprintf("%v", left))
 		} else {
 			p.pos = savedPos
@@ -3777,7 +3833,7 @@ func (p *esqlParser) parseComparison() any {
 		if left == nil || pat == nil {
 			return false
 		}
-		re, err := regexp.Compile(fmt.Sprintf("%v", pat))
+		re, err := painless.CompileBoundedRawRegex(fmt.Sprintf("%v", pat))
 		return err == nil && re.MatchString(fmt.Sprintf("%v", left))
 	}
 	t := p.peek()
@@ -4231,7 +4287,7 @@ func matchESQLLike(val, pattern string) bool {
 		}
 	}
 	rb.WriteString("$")
-	re, err := regexp.Compile("(?s)" + rb.String())
+	re, err := painless.CompileBoundedRawRegex("(?s)" + rb.String())
 	return err == nil && re.MatchString(val)
 }
 

@@ -30,6 +30,7 @@ import (
 
 	"github.com/es2doris/doris-es-proxy/pkg/analysis"
 	"github.com/es2doris/doris-es-proxy/pkg/esast"
+	"github.com/es2doris/doris-es-proxy/pkg/painless"
 	"github.com/es2doris/doris-es-proxy/pkg/schema"
 )
 
@@ -114,7 +115,7 @@ func sqlCollectRawValuesBranch(fullAggName, valExpr, fromClause, whereClause str
 		}
 	}
 	return fmt.Sprintf(
-		"SELECT %s AS `_agg_name`, CONCAT('_vals:', IF(COUNT(%s) <= 50000, COALESCE(ARRAY_JOIN(COLLECT_LIST(CAST(%s AS DOUBLE)), ','), ''), ':OVERFLOW:')) AS `_bucket_key`, CAST(COUNT(%s) AS DOUBLE) AS `_doc_count` FROM %s%s",
+		"SELECT %s AS `_agg_name`, CONCAT('_vals:', IF(COUNT(%s) <= 50000, COALESCE(ARRAY_JOIN(COLLECT_LIST(TRY_CAST(%s AS DOUBLE)), ','), ''), ':OVERFLOW:')) AS `_bucket_key`, CAST(COUNT(%s) AS DOUBLE) AS `_doc_count` FROM %s%s",
 		quoteStr(RawValuesAggPrefix+fullAggName), valExpr, valExpr, valExpr, fromClause, w,
 	)
 }
@@ -124,7 +125,7 @@ func sqlCollectRawValuesBranch(fullAggName, valExpr, fromClause, whereClause str
 // `normalizeDorisSQL` rewrites `'\x1f'` -> `CHAR(31)` cleanly.
 func sqlCollectGroupedRawValuesBranch(subFull, parentBucketExpr, valExpr, fromClause, whereClause string) string {
 	return fmt.Sprintf(
-		"SELECT %s AS `_agg_name`, CONCAT(CAST(%s AS STRING), '\\x1f', '_vals:', IF(COUNT(%s) <= 50000, COALESCE(ARRAY_JOIN(COLLECT_LIST(CAST(%s AS DOUBLE)), ','), ''), ':OVERFLOW:')) AS `_bucket_key`, CAST(COUNT(%s) AS DOUBLE) AS `_doc_count` "+
+		"SELECT %s AS `_agg_name`, CONCAT(CAST(%s AS STRING), '\\x1f', '_vals:', IF(COUNT(%s) <= 50000, COALESCE(ARRAY_JOIN(COLLECT_LIST(TRY_CAST(%s AS DOUBLE)), ','), ''), ':OVERFLOW:')) AS `_bucket_key`, CAST(COUNT(%s) AS DOUBLE) AS `_doc_count` "+
 			"FROM %s WHERE %s GROUP BY %s",
 		quoteStr(RawValuesAggPrefix+subFull), parentBucketExpr, valExpr, valExpr, valExpr, fromClause, whereClause, parentBucketExpr,
 	)
@@ -1133,7 +1134,7 @@ func (t *Transpiler) compileKNNRound61(kq *esast.KNNQuery, scoring bool, nctx *n
 		}
 		if t.Schema.DorisDB != "" && t.Schema.DorisTable != "" && topLimit > 0 {
 			topSubquery := fmt.Sprintf("`_id` IN (SELECT `_id` FROM (SELECT `_id`, ROW_NUMBER() OVER (ORDER BY %s DESC, `_id` ASC) AS `_rn` FROM `%s`.`%s` WHERE `__DORIS_DELETE_SIGN__` = 0 AND %s) `_knn_top` WHERE `_rn` <= %d)",
-				maxChildScoreExpr, t.Schema.DorisDB, t.Schema.DorisTable, preFilter, topLimit)
+				maxChildScoreExpr, escapeDorisBacktickIdent(t.Schema.DorisDB), escapeDorisBacktickIdent(t.Schema.DorisTable), preFilter, topLimit)
 			conds = append(conds, topSubquery)
 			safeConds = append(safeConds, topSubquery)
 		}
@@ -1182,10 +1183,33 @@ func (t *Transpiler) compileKNNRound61(kq *esast.KNNQuery, scoring bool, nctx *n
 		preFilter = fmt.Sprintf("(%s) AND (%s)", preFilter, t.activeAliasWhere)
 	}
 	if nctx == nil && t.Schema != nil && t.Schema.DorisDB != "" && t.Schema.DorisTable != "" && topLimit > 0 {
-		topSubquery := fmt.Sprintf("`_id` IN (SELECT `_id` FROM (SELECT `_id`, ROW_NUMBER() OVER (ORDER BY %s DESC, `_id` ASC) AS `_rn` FROM `%s`.`%s` WHERE `__DORIS_DELETE_SIGN__` = 0 AND %s) `_knn_top` WHERE `_rn` <= %d)",
-			rawScoreExpr, t.Schema.DorisDB, t.Schema.DorisTable, preFilter, topLimit)
-		conds = append(conds, topSubquery)
-		safeConds = append(safeConds, topSubquery)
+		escapedDB := escapeDorisBacktickIdent(t.Schema.DorisDB)
+		escapedTable := escapeDorisBacktickIdent(t.Schema.DorisTable)
+		if annFn, annDir, okANN := t.resolveKNNANNFuncR67(kq, resolvedField, b, elemType, metric, filterConds, nctx); okANN {
+			annCol := fmt.Sprintf("`%s`", escapeDorisBacktickIdent(b.ColumnName))
+			annExpr := fmt.Sprintf("%s(%s, %s)", annFn, annCol, vecLit)
+			annWhereParts := []string{"`__DORIS_DELETE_SIGN__` = 0"}
+			annWhereParts = append(annWhereParts, filterConds...)
+			if t.activeAliasWhere != "" && t.activeAliasWhere != "TRUE" {
+				annWhereParts = append(annWhereParts, fmt.Sprintf("(%s)", t.activeAliasWhere))
+			}
+			topSubquery := fmt.Sprintf(
+				"`_id` IN (SELECT `_id` FROM (SELECT `_id` FROM `%s`.`%s` WHERE %s ORDER BY %s %s LIMIT %d) `_knn_top`)",
+				escapedDB,
+				escapedTable,
+				strings.Join(annWhereParts, " AND "),
+				annExpr,
+				annDir,
+				topLimit,
+			)
+			conds = append(conds, topSubquery)
+			safeConds = append(safeConds, topSubquery)
+		} else {
+			topSubquery := fmt.Sprintf("`_id` IN (SELECT `_id` FROM (SELECT `_id`, ROW_NUMBER() OVER (ORDER BY %s DESC, `_id` ASC) AS `_rn` FROM `%s`.`%s` WHERE `__DORIS_DELETE_SIGN__` = 0 AND %s) `_knn_top` WHERE `_rn` <= %d)",
+				rawScoreExpr, escapedDB, escapedTable, preFilter, topLimit)
+			conds = append(conds, topSubquery)
+			safeConds = append(safeConds, topSubquery)
+		}
 	}
 
 	whereSQL := strings.Join(conds, " AND ")
@@ -1212,6 +1236,118 @@ func buildZeroVectorLiteralR61(dim int) string {
 		parts[i] = "0.0"
 	}
 	return fmt.Sprintf("CAST([%s] AS ARRAY<FLOAT>)", strings.Join(parts, ", "))
+}
+
+func lookupRawFieldPropertyR67(props map[string]esast.FieldProperty, parts []string) (esast.FieldProperty, bool) {
+	if len(props) == 0 || len(parts) == 0 {
+		return esast.FieldProperty{}, false
+	}
+	if fp, ok := props[parts[0]]; ok {
+		if len(parts) == 1 {
+			return fp, true
+		}
+		if sub, okSub := lookupRawFieldPropertyR67(fp.Properties, parts[1:]); okSub {
+			return sub, true
+		}
+		if len(parts) == 2 && len(fp.Fields) > 0 {
+			if sfp, okF := fp.Fields[parts[1]]; okF {
+				return sfp, true
+			}
+		}
+	}
+	for i := len(parts); i >= 2; i-- {
+		joined := strings.Join(parts[:i], ".")
+		if fp, ok := props[joined]; ok {
+			if i == len(parts) {
+				return fp, true
+			}
+			if sub, okSub := lookupRawFieldPropertyR67(fp.Properties, parts[i:]); okSub {
+				return sub, true
+			}
+		}
+	}
+	return esast.FieldProperty{}, false
+}
+
+func isQuantizedVectorForANNR67(s *schema.IndexSchema, resolvedField string, b schema.FieldBinding) bool {
+	if b.VectorIndexOptions == nil {
+		return false
+	}
+	idxType, _ := b.VectorIndexOptions["type"].(string)
+	switch strings.ToLower(strings.TrimSpace(idxType)) {
+	case "int4_hnsw", "int4_flat", "bbq_hnsw", "bbq_flat", "int8_flat", "flat":
+		return true
+	case "int8_hnsw":
+		// MaterializeDenseVectorIndexOptions defaults omitted ES 8 index_options to "int8_hnsw";
+		// treat as quantized only when explicitly configured in RawMapping (or when RawMapping is absent).
+		if s == nil || s.RawMapping == nil {
+			return true
+		}
+		if prop, ok := lookupRawFieldPropertyR67(s.RawMapping.Properties, strings.Split(resolvedField, ".")); ok {
+			return prop.IndexOptions != nil
+		}
+		return true
+	default:
+		return false
+	}
+}
+
+func isSimpleANNPreFilterSQLR67(pred string) bool {
+	if pred == "" || pred == "TRUE" {
+		return true
+	}
+	for _, disallowed := range []string{
+		"array_exists(", "array_map(", "`_doc`", "`_source`",
+		" REGEXP ", " LIKE ", "SELECT ", "TRY_CAST(", "CAST(", "NOT (",
+	} {
+		if strings.Contains(pred, disallowed) {
+			return false
+		}
+	}
+	return true
+}
+
+func (t *Transpiler) resolveKNNANNFuncR67(
+	kq *esast.KNNQuery,
+	resolvedField string,
+	b schema.FieldBinding,
+	elemType string,
+	metric string,
+	filterConds []string,
+	nctx *nestedCtx,
+) (annFn string, annDir string, ok bool) {
+	if !t.Opts.AllowANNPushdown {
+		return "", "", false
+	}
+	annMode := strings.ToLower(strings.TrimSpace(t.Opts.VectorANNMode))
+	if annMode != "hnsw" && annMode != "ivf" {
+		return "", "", false
+	}
+	if !t.inTopLevelKNN || nctx != nil || t.activeHasRescoreOrMinScore || kq == nil || kq.Similarity != nil {
+		return "", "", false
+	}
+	if b.Kind != schema.StoragePromotedVector || b.ColumnName == "" || b.NotIndexed || b.VectorDims <= 0 || b.AutoDims {
+		return "", "", false
+	}
+	if elemType != "float" || isQuantizedVectorForANNR67(t.Schema, resolvedField, b) {
+		return "", "", false
+	}
+	if !isSimpleANNPreFilterSQLR67(t.activeAliasWhere) {
+		return "", "", false
+	}
+	for _, fc := range filterConds {
+		if !isSimpleANNPreFilterSQLR67(fc) {
+			return "", "", false
+		}
+	}
+	switch metric {
+	case "l2_norm", "l2", "l2_distance":
+		return "l2_distance_approximate", "ASC", true
+	case "dot_product", "max_inner_product":
+		return "inner_product_approximate", "DESC", true
+	default:
+		return "", "", false
+	}
 }
 
 func buildCosineSafeExprsR61(colExpr, vecLit string, dim int) (baseCond, safeCol string) {
@@ -1856,7 +1992,11 @@ func EvaluateIntervalsRuleWithAnalysis(
 			var re *regexp.Regexp
 			if maxEdits > 0 {
 				pat := "^(" + buildFuzzyEditDistanceRegex(term, maxEdits, r.Fuzzy.PrefixLength, allowTransp) + ")$"
-				re, _ = regexp.Compile(pat)
+				var err error
+				re, err = painless.CompileBoundedRegex(pat)
+				if err != nil {
+					return nil, err
+				}
 			}
 			var spans []IntervalsSpan
 			for _, dt := range st.tokens {

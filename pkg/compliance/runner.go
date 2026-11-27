@@ -24,7 +24,11 @@ import (
 	"unicode/utf8"
 )
 
-const proxyTargetVersion = "7.10.2"
+const (
+	proxyTargetVersion     = "7.10.2"
+	DefaultFixtureAuthUser = "x_pack_rest_user"
+	DefaultFixtureAuthPass = "x-pack-test-password"
+)
 
 var supportedRunnerFeatures = map[string]bool{
 	"headers":                true,
@@ -53,6 +57,7 @@ var supportedRunnerFeatures = map[string]bool{
 	"not_exists":             true,
 	"yaml":                   true,
 	"catch_param":            true,
+	"catch_unauthorized":     true,
 	"stash_in_key":           true,
 	"stash_in_path":          true,
 	"node_selector":          true,
@@ -62,6 +67,8 @@ var supportedRunnerFeatures = map[string]bool{
 	"mustache":               true,
 	"clean_text":             true,
 	"capabilities":           true,
+	"spi_on_classpath_jdk9":  true,
+	"fips_140":               true,
 }
 
 var defaultSupportedClusterFeatures = map[string]bool{
@@ -90,6 +97,12 @@ var defaultSupportedClusterFeatures = map[string]bool{
 	"stats.include_disk_thresholds":                            true,
 	"mapper.range.null_values_off_by_one_fix":                  true,
 	"esql.mv_ordering_sorted_ascending":                        true,
+	"_internal.get_desired_balance":                            true,
+	"_internal.delete_desired_balance":                         true,
+	"_internal.update_desired_nodes":                           true,
+	"_internal.get_desired_nodes":                              true,
+	"_internal.delete_desired_nodes":                           true,
+	"_internal.prevalidate_node_removal":                       true,
 }
 
 var es8OnlyClusterFeatures = map[string]bool{
@@ -110,6 +123,12 @@ var es8OnlyClusterFeatures = map[string]bool{
 	"stats.include_disk_thresholds":                            true,
 	"mapper.range.null_values_off_by_one_fix":                  true,
 	"esql.mv_ordering_sorted_ascending":                        true,
+	"_internal.get_desired_balance":                            true,
+	"_internal.delete_desired_balance":                         true,
+	"_internal.update_desired_nodes":                           true,
+	"_internal.get_desired_nodes":                              true,
+	"_internal.delete_desired_nodes":                           true,
+	"_internal.prevalidate_node_removal":                       true,
 }
 
 // DefaultSupportedTestRunnerFeatures returns a copy of the default test-runner feature set.
@@ -173,10 +192,35 @@ type SuiteReport struct {
 	FileReports []FileReport
 }
 
+// RunOptions configures target version and default fixture credentials for RunSuiteFSWithOptions / RunSpecFileWithOptions.
+type RunOptions struct {
+	TargetVersion     string
+	DefaultAuthUser   string
+	DefaultAuthPass   string
+	DefaultAuthHeader string
+}
+
+func (o RunOptions) resolvedAuthHeader() string {
+	if h := strings.TrimSpace(o.DefaultAuthHeader); h != "" {
+		return h
+	}
+	return basicAuthHeaderValue(o.DefaultAuthUser, o.DefaultAuthPass)
+}
+
+func basicAuthHeaderValue(user, pass string) string {
+	if user == "" && pass == "" {
+		return ""
+	}
+	return "Basic " + base64.StdEncoding.EncodeToString([]byte(user+":"+pass))
+}
+
 // RunEmbeddedSuite executes all embedded specs/*.yml files against baseURL.
 func RunEmbeddedSuite(t *testing.T, baseURL string) {
 	t.Helper()
-	report := RunSuiteFS(t, EmbeddedSpecsFS, baseURL)
+	report := RunSuiteFSWithOptions(t, EmbeddedSpecsFS, baseURL, RunOptions{
+		DefaultAuthUser: DefaultFixtureAuthUser,
+		DefaultAuthPass: DefaultFixtureAuthPass,
+	})
 	if report.FilesRun == 0 {
 		t.Fatalf("no embedded rest-api-spec YAML files were executed")
 	}
@@ -185,12 +229,18 @@ func RunEmbeddedSuite(t *testing.T, baseURL string) {
 // RunSuiteFS discovers and runs all *.yml files in fsys (both root and specs/*.yml) against baseURL.
 func RunSuiteFS(t *testing.T, fsys fs.FS, baseURL string) SuiteReport {
 	t.Helper()
-	return RunSuiteFSWithVersion(t, fsys, baseURL, "")
+	return RunSuiteFSWithOptions(t, fsys, baseURL, RunOptions{})
 }
 
 // RunSuiteFSWithVersion discovers and runs all *.yml files in fsys against baseURL using explicitTargetVersion
 // (falling back to CONFORMANCE_TARGET_ES_VERSION or proxyTargetVersion when explicitTargetVersion is empty).
 func RunSuiteFSWithVersion(t *testing.T, fsys fs.FS, baseURL, explicitTargetVersion string) SuiteReport {
+	t.Helper()
+	return RunSuiteFSWithOptions(t, fsys, baseURL, RunOptions{TargetVersion: explicitTargetVersion})
+}
+
+// RunSuiteFSWithOptions discovers and runs all *.yml files in fsys against baseURL using opts.
+func RunSuiteFSWithOptions(t *testing.T, fsys fs.FS, baseURL string, opts RunOptions) SuiteReport {
 	t.Helper()
 	var files []string
 	err := fs.WalkDir(fsys, ".", func(p string, d fs.DirEntry, walkErr error) error {
@@ -208,7 +258,8 @@ func RunSuiteFSWithVersion(t *testing.T, fsys fs.FS, baseURL, explicitTargetVers
 	sort.Strings(files)
 
 	client := &http.Client{Timeout: 30 * time.Second}
-	resolvedTarget := resolveRunnerTargetVersion(explicitTargetVersion)
+	resolvedTarget := resolveRunnerTargetVersion(opts.TargetVersion)
+	authHeader := opts.resolvedAuthHeader()
 	var report SuiteReport
 
 	for _, file := range files {
@@ -221,7 +272,7 @@ func RunSuiteFSWithVersion(t *testing.T, fsys fs.FS, baseURL, explicitTargetVers
 			t.Fatalf("failed parsing spec file %s: %v", file, parseErr)
 		}
 
-		fileRep := runSpecDocumentWithVersion(t, client, baseURL, path.Base(file), specDoc, &report, resolvedTarget)
+		fileRep := runSpecDocumentWithAuth(t, client, baseURL, path.Base(file), specDoc, &report, resolvedTarget, authHeader)
 		report.FilesRun++
 		report.FileReports = append(report.FileReports, fileRep)
 	}
@@ -232,21 +283,27 @@ func RunSuiteFSWithVersion(t *testing.T, fsys fs.FS, baseURL, explicitTargetVers
 // RunSpecFile parses and executes a single rest-api-spec YAML file against baseURL.
 func RunSpecFile(t *testing.T, name, content, baseURL string) FileReport {
 	t.Helper()
-	return RunSpecFileWithVersion(t, name, content, baseURL, "")
+	return RunSpecFileWithOptions(t, name, content, baseURL, RunOptions{})
 }
 
 // RunSpecFileWithVersion parses and executes a single rest-api-spec YAML file against baseURL
 // using explicitTargetVersion (falling back to CONFORMANCE_TARGET_ES_VERSION or proxyTargetVersion when empty).
 func RunSpecFileWithVersion(t *testing.T, name, content, baseURL, explicitTargetVersion string) FileReport {
 	t.Helper()
+	return RunSpecFileWithOptions(t, name, content, baseURL, RunOptions{TargetVersion: explicitTargetVersion})
+}
+
+// RunSpecFileWithOptions parses and executes a single rest-api-spec YAML file against baseURL using opts.
+func RunSpecFileWithOptions(t *testing.T, name, content, baseURL string, opts RunOptions) FileReport {
+	t.Helper()
 	specDoc, err := ParseSpecFile(content)
 	if err != nil {
 		t.Fatalf("failed parsing spec file %s: %v", name, err)
 	}
 	client := &http.Client{Timeout: 30 * time.Second}
-	resolvedTarget := resolveRunnerTargetVersion(explicitTargetVersion)
+	resolvedTarget := resolveRunnerTargetVersion(opts.TargetVersion)
 	var dummy SuiteReport
-	return runSpecDocumentWithVersion(t, client, baseURL, name, specDoc, &dummy, resolvedTarget)
+	return runSpecDocumentWithAuth(t, client, baseURL, name, specDoc, &dummy, resolvedTarget, opts.resolvedAuthHeader())
 }
 
 func resolveRunnerTargetVersion(explicitTargetVersion string) string {
@@ -266,6 +323,11 @@ func runSpecDocument(t *testing.T, client *http.Client, baseURL, fileName string
 
 func runSpecDocumentWithVersion(t *testing.T, client *http.Client, baseURL, fileName string, specDoc *SpecDocument, report *SuiteReport, targetVersion string) FileReport {
 	t.Helper()
+	return runSpecDocumentWithAuth(t, client, baseURL, fileName, specDoc, report, targetVersion, "")
+}
+
+func runSpecDocumentWithAuth(t *testing.T, client *http.Client, baseURL, fileName string, specDoc *SpecDocument, report *SuiteReport, targetVersion, defaultAuthHeader string) FileReport {
+	t.Helper()
 	fileRep := FileReport{File: fileName}
 	trimmedBase := strings.TrimRight(baseURL, "/")
 	if strings.TrimSpace(targetVersion) == "" {
@@ -275,6 +337,7 @@ func runSpecDocumentWithVersion(t *testing.T, client *http.Client, baseURL, file
 		probeCtx := newRunnerContext(client, trimmedBase)
 		probeCtx.targetVersion = targetVersion
 		probeCtx.supportedClusterFeatures = DefaultSupportedClusterFeaturesForVersion(targetVersion)
+		probeCtx.setDefaultAuthHeader(defaultAuthHeader)
 		if reason, skip := probeCtx.evalSkipSpec(specDoc.Skip, false); skip {
 			t.Skipf("file skipped: %s", reason)
 		}
@@ -304,6 +367,7 @@ func runSpecDocumentWithVersion(t *testing.T, client *http.Client, baseURL, file
 				ctx := newRunnerContext(client, trimmedBase)
 				ctx.targetVersion = targetVersion
 				ctx.supportedClusterFeatures = DefaultSupportedClusterFeaturesForVersion(targetVersion)
+				ctx.setDefaultAuthHeader(defaultAuthHeader)
 				defer ctx.cleanupAll()
 
 				for i, step := range specDoc.Setup {
@@ -369,6 +433,7 @@ type runnerContext struct {
 	client                       *http.Client
 	baseURL                      string
 	targetVersion                string
+	defaultAuthHeader            string
 	supportedClusterFeatures     map[string]bool
 	supportedTestRunnerFeatures  map[string]bool
 	stash                        map[string]any
@@ -5119,6 +5184,15 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 			reqPath = "/_monitoring/bulk"
 		}
 
+	case "xpack-monitoring.bulk":
+		method = http.MethodPost
+		isNDJSON = true
+		if typ := popString("type"); typ != "" {
+			reqPath = "/_xpack/monitoring/" + escapeIDSeg(typ) + "/_bulk"
+		} else {
+			reqPath = "/_xpack/monitoring/_bulk"
+		}
+
 	case "license.post_start_basic":
 		method = http.MethodPost
 		reqPath = "/_license/start_basic"
@@ -6302,6 +6376,13 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 		method = http.MethodPut
 		historyID := popString("history_id")
 		ver := popString("version")
+		for k := range remaining {
+			switch k {
+			case "dry_run", "timeout", "master_timeout", "cluster_manager_timeout", "error_trace", "filter_path", "human", "pretty":
+			default:
+				return nil, fmt.Errorf("unknown parameter [%s] for action [%s]", k, action)
+			}
+		}
 		if historyID != "" && ver != "" {
 			reqPath = "/_internal/desired_nodes/" + escapeIDSeg(historyID) + "/" + escapeIDSeg(ver)
 		} else {
@@ -6310,7 +6391,7 @@ func (c *runnerContext) buildActionRequest(action string, params map[string]any)
 
 	case "_internal.get_desired_nodes":
 		method = http.MethodGet
-		reqPath = "/_internal/desired_nodes"
+		reqPath = "/_internal/desired_nodes/_latest"
 
 	case "_internal.delete_desired_nodes":
 		method = http.MethodDelete
@@ -6569,6 +6650,20 @@ func escapeCommaIDSegs(raw string) string {
 	return strings.Join(parts, ",")
 }
 
+func (c *runnerContext) setBasicAuth(user, pass string) {
+	if c == nil {
+		return
+	}
+	c.defaultAuthHeader = basicAuthHeaderValue(user, pass)
+}
+
+func (c *runnerContext) setDefaultAuthHeader(hdr string) {
+	if c == nil {
+		return
+	}
+	c.defaultAuthHeader = strings.TrimSpace(hdr)
+}
+
 func (c *runnerContext) rawHTTP(method, reqPath string, query url.Values, body []byte, headers map[string]string) (int, string, error) {
 	return c.rawHTTPWithContentType(method, reqPath, query, body, headers, false)
 }
@@ -6599,8 +6694,15 @@ func (c *runnerContext) rawHTTPWithContentType(method, reqPath string, query url
 	} else if len(body) > 0 {
 		req.Header.Set("Content-Type", "application/json")
 	}
+	hasAuthHeader := false
 	for k, v := range headers {
+		if strings.EqualFold(strings.TrimSpace(k), "Authorization") {
+			hasAuthHeader = true
+		}
 		req.Header.Set(k, v)
+	}
+	if !hasAuthHeader && c.defaultAuthHeader != "" {
+		req.Header.Set("Authorization", c.defaultAuthHeader)
 	}
 	resp, err := c.client.Do(req)
 	if err != nil {
@@ -6930,6 +7032,9 @@ func (c *runnerContext) probeServerCapability(capReq CapabilityRequirement) bool
 	req, err := http.NewRequest(http.MethodGet, fullURL, nil)
 	if err != nil {
 		return false
+	}
+	if c.defaultAuthHeader != "" {
+		req.Header.Set("Authorization", c.defaultAuthHeader)
 	}
 	resp, err := c.client.Do(req)
 	if err != nil {

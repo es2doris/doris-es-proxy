@@ -352,6 +352,8 @@ func TestRound66_P1_AuthDLSFilteredAliasesAndCache(t *testing.T) {
 	srv, h := newR66TestServer(t)
 
 	// Setup index + filtered aliases + denied index for _terms_enum tests.
+	srv.SetAuth("secadmin", "setup-pw", "")
+	setupHdr := map[string]string{"Authorization": "Basic " + base64.StdEncoding.EncodeToString([]byte("secadmin:setup-pw"))}
 	for _, setup := range []struct {
 		method, path, body string
 	}{
@@ -370,11 +372,12 @@ func TestRound66_P1_AuthDLSFilteredAliasesAndCache(t *testing.T) {
 		{http.MethodPost, "/_security/user/cat_user", `{"password":"cat-pw","roles":["dls_all_role"]}`},
 		{http.MethodPost, "/_security/user/disabled_u", `{"password":"dis-pw","enabled":false,"roles":["superuser"]}`},
 	} {
-		st, _, _, raw := doR66Req(t, h, setup.method, setup.path, setup.body, nil)
+		st, _, _, raw := doR66Req(t, h, setup.method, setup.path, setup.body, setupHdr)
 		if st != http.StatusOK && st != http.StatusCreated {
 			t.Fatalf("%s %s failed: %d %s", setup.method, setup.path, st, raw)
 		}
 	}
+	srv.SetAuth("", "", "")
 
 	basic := func(u, p string) map[string]string {
 		return map[string]string{"Authorization": "Basic " + base64.StdEncoding.EncodeToString([]byte(u+":"+p))}
@@ -402,8 +405,8 @@ func TestRound66_P1_AuthDLSFilteredAliasesAndCache(t *testing.T) {
 		basic("disabled_u", "dis-pw"),
 	} {
 		st, _, res, _ := doR66Req(t, h, http.MethodPost, "/cat_shared/_terms_enum", `{"field":"tag"}`, deniedHdr)
-		if st != http.StatusOK {
-			t.Fatalf("unexpected error status %d", st)
+		if st != http.StatusUnauthorized {
+			t.Fatalf("expected 401 unauthorized for denied credentials %v, got %d (%+v)", deniedHdr, st, res)
 		}
 		if terms, _ := res["terms"].([]any); len(terms) != 0 {
 			t.Fatalf("expected denied credentials %v to yield 0 terms, got %+v", deniedHdr, res)

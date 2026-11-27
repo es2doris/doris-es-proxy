@@ -654,11 +654,13 @@ func TestRound65_Track123_MonitoringRoutesHistogramULAndAdminCoverage(t *testing
 	srv.securityRoles = map[string]map[string]any{
 		"monitor_only": {"cluster": []string{"monitor"}},
 		"mon_writer":   {"cluster": []string{"cluster:admin/xpack/monitoring/bulk"}},
+		"mon_admin":    {"cluster": []string{"all"}, "indices": []any{map[string]any{"names": []any{"*"}, "privileges": []any{"all"}}}},
 	}
 	srv.securityUsers = map[string]map[string]any{
 		"reader": {"password": "pass", "roles": []string{"monitor_only"}},
 		"writer": {"password": "pass", "roles": []string{"mon_writer"}},
 		"agent":  {"password": "pass", "roles": []string{"remote_monitoring_agent"}},
+		"admin":  {"password": "pass", "roles": []string{"mon_admin"}},
 	}
 	srv.mu.Unlock()
 
@@ -714,8 +716,8 @@ func TestRound65_Track123_MonitoringRoutesHistogramULAndAdminCoverage(t *testing
 		t.Fatalf("expected 200 on _xpack/monitoring/beats/bulk, got %d: %s", st, raw)
 	}
 	// Closed monitoring index -> 500 export_exception
-	_, _, _ = doR65MarginReq(t, srv, http.MethodPut, "/.monitoring-kibana-7-2026.11.22", `{}`)
-	_, _, _ = doR65MarginReq(t, srv, http.MethodPost, "/.monitoring-kibana-7-2026.11.22/_close", ``)
+	_, _, _ = doR65MarginReq(t, srv, http.MethodPut, "/.monitoring-kibana-7-2026.11.22", `{}`, authHeader("admin", "pass"))
+	_, _, _ = doR65MarginReq(t, srv, http.MethodPost, "/.monitoring-kibana-7-2026.11.22/_close", ``, authHeader("admin", "pass"))
 	st, _, raw = doR65MarginReq(t, srv, http.MethodPost, "/_monitoring/bulk?system_id=kibana&system_api_version=7&interval=10s",
 		`{"index":{}}`+"\n"+`{"status":"green"}`+"\n",
 		authHeader("agent", "pass"))
@@ -733,7 +735,7 @@ func TestRound65_Track123_MonitoringRoutesHistogramULAndAdminCoverage(t *testing
 		{http.MethodDelete, "/_nodes/_clear_repositories_metering_archive/1"},
 		{http.MethodDelete, "/_nodes/doris-fe-1/_clear_repositories_metering_archive/1"},
 	} {
-		st, _, raw = doR65MarginReq(t, srv, tc.method, tc.path, "")
+		st, _, raw = doR65MarginReq(t, srv, tc.method, tc.path, "", authHeader("admin", "pass"))
 		if st != http.StatusOK {
 			t.Fatalf("%s %s failed: %d %s", tc.method, tc.path, st, raw)
 		}
@@ -776,16 +778,16 @@ func TestRound65_Track123_MonitoringRoutesHistogramULAndAdminCoverage(t *testing
 				"ts_ns": {"type": "date_nanos"}
 			}
 		}
-	}`)
+	}`, authHeader("admin", "pass"))
 	if st != http.StatusOK {
 		t.Fatalf("create r65_cov_idx failed: %d %s", st, raw)
 	}
 	_, _, _ = doR65MarginReq(t, srv, http.MethodPost, "/_bulk?refresh=true",
 		`{"index":{"_index":"r65_cov_idx","_id":"1"}}`+"\n"+`{"title":"alpha","score":10}`+"\n"+
-			`{"index":{"_index":"r65_cov_idx","_id":"2"}}`+"\n"+`{"title":"alpha beta","score":20}`+"\n")
+			`{"index":{"_index":"r65_cov_idx","_id":"2"}}`+"\n"+`{"title":"alpha beta","score":20}`+"\n", authHeader("admin", "pass"))
 	// Overflow date_nanos in ES8 bulk -> check caused_by on document_parsing_exception
 	st, bErr, _ := doR65MarginReq(t, srv, http.MethodPost, "/_bulk",
-		`{"index":{"_index":"r65_cov_idx","_id":"bad_ns"}}`+"\n"+`{"ts_ns":"2500-01-01T00:00:00Z"}`+"\n")
+		`{"index":{"_index":"r65_cov_idx","_id":"bad_ns"}}`+"\n"+`{"ts_ns":"2500-01-01T00:00:00Z"}`+"\n", authHeader("admin", "pass"))
 	if st == http.StatusOK && bErr["errors"] == true {
 		itemErr := bErr["items"].([]any)[0].(map[string]any)["index"].(map[string]any)["error"].(map[string]any)
 		if (itemErr["type"] == "document_parsing_exception" || itemErr["type"] == "mapper_parsing_exception") && itemErr["caused_by"] == nil {
@@ -794,11 +796,11 @@ func TestRound65_Track123_MonitoringRoutesHistogramULAndAdminCoverage(t *testing
 	}
 
 	// _count (`min_score`, `?min_score=`, unknown key 400)
-	st, cntRes, raw := doR65MarginReq(t, srv, http.MethodPost, "/r65_cov_idx/_count", `{"query":{"match":{"title":"alpha"}},"min_score":0.1}`)
+	st, cntRes, raw := doR65MarginReq(t, srv, http.MethodPost, "/r65_cov_idx/_count", `{"query":{"match":{"title":"alpha"}},"min_score":0.1}`, authHeader("admin", "pass"))
 	if st != http.StatusOK || cntRes["count"] == nil {
 		t.Fatalf("_count min_score failed: %d %s", st, raw)
 	}
-	st, _, _ = doR65MarginReq(t, srv, http.MethodPost, "/r65_cov_idx/_count", `{"unknown_field":1}`)
+	st, _, _ = doR65MarginReq(t, srv, http.MethodPost, "/r65_cov_idx/_count", `{"unknown_field":1}`, authHeader("admin", "pass"))
 	if st != http.StatusBadRequest {
 		t.Fatalf("expected 400 on unknown _count field, got %d", st)
 	}
@@ -812,7 +814,7 @@ func TestRound65_Track123_MonitoringRoutesHistogramULAndAdminCoverage(t *testing
 		"/r65_cov_idx/_segments",
 		"/r65_cov_idx/_shard_stores",
 	} {
-		st, _, raw = doR65MarginReq(t, srv, http.MethodGet, ep, "")
+		st, _, raw = doR65MarginReq(t, srv, http.MethodGet, ep, "", authHeader("admin", "pass"))
 		if st != http.StatusOK {
 			t.Fatalf("GET %s failed: %d %s", ep, st, raw)
 		}

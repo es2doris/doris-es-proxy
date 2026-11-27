@@ -155,7 +155,7 @@ func TestTranspileOpenMetadataSearchAndFacetAggregations(t *testing.T) {
 		"`f__name` MATCH_ALL 'orders'",
 		"`f__displayName` MATCH_ALL 'orders'",
 		"array_contains(`n__columns__name`, 'user_id') AND array_contains(`n__columns__dataType`, 'INT')",
-		"array_exists(_el -> (json_extract_string(_el, '$.name') = 'user_id') AND (json_extract_string(_el, '$.dataType') = 'INT'), `n__columns`)",
+		`array_exists(_el -> (json_extract_string(_el, '$."name"') = 'user_id') AND (json_extract_string(_el, '$."dataType"') = 'INT'), ` + "`n__columns`" + `)`,
 		"array_contains(`f__tags__tagFQN`, 'PII.Sensitive')",
 		"`f__serviceType` IN ('BigQuery', 'Snowflake')",
 		"LOG10(GREATEST(1e-300, 1.0 + (0.0500 * COALESCE(`f__usageSummary__weeklyStats__count`, 0.0000))))",
@@ -179,7 +179,7 @@ func TestTranspileOpenMetadataSearchAndFacetAggregations(t *testing.T) {
 		"WITH `base_matched` AS (SELECT * FROM `es_compat`.`table_search_index`",
 		"FROM `base_matched` LATERAL VIEW EXPLODE(`f__tags__tagFQN`) `_t` AS `_elem`",
 		"FROM `base_matched` LATERAL VIEW EXPLODE(`n__columns`) `_nt` AS `_nel`",
-		"json_extract_string(`_nel`, '$.dataType') AS `_bucket_key`",
+		"json_extract_string(`_nel`, '$." + `"dataType"` + "') AS `_bucket_key`",
 		"COUNT(DISTINCT `f__serviceType`)",
 	}
 	for _, sub := range expectedAggsSubstrings {
@@ -563,9 +563,9 @@ func TestCriticalBug2_FulltextInSelect_MinimumShouldMatch_LuceneRangeAndExists_D
 	for _, want := range []string{
 		"LATERAL VIEW EXPLODE(`f__tags`) `_sub_t` AS `_sub_elem`",
 		"SELECT '__meta_total' AS `_agg_name`, '_count' AS `_bucket_key`, CAST(COUNT(*) AS DOUBLE) AS `_doc_count` FROM `base_matched` WHERE `f__group` = 'admin'",
-		"CAST(json_extract_string(_el, '$.likes') AS BIGINT) >= 10",
-		"lower(json_extract_string(_el, '$.author')) = lower('alice')",
-		"json_extract_string(_el, '$.dyn_flag') = 'yes'",
+		`TRY_CAST(json_extract_string(_el, '$."likes"') AS BIGINT) >= 10`,
+		`lower(json_extract_string(_el, '$."author"')) = lower('alice')`,
+		`json_extract_string(_el, '$."dyn_flag"') = 'yes'`,
 	} {
 		if !strings.Contains(deepPlan.AggsSQL, want) {
 			t.Fatalf("expected deepPlan.AggsSQL to contain %q, got:\n%s", want, deepPlan.AggsSQL)
@@ -879,13 +879,13 @@ func TestTranspiler_Round3DeepEvalFixes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(plan3.HitsSQL, "CAST(json_extract_string(_el, '$.ts') AS BIGINT) >= 1790812800000") {
-		t.Fatalf("expected nested date range to normalize ISO string to epoch millis in json_extract_string, got:\n%s", plan3.HitsSQL)
+	if !strings.Contains(plan3.HitsSQL, `TRY_CAST(json_extract_string(_el, '$."ts"') AS BIGINT) >= 1790812800000`) {
+		t.Fatalf(`expected nested date range to normalize ISO string to epoch millis in json_extract_string, got:`+"\n%s", plan3.HitsSQL)
 	}
 	if !strings.Contains(plan3.AggsSQL, "COALESCE(CAST(`f__env` AS STRING), 'N/A')") {
 		t.Fatalf("expected terms missing to emit COALESCE(CAST(`f__env` AS STRING), 'N/A'), got:\n%s", plan3.AggsSQL)
 	}
-	if !strings.Contains(plan3.AggsSQL, "json_extract_string(`_nel`, '$.kind')") {
+	if !strings.Contains(plan3.AggsSQL, "json_extract_string(`_nel`, '$."+`"kind"`+"')") {
 		t.Fatalf("expected nested terms agg to strip .keyword suffix ('$.kind'), got:\n%s", plan3.AggsSQL)
 	}
 	if !strings.Contains(plan3.AggsSQL, "> 'checkout\x1fprod'") {
@@ -1123,7 +1123,7 @@ func TestRound29TranspilerNestedDateBoundsRelativeNestedPathsLuceneExistsAndSubA
 	if !strings.Contains(planNR.HitsSQL, "1790812800000") || !strings.Contains(planNR.HitsSQL, "1790985599000") {
 		t.Fatalf("expected nested date gt/lte ISO bounds to normalize to epoch millis, got:\n%s", planNR.HitsSQL)
 	}
-	if !strings.Contains(planNR.HitsSQL, "$.title__keyword") {
+	if !strings.Contains(planNR.HitsSQL, `$."title__keyword"`) {
 		t.Fatalf("expected relative nested title.keyword and nested sort filter to route to $.title__keyword, got:\n%s", planNR.HitsSQL)
 	}
 
@@ -1901,7 +1901,7 @@ func TestRound32NestedDateQueriesMultiValuedIPsLuceneAndStringStats(t *testing.T
 		t.Fatalf("expected nested date queries to use epoch millis 1767225600000 and 1767398399999, got:\n%s", plan1.HitsSQL)
 	}
 	// Verify Fix 4: nested .keyword with null_value uses $.name__keyword
-	if !strings.Contains(plan1.HitsSQL, "$.name__keyword") {
+	if !strings.Contains(plan1.HitsSQL, `$."name__keyword"`) {
 		t.Fatalf("expected $.name__keyword in HitsSQL for nested .keyword with null_value, got:\n%s", plan1.HitsSQL)
 	}
 	// Verify Fix 5: multi-valued nested IP uses array_exists with IPV4_STRING_TO_NUM_OR_NULL
@@ -2587,7 +2587,7 @@ func TestRound44TranspilerNestedMultiFieldLuceneRangeDateZoneDoris4SearchAndMinS
 		}
 	}`), &nestedMFReq)
 	cqNestedMF := tr.CompileQuery(nestedMFReq.Query, false, nil)
-	if !strings.Contains(cqNestedMF.WhereSQL, "json_extract_string(_el, '$.code__lc')") || !strings.Contains(cqNestedMF.WhereSQL, "'sku-1'") {
+	if !strings.Contains(cqNestedMF.WhereSQL, `json_extract_string(_el, '$."code__lc"')`) || !strings.Contains(cqNestedMF.WhereSQL, "'sku-1'") {
 		t.Fatalf("F7 expected correlated nested custom multi-field items.code.lc to extract $.code__lc with 'sku-1', got:\n%s", cqNestedMF.WhereSQL)
 	}
 
@@ -3286,8 +3286,8 @@ func TestRound48TranspilerSpecCompliance(t *testing.T) {
 	_ = json.Unmarshal([]byte(`{"nested": {"path": "items", "query": {"range": {"win": {"gte": 2, "lte": 8}}}}}`), &nestedRangeQ)
 	_ = json.Unmarshal([]byte(`{"range": {"rng_alias": {"gte": "2026-01-01T00:00:00Z", "lte": "2026-01-01", "time_zone": "+02:00"}}}`), &aliasRangeQ)
 
-	if w := tr.CompileQuery(&nestedRangeQ, false, nil).WhereSQL; !strings.Contains(w, "$.win._gte") || !strings.Contains(w, "n__items") {
-		t.Fatalf("F14 expected nested range query to read $.win._gte from correlated nested element, got %s", w)
+	if w := tr.CompileQuery(&nestedRangeQ, false, nil).WhereSQL; !strings.Contains(w, `$."win"."_gte"`) || !strings.Contains(w, "n__items") {
+		t.Fatalf(`F14 expected nested range query to read $."win"."_gte" from correlated nested element, got %s`, w)
 	}
 	wAliasRng := tr.CompileQuery(&aliasRangeQ, false, nil).WhereSQL
 	// 2026-01-01T00:00:00Z has explicit Z so it must NOT subtract +02:00 (stays 1767225600000), while "2026-01-01" has no explicit TZ so it rounds up and subtracts +02:00
@@ -3307,7 +3307,7 @@ func TestRound48TranspilerSpecCompliance(t *testing.T) {
 	if w := tr.CompileQuery(&flatSubKeyQ, false, nil).WhereSQL; !strings.Contains(w, "array_contains(TRY_CAST(`_doc`['labels']['env'] AS ARRAY<STRING>), 'prod')") {
 		t.Fatalf("F15 expected flattened sub-key term query to check array_contains on _doc['labels']['env'], got %s", w)
 	}
-	if w := tr.CompileQuery(&flatNestedQ, false, nil).WhereSQL; !strings.Contains(w, "$.attrs.color") || !strings.Contains(w, "ARRAY<STRING>") {
+	if w := tr.CompileQuery(&flatNestedQ, false, nil).WhereSQL; !strings.Contains(w, `$."attrs"."color"`) || !strings.Contains(w, "ARRAY<STRING>") {
 		t.Fatalf("F15 expected nested flattened sub-key query to extract $.attrs.color and check ARRAY<STRING>, got %s", w)
 	}
 }
@@ -3517,7 +3517,7 @@ func TestRound50TranspilerGeoPolygonRangeContainsNestedSpanSortAndTermsSet(t *te
 	}
 	_ = json.Unmarshal([]byte(`{"nested": {"path": "items", "query": {"range": {"items.window": {"gte": 5, "lte": 15}}}}}`), &nestedRangeQ)
 	cqNR := tr.CompileQuery(&nestedRangeQ, false, nil)
-	if !strings.Contains(cqNR.WhereSQL, "$.window._gte") || !strings.Contains(cqNR.WhereSQL, "-1e100") || !strings.Contains(cqNR.WhereSQL, "1e100") {
+	if !strings.Contains(cqNR.WhereSQL, `$."window"."_gte"`) || !strings.Contains(cqNR.WhereSQL, "-1e100") || !strings.Contains(cqNR.WhereSQL, "1e100") {
 		t.Fatalf("F12 expected nested range subfield query to extract _gte/_lte with -1e100/1e100 fallback, got %s", cqNR.WhereSQL)
 	}
 
@@ -3658,8 +3658,8 @@ func TestRound51TranspilerF10ToF18(t *testing.T) {
 	_ = json.Unmarshal([]byte(`{"nested":{"path":"places","query":{"distance_feature":{"field":"places.pin","origin":[-74.0,40.7],"pivot":"1000m"}}}}`), &nestedGeoDFQ)
 	cqNestedGeo := tr.CompileQuery(&nestedGeoDFQ, true, nil)
 	cqInnerGeo := tr.CompileQuery(&nestedGeoDFQ.Nested.Query, true, &nestedCtx{nestedPath: "places", elemVar: "_el"})
-	if !strings.Contains(cqNestedGeo.WhereSQL, "$.pin") || !strings.Contains(cqInnerGeo.ScoreSQL, "ST_Distance_Sphere") {
-		t.Fatalf("F11 expected nested geo_point distance_feature to extract $.pin and compute ST_Distance_Sphere, got where=%s score=%s", cqNestedGeo.WhereSQL, cqInnerGeo.ScoreSQL)
+	if !strings.Contains(cqNestedGeo.WhereSQL, `$."pin"`) || !strings.Contains(cqInnerGeo.ScoreSQL, "ST_Distance_Sphere") {
+		t.Fatalf(`F11 expected nested geo_point distance_feature to extract $."pin" and compute ST_Distance_Sphere, got where=%s score=%s`, cqNestedGeo.WhereSQL, cqInnerGeo.ScoreSQL)
 	}
 
 	// F12: function_score decay wraps NULL check (ELSE 0.0) and honors multi_value_mode on array numeric field

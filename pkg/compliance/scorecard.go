@@ -53,6 +53,9 @@ func effectiveMaxRecordedFailureSamples() int {
 type SuiteOptions struct {
 	CorpusName                  string
 	TargetVersion               string
+	DefaultAuthUser             string
+	DefaultAuthPass             string
+	DefaultAuthHeader           string
 	SupportedClusterFeatures    map[string]bool
 	SupportedTestRunnerFeatures map[string]bool
 	Categories                  []string
@@ -61,6 +64,13 @@ type SuiteOptions struct {
 	NewSectionHandler           func() (http.Handler, func())
 	ConfigureRemoteTransport    func(handler http.Handler, transport http.RoundTripper)
 	ReuseSetupForReadOnlyFiles  bool
+}
+
+func (o SuiteOptions) resolvedAuthHeader() string {
+	if h := strings.TrimSpace(o.DefaultAuthHeader); h != "" {
+		return h
+	}
+	return basicAuthHeaderValue(o.DefaultAuthUser, o.DefaultAuthPass)
 }
 
 // SectionFailure records a single failed section or parse error during scorecard execution.
@@ -193,9 +203,19 @@ func ScoreDirectories(opts SuiteOptions, dirs ...string) (*SuiteScorecard, error
 	if opts.NewHandler == nil && opts.NewSectionHandler == nil {
 		return nil, fmt.Errorf("scorecard: SuiteOptions.NewHandler or NewSectionHandler is required")
 	}
-	var entries []scoredSpecEntry
-	for _, rootDir := range dirs {
+	type rawDirEntry struct {
+		fullPath  string
+		cleanRoot string
+		dirIdx    int
+		disp      string
+		category  string
+		qualifier string
+	}
+	var rawEntries []rawDirEntry
+	rawDispCounts := make(map[string]int)
+	for dirIdx, rootDir := range dirs {
 		cleanRoot := filepath.Clean(rootDir)
+		qualifier := deriveCorpusQualifier(cleanRoot)
 		err := filepath.WalkDir(cleanRoot, func(fullPath string, d fs.DirEntry, walkErr error) error {
 			if walkErr != nil {
 				return walkErr
@@ -219,16 +239,14 @@ func ScoreDirectories(opts SuiteOptions, dirs ...string) (*SuiteScorecard, error
 			if !strings.Contains(relSlash, "/") && cat != "" && cat != "root" {
 				disp = cat + "/" + relSlash
 			}
-			if opts.FileFilter != nil && !opts.FileFilter(disp) {
-				return nil
-			}
-			pathCopy := fullPath
-			entries = append(entries, scoredSpecEntry{
-				displayPath: disp,
-				category:    cat,
-				readContent: func() ([]byte, error) {
-					return os.ReadFile(filepath.Clean(pathCopy)) // #nosec G304 -- trusted local conformance test corpus path
-				},
+			rawDispCounts[disp]++
+			rawEntries = append(rawEntries, rawDirEntry{
+				fullPath:  fullPath,
+				cleanRoot: cleanRoot,
+				dirIdx:    dirIdx,
+				disp:      disp,
+				category:  cat,
+				qualifier: qualifier,
 			})
 			return nil
 		})
@@ -236,7 +254,59 @@ func ScoreDirectories(opts SuiteOptions, dirs ...string) (*SuiteScorecard, error
 			return nil, fmt.Errorf("scorecard: walking %s: %w", cleanRoot, err)
 		}
 	}
+
+	// Pass 2: corpus-qualify ONLY colliding displayPath entries so non-colliding
+	// core paths stay stable while colliding module/plugin specs resolve 1:1 uniquely.
+	qualifiedCounts := make(map[string]int, len(rawEntries))
+	for i := range rawEntries {
+		e := &rawEntries[i]
+		if rawDispCounts[e.disp] > 1 && e.qualifier != "" && !strings.HasPrefix(e.disp, e.qualifier+"/") {
+			e.disp = e.qualifier + "/" + e.disp
+		}
+		qualifiedCounts[e.disp]++
+	}
+
+	var entries []scoredSpecEntry
+	for _, e := range rawEntries {
+		disp := e.disp
+		if qualifiedCounts[disp] > 1 {
+			fallbackPrefix := strings.Trim(filepath.ToSlash(filepath.Base(e.cleanRoot)), "/")
+			if fallbackPrefix == "" || fallbackPrefix == "." || fallbackPrefix == "test" {
+				fallbackPrefix = fmt.Sprintf("corpus_%d", e.dirIdx)
+			}
+			disp = fallbackPrefix + "/" + disp
+		}
+		if opts.FileFilter != nil && !opts.FileFilter(disp) {
+			continue
+		}
+		pathCopy := e.fullPath
+		entries = append(entries, scoredSpecEntry{
+			displayPath: disp,
+			category:    e.category,
+			readContent: func() ([]byte, error) {
+				return os.ReadFile(filepath.Clean(pathCopy)) // #nosec G304 -- trusted local conformance test corpus path
+			},
+		})
+	}
 	return scoreEntries(opts, entries), nil
+}
+
+func deriveCorpusQualifier(rootDir string) string {
+	rootSlash := filepath.ToSlash(rootDir)
+	for _, marker := range []string{"/modules/", "/x-pack/plugin/", "/plugins/", "/x-pack/qa/"} {
+		if idx := strings.Index(rootSlash, marker); idx >= 0 {
+			rest := rootSlash[idx+1:]
+			markerParts := strings.Count(strings.Trim(marker, "/"), "/") + 1
+			parts := strings.Split(rest, "/")
+			if len(parts) > markerParts && parts[markerParts] != "" {
+				return strings.Join(parts[:markerParts+1], "/")
+			}
+		}
+	}
+	if strings.Contains(rootSlash, "/yamlRestTestV7Compat/") {
+		return "v7compat"
+	}
+	return ""
 }
 
 // ScoreSuiteFS executes all rest-api-spec YAML files in fsys without aborting on failures or panics.
@@ -331,16 +401,20 @@ func deriveSpecCategory(rootDir, relSlash string) string {
 	return "root"
 }
 
-func newConfiguredRunnerContext(
+func newConfiguredRunnerContextWithAuth(
 	client *http.Client,
 	baseURL string,
 	targetVersion string,
+	authHeader string,
 	clusterFeatures map[string]bool,
 	runnerFeatures map[string]bool,
 ) *runnerContext {
 	ctx := newRunnerContext(client, baseURL)
 	if targetVersion != "" {
 		ctx.targetVersion = targetVersion
+	}
+	if authHeader != "" {
+		ctx.setDefaultAuthHeader(authHeader)
 	}
 	if clusterFeatures != nil {
 		ctx.supportedClusterFeatures = clusterFeatures
@@ -356,6 +430,7 @@ func scoreEntries(opts SuiteOptions, entries []scoredSpecEntry) *SuiteScorecard 
 	if targetVer == "" {
 		targetVer = defaultScorecardTargetVersion
 	}
+	authHeader := opts.resolvedAuthHeader()
 	corpusName := opts.CorpusName
 	if corpusName == "" {
 		corpusName = "rest-api-spec"
@@ -431,7 +506,7 @@ func scoreEntries(opts SuiteOptions, entries []scoredSpecEntry) *SuiteScorecard 
 			probeCleanup()
 		}()
 	}
-	probeCtx := newConfiguredRunnerContext(probeClient, "http://conformance.local", targetVer, clusterFeats, runnerFeats)
+	probeCtx := newConfiguredRunnerContextWithAuth(probeClient, "http://conformance.local", targetVer, authHeader, clusterFeats, runnerFeats)
 
 	for _, entry := range entries {
 		if categoryFilter != nil && !categoryFilter[entry.category] {
@@ -465,11 +540,12 @@ func scoreEntries(opts SuiteOptions, entries []scoredSpecEntry) *SuiteScorecard 
 		}
 
 		if opts.ReuseSetupForReadOnlyFiles && isReadOnlySpecDocumentForSetupReuse(specDoc) {
-			executeReadOnlyFileWithSharedSetup(
+			executeReadOnlyFileWithSharedSetupAndAuth(
 				opts.NewHandler,
 				opts.NewSectionHandler,
 				opts.ConfigureRemoteTransport,
 				targetVer,
+				authHeader,
 				clusterFeats,
 				runnerFeats,
 				entry.displayPath,
@@ -484,11 +560,12 @@ func scoreEntries(opts SuiteOptions, entries []scoredSpecEntry) *SuiteScorecard 
 
 		for _, sec := range specDoc.Sections {
 			sc.SectionsTotal++
-			skipped, secErr := executeScoredSectionWithCategory(
+			skipped, secErr := executeScoredSectionWithCategoryAndAuth(
 				opts.NewHandler,
 				opts.NewSectionHandler,
 				opts.ConfigureRemoteTransport,
 				targetVer,
+				authHeader,
 				clusterFeats,
 				runnerFeats,
 				entry.category,
@@ -663,6 +740,21 @@ func executeScoredSectionWithCategory(
 	specDoc *SpecDocument,
 	sec SpecSection,
 ) (skipped bool, err error) {
+	return executeScoredSectionWithCategoryAndAuth(newHandler, newSectionHandler, remoteHook, targetVer, "", clusterFeats, runnerFeats, category, specDoc, sec)
+}
+
+func executeScoredSectionWithCategoryAndAuth(
+	newHandler func() http.Handler,
+	newSectionHandler func() (http.Handler, func()),
+	remoteHook func(handler http.Handler, transport http.RoundTripper),
+	targetVer string,
+	authHeader string,
+	clusterFeats map[string]bool,
+	runnerFeats map[string]bool,
+	category string,
+	specDoc *SpecDocument,
+	sec SpecSection,
+) (skipped bool, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			skipped = false
@@ -692,10 +784,10 @@ func executeScoredSectionWithCategory(
 	client := &http.Client{
 		Transport: transport,
 	}
-	if repoCleanup := setupCategoryFixtureIfNeeded(category, client); repoCleanup != nil {
+	if repoCleanup := setupCategoryFixtureIfNeededWithAuth(category, client, authHeader); repoCleanup != nil {
 		defer repoCleanup()
 	}
-	ctx := newConfiguredRunnerContext(client, "http://conformance.local", targetVer, clusterFeats, runnerFeats)
+	ctx := newConfiguredRunnerContextWithAuth(client, "http://conformance.local", targetVer, authHeader, clusterFeats, runnerFeats)
 	defer safeCleanupRunnerContext(ctx)
 
 	for i, step := range specDoc.Setup {
@@ -857,6 +949,10 @@ func findStaticRepoSettingsSetter(client *http.Client) StaticRepoSettingsSetter 
 }
 
 func setupCategoryFixtureIfNeeded(category string, client *http.Client) func() {
+	return setupCategoryFixtureIfNeededWithAuth(category, client, "")
+}
+
+func setupCategoryFixtureIfNeededWithAuth(category string, client *http.Client, authHeader string) func() {
 	if !strings.EqualFold(strings.TrimSpace(category), "repository_url") || client == nil {
 		return nil
 	}
@@ -878,6 +974,9 @@ func setupCategoryFixtureIfNeeded(category string, client *http.Client) func() {
 		req, rErr := http.NewRequest(method, "http://conformance.local"+reqPath, bodyReader)
 		if rErr != nil {
 			return
+		}
+		if authHeader != "" {
+			req.Header.Set("Authorization", authHeader)
 		}
 		if payload != nil {
 			req.Header.Set("Content-Type", "application/json")
@@ -967,6 +1066,24 @@ func executeReadOnlyFileWithSharedSetup(
 	cs *CategoryScore,
 	recordFailure func(file, cat, section, errMsg string),
 ) {
+	executeReadOnlyFileWithSharedSetupAndAuth(newHandler, newSectionHandler, remoteHook, targetVer, "", clusterFeats, runnerFeats, displayPath, category, specDoc, sc, cs, recordFailure)
+}
+
+func executeReadOnlyFileWithSharedSetupAndAuth(
+	newHandler func() http.Handler,
+	newSectionHandler func() (http.Handler, func()),
+	remoteHook func(handler http.Handler, transport http.RoundTripper),
+	targetVer string,
+	authHeader string,
+	clusterFeats map[string]bool,
+	runnerFeats map[string]bool,
+	displayPath string,
+	category string,
+	specDoc *SpecDocument,
+	sc *SuiteScorecard,
+	cs *CategoryScore,
+	recordFailure func(file, cat, section, errMsg string),
+) {
 	var handler http.Handler
 	var fileCleanup func()
 	if newSectionHandler != nil {
@@ -984,10 +1101,10 @@ func executeReadOnlyFileWithSharedSetup(
 	transport := inProcessHandlerTransport{handler: handler}
 	configureHandlerRemoteReindexWithHook(handler, transport, remoteHook)
 	client := &http.Client{Transport: transport}
-	if repoCleanup := setupCategoryFixtureIfNeeded(category, client); repoCleanup != nil {
+	if repoCleanup := setupCategoryFixtureIfNeededWithAuth(category, client, authHeader); repoCleanup != nil {
 		defer repoCleanup()
 	}
-	setupCtx := newConfiguredRunnerContext(client, "http://conformance.local", targetVer, clusterFeats, runnerFeats)
+	setupCtx := newConfiguredRunnerContextWithAuth(client, "http://conformance.local", targetVer, authHeader, clusterFeats, runnerFeats)
 	defer safeCleanupRunnerContext(setupCtx)
 
 	for i, step := range specDoc.Setup {
@@ -1033,7 +1150,7 @@ func executeReadOnlyFileWithSharedSetup(
 		if isBasicLicenseRestrictionSection(sec) {
 			return true, nil
 		}
-		secCtx := newConfiguredRunnerContext(client, "http://conformance.local", targetVer, clusterFeats, runnerFeats)
+		secCtx := newConfiguredRunnerContextWithAuth(client, "http://conformance.local", targetVer, authHeader, clusterFeats, runnerFeats)
 		defer safeCleanupRunnerContext(secCtx)
 		for k, v := range baseStash {
 			secCtx.stash[k] = v

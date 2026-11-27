@@ -300,13 +300,13 @@ func FuzzTermsEnumDLSFLS(f *testing.F) {
 			}
 		}
 
-		// Verify size boundary enforcement matches ES (> 65536 or <= 0 => 400).
+		// Verify size boundary enforcement matches ES (> 65536 or <= 0 => 400, unless fail-closed 401 rejected bad auth first).
 		var parsedBody map[string]any
 		if json.Unmarshal([]byte(reqBody), &parsedBody) == nil {
 			if rawSz, hasSz := parsedBody["size"]; hasSz && rawSz != nil {
 				if szF, okF := toFloat(rawSz); okF && (szF <= 0 || szF > maxTermsEnumSize) {
-					if rec.Code != http.StatusBadRequest {
-						t.Fatalf("expected HTTP 400 for out-of-bounds size=%v on valid JSON body, got %d (%s)", rawSz, rec.Code, bodyStr)
+					if rec.Code != http.StatusBadRequest && rec.Code != http.StatusUnauthorized {
+						t.Fatalf("expected HTTP 400/401 for out-of-bounds size=%v on valid JSON body, got %d (%s)", rawSz, rec.Code, bodyStr)
 					}
 				}
 			}

@@ -331,9 +331,16 @@ func TestRound56SecurityProfilesSettingsAndCCSAPIKey(t *testing.T) {
 		t.Fatalf("expected 200 creating cross_cluster api_key, got %d: %+v", code, ccsKey)
 	}
 	keyID, _ := ccsKey["id"].(string)
-	code, _, updKey := doRound56Raw(t, srv, http.MethodPut, "/_security/cross_cluster/api_key/"+keyID, `{"access":{"replication":[{"names":["logs-*"]}]}}`)
-	if code != http.StatusOK || updKey["updated"] != true {
-		t.Fatalf("expected 200 updated=true on PUT cross_cluster/api_key/{id}, got %d: %+v", code, updKey)
+	ccsEncoded, _ := ccsKey["encoded"].(string)
+	updReq := httptest.NewRequest(http.MethodPut, "/_security/cross_cluster/api_key/"+keyID, strings.NewReader(`{"access":{"replication":[{"names":["logs-*"]}]}}`))
+	updReq.Header.Set("Content-Type", "application/json")
+	updReq.Header.Set("Authorization", "ApiKey "+ccsEncoded)
+	updRec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(updRec, updReq)
+	var updKey map[string]any
+	_ = json.Unmarshal(updRec.Body.Bytes(), &updKey)
+	if updRec.Code != http.StatusOK || updKey["updated"] != true {
+		t.Fatalf("expected 200 updated=true on PUT cross_cluster/api_key/{id}, got %d: %+v", updRec.Code, updKey)
 	}
 }
 
@@ -707,13 +714,20 @@ func TestRound56ExtendedESQLFunctionsMLAndSecuritySubRoutes(t *testing.T) {
 	if c, _, _ := doRound56Raw(t, srv, http.MethodGet, "/_security/settings", ""); c != http.StatusOK {
 		t.Fatalf("expected 200 on GET _security/settings, got %d", c)
 	}
-	code, _, ccKey := doRound56Raw(t, srv, http.MethodPost, "/_security/cross_cluster/api_key", `{"name":"cc-east","expiration":"7d","access":{"search":[{"names":["logs-*"]}]},"metadata":{"env":"prod"}}`)
+	ccSrv := NewServer("es_db", NewMemoryBackend(false), transpiler.TranspilerOptions{})
+	code, _, ccKey := doRound56Raw(t, ccSrv, http.MethodPost, "/_security/cross_cluster/api_key", `{"name":"cc-east","expiration":"7d","access":{"search":[{"names":["logs-*"]}]},"metadata":{"env":"prod"}}`)
 	if code != http.StatusOK || ccKey["id"] == nil {
 		t.Fatalf("expected 200 on POST cross_cluster/api_key, got %d: %+v", code, ccKey)
 	}
 	ccID := ccKey["id"].(string)
-	if c, _, _ := doRound56Raw(t, srv, http.MethodPut, "/_security/cross_cluster/api_key/"+ccID, `{"access":{"search":[{"names":["metrics-*"]}]},"expiration":"14d","metadata":{"env":"prod2"}}`); c != http.StatusOK {
-		t.Fatalf("expected 200 on PUT cross_cluster/api_key/{id}, got %d", c)
+	ccEncoded, _ := ccKey["encoded"].(string)
+	ccUpdReq := httptest.NewRequest(http.MethodPut, "/_security/cross_cluster/api_key/"+ccID, strings.NewReader(`{"access":{"search":[{"names":["metrics-*"]}]},"expiration":"14d","metadata":{"env":"prod2"}}`))
+	ccUpdReq.Header.Set("Content-Type", "application/json")
+	ccUpdReq.Header.Set("Authorization", "ApiKey "+ccEncoded)
+	ccUpdRec := httptest.NewRecorder()
+	ccSrv.Handler().ServeHTTP(ccUpdRec, ccUpdReq)
+	if ccUpdRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 on PUT cross_cluster/api_key/{id}, got %d: %s", ccUpdRec.Code, ccUpdRec.Body.String())
 	}
 
 	// 6. Data frame analytics _stats/_preview/_explain/_update + _cat/ml + downsample settings variants + lifecycle DELETE

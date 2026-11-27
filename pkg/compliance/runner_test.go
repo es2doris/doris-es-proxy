@@ -5154,7 +5154,7 @@ func TestRound60_F1_SequenceNDJSONPutMappingTypedPathsAndNewActions(t *testing.T
 		{"indices.get_upgrade", map[string]any{"index": "idx1"}, http.MethodGet, "/idx1/_upgrade"},
 		{"scripts_painless_context", map[string]any{"context": "score"}, http.MethodGet, "/_scripts/painless/_context"},
 		{"_internal.update_desired_nodes", map[string]any{"history_id": "h1", "version": "2"}, http.MethodPut, "/_internal/desired_nodes/h1/2"},
-		{"_internal.get_desired_nodes", map[string]any{}, http.MethodGet, "/_internal/desired_nodes"},
+		{"_internal.get_desired_nodes", map[string]any{}, http.MethodGet, "/_internal/desired_nodes/_latest"},
 		{"_internal.custom_check", map[string]any{}, http.MethodGet, "/_internal/custom_check"},
 	}
 	for _, tc := range newActions {

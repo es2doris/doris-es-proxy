@@ -19,7 +19,9 @@ package sdkconformance_test
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"testing"
@@ -487,7 +489,8 @@ func runRound66SDKConformanceSubtests(
 		svcTok := "r66_svctok_" + tsSuffix
 		profUser := "r66_prof_" + tsSuffix
 
-		var apiKeyID, grantedKeyID string
+		var apiKeyID, grantedKeyID, ccKeyID string
+		userActive := false
 		t.Cleanup(func() {
 			if apiKeyID != "" {
 				if r, e := (esapi.SecurityInvalidateAPIKeyRequest{Body: strings.NewReader(fmt.Sprintf(`{"ids":[%q]}`, apiKeyID))}).Do(ctx, esClient); r != nil {
@@ -497,6 +500,12 @@ func runRound66SDKConformanceSubtests(
 			}
 			if grantedKeyID != "" {
 				if r, e := (esapi.SecurityInvalidateAPIKeyRequest{Body: strings.NewReader(fmt.Sprintf(`{"ids":[%q]}`, grantedKeyID))}).Do(ctx, esClient); r != nil {
+					_ = r.Body.Close()
+					_ = e
+				}
+			}
+			if ccKeyID != "" {
+				if r, e := (esapi.SecurityInvalidateAPIKeyRequest{Body: strings.NewReader(fmt.Sprintf(`{"ids":[%q]}`, ccKeyID))}).Do(ctx, esClient); r != nil {
 					_ = r.Body.Close()
 					_ = e
 				}
@@ -521,9 +530,11 @@ func runRound66SDKConformanceSubtests(
 				_ = r.Body.Close()
 				_ = e
 			}
-			if r, e := (esapi.SecurityDeleteUserRequest{Username: user1}).Do(ctx, esClient); r != nil {
-				_ = r.Body.Close()
-				_ = e
+			if userActive {
+				if r, e := (esapi.SecurityDeleteUserRequest{Username: user1}).Do(ctx, esClient); r != nil {
+					_ = r.Body.Close()
+					_ = e
+				}
 			}
 		})
 
@@ -536,6 +547,7 @@ func runRound66SDKConformanceSubtests(
 			Username: user1,
 			Body:     strings.NewReader(`{"password":"r66-password-1","roles":["viewer"],"full_name":"R66 User","email":"r66@example.com"}`),
 		}, http.StatusOK)
+		userActive = true
 		doJSONR64(t, ctx, esClient, "security.get_user", esapi.SecurityGetUserRequest{
 			Username: []string{user1},
 		}, http.StatusOK)
@@ -555,7 +567,6 @@ func runRound66SDKConformanceSubtests(
 		doJSONR64(t, ctx, esClient, "security.clear_cached_realms", esapi.SecurityClearCachedRealmsRequest{
 			Realms: []string{"default_native"},
 		}, http.StatusOK)
-		doJSONR64(t, ctx, esClient, "security.delete_user", esapi.SecurityDeleteUserRequest{Username: user1}, http.StatusOK)
 
 		// 3. Roles, Bulk Roles, Role Mappings, Privileges
 		doJSONR64(t, ctx, esClient, "security.put_role", esapi.SecurityPutRoleRequest{
@@ -625,14 +636,19 @@ func runRound66SDKConformanceSubtests(
 		apiKeyID = ""
 
 		grantRes := doJSONR64(t, ctx, esClient, "security.grant_api_key", esapi.SecurityGrantAPIKeyRequest{
-			Body: strings.NewReader(fmt.Sprintf(`{"grant_type":"password","username":"r66_grant_u","password":"secret","api_key":{"name":"r66_granted_%s"}}`, tsSuffix)),
+			Body: strings.NewReader(fmt.Sprintf(`{"grant_type":"password","username":%q,"password":"r66-password-2","api_key":{"name":"r66_granted_%s"}}`, user1, tsSuffix)),
 		}, http.StatusOK)
 		grantedKeyID, _ = grantRes["id"].(string)
+		if grantedKeyID == "" {
+			t.Fatalf("expected non-empty granted api_key id, got %v", grantRes)
+		}
+		doJSONR64(t, ctx, esClient, "security.delete_user", esapi.SecurityDeleteUserRequest{Username: user1}, http.StatusOK)
+		userActive = false
 
 		ccRes := doJSONR64(t, ctx, esClient, "security.create_cross_cluster_api_key", esapi.SecurityCreateCrossClusterAPIKeyRequest{
 			Body: strings.NewReader(fmt.Sprintf(`{"name":"r66_cck_%s","access":{"search":[{"names":["*"]}]}}`, tsSuffix)),
 		}, http.StatusOK)
-		ccKeyID, _ := ccRes["id"].(string)
+		ccKeyID, _ = ccRes["id"].(string)
 		if ccKeyID == "" {
 			t.Fatalf("expected non-empty cross_cluster api_key id, got %v", ccRes)
 		}
@@ -851,9 +867,12 @@ func runRound66SDKConformanceSubtests(
 			DocumentID: secNamedID,
 			Body:       strings.NewReader(`{"value":"r66-secret-put-val"}`),
 		}, http.StatusCreated, http.StatusOK)
-		doJSONR64(t, ctx, esClient, "connector.secret_get", esapi.ConnectorSecretGetRequest{
+		secGetRes := doJSONR64(t, ctx, esClient, "connector.secret_get", esapi.ConnectorSecretGetRequest{
 			DocumentID: secNamedID,
 		}, http.StatusOK)
+		if secGetRes["id"] != secNamedID || secGetRes["value"] != nil || secGetRes["__value"] != nil || secGetRes["has_value"] != true {
+			t.Fatalf("expected redacted connector.secret_get metadata (id=%q, has_value=true, no plaintext value), got %+v", secNamedID, secGetRes)
+		}
 		doJSONR64(t, ctx, esClient, "connector.secret_delete", esapi.ConnectorSecretDeleteRequest{
 			DocumentID: secNamedID,
 		}, http.StatusOK)
@@ -908,5 +927,113 @@ func runRound66SDKConformanceSubtests(
 	t.Run("Round66_05_FeaturesReset", func(t *testing.T) {
 		doJSONR64(t, ctx, esClient, "features.reset_features", esapi.FeaturesResetFeaturesRequest{}, http.StatusOK)
 		wireTransport.assertNoViolations(t, "Round66_05_FeaturesReset")
+	})
+}
+
+func doInternalPerformJSONR67(
+	t *testing.T,
+	ctx context.Context,
+	esClient *elasticsearch.Client,
+	method string,
+	rawPath string,
+	bodyStr string,
+) map[string]any {
+	t.Helper()
+	var bodyReader io.Reader
+	if bodyStr != "" {
+		bodyReader = strings.NewReader(bodyStr)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, rawPath, bodyReader)
+	if err != nil {
+		t.Fatalf("%s %s NewRequestWithContext failed: %v", method, rawPath, err)
+	}
+	if bodyStr != "" {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	resp, err := esClient.Perform(req)
+	if err != nil {
+		t.Fatalf("%s %s Perform failed: %v", method, rawPath, err)
+	}
+	defer resp.Body.Close()
+	raw, readErr := io.ReadAll(resp.Body)
+	if readErr != nil {
+		t.Fatalf("%s %s read body failed: %v", method, rawPath, readErr)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("%s %s unexpected status %d: %s", method, rawPath, resp.StatusCode, string(raw))
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		t.Fatalf("%s %s invalid JSON response: %v (%s)", method, rawPath, err, string(raw))
+	}
+	return parsed
+}
+
+func runRound67InternalEndpointsSubtest(
+	t *testing.T,
+	ctx context.Context,
+	esClient *elasticsearch.Client,
+	wireTransport *wireConformanceTransport,
+) {
+	t.Helper()
+
+	t.Run("Round67_InternalEndpoints", func(t *testing.T) {
+		desiredNodesDirty := false
+		t.Cleanup(func() {
+			if !desiredNodesDirty {
+				return
+			}
+			req, err := http.NewRequestWithContext(ctx, http.MethodDelete, "/_internal/desired_nodes", nil)
+			if err != nil {
+				return
+			}
+			if resp, err := esClient.Perform(req); err == nil && resp != nil {
+				_ = resp.Body.Close()
+			}
+		})
+
+		// 1. _internal.get_desired_balance
+		balRes := doInternalPerformJSONR67(t, ctx, esClient, http.MethodGet, "/_internal/desired_balance", "")
+		if _, ok := balRes["routing_table"].(map[string]any); !ok {
+			t.Fatalf("expected routing_table object in GET /_internal/desired_balance, got %+v", balRes)
+		}
+		if _, ok := balRes["cluster_balance_stats"].(map[string]any); !ok {
+			t.Fatalf("expected cluster_balance_stats object in GET /_internal/desired_balance, got %+v", balRes)
+		}
+
+		// 2. _internal.delete_desired_balance
+		delBalRes := doInternalPerformJSONR67(t, ctx, esClient, http.MethodDelete, "/_internal/desired_balance", "")
+		if ack, _ := delBalRes["acknowledged"].(bool); !ack {
+			t.Fatalf("expected acknowledged=true from DELETE /_internal/desired_balance, got %+v", delBalRes)
+		}
+
+		// 3. _internal.update_desired_nodes
+		putNodesBody := `{"nodes":[{"settings":{"node.name":"doris-fe-1"},"processors":4,"memory":"64gb","storage":"128gb"}]}`
+		putNodesRes := doInternalPerformJSONR67(t, ctx, esClient, http.MethodPut, "/_internal/desired_nodes/r67-hist-1/1", putNodesBody)
+		desiredNodesDirty = true
+		if dry, _ := putNodesRes["dry_run"].(bool); dry {
+			t.Fatalf("expected dry_run=false from PUT /_internal/desired_nodes/r67-hist-1/1, got %+v", putNodesRes)
+		}
+
+		// 4. _internal.get_desired_nodes (must follow PUT so desired_nodes exists and returns 200)
+		getNodesRes := doInternalPerformJSONR67(t, ctx, esClient, http.MethodGet, "/_internal/desired_nodes/_latest", "")
+		if getNodesRes["history_id"] != "r67-hist-1" || getNodesRes["version"] != float64(1) {
+			t.Fatalf("expected history_id=r67-hist-1, version=1 from GET /_internal/desired_nodes/_latest, got %+v", getNodesRes)
+		}
+
+		// 5. _internal.prevalidate_node_removal
+		prevalRes := doInternalPerformJSONR67(t, ctx, esClient, http.MethodPost, "/_internal/prevalidate_node_removal?ids=doris-fe-1", "")
+		if safe, _ := prevalRes["is_safe"].(bool); !safe {
+			t.Fatalf("expected is_safe=true from POST /_internal/prevalidate_node_removal, got %+v", prevalRes)
+		}
+
+		// 6. _internal.delete_desired_nodes
+		delNodesRes := doInternalPerformJSONR67(t, ctx, esClient, http.MethodDelete, "/_internal/desired_nodes", "")
+		if ack, _ := delNodesRes["acknowledged"].(bool); !ack {
+			t.Fatalf("expected acknowledged=true from DELETE /_internal/desired_nodes, got %+v", delNodesRes)
+		}
+		desiredNodesDirty = false
+
+		wireTransport.assertNoViolations(t, "Round67_InternalEndpoints")
 	})
 }

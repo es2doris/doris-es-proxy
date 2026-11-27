@@ -4549,11 +4549,19 @@ func evalMovingFunctionsStaticRound60(method string, evalArgs []any) (any, error
 	case "holtWinters":
 		period := 1
 		if len(evalArgs) >= 5 {
-			if p, ok := toInt64Painless(evalArgs[4]); ok && p > 0 {
+			p, ok := toInt64Painless(evalArgs[4])
+			if !ok {
+				if evalArgs[4] != nil {
+					return nil, nil
+				}
+			} else {
+				if p <= 0 || p > int64(len(vals)/2) || p > MaxPainlessSliceItems {
+					return nil, nil
+				}
 				period = int(p)
 			}
 		}
-		if len(vals) < period*2 {
+		if period <= 0 || len(vals)/2 < period || period > MaxPainlessSliceItems {
 			return nil, nil
 		}
 		alpha, beta, gamma := 0.3, 0.1, 0.1
@@ -5172,8 +5180,11 @@ func uppercaseValueOrSliceRound60(v any) any {
 }
 
 func splitProcessorRegexRound60(val, sepPattern string) ([]any, error) {
-	re, err := regexp.Compile(sepPattern)
+	re, err := CompileBoundedRegex(sepPattern)
 	if err != nil {
+		if pe, ok := err.(*painlessExceptionError); ok {
+			return nil, pe
+		}
 		return nil, &painlessExceptionError{exType: "IllegalArgumentException", message: err.Error()}
 	}
 	parts := re.Split(val, -1)

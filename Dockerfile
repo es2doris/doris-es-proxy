@@ -15,8 +15,8 @@
 # specific language governing permissions and limitations
 # under the License.
 
-FROM golang:1.26-alpine AS builder
-ARG VERSION=v0.22.0
+FROM golang:1.25-alpine AS builder
+ARG VERSION=v0.23.0
 WORKDIR /src
 COPY go.mod go.sum ./
 COPY cmd ./cmd

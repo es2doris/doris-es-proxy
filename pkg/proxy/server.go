@@ -21,12 +21,14 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"html"
 	"io"
+	"log/slog"
 	"math"
 	"math/big"
 	"net"
@@ -140,6 +142,30 @@ type SQLRowsBackend interface {
 	QueryRows(ctx context.Context, sql string) ([]map[string]any, error)
 }
 
+// IncrementalCatalogBackend is an optional extension of CatalogBackend for watermark-based
+// delta catalog polling across stateless proxy replicas.
+type IncrementalCatalogBackend interface {
+	LoadCatalogEntriesSince(ctx context.Context, db string, sinceEpochMs int64) ([]CatalogEntry, error)
+}
+
+// VersionProbeBackend is an optional extension of DorisBackend for probing the live
+// Apache Doris FE/SQL version.
+type VersionProbeBackend interface {
+	ProbeDorisVersion(ctx context.Context) (string, error)
+}
+
+// ClusterHealthBackend is an optional extension of DorisBackend for probing Doris FE HTTP
+// reachability and alive Backend (BE) count in `/readyz`.
+type ClusterHealthBackend interface {
+	CheckClusterHealth(ctx context.Context) (aliveBEs int, feHTTPOK bool, err error)
+}
+
+// DBStatsBackend is an optional extension of DorisBackend for exporting sql.DB pool statistics
+// to `/metrics`.
+type DBStatsBackend interface {
+	DBStats() (sql.DBStats, bool)
+}
+
 func sqlRowValToInt64R66(v any) (int64, bool) {
 	switch tv := v.(type) {
 	case nil:
@@ -223,115 +249,7 @@ func (s *Server) populateCorpusBM25StatsIfNeededR66(
 	req *esast.SearchRequest,
 	opts *transpiler.TranspilerOptions,
 ) {
-	if s == nil || s.backend == nil || idxSchema == nil || req == nil || opts == nil || idxSchema.DorisTable == "" {
-		return
-	}
-	if _, isMem := s.backend.(*MemoryBackend); isMem {
-		return
-	}
-	rowsBackend, ok := s.backend.(SQLRowsBackend)
-	if !ok {
-		return
-	}
-	reqs := transpiler.CollectBM25QueryRequirements(req, idxSchema, *opts)
-	if len(reqs) == 0 {
-		return
-	}
-	dbName := idxSchema.DorisDB
-	if dbName == "" {
-		dbName = s.dorisDB
-	}
-	safeDB := escapeDorisDBIdent(dbName)
-	safeTable := sanitizeAndEscapeDorisIdent(idxSchema.DorisTable)
-
-	selectExprs := make([]string, 0, len(reqs)*4+1)
-	selectExprs = append(selectExprs, "COUNT(*) AS `__bm25_total_rows`")
-	edgeAposPat := transpiler.EscapeDorisSQLString(`(^|[^[:alnum:]_])'+|'+([^[:alnum:]_]|$)`)
-	delimPat := transpiler.EscapeDorisSQLString(`[^[:alnum:]_']+`)
-
-	for i, r := range reqs {
-		strCol := fmt.Sprintf("COALESCE(CAST(%s AS STRING), '')", r.ColExpr)
-		if !r.CaseSensitive {
-			strCol = fmt.Sprintf("LOWER(%s)", strCol)
-		}
-		stripEdge := fmt.Sprintf("REGEXP_REPLACE(%s, '%s', ' ')", strCol, edgeAposPat)
-		trimOne := fmt.Sprintf("TRIM(REGEXP_REPLACE(%s, '%s', ' '))", stripEdge, delimPat)
-		normDbl := fmt.Sprintf("CONCAT(' ', REPLACE(%s, ' ', '  '), ' ')", trimOne)
-		tokCnt := fmt.Sprintf(
-			"CASE WHEN %s IS NULL OR %s = '' THEN NULL ELSE CAST(1 + CHAR_LENGTH(%s) - CHAR_LENGTH(REPLACE(%s, ' ', '')) AS DOUBLE) END",
-			r.ColExpr, trimOne, trimOne, trimOne,
-		)
-		selectExprs = append(selectExprs,
-			fmt.Sprintf("SUM(CASE WHEN %s IS NOT NULL AND %s != '' THEN 1 ELSE 0 END) AS `__bm25_n_%d`", r.ColExpr, trimOne, i),
-			fmt.Sprintf("AVG(%s) AS `__bm25_avgdl_%d`", tokCnt, i),
-		)
-		for j, tk := range r.Terms {
-			patTerm := tk
-			if !r.CaseSensitive {
-				patTerm = strings.ToLower(patTerm)
-			}
-			patLit := "'" + transpiler.EscapeDorisSQLString(" "+patTerm+" ") + "'"
-			selectExprs = append(selectExprs,
-				fmt.Sprintf("SUM(CASE WHEN LOCATE(%s, %s) > 0 THEN 1 ELSE 0 END) AS `__bm25_df_%d_%d`", patLit, normDbl, i, j),
-			)
-		}
-	}
-
-	// #nosec G201 -- identifiers are sanitized via escapeDorisDBIdent and sanitizeAndEscapeDorisIdent; patterns are SQL-escaped
-	statsSQL := fmt.Sprintf(
-		"SELECT %s FROM `%s`.`%s` WHERE `__DORIS_DELETE_SIGN__` = 0",
-		strings.Join(selectExprs, ", "),
-		safeDB,
-		safeTable,
-	)
-	rows, err := rowsBackend.QueryRows(ctx, statsSQL)
-	if err != nil || len(rows) == 0 {
-		return
-	}
-	row := rows[0]
-	if opts.CorpusBM25Stats == nil {
-		opts.CorpusBM25Stats = make(map[string]*transpiler.BM25FieldTermStats, len(reqs)*2)
-	}
-	for i, r := range reqs {
-		nVal, _ := sqlRowValToInt64R66(row[fmt.Sprintf("__bm25_n_%d", i)])
-		avgVal, _ := sqlRowValToFloat64R66(row[fmt.Sprintf("__bm25_avgdl_%d", i)])
-		termDF := make(map[string]int64, len(r.Terms))
-		for j, tk := range r.Terms {
-			dfVal, _ := sqlRowValToInt64R66(row[fmt.Sprintf("__bm25_df_%d_%d", i, j)])
-			termDF[tk] = dfVal
-		}
-		mergeStats := func(key string) {
-			if key == "" {
-				return
-			}
-			if existing, exists := opts.CorpusBM25Stats[key]; exists && existing != nil {
-				if existing.TotalDocs == 0 && nVal > 0 {
-					existing.TotalDocs = nVal
-				}
-				if existing.AvgDL == 0 && avgVal > 0 {
-					existing.AvgDL = avgVal
-				}
-				if existing.TermDocFreq == nil {
-					existing.TermDocFreq = make(map[string]int64, len(termDF))
-				}
-				for tk, df := range termDF {
-					existing.TermDocFreq[tk] = df
-				}
-				return
-			}
-			dfCopy := make(map[string]int64, len(termDF))
-			for tk, df := range termDF {
-				dfCopy[tk] = df
-			}
-			opts.CorpusBM25Stats[key] = &transpiler.BM25FieldTermStats{
-				TotalDocs:   nVal,
-				AvgDL:       avgVal,
-				TermDocFreq: dfCopy,
-			}
-		}
-		mergeStats(r.ColExpr)
-		mergeStats(r.Field)
-	}
+	s.populateCorpusBM25StatsWithCacheR67(ctx, idxSchema, req, opts)
 }
 
 // AliasMetadata stores optional Elasticsearch alias filter, write-index flag, hidden flag, and routing metadata.
@@ -486,7 +404,6 @@ type Server struct {
 	migrationSystemFeatures       map[string]bool
 	legacyTemplates               map[string]esast.IndexTemplateRequest
 	pits                          map[string]*pitContextEntry
-	pitSeq                        int64
 	scrollContexts                map[string]*scrollContextEntry
 	invalidatedScrollSessions     map[string]bool
 	scrollSeq                     int64
@@ -502,6 +419,26 @@ type Server struct {
 	indexStats                    map[string]*indexLiveStats
 	implicitTimestampSortEligible map[string]bool
 	unmergedDeletedSources        map[string][][]byte
+	unmergedDeletedBytes          map[string]int64
+	unmergedDeletedOrder          []string
+	unmergedTotalBytes            int64
+	docRoutingOrder               map[string][]string
+	docVersionOrder               map[string][]string
+	securityEpoch                 atomic.Uint64
+	allowTestFixtureAuth          atomic.Bool
+	ddlOptsMu                     sync.RWMutex
+	ddlOpts                       schema.DorisDDLOptions
+	bm25Mu                        sync.RWMutex
+	bm25Mode                      string
+	bm25MaxRows                   int64
+	bm25Cache                     *bm25CorpusCacheR67
+	catalogSyncer                 *CatalogSyncer
+	metrics                       *ProxyMetricsR67
+	readyzCache                   *readyzCacheR67
+	loggerMu                      sync.RWMutex
+	logger                        *slog.Logger
+	asyncTaskSem                  chan struct{}
+	internalClusterState          *internalClusterStateR67
 }
 
 func NewServer(dorisDB string, backend DorisBackend, opts transpiler.TranspilerOptions) *Server {
@@ -524,6 +461,8 @@ func NewServer(dorisDB string, backend DorisBackend, opts transpiler.TranspilerO
 		aliasMeta:                     make(map[string]map[string]AliasMetadata),
 		docRouting:                    make(map[string]map[string]string),
 		docVersions:                   make(map[string]map[string]int64),
+		docRoutingOrder:               make(map[string][]string),
+		docVersionOrder:               make(map[string][]string),
 		indexDefaultPipelines:         make(map[string]string),
 		indexFinalPipelines:           make(map[string]string),
 		templates:                     make(map[string]esast.IndexTemplateRequest),
@@ -604,23 +543,95 @@ func NewServer(dorisDB string, backend DorisBackend, opts transpiler.TranspilerO
 		indexStats:                    make(map[string]*indexLiveStats),
 		implicitTimestampSortEligible: make(map[string]bool),
 		unmergedDeletedSources:        make(map[string][][]byte),
+		unmergedDeletedBytes:          make(map[string]int64),
+		bm25Mode:                      BM25ModeAuto,
+		bm25MaxRows:                   defaultBM25MaxRowsR67,
+		bm25Cache:                     newBM25CorpusCacheR67(),
+		metrics:                       newProxyMetricsR67(),
+		readyzCache:                   newReadyzCacheR67(),
+		asyncTaskSem:                  make(chan struct{}, 16),
+		internalClusterState:          newInternalClusterStateR67(),
 	}
+	s.catalogSyncer = newCatalogSyncer(s)
 	s.coalescer = newStreamLoadCoalescer(func(ctx context.Context, table string, ndjson []byte, syncRefresh bool) error {
+		slStart := time.Now()
 		err := s.backend.StreamLoad(ctx, table, ndjson, syncRefresh)
+		s.RecordStreamLoadMetrics(time.Since(slStart), int64(len(ndjson)), 0, err)
 		s.queryCache.InvalidateAll()
+		s.invalidateBM25ForTableR67(s.dorisDB, table)
 		return err
 	})
 	return s
+}
+
+// SecurityEpoch returns the monotonic security mutation generation counter.
+func (s *Server) SecurityEpoch() uint64 {
+	if s == nil {
+		return 0
+	}
+	return s.securityEpoch.Load()
+}
+
+func (s *Server) bumpSecurityEpoch() uint64 {
+	if s == nil {
+		return 0
+	}
+	ep := s.securityEpoch.Add(1)
+	if s.queryCache != nil {
+		s.queryCache.InvalidateAll()
+	}
+	s.invalidateShardRequestCacheR63()
+	return ep
+}
+
+// SetAllowTestFixtureAuth enables or disables acceptance of the upstream YAML fixture
+// `test_admin:x-pack-test-password` credential when static proxy auth is not configured.
+func (s *Server) SetAllowTestFixtureAuth(allow bool) {
+	if s == nil {
+		return
+	}
+	s.allowTestFixtureAuth.Store(allow)
+	s.bumpSecurityEpoch()
+}
+
+// AllowTestFixtureAuth reports whether the upstream YAML test fixture credential is enabled.
+func (s *Server) AllowTestFixtureAuth() bool {
+	if s == nil {
+		return false
+	}
+	return s.allowTestFixtureAuth.Load()
+}
+
+// SetDorisDDLOptions configures Doris DDL generation options (replication, cloud mode, buckets, key model, ANN mode).
+func (s *Server) SetDorisDDLOptions(opts schema.DorisDDLOptions) {
+	if s == nil {
+		return
+	}
+	s.ddlOptsMu.Lock()
+	s.ddlOpts = opts
+	s.ddlOptsMu.Unlock()
+}
+
+// DorisDDLOptions returns the configured Doris DDL generation options.
+func (s *Server) DorisDDLOptions() schema.DorisDDLOptions {
+	if s == nil {
+		return schema.DorisDDLOptions{}
+	}
+	s.ddlOptsMu.RLock()
+	opts := s.ddlOpts
+	s.ddlOptsMu.RUnlock()
+	return opts
 }
 
 // SetAuth configures optional inbound HTTP Basic Auth (`basicUser` / `basicPass`) and/or
 // Elasticsearch `ApiKey` / `Bearer` token authentication.
 func (s *Server) SetAuth(basicUser, basicPass, apiKey string) {
 	s.authMu.Lock()
-	defer s.authMu.Unlock()
 	s.basicAuthUser = strings.TrimSpace(basicUser)
 	s.basicAuthPass = basicPass
 	s.apiKey = strings.TrimSpace(apiKey)
+	s.authMu.Unlock()
+	s.bumpSecurityEpoch()
 }
 
 func splitStaticRepoSettingListR66(items []string) []string {
@@ -728,6 +739,9 @@ func (s *Server) getStaticRepoDefaultsR66() (pathRepos []string, allowedURLs []s
 
 // Close flushes any buffered group-commit Stream Load batches and waits for in-flight flushes prior to server shutdown.
 func (s *Server) Close(ctx context.Context) error {
+	if s.catalogSyncer != nil {
+		s.catalogSyncer.Stop()
+	}
 	err := s.coalescer.Close(ctx)
 	s.staticRepoMu.Lock()
 	s.staticPathRepos = nil
@@ -758,6 +772,7 @@ func (s *Server) SetMaxRequestBodyBytes(maxBytes int64) {
 func (s *Server) streamLoad(ctx context.Context, table string, ndjson []byte, syncRefresh bool) error {
 	err := s.coalescer.Submit(ctx, table, ndjson, syncRefresh)
 	s.queryCache.InvalidateAll()
+	s.invalidateBM25ForTableR67(s.dorisDB, table)
 	return err
 }
 
@@ -777,6 +792,8 @@ func (s *Server) allocVersion(minFloor int64) int64 {
 	}
 }
 
+const maxGlobalDocMetaEntriesR67 = 200000
+
 func (s *Server) setDocRouting(indexName, docID, routing string) {
 	if indexName == "" || docID == "" {
 		return
@@ -786,6 +803,9 @@ func (s *Server) setDocRouting(indexName, docID, routing string) {
 	if s.docRouting == nil {
 		s.docRouting = make(map[string]map[string]string)
 	}
+	if s.docRoutingOrder == nil {
+		s.docRoutingOrder = make(map[string][]string)
+	}
 	if routing == "" {
 		if m, ok := s.docRouting[indexName]; ok {
 			delete(m, docID)
@@ -794,6 +814,27 @@ func (s *Server) setDocRouting(indexName, docID, routing string) {
 	}
 	if s.docRouting[indexName] == nil {
 		s.docRouting[indexName] = make(map[string]string)
+	}
+	if _, exists := s.docRouting[indexName][docID]; !exists {
+		s.docRoutingOrder[indexName] = append(s.docRoutingOrder[indexName], docID)
+		for len(s.docRouting[indexName]) >= maxDocMetaPerIndexR62Admin && len(s.docRoutingOrder[indexName]) > 0 {
+			evictID := s.docRoutingOrder[indexName][0]
+			s.docRoutingOrder[indexName] = s.docRoutingOrder[indexName][1:]
+			delete(s.docRouting[indexName], evictID)
+		}
+		totalRouting := 0
+		for _, m := range s.docRouting {
+			totalRouting += len(m)
+		}
+		if totalRouting >= maxGlobalDocMetaEntriesR67 {
+			for idxK, m := range s.docRouting {
+				if idxK != indexName && len(m) > 0 {
+					delete(s.docRouting, idxK)
+					delete(s.docRoutingOrder, idxK)
+					break
+				}
+			}
+		}
 	}
 	s.docRouting[indexName][docID] = routing
 }
@@ -822,8 +863,32 @@ func (s *Server) setDocVersion(indexName, docID string, ver int64) {
 	if s.docVersions == nil {
 		s.docVersions = make(map[string]map[string]int64)
 	}
+	if s.docVersionOrder == nil {
+		s.docVersionOrder = make(map[string][]string)
+	}
 	if s.docVersions[indexName] == nil {
 		s.docVersions[indexName] = make(map[string]int64)
+	}
+	if _, exists := s.docVersions[indexName][docID]; !exists {
+		s.docVersionOrder[indexName] = append(s.docVersionOrder[indexName], docID)
+		for len(s.docVersions[indexName]) >= maxDocMetaPerIndexR62Admin && len(s.docVersionOrder[indexName]) > 0 {
+			evictID := s.docVersionOrder[indexName][0]
+			s.docVersionOrder[indexName] = s.docVersionOrder[indexName][1:]
+			delete(s.docVersions[indexName], evictID)
+		}
+		totalVersions := 0
+		for _, m := range s.docVersions {
+			totalVersions += len(m)
+		}
+		if totalVersions >= maxGlobalDocMetaEntriesR67 {
+			for idxK, m := range s.docVersions {
+				if idxK != indexName && len(m) > 0 {
+					delete(s.docVersions, idxK)
+					delete(s.docVersionOrder, idxK)
+					break
+				}
+			}
+		}
 	}
 	s.docVersions[indexName][docID] = ver
 }
@@ -934,286 +999,10 @@ func (s *Server) BootstrapCatalog(ctx context.Context) error {
 }
 
 func (s *Server) syncCatalogFromBackend(ctx context.Context) error {
-	cb, ok := s.backend.(CatalogBackend)
-	if !ok {
+	if s == nil || s.catalogSyncer == nil {
 		return nil
 	}
-	entries, err := cb.LoadCatalogEntries(ctx, s.dorisDB)
-	if err != nil {
-		return err
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for _, e := range entries {
-		isDeleted := e.PayloadJSON == "__DELETED__"
-		switch e.EntityType {
-		case "template":
-			if isDeleted {
-				delete(s.templates, e.EntityKey)
-				continue
-			}
-			var tpl esast.IndexTemplateRequest
-			if err := json.Unmarshal([]byte(e.PayloadJSON), &tpl); err == nil {
-				s.templates[e.EntityKey] = tpl
-			}
-		case "legacy_template":
-			if isDeleted {
-				delete(s.legacyTemplates, e.EntityKey)
-				continue
-			}
-			var tpl esast.IndexTemplateRequest
-			if err := json.Unmarshal([]byte(e.PayloadJSON), &tpl); err == nil {
-				tpl.Legacy = true
-				if s.legacyTemplates == nil {
-					s.legacyTemplates = make(map[string]esast.IndexTemplateRequest)
-				}
-				s.legacyTemplates[e.EntityKey] = tpl
-			}
-		case "component_template":
-			if isDeleted {
-				delete(s.componentTemplates, e.EntityKey)
-				continue
-			}
-			var comp map[string]any
-			if err := json.Unmarshal([]byte(e.PayloadJSON), &comp); err == nil && comp != nil {
-				if s.componentTemplates == nil {
-					s.componentTemplates = make(map[string]map[string]any)
-				}
-				s.componentTemplates[e.EntityKey] = comp
-			}
-		case "index":
-			if isDeleted {
-				delete(s.indices, e.EntityKey)
-				delete(s.indexDefaultPipelines, e.EntityKey)
-				delete(s.indexFinalPipelines, e.EntityKey)
-				delete(s.indexCustomSettings, e.EntityKey)
-				delete(s.closedIndices, e.EntityKey)
-				delete(s.indexNextSeqNo, e.EntityKey)
-				delete(s.docSeqNos, e.EntityKey)
-				delete(s.docDeleted, e.EntityKey)
-				delete(s.docExtTombstones, e.EntityKey)
-				delete(s.unrefreshedDocs, e.EntityKey)
-				delete(s.indexStats, e.EntityKey)
-				continue
-			}
-			var spec esast.MappingSpec
-			var metaEnv struct {
-				DefaultPipeline       string           `json:"_default_pipeline,omitempty"`
-				FinalPipeline         string           `json:"_final_pipeline,omitempty"`
-				CustomSettings        map[string]any   `json:"_custom_settings,omitempty"`
-				Closed                bool             `json:"_closed,omitempty"`
-				LegacyTypeName        string           `json:"_legacy_type_name,omitempty"`
-				ES8Mode               *bool            `json:"_es8_mode,omitempty"`
-				FieldAddedAtSeqNo     map[string]int64 `json:"_field_added_seq_no,omitempty"`
-				AdoptedConstantFields []string         `json:"_adopted_constant_fields,omitempty"`
-			}
-			if len(strings.TrimSpace(e.PayloadJSON)) > 0 && e.PayloadJSON != "null" {
-				_ = json.Unmarshal([]byte(e.PayloadJSON), &spec)
-				_ = json.Unmarshal([]byte(e.PayloadJSON), &metaEnv)
-			}
-			var specPtr *esast.MappingSpec
-			if len(spec.Properties) > 0 || len(spec.Runtime) > 0 || spec.Dynamic != nil || spec.Subobjects != nil || spec.Routing != nil ||
-				len(spec.DynamicTemplates) > 0 || spec.DateDetection != nil || spec.NumericDetection != nil || len(spec.DynamicDateFormats) > 0 ||
-				len(spec.Meta) > 0 || len(spec.Source) > 0 || len(spec.Size) > 0 || spec.Enabled != nil {
-				specPtr = &spec
-			}
-			prevSchema := s.indices[e.EntityKey]
-			compiled := schema.CompileIndexSchema(s.dorisDB, e.EntityKey, specPtr)
-			if prevSchema != nil {
-				compiled.LegacyTypeName = prevSchema.LegacyTypeName
-				compiled.ES8Mode = prevSchema.ES8Mode
-				compiled.IndexMode = prevSchema.IndexMode
-				compiled.RoutingPath = prevSchema.RoutingPath
-				compiled.TimeSeriesStartTime = prevSchema.TimeSeriesStartTime
-				compiled.TimeSeriesEndTime = prevSchema.TimeSeriesEndTime
-				compiled.SyntheticSource = prevSchema.SyntheticSource
-				compiled.CopyIndexMappingSettingsFrom(prevSchema)
-				if len(prevSchema.FieldAddedAtSeqNo) > 0 {
-					compiled.FieldAddedAtSeqNo = make(map[string]int64, len(prevSchema.FieldAddedAtSeqNo))
-					for k, v := range prevSchema.FieldAddedAtSeqNo {
-						compiled.FieldAddedAtSeqNo[k] = v
-					}
-				}
-				for fn, pfb := range prevSchema.Fields {
-					if pfb.AdoptedConstantValue {
-						if cfb, ok := compiled.Fields[fn]; ok {
-							cfb.AdoptedConstantValue = true
-							compiled.Fields[fn] = cfb
-						}
-					}
-				}
-			}
-			for _, fn := range metaEnv.AdoptedConstantFields {
-				if cfb, ok := compiled.Fields[fn]; ok {
-					cfb.AdoptedConstantValue = true
-					compiled.Fields[fn] = cfb
-				}
-			}
-			if metaEnv.LegacyTypeName != "" {
-				compiled.LegacyTypeName = metaEnv.LegacyTypeName
-			}
-			if metaEnv.ES8Mode != nil {
-				compiled.ES8Mode = *metaEnv.ES8Mode
-			}
-			if len(metaEnv.FieldAddedAtSeqNo) > 0 {
-				if compiled.FieldAddedAtSeqNo == nil {
-					compiled.FieldAddedAtSeqNo = make(map[string]int64, len(metaEnv.FieldAddedAtSeqNo))
-				}
-				for k, v := range metaEnv.FieldAddedAtSeqNo {
-					compiled.FieldAddedAtSeqNo[k] = v
-				}
-			}
-			s.indices[e.EntityKey] = compiled
-			if metaEnv.DefaultPipeline != "" {
-				s.indexDefaultPipelines[e.EntityKey] = metaEnv.DefaultPipeline
-			} else {
-				delete(s.indexDefaultPipelines, e.EntityKey)
-			}
-			if metaEnv.FinalPipeline != "" {
-				s.indexFinalPipelines[e.EntityKey] = metaEnv.FinalPipeline
-			} else {
-				delete(s.indexFinalPipelines, e.EntityKey)
-			}
-			if len(metaEnv.CustomSettings) > 0 {
-				if s.indexCustomSettings == nil {
-					s.indexCustomSettings = make(map[string]map[string]any)
-				}
-				s.indexCustomSettings[e.EntityKey] = metaEnv.CustomSettings
-				_ = parseAndApplyIndexMappingSettingsRound59(metaEnv.CustomSettings, compiled)
-				if compiled.AnalysisConfig == nil {
-					_ = compiled.SetAnalysisSettings(normalizeJSONNumbersForAnalysisR65(metaEnv.CustomSettings))
-				}
-				tsMode, tsRoutingPath, tsStart, tsEnd, tsErr := schema.ExtractTSDBSettings(metaEnv.CustomSettings)
-				if tsErr == nil && tsMode == "time_series" {
-					compiled.IndexMode = "time_series"
-					compiled.RoutingPath = tsRoutingPath
-					compiled.TimeSeriesStartTime = tsStart
-					compiled.TimeSeriesEndTime = tsEnd
-					compiled.SyntheticSource = true
-				}
-			} else {
-				delete(s.indexCustomSettings, e.EntityKey)
-			}
-			if metaEnv.Closed {
-				if s.closedIndices == nil {
-					s.closedIndices = make(map[string]bool)
-				}
-				s.closedIndices[e.EntityKey] = true
-			} else {
-				delete(s.closedIndices, e.EntityKey)
-			}
-		case "pipeline":
-			if isDeleted {
-				delete(s.pipelines, e.EntityKey)
-				continue
-			}
-			var pipe map[string]any
-			if err := json.Unmarshal([]byte(e.PayloadJSON), &pipe); err == nil && pipe != nil {
-				if s.pipelines == nil {
-					s.pipelines = make(map[string]map[string]any)
-				}
-				s.pipelines[e.EntityKey] = pipe
-			}
-		case "enrich_policy":
-			if isDeleted {
-				delete(s.enrichPolicies, e.EntityKey)
-				continue
-			}
-			var pol map[string]any
-			if err := json.Unmarshal([]byte(e.PayloadJSON), &pol); err == nil && pol != nil {
-				if s.enrichPolicies == nil {
-					s.enrichPolicies = make(map[string]map[string]any)
-				}
-				s.enrichPolicies[e.EntityKey] = pol
-			}
-		case "alias":
-			if isDeleted {
-				delete(s.aliases, e.EntityKey)
-				delete(s.aliasMeta, e.EntityKey)
-				continue
-			}
-			var targets []string
-			if err := json.Unmarshal([]byte(e.PayloadJSON), &targets); err == nil {
-				if len(targets) > 0 {
-					s.aliases[e.EntityKey] = targets
-					delete(s.aliasMeta, e.EntityKey)
-				} else {
-					delete(s.aliases, e.EntityKey)
-					delete(s.aliasMeta, e.EntityKey)
-				}
-			} else {
-				var env struct {
-					Targets []string                 `json:"targets"`
-					Meta    map[string]AliasMetadata `json:"meta,omitempty"`
-				}
-				if err := json.Unmarshal([]byte(e.PayloadJSON), &env); err == nil {
-					if len(env.Targets) > 0 {
-						s.aliases[e.EntityKey] = env.Targets
-						if len(env.Meta) > 0 {
-							s.aliasMeta[e.EntityKey] = env.Meta
-						} else {
-							delete(s.aliasMeta, e.EntityKey)
-						}
-					} else {
-						delete(s.aliases, e.EntityKey)
-						delete(s.aliasMeta, e.EntityKey)
-					}
-				}
-			}
-		case "data_stream":
-			if isDeleted {
-				delete(s.dataStreams, e.EntityKey)
-				continue
-			}
-			var ds map[string]any
-			if err := json.Unmarshal([]byte(e.PayloadJSON), &ds); err == nil && len(ds) > 0 {
-				if s.dataStreams == nil {
-					s.dataStreams = make(map[string]map[string]any)
-				}
-				s.dataStreams[e.EntityKey] = ds
-			}
-		case "ilm_policy":
-			if isDeleted {
-				delete(s.ilmPolicies, e.EntityKey)
-				continue
-			}
-			var pol map[string]any
-			if err := json.Unmarshal([]byte(e.PayloadJSON), &pol); err == nil && len(pol) > 0 {
-				if s.ilmPolicies == nil {
-					s.ilmPolicies = make(map[string]map[string]any)
-				}
-				s.ilmPolicies[e.EntityKey] = pol
-			}
-		case "script":
-			if isDeleted {
-				delete(s.scripts, e.EntityKey)
-				continue
-			}
-			var sc map[string]any
-			if err := json.Unmarshal([]byte(e.PayloadJSON), &sc); err == nil && len(sc) > 0 {
-				if s.scripts == nil {
-					s.scripts = make(map[string]map[string]any)
-				}
-				s.scripts[e.EntityKey] = sc
-			}
-		case "index_seq_state":
-			if isDeleted {
-				delete(s.indexNextSeqNo, e.EntityKey)
-				continue
-			}
-			var st persistedIndexSeqState
-			if err := json.Unmarshal([]byte(e.PayloadJSON), &st); err == nil {
-				if s.indexNextSeqNo == nil {
-					s.indexNextSeqNo = make(map[string]int64)
-				}
-				if st.NextSeqNo > s.indexNextSeqNo[e.EntityKey] {
-					s.indexNextSeqNo[e.EntityKey] = st.NextSeqNo
-				}
-			}
-		}
-	}
-	s.queryCache.InvalidateAll()
-	return nil
+	return s.catalogSyncer.Sync(ctx)
 }
 
 func (s *Server) persistDataStream(ctx context.Context, name string, ds map[string]any) {
@@ -1535,6 +1324,9 @@ func (s *Server) Handler() http.Handler {
 		}
 
 		switch {
+		case segs[0] == "_internal":
+			s.handleInternalAPI(w, r, segs)
+			return
 		case segs[0] == "_info":
 			if len(segs) >= 2 {
 				r.SetPathValue("target", strings.Join(segs[1:], "/"))
@@ -1663,11 +1455,11 @@ func (s *Server) Handler() http.Handler {
 			s.handleSSLCertificates(w, r)
 			return
 		case segs[0] == "_license" || segs[0] == "_xpack":
-			if len(segs) == 3 && segs[0] == "_xpack" && segs[1] == "monitoring" && segs[2] == "bulk" {
+			if len(segs) == 3 && segs[0] == "_xpack" && segs[1] == "monitoring" && (segs[2] == "bulk" || segs[2] == "_bulk") {
 				s.handleMonitoringBulkR65(w, r)
 				return
 			}
-			if len(segs) == 4 && segs[0] == "_xpack" && segs[1] == "monitoring" && segs[3] == "bulk" {
+			if len(segs) == 4 && segs[0] == "_xpack" && segs[1] == "monitoring" && (segs[3] == "bulk" || segs[3] == "_bulk") {
 				r.SetPathValue("type", segs[2])
 				s.handleMonitoringBulkR65(w, r)
 				return
@@ -3402,39 +3194,7 @@ func (s *Server) handleIndexSettings(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleSecurityAuthenticate(w http.ResponseWriter, r *http.Request) {
-	s.authMu.RLock()
-	basicUser := s.basicAuthUser
-	basicPass := s.basicAuthPass
-	s.authMu.RUnlock()
-
-	username := "elastic"
-	if u, _, ok := r.BasicAuth(); ok && u != "" {
-		username = u
-	} else if authHdr := strings.TrimSpace(r.Header.Get("Authorization")); len(authHdr) > 7 && strings.EqualFold(authHdr[:7], "ApiKey ") {
-		if decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(authHdr[7:])); err == nil {
-			if parts := strings.SplitN(string(decoded), ":", 2); len(parts) == 2 && parts[0] != "" {
-				username = parts[0]
-			}
-		}
-	} else if basicUser != "" && basicPass != "" {
-		username = basicUser
-	}
-	authType := "REALM"
-	if authHdr := strings.TrimSpace(r.Header.Get("Authorization")); len(authHdr) > 7 && strings.EqualFold(authHdr[:7], "ApiKey ") {
-		authType = "API_KEY"
-	}
-	realmInfo := map[string]any{"name": "default_native", "type": "native"}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"username":             username,
-		"roles":                []string{"superuser"},
-		"full_name":            "doris-es-proxy",
-		"email":                "",
-		"metadata":             map[string]any{},
-		"enabled":              true,
-		"authentication_realm": realmInfo,
-		"lookup_realm":         realmInfo,
-		"authentication_type":  authType,
-	})
+	s.handleSecurityAuthenticateR67(w, r)
 }
 
 func readRequestBody(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
@@ -5077,7 +4837,7 @@ func (s *Server) handleCreateIndex(w http.ResponseWriter, r *http.Request) {
 		writeESError(w, http.StatusBadRequest, "illegal_argument_exception", err.Error())
 		return
 	}
-	ddl := schema.GenerateCreateTableDDL(compiled)
+	ddl := schema.GenerateCreateTableDDLWithOptions(compiled, s.DorisDDLOptions())
 	if err := s.backend.ExecDDL(r.Context(), ddl); err != nil {
 		writeESError(w, http.StatusInternalServerError, "doris_ddl_exception", err.Error())
 		return
@@ -5687,8 +5447,9 @@ func (s *Server) handlePutDoc(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	ingRes, ingSt, ingET, ingER := s.applyWritePipelinesFullRound61(
-		rawReqIndex, docID, reqPipe, "", initPipeRouting, json.RawMessage(rawDoc), false,
+	docType := explicitLegacyDocTypeFromRequest(r)
+	ingRes, ingSt, ingET, ingER := s.applyWritePipelinesFullWithTypeR67(
+		rawReqIndex, docType, docID, reqPipe, "", initPipeRouting, json.RawMessage(rawDoc), false,
 	)
 	if ingSt != 0 {
 		if fsBacking, fsID, fsSeq, okFS := s.recordFailureStoreDocumentR62Search(
@@ -6956,6 +6717,7 @@ func (s *Server) handleDeleteDoc(w http.ResponseWriter, r *http.Request) {
 	}
 	s.recordTSDBTombstoneVersionR63(indexName, docID, nextVer)
 	s.queryCache.InvalidateAll()
+	s.invalidateBM25ForIndexR67(indexName)
 	if st := s.getOrCreateIndexLiveStats(indexName); st != nil {
 		st.deleteTotal.Add(1)
 		if immediateForced {
@@ -8350,6 +8112,9 @@ func (s *Server) handleUpdateByQuery(w http.ResponseWriter, r *http.Request) {
 			s.refreshAllIndexShardsRound60(idx)
 		}
 	}
+	for idx := range touchedIndices {
+		s.invalidateBM25ForIndexR67(idx)
+	}
 	s.queryCache.InvalidateAll()
 
 	resp := buildUBQResp(nil)
@@ -8767,6 +8532,9 @@ func (s *Server) handleDeleteByQuery(w http.ResponseWriter, r *http.Request) {
 			s.refreshAllIndexShardsRound60(idx)
 		}
 	}
+	for idx := range touchedIndices {
+		s.invalidateBM25ForIndexR67(idx)
+	}
 	s.queryCache.InvalidateAll()
 
 	resp := buildDBQResp(nil)
@@ -8936,9 +8704,13 @@ func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
 			if op.AutoGeneratedID {
 				pipeInputID = ""
 			}
+			opType := explicitLegacyDocTypeFromRequest(r)
+			if idx < len(metaInfos) && strings.TrimSpace(metaInfos[idx].docType) != "" {
+				opType = strings.TrimSpace(metaInfos[idx].docType)
+			}
 			pStart := time.Now()
-			ingRes, ingSt, ingET, ingER := s.applyWritePipelinesFullRound61(
-				origOpIndex, pipeInputID, op.Pipeline, defaultPipeline, initOpRouting, op.Source, false,
+			ingRes, ingSt, ingET, ingER := s.applyWritePipelinesFullWithTypeR67(
+				origOpIndex, opType, pipeInputID, op.Pipeline, defaultPipeline, initOpRouting, op.Source, false,
 			)
 			if len(ingRes.ExecutedPipelines) > 0 || ingSt != 0 {
 				ingestDur += time.Since(pStart)
@@ -10353,20 +10125,32 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	origRawSearchBody := append([]byte(nil), bodyBytes...)
+	isES8Mode := s.isES8Mode(r)
 	emitRawBodyDeprecationWarningsR63(w, s, r, origRawSearchBody)
-	bodyBytes = normalizeSearchSliceBodyR62Search(bodyBytes)
-	bodyBytes = normalizeMLTDocIDsInRawJSONRound60(bodyBytes)
-	var stdRetSt int
-	var stdRetType, stdRetReason string
-	bodyBytes, stdRetSt, stdRetType, stdRetReason = s.validateAndRewriteStandardRetrieverRound61(bodyBytes)
-	if stdRetSt != 0 {
-		writeESError(w, stdRetSt, stdRetType, stdRetReason)
-		return
+	if bytes.Contains(bodyBytes, []byte(`"slice"`)) {
+		bodyBytes = normalizeSearchSliceBodyR62Search(bodyBytes)
 	}
-	bodyBytes = s.rewriteSearchBodyQueryRules(bodyBytes)
-	bodyBytes, ok = s.preprocessSearchBodyRound57(w, r.PathValue("index"), bodyBytes)
-	if !ok {
-		return
+	if bytes.Contains(bodyBytes, []byte("more_like_this")) {
+		bodyBytes = normalizeMLTDocIDsInRawJSONRound60(bodyBytes)
+	}
+	if bytes.Contains(bodyBytes, []byte(`"retriever"`)) {
+		var stdRetSt int
+		var stdRetType, stdRetReason string
+		bodyBytes, stdRetSt, stdRetType, stdRetReason = s.validateAndRewriteStandardRetrieverRound61(bodyBytes)
+		if stdRetSt != 0 {
+			writeESError(w, stdRetSt, stdRetType, stdRetReason)
+			return
+		}
+	}
+	if bytes.Contains(bodyBytes, []byte(`"rule"`)) || bytes.Contains(bodyBytes, []byte(`"rule_query"`)) || bytes.Contains(bodyBytes, []byte(`"retriever"`)) {
+		bodyBytes = s.rewriteSearchBodyQueryRules(bodyBytes)
+	}
+	if bytes.Contains(bodyBytes, []byte(`"aggs"`)) || bytes.Contains(bodyBytes, []byte(`"aggregations"`)) ||
+		bytes.Contains(bodyBytes, []byte("query_vector_builder")) || bytes.Contains(bodyBytes, []byte("sparse_vector")) {
+		bodyBytes, ok = s.preprocessSearchBodyRound57(w, r.PathValue("index"), bodyBytes)
+		if !ok {
+			return
+		}
 	}
 	isNegOneAccurate, tthErr := validateRestTotalHitsAsIntWithRawBody(r, bodyBytes, false)
 	if tthErr != "" {
@@ -10379,12 +10163,16 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if len(bytes.TrimSpace(bodyBytes)) > 0 {
-		var preNormSt int
-		var preNormType, preNormReason string
-		bodyBytes, preNormSt, preNormType, preNormReason = preNormalizeSearchBodyR63(bodyBytes, s.isES8Mode(r))
-		if preNormSt != 0 {
-			writeESError(w, preNormSt, preNormType, preNormReason)
-			return
+		if bytes.Contains(bodyBytes, []byte("random_sampler")) ||
+			(bytes.Contains(bodyBytes, []byte("sigma")) && bytes.Contains(bodyBytes, []byte("extended_stats"))) ||
+			(!isES8Mode && bytes.Contains(bodyBytes, []byte("document_type")) && bytes.Contains(bodyBytes, []byte("percolate"))) {
+			var preNormSt int
+			var preNormType, preNormReason string
+			bodyBytes, preNormSt, preNormType, preNormReason = preNormalizeSearchBodyR63(bodyBytes, isES8Mode)
+			if preNormSt != 0 {
+				writeESError(w, preNormSt, preNormType, preNormReason)
+				return
+			}
 		}
 		if err := json.Unmarshal(bodyBytes, &req); err != nil {
 			errMsg := err.Error()
@@ -10716,10 +10504,14 @@ func isTableNotFoundError(err error) bool {
 		return false
 	}
 	lower := strings.ToLower(err.Error())
-	if strings.Contains(lower, "unknown table") || strings.Contains(lower, "unknown database") || strings.Contains(lower, "doesn't exist") {
+	if strings.Contains(lower, "unknown table") || strings.Contains(lower, "unknown database") {
 		return true
 	}
-	if strings.Contains(lower, "does not exist") {
+	if strings.Contains(lower, "1146 (42s02)") || strings.Contains(lower, "error 1146") ||
+		strings.Contains(lower, "1049 (42000)") || strings.Contains(lower, "error 1049") {
+		return true
+	}
+	if strings.Contains(lower, "doesn't exist") || strings.Contains(lower, "does not exist") {
 		return strings.Contains(lower, "table") || strings.Contains(lower, "database")
 	}
 	return false
@@ -10928,8 +10720,9 @@ func (s *Server) handleDorisExplain(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleDorisDDL(w http.ResponseWriter, r *http.Request) {
 	indexName := s.resolveIndexName(r.PathValue("index"))
 	idxSchema := s.getOrCompileReadOnlySchema(r.Context(), indexName)
-	ddl := schema.GenerateCreateTableDDL(idxSchema)
-	if r.URL.Query().Get("format") == "txt" || r.URL.Query().Get("format") == "sql" {
+	ddl := schema.GenerateCreateTableDDLWithOptions(idxSchema, s.DorisDDLOptions())
+	fmtParam := requestQueryValuesR67(r).Get("format")
+	if fmtParam == "txt" || fmtParam == "sql" {
 		ensureESCompatHeaders(w, r)
 		w.Header().Set("Content-Type", "text/plain; charset=UTF-8")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
@@ -10990,7 +10783,7 @@ func (s *Server) buildDorisExplainObject(ctx context.Context, rawIndexPattern st
 			"index":                    indexName,
 			"doris_database":           idxSchema.DorisDB,
 			"doris_table":              idxSchema.DorisTable,
-			"create_table_ddl":         schema.GenerateCreateTableDDL(idxSchema),
+			"create_table_ddl":         schema.GenerateCreateTableDDLWithOptions(idxSchema, s.DorisDDLOptions()),
 			"hits_sql":                 plan.HitsSQL,
 			"hits_sql_normalized":      NormalizeDorisSQL(plan.HitsSQL),
 			"aggs_sql":                 plan.AggsSQL,
@@ -11033,6 +10826,7 @@ func (s *Server) handleMSearch(w http.ResponseWriter, r *http.Request) {
 		return s.buildMSearchErrItemR61CRUD(status, eType, eReason, errIdx)
 	}
 
+	const maxMSearchSubRequestsR67 = 1024
 	responses := make([]map[string]any, 0)
 	for {
 		var headerLine []byte
@@ -11045,6 +10839,11 @@ func (s *Server) handleMSearch(w http.ResponseWriter, r *http.Request) {
 		}
 		if len(headerLine) == 0 {
 			break
+		}
+		if len(responses) >= maxMSearchSubRequestsR67 {
+			writeESError(w, http.StatusBadRequest, "action_request_validation_exception",
+				fmt.Sprintf("Validation Failed: 1: too many sub-requests in _msearch (%d exceeds max %d);", len(responses)+1, maxMSearchSubRequestsR67))
+			return
 		}
 		var bodyLine []byte
 		hasBodyLine := false
@@ -11101,16 +10900,25 @@ func (s *Server) handleMSearch(w http.ResponseWriter, r *http.Request) {
 		effRestTotalHits := (hasHdrRestTotalHits && hdrRestTotalHits) || (!hasHdrRestTotalHits && isTruthyBoolQueryParam(r, "rest_total_hits_as_int"))
 
 		var req esast.SearchRequest
-		bodyLine = normalizeSearchSliceBodyR62Search(bodyLine)
-		bodyLine = normalizeMLTDocIDsInRawJSONRound60(bodyLine)
-		var stdRetSt int
-		var stdRetType, stdRetReason string
-		bodyLine, stdRetSt, stdRetType, stdRetReason = s.validateAndRewriteStandardRetrieverRound61(bodyLine)
-		if stdRetSt != 0 {
-			responses = append(responses, buildMSearchErrItem(stdRetSt, stdRetType, stdRetReason, ""))
-			continue
+		msearchES8 := s.isES8Mode(r)
+		if bytes.Contains(bodyLine, []byte(`"slice"`)) {
+			bodyLine = normalizeSearchSliceBodyR62Search(bodyLine)
 		}
-		bodyLine = s.rewriteSearchBodyQueryRules(bodyLine)
+		if bytes.Contains(bodyLine, []byte("more_like_this")) {
+			bodyLine = normalizeMLTDocIDsInRawJSONRound60(bodyLine)
+		}
+		if bytes.Contains(bodyLine, []byte(`"retriever"`)) {
+			var stdRetSt int
+			var stdRetType, stdRetReason string
+			bodyLine, stdRetSt, stdRetType, stdRetReason = s.validateAndRewriteStandardRetrieverRound61(bodyLine)
+			if stdRetSt != 0 {
+				responses = append(responses, buildMSearchErrItem(stdRetSt, stdRetType, stdRetReason, ""))
+				continue
+			}
+		}
+		if bytes.Contains(bodyLine, []byte(`"rule"`)) || bytes.Contains(bodyLine, []byte(`"rule_query"`)) || bytes.Contains(bodyLine, []byte(`"retriever"`)) {
+			bodyLine = s.rewriteSearchBodyQueryRules(bodyLine)
+		}
 		isNegOneAccurate, tthErr := validateRestTotalHitsAsIntWithRawBody(r, bodyLine, effRestTotalHits)
 		if tthErr != "" {
 			if isTruthyBoolQueryParam(r, "rest_total_hits_as_int") && !hasHdrRestTotalHits {
@@ -11121,12 +10929,16 @@ func (s *Server) handleMSearch(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		if len(bodyLine) > 0 {
-			var preNormSt int
-			var preNormType, preNormReason string
-			bodyLine, preNormSt, preNormType, preNormReason = preNormalizeSearchBodyR63(bodyLine, s.isES8Mode(r))
-			if preNormSt != 0 {
-				responses = append(responses, buildMSearchErrItem(preNormSt, preNormType, preNormReason, ""))
-				continue
+			if bytes.Contains(bodyLine, []byte("random_sampler")) ||
+				(bytes.Contains(bodyLine, []byte("sigma")) && bytes.Contains(bodyLine, []byte("extended_stats"))) ||
+				(!msearchES8 && bytes.Contains(bodyLine, []byte("document_type")) && bytes.Contains(bodyLine, []byte("percolate"))) {
+				var preNormSt int
+				var preNormType, preNormReason string
+				bodyLine, preNormSt, preNormType, preNormReason = preNormalizeSearchBodyR63(bodyLine, msearchES8)
+				if preNormSt != 0 {
+					responses = append(responses, buildMSearchErrItem(preNormSt, preNormType, preNormReason, ""))
+					continue
+				}
 			}
 			if err := json.Unmarshal(bodyLine, &req); err != nil {
 				if et, er, okH := rewriteSignificantHeuristicParseErrorR62Search(bodyLine, err.Error()); okH {
@@ -11582,6 +11394,7 @@ func (s *Server) executeSearchRequest(
 		}
 	}
 	aliasFilters = s.resolveTermsLookupsInAliasFilters(ctx, aliasFilters)
+	aliasFilters = s.applyDynamicDLSFiltersR67(httpReq, targets, aliasFilters)
 	var reqRouting string
 	if req != nil {
 		reqRouting = strings.TrimSpace(req.Routing)
@@ -12942,7 +12755,11 @@ func (s *Server) executeSearchRequest(
 	if searchScope != nil {
 		searchScope.schemasByIndex = schemasByIndex
 	}
-	resp := buildESResponseWithSchemas(primaryIndex, primarySchema, schemasByIndex, req, allHits, allAggRows, tookMs, docLookup)
+	resp, bucketBudgetErr := buildESResponseWithSchemasAndBudgetR67(primaryIndex, primarySchema, schemasByIndex, req, allHits, allAggRows, tookMs, docLookup, s.effectiveSearchMaxBucketsRound60())
+	if bucketBudgetErr != nil {
+		return nil, http.StatusBadRequest, "search_phase_execution_exception", bucketBudgetErr.Error()
+	}
+	s.applyDynamicFLSOnResponseR67(httpReq, targets, resp)
 	if req != nil && len(req.EffectiveAggs()) > 0 {
 		if aggsOut, okAgg := resp["aggregations"].(map[string]any); okAgg {
 			if _, qErr := stripAndApplyExactQuantilesR61Search(allAggRows, req.EffectiveAggs(), aggsOut, isES8); qErr != nil {
@@ -14906,6 +14723,31 @@ func buildESResponse(indexName string, idxSchema *schema.IndexSchema, req *esast
 }
 
 func buildESResponseWithSchemas(indexName string, idxSchema *schema.IndexSchema, schemasByIndex map[string]*schema.IndexSchema, req *esast.SearchRequest, hits []HitRow, aggRows []AggRow, tookMs int64, docLookup func(string) *HitRow) map[string]any {
+	resp, _ := buildESResponseWithSchemasAndBudgetR67(indexName, idxSchema, schemasByIndex, req, hits, aggRows, tookMs, docLookup, 0)
+	return resp
+}
+
+func buildESResponseWithSchemasAndBudgetR67(indexName string, idxSchema *schema.IndexSchema, schemasByIndex map[string]*schema.IndexSchema, req *esast.SearchRequest, hits []HitRow, aggRows []AggRow, tookMs int64, docLookup func(string) *HitRow, maxBuckets int) (map[string]any, error) {
+	if maxBuckets > 0 && req != nil && len(req.EffectiveAggs()) > 0 {
+		sc := scopeFromDocLookupR63(docLookup)
+		if sc == nil {
+			localScope := &activeSearchScope{}
+			origLookup := docLookup
+			docLookup = func(id string) *HitRow {
+				if id == r63DocLookupScopeSentinel {
+					return &HitRow{SearchScope: localScope}
+				}
+				if origLookup != nil {
+					return origLookup(id)
+				}
+				return nil
+			}
+			sc = localScope
+		}
+		budget := newHistBucketBudgetR67(maxBuckets)
+		activeHistBudgetsR67.Store(sc, budget)
+		defer activeHistBudgetsR67.Delete(sc)
+	}
 	var totalHits int64
 	var maxScore float64
 	esHits := make([]map[string]any, 0, len(hits))
@@ -15256,6 +15098,9 @@ func buildESResponseWithSchemas(indexName string, idxSchema *schema.IndexSchema,
 	}
 
 	aggsOut := buildAggsMapWithSchema(indexName, "", req.EffectiveAggs(), bucketsByAgg, aggTotalHits, docLookup, idxSchema)
+	if budget := histBudgetFromDocLookupR67(docLookup); budget != nil && budget.exceeded {
+		return nil, budget.err()
+	}
 
 	reqSizeZero := req != nil && req.Size != nil && *req.Size == 0
 	var envelopeMaxScore any = maxScore
@@ -15288,7 +15133,7 @@ func buildESResponseWithSchemas(indexName string, idxSchema *schema.IndexSchema,
 	if len(aggsOut) > 0 {
 		res["aggregations"] = aggsOut
 	}
-	return res
+	return res, nil
 }
 
 type nestedElemCandidate struct {
@@ -17011,7 +16856,11 @@ func buildAggsMapWithSchema(
 			dhEff := resolveDateHistogramWithSchemaFormatR65(spec.DateHistogram, idxSchema, docLookup)
 			var dsResultsOffset bool
 			dhEff, dsResultsOffset = resolveDownsampledDateHistogramSpecR66(dhEff, idxSchema)
-			rows = synthesizeDateHistogramBuckets(rows, dhEff)
+			histBudget := histBudgetFromDocLookupR67(docLookup)
+			rows = synthesizeDateHistogramBucketsWithBudgetR67(rows, dhEff, histBudget)
+			if histBudget != nil && histBudget.exceeded {
+				return aggsOut
+			}
 			if len(rows) > 1 {
 				sort.SliceStable(rows, func(i, j int) bool {
 					ki, _ := strconv.ParseInt(rows[i].BucketKey, 10, 64)
@@ -17050,7 +16899,11 @@ func buildAggsMapWithSchema(
 			}
 			aggsOut[aggName] = dhOut
 		case spec.Histogram != nil:
-			rows = synthesizeHistogramBuckets(rows, spec.Histogram)
+			histBudget := histBudgetFromDocLookupR67(docLookup)
+			rows = synthesizeHistogramBucketsWithBudgetR67(rows, spec.Histogram, histBudget)
+			if histBudget != nil && histBudget.exceeded {
+				return aggsOut
+			}
 			if len(rows) > 1 {
 				sort.SliceStable(rows, func(i, j int) bool {
 					ki, _ := parseFiniteFloat(rows[i].BucketKey)
@@ -18018,10 +17871,10 @@ func filterAndSortTermsRowsWithSubAggs(
 	}
 	var incRe, excRe *regexp.Regexp
 	if s, ok := spec.Include.(string); ok {
-		incRe, _ = regexp.Compile("^(?:" + s + ")$")
+		incRe, _ = painless.CompileBoundedRawRegex("^(?:" + s + ")$")
 	}
 	if s, ok := spec.Exclude.(string); ok {
-		excRe, _ = regexp.Compile("^(?:" + s + ")$")
+		excRe, _ = painless.CompileBoundedRawRegex("^(?:" + s + ")$")
 	}
 	if spec.Include != nil || spec.Exclude != nil || minDocCount > 0 {
 		tFieldType := termsFieldTypeRound60(spec, idxSchema)
@@ -18589,7 +18442,7 @@ func matchesTermsFilterPrecompiled(key string, filter any, precompiled *regexp.R
 		if precompiled != nil {
 			return precompiled.MatchString(key)
 		}
-		if re, err := regexp.Compile("^(?:" + fv + ")$"); err == nil {
+		if re, err := painless.CompileBoundedRawRegex("^(?:" + fv + ")$"); err == nil {
 			return re.MatchString(key)
 		}
 		return matchWildcardPattern(fv, key)
@@ -21429,29 +21282,251 @@ func emptyBoxplotFillValueR66(idxSchema *schema.IndexSchema, docLookup func(stri
 	return nil
 }
 
+type histBucketBudgetR67 struct {
+	remaining int
+	max       int
+	exceeded  bool
+}
+
+func newHistBucketBudgetR67(maxBuckets int) *histBucketBudgetR67 {
+	return &histBucketBudgetR67{
+		remaining: maxBuckets,
+		max:       maxBuckets,
+	}
+}
+
+func (b *histBucketBudgetR67) consume(n int) bool {
+	if b == nil || b.max <= 0 {
+		return true
+	}
+	if b.exceeded || b.remaining < n {
+		b.exceeded = true
+		return false
+	}
+	b.remaining -= n
+	return true
+}
+
+func (b *histBucketBudgetR67) err() error {
+	if b == nil || !b.exceeded {
+		return nil
+	}
+	return fmt.Errorf(
+		"all_shards_failed|too_many_buckets_exception|Trying to create too many buckets. Must be less than or equal to: [%d] but this number of buckets was exceeded. This limit can be set by changing the [search.max_buckets] cluster level setting",
+		b.max,
+	)
+}
+
+var activeHistBudgetsR67 sync.Map // map[*activeSearchScope]*histBucketBudgetR67
+
+func histBudgetFromDocLookupR67(docLookup func(string) *HitRow) *histBucketBudgetR67 {
+	sc := scopeFromDocLookupR63(docLookup)
+	if sc == nil {
+		return nil
+	}
+	if v, ok := activeHistBudgetsR67.Load(sc); ok {
+		b, _ := v.(*histBucketBudgetR67)
+		return b
+	}
+	return nil
+}
+
 func synthesizeDateHistogramBuckets(rows []AggRow, spec *esast.DateHistogramAggSpec) []AggRow {
+	return synthesizeDateHistogramBucketsWithBudgetR67(rows, spec, nil)
+}
+
+func synthesizeDateHistogramBucketsWithBudgetR67(rows []AggRow, spec *esast.DateHistogramAggSpec, budget *histBucketBudgetR67) []AggRow {
 	if spec != nil && spec.EffectiveCalendarUnit() == "" {
 		tzRaw := strings.TrimSpace(spec.TimeZone)
 		if tzRaw != "" && tzRaw != "Z" && !strings.EqualFold(tzRaw, "UTC") {
 			if loc, _, isFixed, err := esast.ParseESTimeZone(tzRaw); err == nil && loc != nil && !isFixed {
-				return synthesizeFixedTZDateHistogramBucketsR66(rows, spec, loc)
+				return synthesizeFixedTZDateHistogramBucketsWithBudgetR67(rows, spec, loc, budget)
 			}
 		}
 	}
-	return synthesizeDateHistogramBucketsRound59(rows, spec)
+	return synthesizeDateHistogramBucketsBoundedR67(rows, spec, budget)
 }
+
+func synthesizeDateHistogramBucketsBoundedR67(rows []AggRow, spec *esast.DateHistogramAggSpec, budget *histBucketBudgetR67) []AggRow {
+	if spec == nil {
+		return rows
+	}
+	nowUTC := time.Now().UTC()
+	var hardMin, hardMax int64
+	hasHardMin, hasHardMax := false, false
+	if spec.HardBounds != nil {
+		if spec.HardBounds.Min != nil {
+			if ms, ok := parseDateHistogramBoundMsRound59(spec.HardBounds.Min, spec, nowUTC, false); ok {
+				hardMin = floorDateHistogramBucketMillisRound59(ms, spec)
+				hasHardMin = true
+			}
+		}
+		if spec.HardBounds.Max != nil {
+			if ms, ok := parseDateHistogramBoundMsRound59(spec.HardBounds.Max, spec, nowUTC, true); ok {
+				hardMax = floorDateHistogramBucketMillisRound59(ms, spec)
+				hasHardMax = true
+			}
+		}
+	}
+	if hasHardMin || hasHardMax {
+		filtered := make([]AggRow, 0, len(rows))
+		for _, r := range rows {
+			k, err := strconv.ParseInt(r.BucketKey, 10, 64)
+			if err != nil {
+				continue
+			}
+			if (hasHardMin && k < hardMin) || (hasHardMax && k > hardMax) {
+				continue
+			}
+			filtered = append(filtered, r)
+		}
+		rows = filtered
+	}
+	if spec.MinDocCount != nil && *spec.MinDocCount > 0 {
+		minCnt := int64(*spec.MinDocCount)
+		filtered := make([]AggRow, 0, len(rows))
+		for _, r := range rows {
+			if r.effectiveCount() >= minCnt {
+				filtered = append(filtered, r)
+			}
+		}
+		return filtered
+	}
+	byKey := make(map[int64]AggRow, len(rows))
+	var minKey, maxKey int64
+	hasMinKey, hasMaxKey := false, false
+	for _, r := range rows {
+		if k, err := strconv.ParseInt(r.BucketKey, 10, 64); err == nil {
+			byKey[k] = r
+			if !hasMinKey || k < minKey {
+				minKey = k
+				hasMinKey = true
+			}
+			if !hasMaxKey || k > maxKey {
+				maxKey = k
+				hasMaxKey = true
+			}
+		}
+	}
+	if spec.ExtendedBounds != nil {
+		if spec.ExtendedBounds.Min != nil {
+			if ms, ok := parseDateHistogramBoundMsRound59(spec.ExtendedBounds.Min, spec, nowUTC, false); ok {
+				extMin := floorDateHistogramExtendedBoundMillisRound66(ms, spec)
+				if !hasMinKey || extMin < minKey {
+					minKey = extMin
+					hasMinKey = true
+				}
+			}
+		}
+		if spec.ExtendedBounds.Max != nil {
+			if ms, ok := parseDateHistogramBoundMsRound59(spec.ExtendedBounds.Max, spec, nowUTC, true); ok {
+				extMax := floorDateHistogramExtendedBoundMillisRound66(ms, spec)
+				if !hasMaxKey || extMax > maxKey {
+					maxKey = extMax
+					hasMaxKey = true
+				}
+			}
+		}
+	}
+	hasObserved := hasMinKey && hasMaxKey
+	if !hasObserved && hasHardMin && hasHardMax {
+		minKey = hardMin
+		maxKey = hardMax
+		hasObserved = true
+	}
+	if hasHardMin && (!hasObserved || minKey < hardMin) {
+		minKey = hardMin
+	}
+	if hasHardMax && (!hasObserved || maxKey > hardMax) {
+		maxKey = hardMax
+	}
+	if !hasObserved || maxKey < minKey {
+		return rows
+	}
+
+	const maxSynthesizedBuckets = 100001
+	var out []AggRow
+	for k := minKey; k <= maxKey && len(out) < maxSynthesizedBuckets; {
+		if !budget.consume(1) {
+			return out
+		}
+		if existing, ok := byKey[k]; ok {
+			out = append(out, existing)
+		} else {
+			out = append(out, AggRow{
+				BucketKey: strconv.FormatInt(k, 10),
+				DocCount:  0,
+				Value:     0,
+			})
+		}
+		nextK := stepDateHistogramBucketMillisRound59(k, spec)
+		if nextK <= k {
+			break
+		}
+		k = nextK
+	}
+	return out
+}
+
+const (
+	maxUnmergedDocsPerIndexR67  = 1000
+	maxUnmergedBytesPerIndexR67 = 16 * 1024 * 1024
+	maxUnmergedTotalBytesR67    = 64 * 1024 * 1024
+)
 
 func (s *Server) recordUnmergedOverwrittenSourceR66(indexName string, rawSrc []byte) {
 	if s == nil || indexName == "" || len(bytes.TrimSpace(rawSrc)) == 0 {
 		return
 	}
+	cpLen := int64(len(rawSrc))
+	if cpLen > maxUnmergedBytesPerIndexR67 {
+		return
+	}
 	cp := append([]byte(nil), rawSrc...)
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.unmergedDeletedSources == nil {
 		s.unmergedDeletedSources = make(map[string][][]byte)
 	}
+	if s.unmergedDeletedBytes == nil {
+		s.unmergedDeletedBytes = make(map[string]int64)
+	}
+	// Enforce per-index doc count and byte caps with FIFO eviction.
+	idxList := s.unmergedDeletedSources[indexName]
+	for len(idxList) > 0 && (len(idxList) >= maxUnmergedDocsPerIndexR67 || s.unmergedDeletedBytes[indexName]+cpLen > maxUnmergedBytesPerIndexR67) {
+		evictedLen := int64(len(idxList[0]))
+		idxList = idxList[1:]
+		s.unmergedDeletedBytes[indexName] -= evictedLen
+		s.unmergedTotalBytes -= evictedLen
+	}
+	s.unmergedDeletedSources[indexName] = idxList
+
+	// Enforce global total cap across all indices with FIFO eviction.
+	for s.unmergedTotalBytes+cpLen > maxUnmergedTotalBytesR67 && len(s.unmergedDeletedOrder) > 0 {
+		oldestIdx := s.unmergedDeletedOrder[0]
+		s.unmergedDeletedOrder = s.unmergedDeletedOrder[1:]
+		oList := s.unmergedDeletedSources[oldestIdx]
+		if len(oList) == 0 {
+			continue
+		}
+		evictedLen := int64(len(oList[0]))
+		oList = oList[1:]
+		if len(oList) == 0 {
+			delete(s.unmergedDeletedSources, oldestIdx)
+		} else {
+			s.unmergedDeletedSources[oldestIdx] = oList
+		}
+		s.unmergedDeletedBytes[oldestIdx] -= evictedLen
+		if s.unmergedDeletedBytes[oldestIdx] <= 0 {
+			delete(s.unmergedDeletedBytes, oldestIdx)
+		}
+		s.unmergedTotalBytes -= evictedLen
+	}
+
 	s.unmergedDeletedSources[indexName] = append(s.unmergedDeletedSources[indexName], cp)
-	s.mu.Unlock()
+	s.unmergedDeletedBytes[indexName] += cpLen
+	s.unmergedTotalBytes += cpLen
+	s.unmergedDeletedOrder = append(s.unmergedDeletedOrder, indexName)
 }
 
 func (s *Server) getUnmergedOverwrittenSourcesR66(indexName string) [][]byte {
@@ -21558,6 +21633,10 @@ func floorDateHistogramBucketFixedTZAwareR66(ms int64, spec *esast.DateHistogram
 }
 
 func synthesizeFixedTZDateHistogramBucketsR66(rows []AggRow, spec *esast.DateHistogramAggSpec, loc *time.Location) []AggRow {
+	return synthesizeFixedTZDateHistogramBucketsWithBudgetR67(rows, spec, loc, nil)
+}
+
+func synthesizeFixedTZDateHistogramBucketsWithBudgetR67(rows []AggRow, spec *esast.DateHistogramAggSpec, loc *time.Location, budget *histBucketBudgetR67) []AggRow {
 	nowUTC := time.Now().UTC()
 	var hardMin, hardMax int64
 	hasHardMin, hasHardMax := false, false
@@ -21675,7 +21754,13 @@ func synthesizeFixedTZDateHistogramBucketsR66(rows []AggRow, spec *esast.DateHis
 	var out []AggRow
 	obsIdx := 0
 	for k := minKey; k <= maxKey && len(out) < maxSynthesizedBuckets; {
+		if !budget.consume(1) {
+			return out
+		}
 		for obsIdx < len(observedKeys) && observedKeys[obsIdx] < k {
+			if !budget.consume(1) {
+				return out
+			}
 			okK := observedKeys[obsIdx]
 			if okK >= minKey && okK <= maxKey {
 				out = append(out, byKey[okK])
@@ -21704,6 +21789,10 @@ func synthesizeFixedTZDateHistogramBucketsR66(rows []AggRow, spec *esast.DateHis
 }
 
 func synthesizeHistogramBuckets(rows []AggRow, spec *esast.HistogramAggSpec) []AggRow {
+	return synthesizeHistogramBucketsWithBudgetR67(rows, spec, nil)
+}
+
+func synthesizeHistogramBucketsWithBudgetR67(rows []AggRow, spec *esast.HistogramAggSpec, budget *histBucketBudgetR67) []AggRow {
 	if spec == nil {
 		return rows
 	}
@@ -21868,8 +21957,14 @@ func synthesizeHistogramBuckets(rows []AggRow, spec *esast.HistogramAggSpec) []A
 	const maxSynthesizedBuckets = 100001
 	var out []AggRow
 	for step := startStep; step <= endStep && len(out) < maxSynthesizedBuckets; step++ {
+		if !budget.consume(1) {
+			return out
+		}
 		if existing, ok := byStep[step]; ok {
 			out = append(out, existing)
+			if step == math.MaxInt64 {
+				break
+			}
 			continue
 		}
 		k := roundHistFloatKeyR65(float64(step)*interval + offset)
@@ -21887,6 +21982,9 @@ func synthesizeHistogramBuckets(rows []AggRow, spec *esast.HistogramAggSpec) []A
 				DocCount:  0,
 				Value:     0,
 			})
+		}
+		if step == math.MaxInt64 {
+			break
 		}
 	}
 	return out
@@ -22568,7 +22666,11 @@ func attachSubAggsToBucketWithSchema(
 			subDHEff := resolveDateHistogramWithSchemaFormatR65(subSpec.DateHistogram, idxSchema, docLookup)
 			var subDSOffset bool
 			subDHEff, subDSOffset = resolveDownsampledDateHistogramSpecR66(subDHEff, idxSchema)
-			matchingRows = synthesizeDateHistogramBuckets(matchingRows, subDHEff)
+			histBudget := histBudgetFromDocLookupR67(docLookup)
+			matchingRows = synthesizeDateHistogramBucketsWithBudgetR67(matchingRows, subDHEff, histBudget)
+			if histBudget != nil && histBudget.exceeded {
+				return
+			}
 			if len(matchingRows) > 1 {
 				sort.SliceStable(matchingRows, func(i, j int) bool {
 					ki, _ := strconv.ParseInt(matchingRows[i].BucketKey, 10, 64)
@@ -22615,7 +22717,11 @@ func attachSubAggsToBucketWithSchema(
 					matchingRows = append(matchingRows, cp)
 				}
 			}
-			matchingRows = synthesizeHistogramBuckets(matchingRows, subSpec.Histogram)
+			histBudget := histBudgetFromDocLookupR67(docLookup)
+			matchingRows = synthesizeHistogramBucketsWithBudgetR67(matchingRows, subSpec.Histogram, histBudget)
+			if histBudget != nil && histBudget.exceeded {
+				return
+			}
 			if len(matchingRows) > 1 {
 				sort.SliceStable(matchingRows, func(i, j int) bool {
 					ki, _ := parseFiniteFloat(matchingRows[i].BucketKey)
@@ -24603,7 +24709,7 @@ func compileHighlightRegexForFields(q *esast.Query, targetFields []string, requi
 	sort.SliceStable(quotedTerms, func(i, j int) bool {
 		return len(quotedTerms[i]) > len(quotedTerms[j])
 	})
-	re, err := regexp.Compile("(?i)(" + strings.Join(quotedTerms, "|") + ")")
+	re, err := painless.CompileBoundedRawRegex("(?i)(" + strings.Join(quotedTerms, "|") + ")")
 	if err != nil {
 		return nil
 	}
@@ -26633,17 +26739,22 @@ func (s *Server) ensureWritableIndexSchemaWithDocs(ctx context.Context, indexNam
 }
 
 func (s *Server) applyArrayPromotionDelta(ctx context.Context, indexName string, oldSchema *schema.IndexSchema, delta *esast.MappingSpec) *schema.IndexSchema {
+	unlockDDL := s.LockIndexDDL(indexName)
+	defer unlockDDL()
 	merged := schema.MergeMappingSpecs(oldSchema.RawMapping, delta)
 	newSchema := schema.CompileIndexSchema(s.dorisDB, indexName, merged)
 	newSchema.CopyIndexMappingSettingsFrom(oldSchema)
 	for _, stmt := range schema.GenerateAlterTableDDL(oldSchema, newSchema) {
-		_ = s.backend.ExecDDL(ctx, stmt)
+		if err := s.backend.ExecDDL(ctx, stmt); err != nil {
+			s.logWarn("array promotion ALTER TABLE failed", "index", indexName, "error", err.Error())
+		}
 	}
 	s.mu.Lock()
 	s.indices[indexName] = newSchema
 	s.mu.Unlock()
 	s.persistIndex(ctx, indexName, newSchema)
 	s.backfillIndexSchemaPreserveVersionR63(ctx, indexName, newSchema)
+	s.invalidateBM25ForIndexR67(indexName)
 	s.queryCache.InvalidateAll()
 	return newSchema
 }
@@ -30337,10 +30448,10 @@ func emitRuntimeRareTermsAggRows(
 	}
 	var incRe, excRe *regexp.Regexp
 	if s, ok := rt.Include.(string); ok {
-		incRe, _ = regexp.Compile("^(?:" + s + ")$")
+		incRe, _ = painless.CompileBoundedRawRegex("^(?:" + s + ")$")
 	}
 	if s, ok := rt.Exclude.(string); ok {
-		excRe, _ = regexp.Compile("^(?:" + s + ")$")
+		excRe, _ = painless.CompileBoundedRawRegex("^(?:" + s + ")$")
 	}
 	byBucket, keys := computeRuntimeTermsScriptBucketDocsWithSchema(idxSchema, docs, synthTerms)
 	var rareKeys []string

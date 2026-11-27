@@ -30,12 +30,12 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync/atomic"
 	"time"
 	"unicode"
 	"unicode/utf8"
 
 	"github.com/es2doris/doris-es-proxy/pkg/esast"
+	"github.com/es2doris/doris-es-proxy/pkg/painless"
 	"github.com/es2doris/doris-es-proxy/pkg/schema"
 	"github.com/es2doris/doris-es-proxy/pkg/transpiler"
 )
@@ -1435,7 +1435,7 @@ func matchSQLLikeExact(val, pattern string) bool {
 		}
 	}
 	rb.WriteString("$")
-	re, err := regexp.Compile(rb.String())
+	re, err := painless.CompileBoundedRawRegex(rb.String())
 	return err == nil && re.MatchString(val)
 }
 
@@ -1802,10 +1802,8 @@ func (s *Server) handleSQLTranslateRound57(w http.ResponseWriter, r *http.Reques
 	writeJSONWithRequest(w, r, http.StatusOK, out)
 }
 
-var sqlAsyncSeqR64 atomic.Uint64
-
 func nextSQLAsyncSearchIDR64() string {
-	return fmt.Sprintf("sql_%d", sqlAsyncSeqR64.Add(1))
+	return "sql_" + randomCryptoTokenB64R67(24)
 }
 
 func (s *Server) handleSQLQueryRound57(w http.ResponseWriter, r *http.Request, body map[string]any) {
@@ -2323,27 +2321,30 @@ func (s *Server) handleSQLQueryRound57(w http.ResponseWriter, r *http.Request, b
 
 	hasWaitTimeout := body["wait_for_completion_timeout"] != nil || (r.URL != nil && r.URL.Query().Has("wait_for_completion_timeout"))
 	explicitTargetVer := s.hasExplicitTargetESVersion()
+	ownerPrincipal, _ := s.requestPrincipalIdentityR67(r)
 
 	s.mu.Lock()
 	if s.sqlAsyncSearches == nil {
 		s.sqlAsyncSearches = make(map[string]map[string]any)
 	}
 	sqlID := nextSQLAsyncSearchIDR64()
+	for s.sqlAsyncSearches[sqlID] != nil {
+		sqlID = nextSQLAsyncSearchIDR64()
+	}
 	var cursorID string
 	if fetchSize > 0 && len(rows) > fetchSize {
-		cursorID = sqlID + "_cur_1"
 		rem := rows[fetchSize:]
 		rows = rows[:fetchSize]
-		pageIdx := 1
+		nextCurID := "sqlcur_" + randomCryptoTokenB64R67(24)
+		cursorID = nextCurID
 		for len(rem) > 0 {
-			curID := fmt.Sprintf("%s_cur_%d", sqlID, pageIdx)
+			curID := nextCurID
 			var pageRows []any
-			var nextCurID string
+			nextCurID = ""
 			if len(rem) > fetchSize {
 				pageRows = rem[:fetchSize]
 				rem = rem[fetchSize:]
-				pageIdx++
-				nextCurID = fmt.Sprintf("%s_cur_%d", sqlID, pageIdx)
+				nextCurID = "sqlcur_" + randomCryptoTokenB64R67(24)
 			} else {
 				pageRows = rem
 				rem = nil
@@ -2356,6 +2357,9 @@ func (s *Server) handleSQLQueryRound57(w http.ResponseWriter, r *http.Request, b
 			}
 			if nextCurID != "" {
 				curObj["cursor"] = nextCurID
+			}
+			if ownerPrincipal != "" {
+				curObj["__owner_principal"] = ownerPrincipal
 			}
 			evictBoundedAsyncRegistryLockedR62Admin(s.sqlAsyncSearches)
 			s.sqlAsyncSearches[curID+"_cursor"] = curObj
@@ -2376,6 +2380,9 @@ func (s *Server) handleSQLQueryRound57(w http.ResponseWriter, r *http.Request, b
 	asyncStored["id"] = sqlID
 	asyncStored["is_partial"] = false
 	asyncStored["is_running"] = false
+	if ownerPrincipal != "" {
+		asyncStored["__owner_principal"] = ownerPrincipal
+	}
 	evictBoundedAsyncRegistryLockedR62Admin(s.sqlAsyncSearches)
 	s.sqlAsyncSearches[sqlID] = asyncStored
 	if hasWaitTimeout || !explicitTargetVer {
@@ -4698,7 +4705,7 @@ func evalEQLExpr(ex eqlExpr, doc map[string]any) (any, error) {
 			return false, nil
 		}
 		if e.op == "regex" || e.op == "~" {
-			re, rErr := regexp.Compile(fmt.Sprintf("%v", rv))
+			re, rErr := painless.CompileBoundedRawRegex(fmt.Sprintf("%v", rv))
 			if rErr != nil {
 				return nil, fmt.Errorf("invalid regex [%v]: %v", rv, rErr)
 			}
@@ -4794,7 +4801,7 @@ func evalEQLExpr(ex eqlExpr, doc map[string]any) (any, error) {
 			if len(vals) < 2 || vals[0] == nil || vals[1] == nil {
 				return false, nil
 			}
-			re, rErr := regexp.Compile(fmt.Sprintf("%v", vals[1]))
+			re, rErr := painless.CompileBoundedRawRegex(fmt.Sprintf("%v", vals[1]))
 			if rErr != nil {
 				return nil, fmt.Errorf("invalid regex [%v]: %v", vals[1], rErr)
 			}
@@ -6768,12 +6775,15 @@ func (s *Server) handleInferenceStreamOrPostRound57(w http.ResponseWriter, r *ht
 		}
 		s.mu.RLock()
 		ep, exists := s.inferenceEndpoints[inferenceID]
+		var epTaskType string
+		if exists && ep != nil {
+			epTaskType, _ = ep["task_type"].(string)
+		}
 		s.mu.RUnlock()
 		if !exists || ep == nil {
 			writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("Inference endpoint [%s] not found", inferenceID))
 			return true
 		}
-		epTaskType, _ := ep["task_type"].(string)
 		if taskType != "" && taskType != epTaskType {
 			writeESError(w, http.StatusBadRequest, "illegal_argument_exception",
 				fmt.Sprintf("Inference endpoint [%s] is for task [%s], not [%s]", inferenceID, epTaskType, taskType))
@@ -6851,11 +6861,14 @@ func (s *Server) handleInferenceStreamOrPostRound57(w http.ResponseWriter, r *ht
 	}
 	s.mu.RLock()
 	ep, exists := s.inferenceEndpoints[inferenceID]
+	var epTaskType string
+	if exists && ep != nil {
+		epTaskType, _ = ep["task_type"].(string)
+	}
 	s.mu.RUnlock()
 	if !exists || ep == nil {
 		return false
 	}
-	epTaskType, _ := ep["task_type"].(string)
 	if taskType != "" && taskType != "_inference" && taskType != epTaskType {
 		return false // let existing handler emit task mismatch 400
 	}
@@ -7273,22 +7286,92 @@ func (s *Server) handleSecurityRound57(w http.ResponseWriter, r *http.Request, s
 				writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
 				return true
 			}
+			callerP, configured, authSt, authReason := s.requestPrincipalAndConfiguredR67(r)
+			if configured && callerP == nil {
+				writeESError(w, authSt, "security_exception", authReason)
+				return true
+			}
 			if r.Method == http.MethodHead {
 				w.WriteHeader(http.StatusOK)
 				return true
 			}
-			writeJSON(w, http.StatusOK, map[string]any{
-				"cluster": []string{"all"},
-				"global":  []any{},
-				"indices": []any{
-					map[string]any{
-						"names":                    []string{"*"},
-						"privileges":               []string{"all"},
-						"allow_restricted_indices": false,
+			s.mu.RLock()
+			if callerP == nil || callerP.isStaticAdmin || sliceContainsStrR67(callerP.roles, "superuser") {
+				s.mu.RUnlock()
+				writeJSON(w, http.StatusOK, map[string]any{
+					"cluster": []string{"all"},
+					"global":  []any{},
+					"indices": []any{
+						map[string]any{
+							"names":                    []string{"*"},
+							"privileges":               []string{"all"},
+							"allow_restricted_indices": false,
+						},
 					},
-				},
-				"applications": []any{},
-				"run_as":       []string{"*"},
+					"applications": []any{},
+					"run_as":       []string{"*"},
+				})
+				return true
+			}
+			roleMaps, isSuper := s.collectEffectiveRoleMapsLockedR67(callerP)
+			if isSuper {
+				s.mu.RUnlock()
+				writeJSON(w, http.StatusOK, map[string]any{
+					"cluster": []string{"all"},
+					"global":  []any{},
+					"indices": []any{
+						map[string]any{
+							"names":                    []string{"*"},
+							"privileges":               []string{"all"},
+							"allow_restricted_indices": false,
+						},
+					},
+					"applications": []any{},
+					"run_as":       []string{"*"},
+				})
+				return true
+			}
+			clusterPrivs := []string{}
+			clusterSeen := make(map[string]bool)
+			runAsList := []string{}
+			runAsSeen := make(map[string]bool)
+			indicesPrivs := []any{}
+			appPrivs := []any{}
+			for _, rm := range roleMaps {
+				for _, cp := range extractRolesListFromAnyR67(rm["cluster"]) {
+					if !clusterSeen[cp] {
+						clusterSeen[cp] = true
+						clusterPrivs = append(clusterPrivs, cp)
+					}
+				}
+				for _, ra := range extractRolesListFromAnyR67(rm["run_as"]) {
+					if !runAsSeen[ra] {
+						runAsSeen[ra] = true
+						runAsList = append(runAsList, ra)
+					}
+				}
+				if idxArr, okI := rm["indices"].([]any); okI {
+					for _, ent := range idxArr {
+						if em, okM := ent.(map[string]any); okM {
+							indicesPrivs = append(indicesPrivs, deepCloneDocMap(em))
+						}
+					}
+				}
+				if appArr, okA := rm["applications"].([]any); okA {
+					for _, ent := range appArr {
+						if em, okM := ent.(map[string]any); okM {
+							appPrivs = append(appPrivs, deepCloneDocMap(em))
+						}
+					}
+				}
+			}
+			s.mu.RUnlock()
+			writeJSON(w, http.StatusOK, map[string]any{
+				"cluster":      clusterPrivs,
+				"global":       []any{},
+				"indices":      indicesPrivs,
+				"applications": appPrivs,
+				"run_as":       runAsList,
 			})
 			return true
 		}
@@ -7300,6 +7383,7 @@ func (s *Server) handleSecurityRound57(w http.ResponseWriter, r *http.Request, s
 				writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
 				return true
 			}
+			s.bumpSecurityEpoch()
 			writeJSON(w, http.StatusOK, securityNodesCacheClearResponse())
 			return true
 		}
@@ -7313,6 +7397,7 @@ func (s *Server) handleSecurityRound57(w http.ResponseWriter, r *http.Request, s
 				writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
 				return true
 			}
+			s.bumpSecurityEpoch()
 			writeJSON(w, http.StatusOK, securityNodesCacheClearResponse())
 			return true
 		}
@@ -7384,6 +7469,9 @@ func (s *Server) handleSecurityRound57(w http.ResponseWriter, r *http.Request, s
 				updatedIDs = append(updatedIDs, idStr)
 			}
 			s.mu.Unlock()
+			if len(updatedIDs) > 0 {
+				s.bumpSecurityEpoch()
+			}
 
 			writeJSON(w, http.StatusOK, map[string]any{
 				"updated":       updatedIDs,
@@ -7430,6 +7518,7 @@ func (s *Server) handleSecurityRound57(w http.ResponseWriter, r *http.Request, s
 				kObj["metadata"] = deepCloneIngestValue(md)
 			}
 			s.mu.Unlock()
+			s.bumpSecurityEpoch()
 			writeJSON(w, http.StatusOK, map[string]any{"updated": true})
 			return true
 		}
@@ -8010,9 +8099,8 @@ func (s *Server) handleSecurityOIDC(w http.ResponseWriter, r *http.Request, segs
 
 	switch segs[2] {
 	case "prepare":
-		nowNs := time.Now().UTC().UnixNano()
-		state := fmt.Sprintf("oidc_state_%d", nowNs)
-		nonce := fmt.Sprintf("oidc_nonce_%d", nowNs)
+		state := "oidc_state_" + randomCryptoTokenB64R67(24)
+		nonce := "oidc_nonce_" + randomCryptoTokenB64R67(24)
 		if st, okS := body["state"].(string); okS && strings.TrimSpace(st) != "" {
 			state = strings.TrimSpace(st)
 		}
@@ -8023,11 +8111,15 @@ func (s *Server) handleSecurityOIDC(w http.ResponseWriter, r *http.Request, segs
 		if s.securitySessions == nil {
 			s.securitySessions = make(map[string]map[string]any)
 		}
+		if _, existed := s.securitySessions[state]; !existed {
+			evictFIFOEntriesLockedR67(s.securitySessions, maxAdminStoreEntriesR67)
+		}
 		s.securitySessions[state] = map[string]any{
-			"type":  "oidc",
-			"state": state,
-			"nonce": nonce,
-			"realm": realm,
+			"type":       "oidc",
+			"state":      state,
+			"nonce":      nonce,
+			"realm":      realm,
+			"created_at": time.Now().UTC().Format("2006-01-02T15:04:05.000Z"),
 		}
 		s.mu.Unlock()
 		writeJSON(w, http.StatusOK, map[string]any{
@@ -8045,19 +8137,24 @@ func (s *Server) handleSecurityOIDC(w http.ResponseWriter, r *http.Request, segs
 			return
 		}
 		state, _ := body["state"].(string)
-		tok := fmt.Sprintf("doris-oidc-token-%d", time.Now().UTC().UnixNano())
-		ref := fmt.Sprintf("doris-oidc-refresh-%d", time.Now().UTC().UnixNano())
+		tok := "oidc_" + randomCryptoTokenB64R67(32)
+		ref := "oidcref_" + randomCryptoTokenB64R67(32)
+		tokHash := sha256HexStrR67(tok)
 		s.mu.Lock()
 		if s.securitySessions == nil {
 			s.securitySessions = make(map[string]map[string]any)
 		}
-		s.securitySessions[tok] = map[string]any{
-			"type":     "oidc_token",
-			"state":    state,
-			"realm":    realm,
-			"username": "elastic",
+		evictFIFOEntriesLockedR67(s.securitySessions, maxAdminStoreEntriesR67)
+		s.securitySessions["oidc:"+tokHash] = map[string]any{
+			"type":       "oidc_token",
+			"token_hash": tokHash,
+			"state":      state,
+			"realm":      realm,
+			"username":   "elastic",
+			"created_at": time.Now().UTC().Format("2006-01-02T15:04:05.000Z"),
 		}
 		s.mu.Unlock()
+		s.bumpSecurityEpoch()
 		writeJSON(w, http.StatusOK, map[string]any{
 			"access_token":  tok,
 			"type":          "Bearer",
@@ -8072,9 +8169,13 @@ func (s *Server) handleSecurityOIDC(w http.ResponseWriter, r *http.Request, segs
 			writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: [token] is required;")
 			return
 		}
+		trimmedTok := strings.TrimSpace(tok)
+		tokHash := sha256HexStrR67(trimmedTok)
 		s.mu.Lock()
-		delete(s.securitySessions, strings.TrimSpace(tok))
+		delete(s.securitySessions, "oidc:"+tokHash)
+		delete(s.securitySessions, trimmedTok)
 		s.mu.Unlock()
+		s.bumpSecurityEpoch()
 		writeJSON(w, http.StatusOK, map[string]any{
 			"redirect": "https://oidc.example.com/end_session",
 		})
@@ -8152,15 +8253,17 @@ func (s *Server) handleSecuritySAML(w http.ResponseWriter, r *http.Request, segs
 
 	switch action {
 	case "prepare":
-		reqID := fmt.Sprintf("saml_req_%d", time.Now().UTC().UnixNano())
+		reqID := "saml_req_" + randomCryptoTokenB64R67(24)
 		s.mu.Lock()
 		if s.securitySessions == nil {
 			s.securitySessions = make(map[string]map[string]any)
 		}
+		evictFIFOEntriesLockedR67(s.securitySessions, maxAdminStoreEntriesR67)
 		s.securitySessions[reqID] = map[string]any{
-			"type":  "saml",
-			"id":    reqID,
-			"realm": realm,
+			"type":       "saml",
+			"id":         reqID,
+			"realm":      realm,
+			"created_at": time.Now().UTC().Format("2006-01-02T15:04:05.000Z"),
 		}
 		s.mu.Unlock()
 		writeJSON(w, http.StatusOK, map[string]any{
@@ -8175,18 +8278,23 @@ func (s *Server) handleSecuritySAML(w http.ResponseWriter, r *http.Request, segs
 			writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: [content] is required;")
 			return
 		}
-		tok := fmt.Sprintf("doris-saml-token-%d", time.Now().UTC().UnixNano())
-		ref := fmt.Sprintf("doris-saml-refresh-%d", time.Now().UTC().UnixNano())
+		tok := "saml_" + randomCryptoTokenB64R67(32)
+		ref := "samlref_" + randomCryptoTokenB64R67(32)
+		tokHash := sha256HexStrR67(tok)
 		s.mu.Lock()
 		if s.securitySessions == nil {
 			s.securitySessions = make(map[string]map[string]any)
 		}
-		s.securitySessions[tok] = map[string]any{
-			"type":     "saml_token",
-			"realm":    realm,
-			"username": "elastic",
+		evictFIFOEntriesLockedR67(s.securitySessions, maxAdminStoreEntriesR67)
+		s.securitySessions["saml:"+tokHash] = map[string]any{
+			"type":       "saml_token",
+			"token_hash": tokHash,
+			"realm":      realm,
+			"username":   "elastic",
+			"created_at": time.Now().UTC().Format("2006-01-02T15:04:05.000Z"),
 		}
 		s.mu.Unlock()
+		s.bumpSecurityEpoch()
 		writeJSON(w, http.StatusOK, map[string]any{
 			"access_token":  tok,
 			"type":          "Bearer",
@@ -8203,9 +8311,13 @@ func (s *Server) handleSecuritySAML(w http.ResponseWriter, r *http.Request, segs
 			writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: [token] is required;")
 			return
 		}
+		trimmedTok := strings.TrimSpace(tok)
+		tokHash := sha256HexStrR67(trimmedTok)
 		s.mu.Lock()
-		delete(s.securitySessions, strings.TrimSpace(tok))
+		delete(s.securitySessions, "saml:"+tokHash)
+		delete(s.securitySessions, trimmedTok)
 		s.mu.Unlock()
+		s.bumpSecurityEpoch()
 		writeJSON(w, http.StatusOK, map[string]any{
 			"redirect": "https://idp.example.com/sso/slo",
 		})
@@ -8296,12 +8408,19 @@ func (s *Server) handleFleetSecretsRound57(w http.ResponseWriter, r *http.Reques
 		if s.fleetSecrets == nil {
 			s.fleetSecrets = make(map[string]map[string]any)
 		}
-		secID := fmt.Sprintf("fleet-secret-%d", len(s.fleetSecrets)+1)
+		secID := ""
 		if reqID, okID := body["id"].(string); okID && strings.TrimSpace(reqID) != "" {
 			secID = strings.TrimSpace(reqID)
+		} else {
+			secID = "fleet-secret-" + randomCryptoTokenB64R67(12)
 		}
 		for s.fleetSecrets[secID] != nil {
-			secID = fmt.Sprintf("fleet-secret-%d-%d", len(s.fleetSecrets)+1, time.Now().UTC().UnixNano()%10000)
+			secID = "fleet-secret-" + randomCryptoTokenB64R67(12)
+		}
+		if len(s.fleetSecrets) >= maxAdminStoreEntriesR67 {
+			s.mu.Unlock()
+			writeESError(w, http.StatusTooManyRequests, "es_rejected_execution_exception", "fleet secret store limit reached")
+			return
 		}
 		entry := map[string]any{
 			"id":         secID,

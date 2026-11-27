@@ -866,6 +866,32 @@ func (s *IndexSchema) CloneIndexSchema() *IndexSchema {
 		}
 		cp.SourceConfig = &sc
 	}
+	if s.AliasFieldKeys != nil {
+		cp.AliasFieldKeys = append([]string{}, s.AliasFieldKeys...)
+	}
+	if s.FlattenedFieldKeys != nil {
+		cp.FlattenedFieldKeys = append([]string{}, s.FlattenedFieldKeys...)
+	}
+	if s.SparseFieldKeys != nil {
+		cp.SparseFieldKeys = append([]string{}, s.SparseFieldKeys...)
+	}
+	if s.histogramFieldKeys != nil {
+		cp.histogramFieldKeys = append([]string{}, s.histogramFieldKeys...)
+	}
+	if s.rangeFieldKeys != nil {
+		cp.rangeFieldKeys = append([]string{}, s.rangeFieldKeys...)
+	}
+	if s.extraCopyToKeys != nil {
+		cp.extraCopyToKeys = append([]string{}, s.extraCopyToKeys...)
+	}
+	if s.enabledFalsePaths != nil {
+		cp.enabledFalsePaths = make([][]string, len(s.enabledFalsePaths))
+		for i, p := range s.enabledFalsePaths {
+			if p != nil {
+				cp.enabledFalsePaths[i] = append([]string{}, p...)
+			}
+		}
+	}
 	cp.RawMapping = deepCloneMappingSpec(s.RawMapping)
 	return &cp
 }
@@ -989,6 +1015,7 @@ func (s *IndexSchema) CloneWithLockedAutoDims(lockedAutoDims map[string]int) (*I
 			addedBindings = append(addedBindings, nb)
 		}
 	}
+	cloned.recomputePrecomputedSlices()
 	return cloned, addedBindings
 }
 
@@ -1472,6 +1499,7 @@ func (s *IndexSchema) BindTSDBFields() {
 		s.Fields = make(map[string]FieldBinding)
 	}
 	s.Fields["_tsid"] = tsidBindingForTSDB()
+	s.recomputePrecomputedSlices()
 }
 
 // PopulateTSDBColumnsForShred computes `__tsid` and `__tsid_key` for `index.mode: time_series` rows during `ShredDocumentWithNow`.
@@ -1550,6 +1578,7 @@ func ApplyIndexModeDefaults(s *IndexSchema) {
 			}
 		}
 	}
+	s.recomputePrecomputedSlices()
 }
 
 // ValidateIndexModeSettings validates `index.mode` and ensures TSDB-only settings (`index.routing_path`,
