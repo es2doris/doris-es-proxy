@@ -353,7 +353,7 @@ func mergeSourceWithDocVariantJSON(srcRaw json.RawMessage, docRaw json.RawMessag
 		}
 		return nil
 	}
-	if len(docTrim) == 0 || bytes.Equal(srcTrim, docTrim) {
+	if len(docTrim) == 0 || bytes.Equal(docTrim, []byte("{}")) || bytes.Equal(docTrim, []byte("null")) || bytes.Equal(srcTrim, docTrim) {
 		return srcRaw
 	}
 	var srcMap map[string]any
@@ -822,8 +822,8 @@ var (
 	reAggArrayExplodeMissing    = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, COALESCE\\(CAST\\((.+?) AS STRING\\), ('(?:''|[^'])*')\\) AS `_bucket_key`, CAST\\((?:COUNT\\(\\*\\)|COUNT\\(DISTINCT `_id`\\)) AS DOUBLE\\) AS `_doc_count` FROM `base_matched` LATERAL VIEW EXPLODE\\(CASE WHEN `([^`]+)` IS NULL.+?\\) `_t` AS `_elem`(?: WHERE (.+?))? GROUP BY `_bucket_key` ORDER BY `_doc_count` DESC, `_bucket_key` ASC LIMIT (\\d+)")
 	reAggScalarTerms            = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, CAST\\((.+?) AS STRING\\) AS `_bucket_key`, CAST\\(" + docCountAggExprPatR62Mem + " AS DOUBLE\\) AS `_doc_count` FROM `base_matched` WHERE (.+?) IS NOT NULL GROUP BY .+? ORDER BY `_doc_count` DESC, `_bucket_key` ASC LIMIT (\\d+)")
 	reAggScalarTermsMissing     = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, COALESCE\\(CAST\\((.+?) AS STRING\\), ('(?:''|[^'])*')\\) AS `_bucket_key`, CAST\\(" + docCountAggExprPatR62Mem + " AS DOUBLE\\) AS `_doc_count` FROM `base_matched`(?: WHERE (.+?))? GROUP BY `_bucket_key` ORDER BY `_doc_count` DESC, `_bucket_key` ASC LIMIT (\\d+)")
-	reAggNestedTerms            = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, (?:json_extract_string\\(`_nel`, '\\$\\.([^']+)'\\)|CAST\\((.+?) AS STRING\\)) AS `_bucket_key`, CAST\\(COUNT\\(\\*\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched` LATERAL VIEW EXPLODE\\(`([^`]+)`\\) `_nt` AS `_nel` WHERE (?:\\((.+)\\) AND )?(?:json_extract_string\\(`_nel`, '\\$\\.[^']+'\\)|CAST\\(.+? AS STRING\\)) IS NOT NULL GROUP BY `_bucket_key` ORDER BY `_doc_count` DESC, `_bucket_key` ASC LIMIT (\\d+)")
-	reAggNestedTermsMissing     = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, COALESCE\\((?:json_extract_string\\(`_nel`, '\\$\\.([^']+)'\\)|CAST\\((.+?) AS STRING\\)), ('(?:''|[^'])*')\\) AS `_bucket_key`, CAST\\(COUNT\\(\\*\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched` LATERAL VIEW EXPLODE\\((?:CASE WHEN )?`([^`]+)`(?: IS NULL.+?)?\\) `_nt` AS `_nel`(?: WHERE (.+?))? GROUP BY `_bucket_key` ORDER BY `_doc_count` DESC, `_bucket_key` ASC LIMIT (\\d+)")
+	reAggNestedTerms            = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, (?:json_extract_string\\(`_nel`, '\\$\\.((?:''|[^'])+)'\\)|CAST\\((.+?) AS STRING\\)) AS `_bucket_key`, CAST\\(COUNT\\(\\*\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched` LATERAL VIEW EXPLODE\\(`([^`]+)`\\) `_nt` AS `_nel` WHERE (?:\\((.+)\\) AND )?(?:json_extract_string\\(`_nel`, '\\$\\.(?:''|[^'])+'\\)|CAST\\(.+? AS STRING\\)) IS NOT NULL GROUP BY `_bucket_key` ORDER BY `_doc_count` DESC, `_bucket_key` ASC LIMIT (\\d+)")
+	reAggNestedTermsMissing     = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, COALESCE\\((?:json_extract_string\\(`_nel`, '\\$\\.((?:''|[^'])+)'\\)|CAST\\((.+?) AS STRING\\)), ('(?:''|[^'])*')\\) AS `_bucket_key`, CAST\\(COUNT\\(\\*\\) AS DOUBLE\\) AS `_doc_count` FROM `base_matched` LATERAL VIEW EXPLODE\\((?:CASE WHEN )?`([^`]+)`(?: IS NULL.+?)?\\) `_nt` AS `_nel`(?: WHERE (.+?))? GROUP BY `_bucket_key` ORDER BY `_doc_count` DESC, `_bucket_key` ASC LIMIT (\\d+)")
 	reAggNestedMetric           = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, '(_metric|_avg_weight|_nested_doc_count|_stats_[a-z_]+)' AS `_bucket_key`, CAST\\((?:COALESCE\\((AVG|SUM|MIN|MAX|COUNT|STDDEV_POP)\\((.+?)\\), 0\\)|(COUNT)\\((DISTINCT )?(.+?)\\)) AS DOUBLE\\) AS `_doc_count` FROM (`base_matched` LATERAL VIEW EXPLODE\\(.+?\\) `_(?:nt|t|ht)` AS `_(?:nel|elem|helem)`)(?: WHERE (.+))?$")
 	reAggWeightedAvg            = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, '(_metric|_stats_avg)' AS `_bucket_key`, CAST\\(COALESCE\\(SUM\\(\\((.+?)\\) \\* \\((.+?)\\)\\) / NULLIF\\(SUM\\((.+?)\\), 0\\), 0\\) AS DOUBLE\\) AS `_doc_count` FROM (`base_matched` LATERAL VIEW EXPLODE\\(.+?\\) `_ht` AS `_helem`)(?: WHERE (.+))?$")
 	reAggPercentileWeighted     = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, '([^']+)' AS `_bucket_key`, CAST\\(COALESCE\\(PERCENTILE_APPROX_WEIGHTED\\((.+?)\\), 0\\) AS DOUBLE\\) AS `_doc_count` FROM (`base_matched` LATERAL VIEW EXPLODE\\(.+?\\) `_ht` AS `_helem`)(?: WHERE (.+))?$")
@@ -845,8 +845,8 @@ var (
 	reAggDateHist               = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, CAST\\((?:TRY_)?CAST\\(FLOOR\\((?:\\((.+?) \\+ (-?\\d+)\\)|(.+?)) / (\\d+)\\) \\* \\d+(?: - -?\\d+)? AS BIGINT\\) AS STRING\\) AS `_bucket_key`, CAST\\((?:COUNT\\(\\*\\)|COUNT\\(DISTINCT `_id`\\)) AS DOUBLE\\) AS `_doc_count` FROM (`base_matched`(?: LATERAL VIEW EXPLODE\\((?:CASE WHEN .+ END|`[^`]+`)\\) `_(?:t|ht|rng_t)` AS `_(?:elem|helem|bidx|off)`)?) WHERE (?:(?:\\((.+)\\) AND )?(?:`[^`]+`|(?:TRY_CAST|CAST)\\([^)]+\\)|`_doc`\\[[^\\]]+\\]) IS NOT NULL|(.+?)) GROUP BY `_bucket_key` ORDER BY (?:TRY_)?CAST\\(`_bucket_key` AS BIGINT\\) ASC")
 	reAggDateHistGeneric        = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, (.+?) AS `_bucket_key`, CAST\\((?:COUNT\\(\\*\\)|COUNT\\(DISTINCT `_id`\\)) AS DOUBLE\\) AS `_doc_count` FROM (.+?) WHERE (.+?) GROUP BY `_bucket_key` ORDER BY (?:TRY_)?CAST\\(`_bucket_key` AS BIGINT\\) ASC")
 	reAggHist                   = regexp.MustCompile(`SELECT '([^']+)' AS ` + "`_agg_name`, CAST\\((?:\\()?(?:(?:TRY_)?CAST\\()?FLOOR\\(\\((.+?) - ([^)]+)\\) / ([^)]+)\\)(?: AS LARGEINT\\))? \\* [^)]+ \\+ [^)]+(?:\\))? AS STRING\\) AS `_bucket_key`, CAST\\((?:COUNT\\(\\*\\)|COUNT\\(DISTINCT `_id`\\)|COALESCE\\(SUM\\((.+?)\\), 0\\)) AS DOUBLE\\) AS `_doc_count` FROM (`base_matched`(?: LATERAL VIEW EXPLODE\\(.+?\\) `_(?:t|ht|rng_t)` AS `_(?:elem|helem|bidx|off)`)?) WHERE (?:(?:\\((.+)\\) AND )?(?:`[^`]+`|(?:TRY_CAST|CAST)\\([^)]+\\)|`_doc`\\[[^\\]]+\\]) IS NOT NULL|(.+?)) GROUP BY `_bucket_key` ORDER BY (?:TRY_)?CAST\\(`_bucket_key` AS DOUBLE\\) ASC")
-	reAggRawValues              = regexp.MustCompile(`^SELECT '(__raw_vals__(?:''|[^'])*)' AS ` + "`_agg_name`, CONCAT\\('_vals:', (?:IF\\(COUNT\\(.+?\\) <= 50000, )?COALESCE\\(ARRAY_JOIN\\(COLLECT_LIST\\(CAST\\((.+?) AS DOUBLE\\)\\), ','\\), ''\\)(?:, ':OVERFLOW:'\\))?\\) AS `_bucket_key`, CAST\\(COUNT\\(.+?\\) AS DOUBLE\\) AS `_doc_count` FROM (.+)$")
-	reAggSubRawValues           = regexp.MustCompile(`^SELECT '(__raw_vals__(?:''|[^'])*)' AS ` + "`_agg_name`, CONCAT\\(CAST\\((.+?) AS STRING\\), '\\\\x1f(?:', '_vals:|_vals:)', (?:IF\\(COUNT\\(.+?\\) <= 50000, )?COALESCE\\(ARRAY_JOIN\\(COLLECT_LIST\\(CAST\\((.+?) AS DOUBLE\\)\\), ','\\), ''\\)(?:, ':OVERFLOW:'\\))?\\) AS `_bucket_key`, CAST\\(COUNT\\(.+?\\) AS DOUBLE\\) AS `_doc_count` FROM (.+)$")
+	reAggRawValues              = regexp.MustCompile(`^SELECT '(__raw_vals__(?:''|[^'])*)' AS ` + "`_agg_name`, CONCAT\\('_vals:', (?:IF\\(COUNT\\(.+?\\) <= 50000, )?COALESCE\\(ARRAY_JOIN\\(COLLECT_LIST\\((?:TRY_)?CAST\\((.+?) AS DOUBLE\\)\\), ','\\), ''\\)(?:, ':OVERFLOW:'\\))?\\) AS `_bucket_key`, CAST\\(COUNT\\(.+?\\) AS DOUBLE\\) AS `_doc_count` FROM (.+)$")
+	reAggSubRawValues           = regexp.MustCompile(`^SELECT '(__raw_vals__(?:''|[^'])*)' AS ` + "`_agg_name`, CONCAT\\(CAST\\((.+?) AS STRING\\), '\\\\x1f(?:', '_vals:|_vals:)', (?:IF\\(COUNT\\(.+?\\) <= 50000, )?COALESCE\\(ARRAY_JOIN\\(COLLECT_LIST\\((?:TRY_)?CAST\\((.+?) AS DOUBLE\\)\\), ','\\), ''\\)(?:, ':OVERFLOW:'\\))?\\) AS `_bucket_key`, CAST\\(COUNT\\(.+?\\) AS DOUBLE\\) AS `_doc_count` FROM (.+)$")
 	reAggRange                  = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, '([^']+)' AS `_bucket_key`, CAST\\(" + docCountAggExprPatR62Mem + " AS DOUBLE\\) AS `_doc_count` FROM (`base_matched`(?: LATERAL VIEW EXPLODE\\(`[^`]+`\\) `_t` AS `_elem`)?) WHERE (.+)$")
 	reAggRangeHistR65           = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, '([^']+)' AS `_bucket_key`, CAST\\(COALESCE\\(SUM\\(TRY_CAST\\(SPLIT_PART\\(`_helem`, ',', 2\\) AS DOUBLE\\)\\), 0\\) AS DOUBLE\\) AS `_doc_count` FROM (`base_matched` LATERAL VIEW EXPLODE\\(.+?\\) `_ht` AS `_helem`) WHERE (.+)$")
 	reAggSubMetric              = regexp.MustCompile(`^SELECT '([^']+)' AS ` + "`_agg_name`, (.+?) AS `_bucket_key`, CAST\\((?:COALESCE\\((AVG|SUM|MIN|MAX|COUNT|STDDEV_POP)\\((.+?)\\), 0\\)|(COUNT)\\((DISTINCT )?(.+?)\\)) AS DOUBLE\\) AS `_doc_count` FROM (.+) WHERE (.+?) GROUP BY `_bucket_key`$")
@@ -1198,7 +1198,7 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 					cp["_nel"] = elemJSON
 					val = resolveColumnValue(cp, scriptExpr)
 				} else {
-					val = extractJSONPathFromStr(elemJSON, strings.Split(relPath, "."))
+					val = extractJSONPathRawR62Mem(elemJSON, "$."+unquoteSQLLiteral("'"+relPath+"'"))
 				}
 				if val != nil {
 					seenInElem := make(map[string]bool)
@@ -1238,7 +1238,7 @@ func evalAggBranch(baseRows []map[string]any, branch string) []AggRow {
 					cp["_nel"] = elemJSON
 					val = resolveColumnValue(cp, scriptExpr)
 				} else {
-					val = extractJSONPathFromStr(elemJSON, strings.Split(relPath, "."))
+					val = extractJSONPathRawR62Mem(elemJSON, "$."+unquoteSQLLiteral("'"+relPath+"'"))
 				}
 				if val == nil {
 					if missingVal != "" {
@@ -3231,13 +3231,10 @@ func evalBucketKeyExprs(row map[string]any, expr string) []string {
 	if strings.HasPrefix(unwrapped, "CAST(") && strings.HasSuffix(unwrapped, " AS STRING)") {
 		unwrapped = strings.TrimSpace(unwrapped[len("CAST(") : len(unwrapped)-len(" AS STRING)")])
 	}
-	if strings.HasPrefix(unwrapped, "json_extract_string(") && strings.HasSuffix(unwrapped, ")") {
-		inner := unwrapped[len("json_extract_string(") : len(unwrapped)-1]
-		if commaIdx := strings.IndexByte(inner, ','); commaIdx > 0 {
-			varName := strings.Trim(strings.TrimSpace(inner[:commaIdx]), "`")
-			rawPathLit := unquoteSQLLiteral(strings.TrimSpace(inner[commaIdx+1:]))
-			elemJSON := extractRowJSONStringR62Mem(row, varName)
-			res := extractJSONPathRawR62Mem(elemJSON, rawPathLit)
+	if strings.HasPrefix(unwrapped, "json_extract_string(") && strings.HasSuffix(unwrapped, ")") && hasMatchingOuterParens(unwrapped, len("json_extract_string")) {
+		args := splitTopLevelArgs(unwrapped[len("json_extract_string(") : len(unwrapped)-1])
+		if len(args) == 2 {
+			res := evalJSONExtractArgsR67Mem(row, args[0], args[1])
 			if arr, ok := res.([]any); ok {
 				var out []string
 				seen := make(map[string]bool, len(arr))
@@ -3671,7 +3668,7 @@ func evalWhereExpr(row map[string]any, expr string) bool {
 		if val == nil {
 			return false
 		}
-		re, err := regexp.Compile(pat)
+		re, err := painless.CompileBoundedRawRegex(pat)
 		if err != nil {
 			return false
 		}
@@ -3861,7 +3858,7 @@ func evalFulltextMatch(row map[string]any, colExpr, matchOp, queryStr string) bo
 
 	switch matchOp {
 	case "MATCH_REGEXP":
-		re, err := regexp.Compile("(?i)" + queryStr)
+		re, err := painless.CompileBoundedRawRegex("(?i)" + queryStr)
 		if err != nil {
 			return false
 		}
@@ -4393,10 +4390,10 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 			lambda := strings.TrimSpace(args[0])
 			if strings.HasPrefix(lambda, "_el -> json_extract_string(_el,") && strings.HasSuffix(lambda, ")") {
 				pathLit := strings.TrimSpace(lambda[len("_el -> json_extract_string(_el,") : len(lambda)-1])
-				relPath := strings.TrimPrefix(unquoteSQLLiteral(pathLit), "$.")
+				rawPath := unquoteSQLLiteral(pathLit)
 				var out []any
 				for _, elemJSON := range toStringSlice(resolveColumnValue(row, strings.TrimSpace(args[1]))) {
-					if v := extractJSONPathFromStr(elemJSON, strings.Split(relPath, ".")); v != nil {
+					if v := extractJSONPathRawR62Mem(elemJSON, rawPath); v != nil {
 						for _, sub := range asSliceOrSingle(v) {
 							if sub != nil {
 								out = append(out, sub)
@@ -4852,14 +4849,10 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 		}
 		return nil
 	}
-	if strings.HasPrefix(colExpr, "json_extract_string(") && strings.HasSuffix(colExpr, ")") {
-		inner := colExpr[len("json_extract_string(") : len(colExpr)-1]
-		commaIdx := strings.IndexByte(inner, ',')
-		if commaIdx > 0 {
-			varName := strings.Trim(strings.TrimSpace(inner[:commaIdx]), "`")
-			rawPathLit := unquoteSQLLiteral(strings.TrimSpace(inner[commaIdx+1:]))
-			elemJSON := extractRowJSONStringR62Mem(row, varName)
-			res := extractJSONPathRawR62Mem(elemJSON, rawPathLit)
+	if strings.HasPrefix(colExpr, "json_extract_string(") && strings.HasSuffix(colExpr, ")") && hasMatchingOuterParens(colExpr, len("json_extract_string")) {
+		args := splitTopLevelArgs(colExpr[len("json_extract_string(") : len(colExpr)-1])
+		if len(args) == 2 {
+			res := evalJSONExtractArgsR67Mem(row, args[0], args[1])
 			if rv, ok := res.(map[string]any); ok {
 				if b, err := json.Marshal(rv); err == nil {
 					return string(b)
@@ -4869,23 +4862,9 @@ func resolveColumnValue(row map[string]any, colExpr string) any {
 		}
 	}
 	if strings.HasPrefix(colExpr, "json_extract(") && strings.HasSuffix(colExpr, ")") && hasMatchingOuterParens(colExpr, len("json_extract")) {
-		inner := colExpr[len("json_extract(") : len(colExpr)-1]
-		args := splitTopLevelArgs(inner)
+		args := splitTopLevelArgs(colExpr[len("json_extract(") : len(colExpr)-1])
 		if len(args) == 2 {
-			varExpr := strings.TrimSpace(args[0])
-			varName := strings.Trim(varExpr, "`")
-			rawPathLit := unquoteSQLLiteral(strings.TrimSpace(args[1]))
-			elemJSON := extractRowJSONStringR62Mem(row, varName)
-			if elemJSON == "" {
-				if resolved := resolveColumnValue(row, varExpr); resolved != nil {
-					if s, okS := resolved.(string); okS {
-						elemJSON = s
-					} else if jb, err := json.Marshal(resolved); err == nil {
-						elemJSON = string(jb)
-					}
-				}
-			}
-			return extractJSONPathRawR62Mem(elemJSON, rawPathLit)
+			return evalJSONExtractArgsR67Mem(row, args[0], args[1])
 		}
 	}
 	isCastDoc := strings.HasPrefix(colExpr, "CAST(`_doc`") && hasMatchingOuterParens(colExpr, 4)
@@ -5752,7 +5731,7 @@ func evalCaseWhenValue(row map[string]any, expr string) any {
 
 var (
 	reUnwrappedBacktickCol = regexp.MustCompile("`([a-zA-Z0-9_]+)`")
-	reUnwrappedJSONExtract = regexp.MustCompile(`json_extract_string\([^)]+\)`)
+	reUnwrappedJSONExtract = regexp.MustCompile(`json_extract_string\([^,]+,\s*'(?:''|[^'])+'\)`)
 	reUnwrappedDocExtract  = regexp.MustCompile("(?:TRY_)?CAST\\(`_doc`(?:\\['[^']+'\\])+ AS [A-Z]+\\)")
 )
 
@@ -5898,11 +5877,11 @@ func extractJSONPathFromStr(rawJSON string, path []string) any {
 	}
 	dec := json.NewDecoder(strings.NewReader(rawJSON))
 	dec.UseNumber()
-	var doc map[string]any
+	var doc any
 	if err := dec.Decode(&doc); err != nil {
 		return nil
 	}
-	var curr any = doc
+	curr := doc
 	for _, seg := range path {
 		switch node := curr.(type) {
 		case map[string]any:
@@ -6326,7 +6305,7 @@ func evalLikePattern(val, pat string, caseInsensitive bool) bool {
 		}
 	}
 	sb.WriteString("$")
-	re, err := regexp.Compile("(?s)" + sb.String())
+	re, err := painless.CompileBoundedRawRegex("(?s)" + sb.String())
 	if err != nil {
 		return false
 	}
@@ -7437,11 +7416,32 @@ func extractRowJSONStringR62Mem(row map[string]any, varName string) string {
 	return ""
 }
 
+func evalJSONExtractArgsR67Mem(row map[string]any, varArg, pathArg string) any {
+	varExpr := strings.TrimSpace(varArg)
+	varName := strings.Trim(varExpr, "`")
+	rawPathLit := unquoteSQLLiteral(strings.TrimSpace(pathArg))
+	elemJSON := extractRowJSONStringR62Mem(row, varName)
+	if elemJSON == "" {
+		if resolved := resolveColumnValue(row, varExpr); resolved != nil {
+			if s, okS := resolved.(string); okS {
+				elemJSON = s
+			} else if jb, err := json.Marshal(resolved); err == nil {
+				elemJSON = string(jb)
+			}
+		}
+	}
+	return extractJSONPathRawR62Mem(elemJSON, rawPathLit)
+}
+
 func extractJSONPathRawR62Mem(rawJSON, rawPath string) any {
 	if rawJSON == "" {
 		return nil
 	}
-	segs := parseDorisJSONPathSegmentsR63Mem(rawPath)
+	trimmedPath := strings.TrimSpace(rawPath)
+	if trimmedPath == "$" {
+		return extractJSONPathFromStr(rawJSON, nil)
+	}
+	segs := parseDorisJSONPathSegmentsR63Mem(trimmedPath)
 	if len(segs) == 0 {
 		return nil
 	}
@@ -7535,16 +7535,15 @@ func resolveRound62AggSubqueriesR62Mem(baseRows []map[string]any, sqlExpr string
 		}
 		closeIn := memFindMatchingParen(sqlExpr, idx+len("`_id` IN "))
 		closeOuter := memFindMatchingParen(sqlExpr, idx+len("`_id` IN (SELECT `_id` FROM "))
-		fromIdx := strings.Index(sqlExpr[idx:], "FROM (SELECT `_id`, ")
-		if closeIn < 0 || closeOuter < 0 || fromIdx < 0 {
+		if closeIn < 0 || closeOuter < 0 {
 			break
 		}
-		innerOpen := idx + fromIdx + len("FROM ")
+		innerOpen := idx + len(divPrefix) - len("(SELECT `_id`, ")
 		closeInner := memFindMatchingParen(sqlExpr, innerOpen)
 		if closeInner < 0 || closeInner >= closeOuter || closeOuter >= closeIn {
 			break
 		}
-		innerSelect := sqlExpr[innerOpen+len("(SELECT `_id`, ") : closeInner]
+		innerSelect := sqlExpr[idx+len(divPrefix) : closeInner]
 		keySplit := strings.Index(innerSelect, " AS `_ds_key`, CAST(")
 		fromSplit := strings.Index(innerSelect, " AS DOUBLE) AS `_ds_score` FROM `base_matched` WHERE ")
 		orderSplit := strings.LastIndex(innerSelect, " ORDER BY `_ds_score` DESC, `_id` ASC LIMIT ")

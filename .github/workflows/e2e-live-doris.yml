@@ -85,6 +85,8 @@ jobs:
             --doris-http "http://127.0.0.1:8030" \
             --doris-db "es_sdk_e2e" \
             --es-version "8.15.5" \
+            --basic-auth-user=elastic \
+            --basic-auth-pass=es-proxy-e2e-pass \
             --log-sql >/tmp/doris-es-proxy.log 2>&1 &
           PROXY_PID=$!
           trap 'kill "$PROXY_PID" 2>/dev/null || true; wait "$PROXY_PID" 2>/dev/null || true' EXIT
@@ -102,7 +104,7 @@ jobs:
             cat /tmp/doris-es-proxy.log || true
             exit 1
           fi
-          DORIS_ES_PROXY_URL=http://127.0.0.1:9200 go -C e2e/sdkconformance test -race -count=1 -v ./...
+          DORIS_ES_PROXY_URL=http://127.0.0.1:9200 DORIS_ES_PROXY_USER=elastic DORIS_ES_PROXY_PASS=es-proxy-e2e-pass go -C e2e/sdkconformance test -race -count=1 -v ./...
 
       - name: Run Curated Upstream Elastic YAML Conformance against Live Apache Doris
         env:
@@ -111,7 +113,7 @@ jobs:
           DORIS_E2E_HTTP: "http://127.0.0.1:8030"
           DORIS_E2E_DB: "es_yaml_e2e"
           DORIS_LIVE_YAML_SHARD: "${{ matrix.shard }}/3"
-          DORIS_LIVE_YAML_MIN_PASSED: "1350"
+          DORIS_LIVE_YAML_MIN_PASSED: "1520"
           DORIS_LIVE_YAML_OUT_JSON: "/tmp/live-doris-yaml-scorecard-shard-${{ matrix.shard }}.json"
         run: go test -v -race -count=1 -timeout 35m ./e2e/... -run TestLiveDorisUpstreamYAMLConformance_E2E
 

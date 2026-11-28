@@ -18,6 +18,7 @@
 package proxy
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -1060,33 +1061,52 @@ func TestRound57F7_ConnectorsAndSearchApplications(t *testing.T) {
 
 func TestRound57F8_SecurityAPIKeyQueryDSLPrivilegesCacheAndAuth(t *testing.T) {
 	srv := newRound57TestServer()
+	srv.SetAuth("elastic", "r57-pass", "")
+	authHdr := "Basic " + base64.StdEncoding.EncodeToString([]byte("elastic:r57-pass"))
+	doSecReq := func(method, path, body string) (int, string, map[string]any, http.Header) {
+		t.Helper()
+		var req *http.Request
+		if body != "" {
+			req = httptest.NewRequest(method, path, strings.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+		} else {
+			req = httptest.NewRequest(method, path, nil)
+		}
+		req.Header.Set("Authorization", authHdr)
+		rec := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rec, req)
+		raw := rec.Body.String()
+		var parsed map[string]any
+		_ = json.Unmarshal(rec.Body.Bytes(), &parsed)
+		return rec.Code, raw, parsed, rec.Header()
+	}
 
 	// 1. API key create, PUT /_security/api_key/{id}, invalidate rejection, and POST /_security/api_key/_bulk_update
-	_, _, k1, _ := doRound57Req(t, srv, http.MethodPost, "/_security/api_key", `{"name":"r57-key-alpha","metadata":{"env":"dev"}}`)
-	_, _, k2, _ := doRound57Req(t, srv, http.MethodPost, "/_security/api_key", `{"name":"r57-key-beta","metadata":{"env":"prod"}}`)
+	_, _, k1, _ := doSecReq(http.MethodPost, "/_security/api_key", `{"name":"r57-key-alpha","metadata":{"env":"dev"}}`)
+	_, _, k2, _ := doSecReq(http.MethodPost, "/_security/api_key", `{"name":"r57-key-beta","metadata":{"env":"prod"}}`)
 	id1, _ := k1["id"].(string)
 	id2, _ := k2["id"].(string)
 
-	cUpd, _, resUpd, _ := doRound57Req(t, srv, http.MethodPut, "/_security/api_key/"+id1, `{
+	cUpd, _, resUpd, _ := doSecReq(http.MethodPut, "/_security/api_key/"+id1, `{
 		"role_descriptors": {"writer": {"cluster": ["monitor"]}},
 		"metadata": {"env": "staging", "owner": "team-a"}
 	}`)
 	if cUpd != http.StatusOK || resUpd["updated"] != true {
 		t.Fatalf("expected 200 updated:true on PUT /_security/api_key/%s, got %d %+v", id1, cUpd, resUpd)
 	}
-	cUpdMiss, _, _, _ := doRound57Req(t, srv, http.MethodPut, "/_security/api_key/no_such_key", `{"metadata":{}}`)
+	cUpdMiss, _, _, _ := doSecReq(http.MethodPut, "/_security/api_key/no_such_key", `{"metadata":{}}`)
 	if cUpdMiss != http.StatusNotFound {
 		t.Fatalf("expected 404 updating missing api_key, got %d", cUpdMiss)
 	}
 
 	// Invalidate id2 -> single PUT returns 400; _bulk_update updates id1 and reports error on id2 + missing_id
-	doRound57Req(t, srv, http.MethodDelete, "/_security/api_key", fmt.Sprintf(`{"ids":[%q]}`, id2))
-	cUpdInv, _, _, _ := doRound57Req(t, srv, http.MethodPut, "/_security/api_key/"+id2, `{"metadata":{"env":"x"}}`)
+	doSecReq(http.MethodDelete, "/_security/api_key", fmt.Sprintf(`{"ids":[%q]}`, id2))
+	cUpdInv, _, _, _ := doSecReq(http.MethodPut, "/_security/api_key/"+id2, `{"metadata":{"env":"x"}}`)
 	if cUpdInv != http.StatusBadRequest {
 		t.Fatalf("expected 400 updating invalidated api_key, got %d", cUpdInv)
 	}
 
-	cBulk, _, resBulk, _ := doRound57Req(t, srv, http.MethodPost, "/_security/api_key/_bulk_update", fmt.Sprintf(`{
+	cBulk, _, resBulk, _ := doSecReq(http.MethodPost, "/_security/api_key/_bulk_update", fmt.Sprintf(`{
 		"ids": [%q, %q, "missing_key_999"],
 		"metadata": {"env": "prod-v2"}
 	}`, id1, id2))
@@ -1095,11 +1115,11 @@ func TestRound57F8_SecurityAPIKeyQueryDSLPrivilegesCacheAndAuth(t *testing.T) {
 	}
 
 	// 2. /_security/_query/{api_key,user,role} with Query DSL, sort, from, size
-	doRound57Req(t, srv, http.MethodPut, "/_security/user/alice_eng", `{"password":"secretPassword123","roles":["admin","dev"],"full_name":"Alice Eng","email":"alice@example.com"}`)
-	doRound57Req(t, srv, http.MethodPut, "/_security/user/bob_sales", `{"password":"secretPassword123","roles":["viewer"],"full_name":"Bob Sales","email":"bob@example.com"}`)
-	doRound57Req(t, srv, http.MethodPut, "/_security/role/r57_analytics_role", `{"cluster":["monitor"],"metadata":{"tier":2}}`)
+	doSecReq(http.MethodPut, "/_security/user/alice_eng", `{"password":"secretPassword123","roles":["admin","dev"],"full_name":"Alice Eng","email":"alice@example.com"}`)
+	doSecReq(http.MethodPut, "/_security/user/bob_sales", `{"password":"secretPassword123","roles":["viewer"],"full_name":"Bob Sales","email":"bob@example.com"}`)
+	doSecReq(http.MethodPut, "/_security/role/r57_analytics_role", `{"cluster":["monitor"],"metadata":{"tier":2}}`)
 
-	cQUser, _, resQUser, _ := doRound57Req(t, srv, http.MethodPost, "/_security/_query/user?with_profile_uid=true", `{
+	cQUser, _, resQUser, _ := doSecReq(http.MethodPost, "/_security/_query/user?with_profile_uid=true", `{
 		"query": {
 			"bool": {
 				"must": [{"prefix": {"username": "alice"}}],
@@ -1119,7 +1139,7 @@ func TestRound57F8_SecurityAPIKeyQueryDSLPrivilegesCacheAndAuth(t *testing.T) {
 		t.Fatalf("expected alice_eng with profile_uid, got %+v", u0)
 	}
 
-	cQRole, _, resQRole, _ := doRound57Req(t, srv, http.MethodPost, "/_security/_query/role", `{
+	cQRole, _, resQRole, _ := doSecReq(http.MethodPost, "/_security/_query/role", `{
 		"query": {"wildcard": {"name": "r57_*"}},
 		"size": 5
 	}`)
@@ -1127,7 +1147,7 @@ func TestRound57F8_SecurityAPIKeyQueryDSLPrivilegesCacheAndAuth(t *testing.T) {
 		t.Fatalf("expected 1 matched role from /_security/_query/role, got %d %+v", cQRole, resQRole)
 	}
 
-	cQKey, _, resQKey, _ := doRound57Req(t, srv, http.MethodPost, "/_security/_query/api_key", `{
+	cQKey, _, resQKey, _ := doSecReq(http.MethodPost, "/_security/_query/api_key", `{
 		"query": {"bool": {"must": [{"term": {"invalidated": false}}, {"match": {"name": "alpha"}}]}}
 	}`)
 	if cQKey != http.StatusOK || fmt.Sprintf("%v", resQKey["total"]) != "1" {
@@ -1135,65 +1155,65 @@ func TestRound57F8_SecurityAPIKeyQueryDSLPrivilegesCacheAndAuth(t *testing.T) {
 	}
 
 	// 3. GET /_security/user/_privileges (must not look up user named "_privileges")
-	cPriv, _, resPriv, _ := doRound57Req(t, srv, http.MethodGet, "/_security/user/_privileges", "")
+	cPriv, _, resPriv, _ := doSecReq(http.MethodGet, "/_security/user/_privileges", "")
 	if cPriv != http.StatusOK || resPriv["cluster"] == nil || resPriv["indices"] == nil {
 		t.Fatalf("expected 200 cluster/indices privileges on GET /_security/user/_privileges, got %d %+v", cPriv, resPriv)
 	}
 
 	// 4. Non-destructive cache-clear interceptors for privilege & service token
-	doRound57Req(t, srv, http.MethodPut, "/_security/privilege", `{"my_app":{"read":{"actions":["data:read/*"]}}}`)
-	cPCC, _, resPCC, _ := doRound57Req(t, srv, http.MethodPost, "/_security/privilege/my_app/_clear_cache", "")
+	doSecReq(http.MethodPut, "/_security/privilege", `{"my_app":{"read":{"actions":["data:read/*"]}}}`)
+	cPCC, _, resPCC, _ := doSecReq(http.MethodPost, "/_security/privilege/my_app/_clear_cache", "")
 	if cPCC != http.StatusOK || resPCC["_nodes"] == nil {
 		t.Fatalf("expected _nodes cache-clear response for privilege, got %d %+v", cPCC, resPCC)
 	}
-	cGetPriv, _, resGetPriv, _ := doRound57Req(t, srv, http.MethodGet, "/_security/privilege/my_app", "")
+	cGetPriv, _, resGetPriv, _ := doSecReq(http.MethodGet, "/_security/privilege/my_app", "")
 	if cGetPriv != http.StatusOK || resGetPriv["my_app"].(map[string]any)["_clear_cache"] != nil {
 		t.Fatalf("privilege _clear_cache must NOT mutate stored privileges: %+v", resGetPriv)
 	}
 
-	_, _, resTok, _ := doRound57Req(t, srv, http.MethodPost, "/_security/service/elastic/fleet-server/credential/token/tok1", "")
+	_, _, resTok, _ := doSecReq(http.MethodPost, "/_security/service/elastic/fleet-server/credential/token/tok1", "")
 	origVal := resTok["token"].(map[string]any)["value"]
-	cSCC, _, resSCC, _ := doRound57Req(t, srv, http.MethodPost, "/_security/service/elastic/fleet-server/credential/token/tok1/_clear_cache", "")
+	cSCC, _, resSCC, _ := doSecReq(http.MethodPost, "/_security/service/elastic/fleet-server/credential/token/tok1/_clear_cache", "")
 	if cSCC != http.StatusOK || resSCC["_nodes"] == nil {
 		t.Fatalf("expected _nodes cache-clear response for service token, got %d %+v", cSCC, resSCC)
 	}
 	_ = origVal
 
 	// 5. OIDC, SAML, Delegate PKI, and SSL Certificates
-	cOIDCPrep, _, resOIDCPrep, _ := doRound57Req(t, srv, http.MethodPost, "/_security/oidc/prepare", `{"realm":"oidc1"}`)
+	cOIDCPrep, _, resOIDCPrep, _ := doSecReq(http.MethodPost, "/_security/oidc/prepare", `{"realm":"oidc1"}`)
 	if cOIDCPrep != http.StatusOK || resOIDCPrep["redirect"] == nil || resOIDCPrep["state"] == nil {
 		t.Fatalf("OIDC prepare failed: %d %+v", cOIDCPrep, resOIDCPrep)
 	}
-	cOIDCAuth, _, resOIDCAuth, _ := doRound57Req(t, srv, http.MethodPost, "/_security/oidc/authenticate", fmt.Sprintf(`{"redirect_uri":"https://app/cb?code=abc","state":%q}`, resOIDCPrep["state"]))
+	cOIDCAuth, _, resOIDCAuth, _ := doSecReq(http.MethodPost, "/_security/oidc/authenticate", fmt.Sprintf(`{"redirect_uri":"https://app/cb?code=abc","state":%q}`, resOIDCPrep["state"]))
 	if cOIDCAuth != http.StatusOK || resOIDCAuth["access_token"] == nil {
 		t.Fatalf("OIDC authenticate failed: %d %+v", cOIDCAuth, resOIDCAuth)
 	}
-	cOIDCOut, _, _, _ := doRound57Req(t, srv, http.MethodPost, "/_security/oidc/logout", fmt.Sprintf(`{"token":%q}`, resOIDCAuth["access_token"]))
+	cOIDCOut, _, _, _ := doSecReq(http.MethodPost, "/_security/oidc/logout", fmt.Sprintf(`{"token":%q}`, resOIDCAuth["access_token"]))
 	if cOIDCOut != http.StatusOK {
 		t.Fatalf("OIDC logout failed: %d", cOIDCOut)
 	}
 
-	cSAMLPrep, _, resSAMLPrep, _ := doRound57Req(t, srv, http.MethodPost, "/_security/saml/prepare", `{"realm":"saml1"}`)
+	cSAMLPrep, _, resSAMLPrep, _ := doSecReq(http.MethodPost, "/_security/saml/prepare", `{"realm":"saml1"}`)
 	if cSAMLPrep != http.StatusOK || resSAMLPrep["id"] == nil {
 		t.Fatalf("SAML prepare failed: %d %+v", cSAMLPrep, resSAMLPrep)
 	}
-	cSAMLAuth, _, resSAMLAuth, _ := doRound57Req(t, srv, http.MethodPost, "/_security/saml/authenticate", `{"content":"PHNhbWw+...","ids":["req1"]}`)
+	cSAMLAuth, _, resSAMLAuth, _ := doSecReq(http.MethodPost, "/_security/saml/authenticate", `{"content":"PHNhbWw+...","ids":["req1"]}`)
 	if cSAMLAuth != http.StatusOK || resSAMLAuth["access_token"] == nil {
 		t.Fatalf("SAML authenticate failed: %d %+v", cSAMLAuth, resSAMLAuth)
 	}
-	cSAMLInv, _, _, _ := doRound57Req(t, srv, http.MethodPost, "/_security/saml/invalidate", `{"query_string":"SAMLRequest=xyz"}`)
-	cSAMLOut, _, _, _ := doRound57Req(t, srv, http.MethodPost, "/_security/saml/logout", fmt.Sprintf(`{"token":%q}`, resSAMLAuth["access_token"]))
-	cSAMLDone, _, _, _ := doRound57Req(t, srv, http.MethodPost, "/_security/saml/complete_logout", `{}`)
-	cSAMLMeta, rawMeta, _, hdrMeta := doRound57Req(t, srv, http.MethodPost, "/_security/saml/metadata", `{"realm_name":"saml1"}`)
+	cSAMLInv, _, _, _ := doSecReq(http.MethodPost, "/_security/saml/invalidate", `{"query_string":"SAMLRequest=xyz"}`)
+	cSAMLOut, _, _, _ := doSecReq(http.MethodPost, "/_security/saml/logout", fmt.Sprintf(`{"token":%q}`, resSAMLAuth["access_token"]))
+	cSAMLDone, _, _, _ := doSecReq(http.MethodPost, "/_security/saml/complete_logout", `{}`)
+	cSAMLMeta, rawMeta, _, hdrMeta := doSecReq(http.MethodPost, "/_security/saml/metadata", `{"realm_name":"saml1"}`)
 	if cSAMLInv != http.StatusOK || cSAMLOut != http.StatusOK || cSAMLDone != http.StatusOK || cSAMLMeta != http.StatusOK || !strings.Contains(hdrMeta.Get("Content-Type"), "xml") || !strings.Contains(rawMeta, "EntityDescriptor") {
 		t.Fatalf("SAML lifecycle failed: inv=%d out=%d done=%d meta=%d body=%q", cSAMLInv, cSAMLOut, cSAMLDone, cSAMLMeta, rawMeta)
 	}
 
-	cPKI, _, resPKI, _ := doRound57Req(t, srv, http.MethodPost, "/_security/delegate_pki", `{"subject_dn":"CN=svc_node,OU=Eng,O=Org"}`)
+	cPKI, _, resPKI, _ := doSecReq(http.MethodPost, "/_security/delegate_pki", `{"subject_dn":"CN=svc_node,OU=Eng,O=Org"}`)
 	if cPKI != http.StatusOK || resPKI["username"] != "svc_node" || resPKI["access_token"] == nil {
 		t.Fatalf("delegate_pki failed: %d %+v", cPKI, resPKI)
 	}
-	cSSL, rawSSL, _, _ := doRound57Req(t, srv, http.MethodGet, "/_security/ssl/certificates", "")
+	cSSL, rawSSL, _, _ := doSecReq(http.MethodGet, "/_security/ssl/certificates", "")
 	if cSSL != http.StatusOK || !strings.Contains(rawSSL, "http.p12") {
 		t.Fatalf("expected 200 JSON array on GET /_security/ssl/certificates, got %d %s", cSSL, rawSSL)
 	}
@@ -1752,10 +1772,26 @@ func TestRound57F_ExtendedBranchCoverage(t *testing.T) {
 	}
 
 	// --- 5. Security Query DSL full clause coverage (exists, terms, prefix, wildcard, match, range, bool should/must_not, sort, search_after) ---
-	for i, kn := range []string{"alpha-key", "beta-key", "gamma-key"} {
-		doRound57Req(t, srv, http.MethodPost, "/_security/api_key", fmt.Sprintf(`{"name":%q,"metadata":{"tier":%d,"env":"prod-us"}}`, kn, (i+1)*10))
+	secSrv := newRound57TestServer()
+	secSrv.SetAuth("elastic", "r57-ext-pw", "")
+	extAuthHdr := "Basic " + base64.StdEncoding.EncodeToString([]byte("elastic:r57-ext-pw"))
+	doSecExt := func(method, path, body string) (int, map[string]any) {
+		t.Helper()
+		req := httptest.NewRequest(method, path, strings.NewReader(body))
+		if body != "" {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		req.Header.Set("Authorization", extAuthHdr)
+		rec := httptest.NewRecorder()
+		secSrv.Handler().ServeHTTP(rec, req)
+		var parsed map[string]any
+		_ = json.Unmarshal(rec.Body.Bytes(), &parsed)
+		return rec.Code, parsed
 	}
-	cSecQ, _, resSecQ, _ := doRound57Req(t, srv, http.MethodPost, "/_security/_query/api_key", `{
+	for i, kn := range []string{"alpha-key", "beta-key", "gamma-key"} {
+		doSecExt(http.MethodPost, "/_security/api_key", fmt.Sprintf(`{"name":%q,"metadata":{"tier":%d,"env":"prod-us"}}`, kn, (i+1)*10))
+	}
+	cSecQ, resSecQ := doSecExt(http.MethodPost, "/_security/_query/api_key", `{
 		"query": {
 			"bool": {
 				"must": [

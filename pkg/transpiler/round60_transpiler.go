@@ -32,6 +32,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/es2doris/doris-es-proxy/pkg/esast"
+	"github.com/es2doris/doris-es-proxy/pkg/painless"
 	"github.com/es2doris/doris-es-proxy/pkg/schema"
 )
 
@@ -1828,7 +1829,7 @@ func wildcardPatternRegex(pat string, caseInsensitive bool) *regexp.Regexp {
 		i += w
 	}
 	sb.WriteByte('$')
-	re, _ := regexp.Compile(sb.String())
+	re, _ := painless.CompileBoundedRegex(sb.String())
 	return re
 }
 
@@ -2011,7 +2012,11 @@ func EvaluateIntervalsRule(
 			var re *regexp.Regexp
 			if maxEdits > 0 {
 				pat := "^(" + buildFuzzyEditDistanceRegex(term, maxEdits, r.Fuzzy.PrefixLength, allowTransp) + ")$"
-				re, _ = regexp.Compile(pat)
+				var err error
+				re, err = painless.CompileBoundedRegex(pat)
+				if err != nil {
+					return nil, err
+				}
 			}
 			var spans []IntervalsSpan
 			for _, dt := range docTokens {

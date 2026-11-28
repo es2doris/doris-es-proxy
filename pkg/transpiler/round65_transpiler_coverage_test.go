@@ -220,7 +220,7 @@ func TestRound65_ProjectionSafeTextMatchSQL(t *testing.T) {
 		t.Fatalf("expected LIKE phrase on title_only, got %s", got)
 	}
 	nestedNctx := &nestedCtx{nestedPath: "items", elemVar: "_el"}
-	if got := tr.projectionSafeTextMatchSQL("items.title", "alpha beta", "and", nestedNctx); !strings.Contains(got, "lower(json_extract_string(_el, '$.title')) LIKE lower('%alpha%')") {
+	if got := tr.projectionSafeTextMatchSQL("items.title", "alpha beta", "and", nestedNctx); !strings.Contains(got, `lower(json_extract_string(_el, '$."title"')) LIKE lower('%alpha%')`) {
 		t.Fatalf("expected nested LIKE on items.title, got %s", got)
 	}
 }

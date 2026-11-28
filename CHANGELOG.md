@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.23.0] - 2026-11-27
+
+### Added
+- **Round-67 `518 / 518` (`100.00%`) `schema.json` Endpoints, `100.00%` Upstream `v7.10.2` (`2,002 / 2,002`) & `v8.15.5` (`4,682 / 4,682`), `964`-File Live Doris `4.1.3` Matrix & `88.2%` Offline Statement Coverage:** Expanded upstream YAML coverage to **`1,564 / 1,564`** files (`0` parse errors): `v7.10.2` **`2,002 / 2,002` active (`100.00%`, `0` failed, `43` skipped across `593` files; CI ratcheted `1980 -> CONFORMANCE_MIN_V7_PASSED=1995`)** and `v8.15.5` **`4,682 / 4,682` active (`100.00%`, `0` failed, `62` skipped across `971` files; CI ratcheted `4600 -> CONFORMANCE_MIN_V8_PASSED=4675`)**; implemented the final `6` `_internal.*` cluster endpoints (`internal_routes.go`: `GET`/`DELETE /_internal/desired_balance`, `PUT` / `GET` / `DELETE` `/_internal/desired_nodes...`, `POST /_internal/prevalidate_node_removal`), reaching **`518 / 518` (`100.00%`)** of `elasticsearch-specification` `8.15` `schema.json` endpoints (`740` HTTP responses across `54` named `t.Run` subtests + core lifecycle suites in `e2e/sdkconformance`, `minValidatedEndpointsTarget` ratcheted `495 -> 518`); expanded Live Apache Doris `4.1.3` Tier-1 suite from `953` to **`964` files** (`MemoryBackend` precheck **`4,682 / 4,682` active (`100.00%`, `0` failed, `27` skipped)** across 3 balanced shards `321 / 322 / 321`, section weights `1570 / 1570 / 1569`, balance ratio `1.0006`; CI ratcheted `1350 -> DORIS_LIVE_YAML_MIN_PASSED=1520`/shard, precheck `900 -> 955` files / `4400 -> 4650` sections); and lifted offline merged statement coverage (`CONFORMANCE_CACHE_DIR=/nonexistent`) from `85.26%` to **`88.2%` (`88.1532%`, `177,984 / 201,903`)** (CI gate ratcheted `84.0% -> 86.0%`).
+- **Production Apache Doris `4.1.3` Fidelity, Multi-Replica Catalog Sync, Multi-BE Stream Load, Observability & Benchmarks:** Added configurable BM25 scoring modes (`--bm25-mode=auto|doris-score|exact-corpus-scan|approx`, `--bm25-max-rows=50000`) with singleflight TTL caching (`bm25_cache.go`); replaced hardcoded table properties with `--doris-replication-num`, `--doris-replication-allocation`, `--doris-cloud`, `--doris-buckets-auto`, `--doris-store-row-column`, and capability-gated `--doris-vector-ann`; extracted `catalog_syncer.go` with watermark-based incremental `_es_catalog` sync (`--catalog-sync-interval=5s`) and tombstone pruning; upgraded `StreamLoadClient` & sharded `StreamLoadCoalescer` for multi-BE round-robin / multi-FE failover, configurable DB connection pools (`--doris-max-open-conns`, `--doris-max-idle-conns`, `--doris-conn-max-lifetime`), and hot-path query/middleware optimizations backed by `6` new benchmarks (`BenchmarkNormalizeDorisSQL`, `BenchmarkQueryHits_RawDocMerge`, `BenchmarkWithWireMiddleware`, `BenchmarkStreamLoad_NDJSON`, `BenchmarkSyncCatalog_NIndices`, `BenchmarkMemBackend_EvalWhereExpr`); and added `observability.go` (deep `/readyz` cache, `slog` `--log-format`/`--log-level`, Prometheus metrics, Grafana dashboard/alerting, and Helm/K8s/Docker updates).
+
+### Fixed
+- **Conforming Search/Ingest Edge Cases:** Fixed `diversified_sampler` inner-subquery slicing in `MemoryBackend` (`membackend.go`) so correlated inner `SELECT _id` expressions are parsed rather than matching the outer `ROW_NUMBER()` wrapper, and restored `_type` metadata in `snapshotIngestDoc` (`features.go`) across dynamic-mapping auto-promote and PIT SDK workflows.
+
+### Security & Fuzzing
+- **Red-Team Security, Concurrency, SQL Safety & `42` Fuzz Targets:** Eliminated concurrent mapping map mutation races, replaced predictable security/cursor tokens with `crypto/rand` credentials and fail-closed RBAC/DLS/FLS enforcement, redacted `_connector/_secret` and `_inference` credentials with allowlisted `/_last_sync` updates, quoted JSONPath segments and guarded SQL `score()` / nested lambda / UTF-8 / Painless `holtWinters` / bounded-regex compilation, tightened StreamLoad redirect & auth cache isolation, and expanded `Makefile` `fuzz` from `33` to **`42` `testing.F` targets** (adding `FuzzPainlessBuiltinsAndRegexBombs`, `FuzzVectorAndFlattenedShredder`, `FuzzJSONPathAndNestedSQLSafety`, `FuzzSQLAndFullESQLEQLEval`, `FuzzHistogramGapFillAndTimeZones`, `FuzzRound66SecurityConnectorInferenceHandlers`, `FuzzFilterPathGlobAndSourceQueryParam`, `FuzzQueryAndShardCacheKeyIsolation`, and `FuzzStreamLoadChunkingHeadersAndErrorURL`).
+
 ## [0.22.0] - 2026-11-24
 
 ### Added
@@ -142,7 +154,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Round-5 Production Hardening:** Added `StreamLoadCoalescer` (`--bulk-coalesce-ms`), `QueryResultCache` (`--query-cache-ttl`) with automatic write invalidation and `now` date-math bypass, inbound HTTP `Basic` / `ApiKey` / `Bearer` authentication, native HTTPS/TLS (`--tls-cert` / `--tls-key`), and `migrate-schema --out-dir`.
 - **Packaging:** Added Helm chart (`deploy/helm/doris-es-proxy`), Prometheus `ServiceMonitor`, Grafana dashboard (`deploy/grafana/doris-es-proxy-dashboard.json`), and GitHub Actions release pipeline (`.github/workflows/release.yml`).
 
-[Unreleased]: https://github.com/es2doris/doris-es-proxy/compare/v0.22.0...HEAD
+[Unreleased]: https://github.com/es2doris/doris-es-proxy/compare/v0.23.0...HEAD
+[0.23.0]: https://github.com/es2doris/doris-es-proxy/compare/v0.22.0...v0.23.0
 [0.22.0]: https://github.com/es2doris/doris-es-proxy/compare/v0.21.0...v0.22.0
 [0.21.0]: https://github.com/es2doris/doris-es-proxy/compare/v0.20.0...v0.21.0
 [0.20.0]: https://github.com/es2doris/doris-es-proxy/compare/v0.19.0...v0.20.0

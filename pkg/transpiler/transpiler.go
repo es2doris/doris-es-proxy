@@ -133,26 +133,29 @@ type TranspilerOptions struct {
 	TermDocFreqFn              func(colExpr string, terms []string, caseSensitive bool) (int, map[string]int)
 	CorpusBM25Stats            map[string]*BM25FieldTermStats
 	RawHistBounds              map[string]RawHistParamStrings
+	VectorANNMode              string // "", "off", "hnsw", "ivf"
+	AllowANNPushdown           bool
 }
 
 type Transpiler struct {
-	Schema                *schema.IndexSchema
-	Opts                  TranspilerOptions
-	unindexedFields       map[string]bool
-	collectedBM25Reqs     []BM25QueryRequirement
-	searchErr             error
-	inFilterAggQuery      bool
-	inLenientQuery        bool
-	inTopLevelKNN         bool
-	inSpanQuery           bool
-	activeRequestSize     int
-	activeAliasWhere      string
-	activeMainScoreSQL    string
-	activeHasKNN          bool
-	luceneDepth           int
-	inQueryString         bool
-	inGeoGridQuery        bool
-	autoGenSynPhraseQuery *bool
+	Schema                     *schema.IndexSchema
+	Opts                       TranspilerOptions
+	unindexedFields            map[string]bool
+	collectedBM25Reqs          []BM25QueryRequirement
+	searchErr                  error
+	inFilterAggQuery           bool
+	inLenientQuery             bool
+	inTopLevelKNN              bool
+	inSpanQuery                bool
+	activeRequestSize          int
+	activeAliasWhere           string
+	activeMainScoreSQL         string
+	activeHasKNN               bool
+	activeHasRescoreOrMinScore bool
+	luceneDepth                int
+	inQueryString              bool
+	inGeoGridQuery             bool
+	autoGenSynPhraseQuery      *bool
 }
 
 func NewTranspiler(s *schema.IndexSchema, opts TranspilerOptions) *Transpiler {
@@ -718,6 +721,36 @@ func (t *Transpiler) validateAggsDocValuesDepthWithParent(aggs map[string]esast.
 type nestedCtx struct {
 	nestedPath string
 	elemVar    string
+	inLambda   bool
+}
+
+func escapeDorisBacktickIdent(ident string) string {
+	return strings.ReplaceAll(ident, "`", "``")
+}
+
+func isInLambdaCtxR67(nctx *nestedCtx) bool {
+	return nctx != nil && nctx.inLambda
+}
+
+func injectMultilineFlagRE2R67(pat string) string {
+	if strings.HasPrefix(pat, "(?i)") {
+		return "(?im)" + pat[4:]
+	}
+	if strings.HasPrefix(pat, "(?im)") || strings.HasPrefix(pat, "(?m)") || strings.HasPrefix(pat, "(?mi)") {
+		return pat
+	}
+	return "(?m)" + pat
+}
+
+func flatArrayRegexpSQLR67(arrExpr, pat string) string {
+	return fmt.Sprintf("(%s IS NOT NULL AND COALESCE(ARRAY_JOIN(%s, '\\n'), '') REGEXP %s)",
+		arrExpr, arrExpr, quoteStr(injectMultilineFlagRE2R67(pat)))
+}
+
+func flatArrayExactCISQLR67(arrExpr, val string) string {
+	pat := quoteStr("%\x1f" + escapeLikeLiteral(strings.ToLower(val)) + "\x1f%")
+	return fmt.Sprintf("(%s IS NOT NULL AND CONCAT('\\x1f', lower(COALESCE(ARRAY_JOIN(%s, '\\x1f'), '')), '\\x1f') LIKE %s)",
+		arrExpr, arrExpr, pat)
 }
 
 func (t *Transpiler) isBoundToNestedCtx(field string, b schema.FieldBinding, nctx *nestedCtx) bool {
@@ -802,15 +835,18 @@ func (t *Transpiler) BuildSearchPlan(req *esast.SearchRequest) (*ExecutionPlan, 
 	}
 	t.activeAliasWhere = aliasWhere
 	t.activeHasKNN = req != nil && (len(req.KNN) > 0 || queryContainsKNNTreeR63(req.Query))
+	t.activeHasRescoreOrMinScore = req != nil && (len(req.Rescore) > 0 || req.MinScore != nil)
 
 	mainQ := CompiledQuery{
 		WhereSQL: "TRUE",
 		ScoreSQL: "1.0",
 	}
 	safeScoreSQL := "1.0"
+	nonScoreMainScoreSQL := "1.0"
 	if req.Query != nil {
 		mainQ = t.CompileQuery(req.Query, true, nil)
 		safeScoreSQL = mainQ.ScoreSQL
+		nonScoreMainScoreSQL = mainQ.ScoreSQL
 		if len(req.KNN) > 0 && mainQ.UsesFulltextMatch && t.Opts.UseDoris4SearchFunc {
 			mainQ.ScoreSQL = fmt.Sprintf("COALESCE(score(), 1.0) * (%s)", mainQ.ScoreSQL)
 		}
@@ -836,6 +872,11 @@ func (t *Transpiler) BuildSearchPlan(req *esast.SearchRequest) (*ExecutionPlan, 
 			if req.Query != nil && mainQ.ScoreSQL != "1.0" && mainQ.ScoreSQL != "0.0" {
 				scoreSQL = fmt.Sprintf("((%s) + (%s))", mainQ.ScoreSQL, knnScore)
 			}
+			if req.Query != nil && nonScoreMainScoreSQL != "1.0" && nonScoreMainScoreSQL != "0.0" {
+				nonScoreMainScoreSQL = fmt.Sprintf("((%s) + (%s))", nonScoreMainScoreSQL, knnScore)
+			} else {
+				nonScoreMainScoreSQL = knnScore
+			}
 			mainQ = CompiledQuery{
 				WhereSQL:          knnWhere,
 				SafeWhereSQL:      knnSafeWhere,
@@ -843,6 +884,7 @@ func (t *Transpiler) BuildSearchPlan(req *esast.SearchRequest) (*ExecutionPlan, 
 				UsesFulltextMatch: knnUsesFT,
 			}
 		} else {
+			nonScoreMainScoreSQL = fmt.Sprintf("((%s) + (%s))", nonScoreMainScoreSQL, knnScore)
 			mainQ = CompiledQuery{
 				WhereSQL:          fmt.Sprintf("((%s) OR (%s))", mainQ.WhereSQL, knnWhere),
 				SafeWhereSQL:      fmt.Sprintf("((%s) OR (%s))", mainQ.EffectiveSafeWhere(), knnSafeWhere),
@@ -854,30 +896,16 @@ func (t *Transpiler) BuildSearchPlan(req *esast.SearchRequest) (*ExecutionPlan, 
 
 	userWhere := mainQ.EffectiveSafeWhere()
 	if req.MinScore != nil && !queryContainsScript(req.Query) && !queryContainsNestedScoring(req.Query) {
-		minScoreExpr := mainQ.ScoreSQL
-		if len(req.KNN) == 0 && mainQ.UsesFulltextMatch && t.Opts.UseDoris4SearchFunc {
-			minScoreExpr = fmt.Sprintf("COALESCE(score(), 1.0) * (%s)", mainQ.ScoreSQL)
-		}
-		minCond := fmt.Sprintf("(CAST(%s AS DOUBLE) >= %s)", minScoreExpr, strconv.FormatFloat(*req.MinScore, 'f', -1, 64))
-		// Never place Doris `score()` inside `mainQ.SafeWhereSQL` / `userWhere`: CTE consumers
-		// (`global`, `join`, `sampler`, etc.) select `FROM base_matched WHERE (<userWhere>)`, where
-		// Doris rejects `score()`. `base_matched` itself already applies `mainQ.WhereSQL`.
-		usesScoreFunc := strings.Contains(minScoreExpr, "score()") || (mainQ.UsesFulltextMatch && t.Opts.UseDoris4SearchFunc)
+		// Never emit Doris `score()` inside `mainQ.WhereSQL`, `mainQ.SafeWhereSQL`, or CTE
+		// `base_matched` filters: Doris rejects `score()` in WHERE clauses and CTE predicates.
+		minCond := fmt.Sprintf("(CAST(%s AS DOUBLE) >= %s)", nonScoreMainScoreSQL, strconv.FormatFloat(*req.MinScore, 'f', -1, 64))
 		prevSafeWhere := mainQ.EffectiveSafeWhere()
 		if mainQ.WhereSQL == "" || mainQ.WhereSQL == "TRUE" {
 			mainQ.WhereSQL = minCond
-			if usesScoreFunc {
-				mainQ.SafeWhereSQL = "TRUE"
-			} else {
-				mainQ.SafeWhereSQL = minCond
-			}
+			mainQ.SafeWhereSQL = minCond
 		} else {
 			mainQ.WhereSQL = fmt.Sprintf("((%s) AND %s)", mainQ.WhereSQL, minCond)
-			if usesScoreFunc {
-				mainQ.SafeWhereSQL = prevSafeWhere
-			} else {
-				mainQ.SafeWhereSQL = fmt.Sprintf("((%s) AND %s)", prevSafeWhere, minCond)
-			}
+			mainQ.SafeWhereSQL = fmt.Sprintf("((%s) AND %s)", prevSafeWhere, minCond)
 		}
 		userWhere = mainQ.EffectiveSafeWhere()
 	}
@@ -900,8 +928,13 @@ func (t *Transpiler) BuildSearchPlan(req *esast.SearchRequest) (*ExecutionPlan, 
 	}
 
 	maxWin := t.effectiveMaxResultWindow()
-	if len(req.SearchAfter) == 0 && from+size > maxWin {
-		return nil, fmt.Errorf("illegal_argument_exception: Result window is too large, from + size must be less than or equal to: [%d] but was [%d]. See the scroll api for a more efficient way to request large data sets. This limit can be set by changing the [index.max_result_window] index level setting.", maxWin, from+size) //nolint:staticcheck // ES exact error message
+	if len(req.SearchAfter) > 0 {
+		if size > maxWin {
+			return nil, fmt.Errorf("illegal_argument_exception: Result window is too large, from + size must be less than or equal to: [%d] but was [%d]. See the scroll api for a more efficient way to request large data sets. This limit can be set by changing the [index.max_result_window] index level setting.", maxWin, size) //nolint:staticcheck // ES exact error message
+		}
+	} else if from > maxWin || size > maxWin || from > maxWin-size {
+		actualWin := new(big.Int).Add(big.NewInt(int64(from)), big.NewInt(int64(size)))
+		return nil, fmt.Errorf("illegal_argument_exception: Result window is too large, from + size must be less than or equal to: [%d] but was [%s]. See the scroll api for a more efficient way to request large data sets. This limit can be set by changing the [index.max_result_window] index level setting.", maxWin, actualWin.String()) //nolint:staticcheck // ES exact error message
 	}
 	if err := t.validateDocvalueAndScriptFieldLimits(req.DocvalueFields, req.ScriptFields); err != nil {
 		return nil, err
@@ -945,6 +978,8 @@ func (t *Transpiler) BuildSearchPlan(req *esast.SearchRequest) (*ExecutionPlan, 
 		if len(req.KNN) == 0 && mainQ.UsesFulltextMatch && t.Opts.UseDoris4SearchFunc {
 			scoreExpr = fmt.Sprintf("COALESCE(score(), 1.0) * (%s)", mainQ.ScoreSQL)
 		}
+		escapedDB := escapeDorisBacktickIdent(t.Schema.DorisDB)
+		escapedTable := escapeDorisBacktickIdent(t.Schema.DorisTable)
 		totalHitsExpr := "COUNT(*) OVER() AS `_total_hits`"
 		if !req.ShouldTrackTotalHits() {
 			totalHitsExpr = "CAST(-1 AS BIGINT) AS `_total_hits`"
@@ -970,9 +1005,9 @@ func (t *Transpiler) BuildSearchPlan(req *esast.SearchRequest) (*ExecutionPlan, 
 			}
 			plan.CollapseMaxScoreSQL = fmt.Sprintf(
 				"SELECT CAST(MAX(`_score`) AS DOUBLE) AS `_overall_max_score` FROM (SELECT CAST(%s AS DOUBLE) AS `_score` FROM `%s`.`%s` WHERE %s) `_scored`",
-				scoreExpr,
-				t.Schema.DorisDB,
-				t.Schema.DorisTable,
+				nonScoreMainScoreSQL,
+				escapedDB,
+				escapedTable,
 				preCollapseWhere,
 			)
 			plan.HitsSQL = fmt.Sprintf(
@@ -991,10 +1026,10 @@ func (t *Transpiler) BuildSearchPlan(req *esast.SearchRequest) (*ExecutionPlan, 
 					"LIMIT %d OFFSET %d",
 				collapseCol,
 				orderBy,
-				scoreExpr,
+				nonScoreMainScoreSQL,
 				totalHitsExpr,
-				t.Schema.DorisDB,
-				t.Schema.DorisTable,
+				escapedDB,
+				escapedTable,
 				preCollapseWhere,
 				outerCollapseWhere,
 				orderBy,
@@ -1013,10 +1048,10 @@ func (t *Transpiler) BuildSearchPlan(req *esast.SearchRequest) (*ExecutionPlan, 
 					"WHERE %s "+
 					"ORDER BY %s "+
 					"LIMIT %d OFFSET %d",
-				scoreExpr,
+				nonScoreMainScoreSQL,
 				totalHitsExpr,
-				t.Schema.DorisDB,
-				t.Schema.DorisTable,
+				escapedDB,
+				escapedTable,
 				preAfterWhere,
 				saPred,
 				orderBy,
@@ -1034,8 +1069,8 @@ func (t *Transpiler) BuildSearchPlan(req *esast.SearchRequest) (*ExecutionPlan, 
 					"LIMIT %d OFFSET %d",
 				scoreExpr,
 				totalHitsExpr,
-				t.Schema.DorisDB,
-				t.Schema.DorisTable,
+				escapedDB,
+				escapedTable,
 				whereClause,
 				orderBy,
 				size,
@@ -1418,6 +1453,13 @@ func (t *Transpiler) CompileQuery(q *esast.Query, scoring bool, nctx *nestedCtx)
 				}
 				if !t.isBoundToNestedCtx(field, b, nctx) && (b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield) {
 					arrColExpr := fmt.Sprintf("`%s`", b.EffectiveArrayColumn(true))
+					if isInLambdaCtxR67(nctx) {
+						if b.Kind == schema.StoragePromotedArray && (b.DorisType == schema.DorisLargeInt || b.DorisType == schema.DorisLargeIntArray) {
+							arrColExpr = fmt.Sprintf("TRY_CAST(%s AS ARRAY<STRING>)", arrColExpr)
+						}
+						arrPred := flatArrayRegexpSQLR67(arrColExpr, pat)
+						return arrPred, arrPred, false
+					}
 					elemExpr := "_x"
 					if b.Kind == schema.StoragePromotedArray && (b.DorisType == schema.DorisLargeInt || b.DorisType == schema.DorisLargeIntArray) {
 						elemExpr = "CAST(_x AS STRING)"
@@ -1426,7 +1468,7 @@ func (t *Transpiler) CompileQuery(q *esast.Query, scoring bool, nctx *nestedCtx)
 					return arrPred, arrPred, false
 				}
 				col := t.sqlColumnRef(field, true, nctx)
-				if nctx != nil && b.Kind == schema.StorageNestedSubfield && nctx.nestedPath == b.NestedPath && b.IsMultiValued {
+				if nctx != nil && b.Kind == schema.StorageNestedSubfield && nctx.nestedPath == b.NestedPath && b.IsMultiValued && !nctx.inLambda {
 					arrPred := fmt.Sprintf("array_exists(_x -> _x IS NOT NULL AND _x REGEXP %s, TRY_CAST(%s AS ARRAY<STRING>))", quoteStr(pat), col)
 					return arrPred, arrPred, false
 				}
@@ -1446,6 +1488,13 @@ func (t *Transpiler) CompileQuery(q *esast.Query, scoring bool, nctx *nestedCtx)
 			}
 			if !t.isBoundToNestedCtx(field, b, nctx) && (b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield) {
 				arrColExpr := fmt.Sprintf("`%s`", b.EffectiveArrayColumn(true))
+				if isInLambdaCtxR67(nctx) {
+					if b.Kind == schema.StoragePromotedArray && (b.DorisType == schema.DorisLargeInt || b.DorisType == schema.DorisLargeIntArray) {
+						arrColExpr = fmt.Sprintf("TRY_CAST(%s AS ARRAY<STRING>)", arrColExpr)
+					}
+					_, arrPred, _ := compiledRE.ScalarSQL(fmt.Sprintf("element_at(%s, 1)", arrColExpr), false, false)
+					return arrPred, arrPred, false
+				}
 				elemExpr := "_x"
 				if b.Kind == schema.StoragePromotedArray && (b.DorisType == schema.DorisLargeInt || b.DorisType == schema.DorisLargeIntArray) {
 					elemExpr = "CAST(_x AS STRING)"
@@ -1458,13 +1507,16 @@ func (t *Transpiler) CompileQuery(q *esast.Query, scoring bool, nctx *nestedCtx)
 				if isRoot, isSubKey := t.flattenedFieldMode(field, b); isSubKey {
 					rawVar := t.flattenedRawVariantRef(field, b, nctx)
 					_, scalarSafe, _ := compiledRE.ScalarSQL(col, false, false)
+					if isInLambdaCtxR67(nctx) {
+						return scalarSafe, scalarSafe, false
+					}
 					arrPred := fmt.Sprintf("(%s OR array_exists(_x -> %s, TRY_CAST(%s AS ARRAY<STRING>)))", scalarSafe, compiledRE.ArrayElemSQL("_x"), rawVar)
 					return arrPred, arrPred, false
 				} else if isRoot {
 					return compiledRE.ScalarSQL(col, false, false)
 				}
 			}
-			if nctx != nil && b.Kind == schema.StorageNestedSubfield && nctx.nestedPath == b.NestedPath && b.IsMultiValued {
+			if nctx != nil && b.Kind == schema.StorageNestedSubfield && nctx.nestedPath == b.NestedPath && b.IsMultiValued && !nctx.inLambda {
 				arrPred := fmt.Sprintf("array_exists(_x -> %s, TRY_CAST(%s AS ARRAY<STRING>))", compiledRE.ArrayElemSQL("_x"), col)
 				return arrPred, arrPred, false
 			}
@@ -1851,10 +1903,18 @@ func (t *Transpiler) compileGeoDistance(gd *esast.GeoDistanceQuery, scoring bool
 			elemExpr, lonExpr, latExpr, tLonStr, tLatStr, distStr)
 	} else if b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield {
 		arrCol := fmt.Sprintf("`%s`", b.EffectiveArrayColumn(true))
-		latExpr := "TRY_CAST(SPLIT_PART(_x, ',', 1) AS DOUBLE)"
-		lonExpr := "TRY_CAST(SPLIT_PART(_x, ',', 2) AS DOUBLE)"
-		whereSQL = fmt.Sprintf("array_exists(_x -> _x IS NOT NULL AND ST_Distance_Sphere(%s, %s, %s, %s) <= %s, %s)",
-			lonExpr, latExpr, tLonStr, tLatStr, distStr, arrCol)
+		if isInLambdaCtxR67(nctx) {
+			elemExpr := fmt.Sprintf("element_at(%s, 1)", arrCol)
+			latExpr := fmt.Sprintf("TRY_CAST(SPLIT_PART(%s, ',', 1) AS DOUBLE)", elemExpr)
+			lonExpr := fmt.Sprintf("TRY_CAST(SPLIT_PART(%s, ',', 2) AS DOUBLE)", elemExpr)
+			whereSQL = fmt.Sprintf("(%s IS NOT NULL AND ST_Distance_Sphere(%s, %s, %s, %s) <= %s)",
+				elemExpr, lonExpr, latExpr, tLonStr, tLatStr, distStr)
+		} else {
+			latExpr := "TRY_CAST(SPLIT_PART(_x, ',', 1) AS DOUBLE)"
+			lonExpr := "TRY_CAST(SPLIT_PART(_x, ',', 2) AS DOUBLE)"
+			whereSQL = fmt.Sprintf("array_exists(_x -> _x IS NOT NULL AND ST_Distance_Sphere(%s, %s, %s, %s) <= %s, %s)",
+				lonExpr, latExpr, tLonStr, tLatStr, distStr, arrCol)
+		}
 	} else {
 		latExpr, lonExpr, notNullCond := t.extractGeoPointExprs(resolvedField, b)
 		whereSQL = fmt.Sprintf("(%s AND ST_Distance_Sphere(%s, %s, %s, %s) <= %s)",
@@ -1913,9 +1973,16 @@ func (t *Transpiler) compileGeoBoundingBox(gb *esast.GeoBoundingBoxQuery, scorin
 		whereSQL = fmt.Sprintf("(%s IS NOT NULL AND %s)", elemExpr, buildBBoxCond(latExpr, lonExpr))
 	} else if b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield {
 		arrCol := fmt.Sprintf("`%s`", b.EffectiveArrayColumn(true))
-		latExpr := "TRY_CAST(SPLIT_PART(_x, ',', 1) AS DOUBLE)"
-		lonExpr := "TRY_CAST(SPLIT_PART(_x, ',', 2) AS DOUBLE)"
-		whereSQL = fmt.Sprintf("array_exists(_x -> _x IS NOT NULL AND %s, %s)", buildBBoxCond(latExpr, lonExpr), arrCol)
+		if isInLambdaCtxR67(nctx) {
+			elemExpr := fmt.Sprintf("element_at(%s, 1)", arrCol)
+			latExpr := fmt.Sprintf("TRY_CAST(SPLIT_PART(%s, ',', 1) AS DOUBLE)", elemExpr)
+			lonExpr := fmt.Sprintf("TRY_CAST(SPLIT_PART(%s, ',', 2) AS DOUBLE)", elemExpr)
+			whereSQL = fmt.Sprintf("(%s IS NOT NULL AND %s)", elemExpr, buildBBoxCond(latExpr, lonExpr))
+		} else {
+			latExpr := "TRY_CAST(SPLIT_PART(_x, ',', 1) AS DOUBLE)"
+			lonExpr := "TRY_CAST(SPLIT_PART(_x, ',', 2) AS DOUBLE)"
+			whereSQL = fmt.Sprintf("array_exists(_x -> _x IS NOT NULL AND %s, %s)", buildBBoxCond(latExpr, lonExpr), arrCol)
+		}
 	} else {
 		latExpr, lonExpr, notNullCond := t.extractGeoPointExprs(resolvedField, b)
 		whereSQL = fmt.Sprintf("(%s AND %s)", notNullCond, buildBBoxCond(latExpr, lonExpr))
@@ -3217,8 +3284,13 @@ func (t *Transpiler) compileMatchFieldWithAnalyzer(
 		if !t.isBoundToNestedCtx(field, b, nctx) && (b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield) {
 			arrCol := b.EffectiveArrayColumn(false)
 			for _, tok := range wsTokens {
-				rePat := quoteStr(buildAnalyzedTokenRegex(tok, true))
-				parts = append(parts, fmt.Sprintf("array_exists(_x -> _x IS NOT NULL AND _x REGEXP %s, `%s`)", rePat, arrCol))
+				tokPat := buildAnalyzedTokenRegex(tok, true)
+				if isInLambdaCtxR67(nctx) {
+					parts = append(parts, flatArrayRegexpSQLR67(fmt.Sprintf("`%s`", arrCol), tokPat))
+				} else {
+					rePat := quoteStr(tokPat)
+					parts = append(parts, fmt.Sprintf("array_exists(_x -> _x IS NOT NULL AND _x REGEXP %s, `%s`)", rePat, arrCol))
+				}
 			}
 		} else {
 			col := t.sqlColumnRef(field, false, nctx)
@@ -3252,8 +3324,13 @@ func (t *Transpiler) compileMatchFieldWithAnalyzer(
 			if !t.isBoundToNestedCtx(field, b, nctx) && (b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield) {
 				arrCol := b.EffectiveArrayColumn(false)
 				for _, tok := range uaxTokens {
-					rePat := quoteStr(buildAnalyzedTokenRegex(tok, false))
-					parts = append(parts, fmt.Sprintf("array_exists(_x -> _x IS NOT NULL AND _x REGEXP %s, `%s`)", rePat, arrCol))
+					tokPat := buildAnalyzedTokenRegex(tok, false)
+					if isInLambdaCtxR67(nctx) {
+						parts = append(parts, flatArrayRegexpSQLR67(fmt.Sprintf("`%s`", arrCol), tokPat))
+					} else {
+						rePat := quoteStr(tokPat)
+						parts = append(parts, fmt.Sprintf("array_exists(_x -> _x IS NOT NULL AND _x REGEXP %s, `%s`)", rePat, arrCol))
+					}
 				}
 			} else {
 				col := t.sqlColumnRef(field, false, nctx)
@@ -3515,6 +3592,12 @@ func (t *Transpiler) projectionSafeTextMatchSQL(field, queryStr, operator string
 		if !t.isBoundToNestedCtx(field, b, nctx) && (b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield) {
 			arrCol := b.EffectiveArrayColumn(true)
 			lit := quoteStr(qTrim)
+			if isInLambdaCtxR67(nctx) {
+				if b.EffectiveLowercase(true) {
+					return flatArrayExactCISQLR67(fmt.Sprintf("`%s`", arrCol), qTrim)
+				}
+				return fmt.Sprintf("array_contains(`%s`, %s)", arrCol, lit)
+			}
 			if b.EffectiveLowercase(true) {
 				return fmt.Sprintf("(array_exists(_x -> lower(_x) = lower(%s), `%s`))", lit, arrCol)
 			}
@@ -3540,8 +3623,13 @@ func (t *Transpiler) projectionSafeTextMatchSQL(field, queryStr, operator string
 				arrCol := b.EffectiveArrayColumn(false)
 				var parts []string
 				for _, tok := range toks {
-					rePat := quoteStr(buildAnalyzedTokenRegex(tok, isWS))
-					parts = append(parts, fmt.Sprintf("array_exists(_x -> _x IS NOT NULL AND _x REGEXP %s, `%s`)", rePat, arrCol))
+					tokPat := buildAnalyzedTokenRegex(tok, isWS)
+					if isInLambdaCtxR67(nctx) {
+						parts = append(parts, flatArrayRegexpSQLR67(fmt.Sprintf("`%s`", arrCol), tokPat))
+					} else {
+						rePat := quoteStr(tokPat)
+						parts = append(parts, fmt.Sprintf("array_exists(_x -> _x IS NOT NULL AND _x REGEXP %s, `%s`)", rePat, arrCol))
+					}
 				}
 				return "(" + strings.Join(parts, joinOp) + ")"
 			}
@@ -3560,7 +3648,11 @@ func (t *Transpiler) projectionSafeTextMatchSQL(field, queryStr, operator string
 		var parts []string
 		for _, tok := range tokens {
 			likeLit := quoteStr("%" + escapeLikeLiteral(tok) + "%")
-			parts = append(parts, fmt.Sprintf("array_exists(_x -> lower(_x) LIKE lower(%s), `%s`)", likeLit, arrCol))
+			if isInLambdaCtxR67(nctx) {
+				parts = append(parts, fmt.Sprintf("lower(COALESCE(ARRAY_JOIN(`%s`, ' '), '')) LIKE lower(%s)", arrCol, likeLit))
+			} else {
+				parts = append(parts, fmt.Sprintf("array_exists(_x -> lower(_x) LIKE lower(%s), `%s`)", likeLit, arrCol))
+			}
 		}
 		return "(" + strings.Join(parts, joinOp) + ")"
 	}
@@ -4407,6 +4499,7 @@ func (t *Transpiler) compileFlatNestedMatchingIDs(path, corrCol string, q *esast
 		inner := t.CompileQuery(q, false, &nestedCtx{
 			nestedPath: path,
 			elemVar:    "_el",
+			inLambda:   true,
 		})
 		return flatNestedIDsExpr(corrCol, inner.WhereSQL, "$._nested_id"), inner.UsesFulltextMatch
 	}
@@ -4450,6 +4543,7 @@ func (t *Transpiler) compileFlatNestedMatchingIDs(path, corrCol string, q *esast
 				inner := t.CompileQuery(&q.Nested.Query, false, &nestedCtx{
 					nestedPath: q.Nested.Path,
 					elemVar:    "_el",
+					inLambda:   true,
 				})
 				if inner.WhereSQL == "FALSE" {
 					return "CAST([] AS ARRAY<STRING>)", inner.UsesFulltextMatch
@@ -4477,7 +4571,7 @@ func (t *Transpiler) compileFlatNestedMatchingIDs(path, corrCol string, q *esast
 					usesFT = usesFT || subFT
 					nestedConjunctions = append(nestedConjunctions, idsExpr)
 				} else {
-					compiled := t.CompileQuery(c, false, &nestedCtx{nestedPath: path, elemVar: "_el"})
+					compiled := t.CompileQuery(c, false, &nestedCtx{nestedPath: path, elemVar: "_el", inLambda: true})
 					usesFT = usesFT || compiled.UsesFulltextMatch
 					if compiled.WhereSQL == "FALSE" {
 						plainConds = []string{"FALSE"}
@@ -4526,26 +4620,24 @@ func (t *Transpiler) compileFlatNestedMatchingIDs(path, corrCol string, q *esast
 					for _, sIDs := range shouldIDs[1:] {
 						shouldCombined = fmt.Sprintf("ARRAY_UNION(%s, %s)", shouldCombined, sIDs)
 					}
-				} else {
-					// Count how many should clauses match each candidate ID without nested lambdas:
-					// pass per-clause `_s_k` pipe sets as parallel ARRAY_REPEAT arguments.
-					candExpr := shouldIDs[0]
+				} else if minShould == len(shouldIDs) {
+					shouldCombined = shouldIDs[0]
 					for _, sIDs := range shouldIDs[1:] {
-						candExpr = fmt.Sprintf("ARRAY_UNION(%s, %s)", candExpr, sIDs)
+						shouldCombined = fmt.Sprintf("ARRAY_INTERSECT(%s, %s)", shouldCombined, sIDs)
 					}
-					var params, args, countTerms []string
-					params = append(params, "_nid")
-					args = append(args, candExpr)
+				} else {
+					// Count how many should clauses match each candidate ID in O(K * M) memory without
+					// nested lambdas or O(K * M^2) ARRAY_REPEAT string duplication: deduplicate each
+					// clause's IDs, sort the concatenated matches, and compare element `j` with `j + minShould - 1`.
+					dedupIDs := make([]string, len(shouldIDs))
 					for idx, sIDs := range shouldIDs {
-						p := fmt.Sprintf("_s%d", idx)
-						params = append(params, p)
-						setStr := fmt.Sprintf("CONCAT('|', COALESCE(ARRAY_JOIN(%s, '|'), ''), '|')", sIDs)
-						args = append(args, fmt.Sprintf("ARRAY_REPEAT(%s, ARRAY_SIZE(%s))", setStr, candExpr))
-						countTerms = append(countTerms, fmt.Sprintf("IF(INSTR(%s, CONCAT('|', _nid, '|')) > 0, 1, 0)", p))
+						dedupIDs[idx] = fmt.Sprintf("ARRAY_DISTINCT(IFNULL(%s, CAST([] AS ARRAY<STRING>)))", sIDs)
 					}
+					mergedExpr := fmt.Sprintf("ARRAY_SORT(ARRAY_CONCAT(%s))", strings.Join(dedupIDs, ", "))
+					shiftedExpr := fmt.Sprintf("ARRAY_SLICE(ARRAY_CONCAT(%s, ARRAY_REPEAT('', %d)), %d)", mergedExpr, minShould-1, minShould)
 					shouldCombined = fmt.Sprintf(
-						"ARRAY_REMOVE(array_map((%s) -> IF((%s) >= %d, _nid, ''), %s), '')",
-						strings.Join(params, ", "), strings.Join(countTerms, " + "), minShould, strings.Join(args, ", "),
+						"ARRAY_DISTINCT(ARRAY_REMOVE(array_map((_a, _b) -> IF(_a != '' AND _a = _b, _a, ''), %s, %s), ''))",
+						mergedExpr, shiftedExpr,
 					)
 				}
 				if len(b.Must) == 0 && len(b.Filter) == 0 {
@@ -4566,6 +4658,7 @@ func (t *Transpiler) compileFlatNestedMatchingIDs(path, corrCol string, q *esast
 	inner := t.CompileQuery(q, false, &nestedCtx{
 		nestedPath: path,
 		elemVar:    "_el",
+		inLambda:   true,
 	})
 	return flatNestedIDsExpr(corrCol, inner.WhereSQL, "$._nested_id"), inner.UsesFulltextMatch
 }
@@ -4579,6 +4672,37 @@ func (t *Transpiler) compileNestedWithParent(nq *esast.NestedQuery, scoring bool
 	corrCol, early := t.resolveNestedCorrCol(nq)
 	if early != nil {
 		return *early
+	}
+	if parentNctx != nil && parentNctx.inLambda {
+		if nq.Path == parentNctx.nestedPath {
+			return t.CompileQuery(&nq.Query, scoring, parentNctx)
+		}
+		var whereSQL string
+		if strings.HasPrefix(nq.Path, parentNctx.nestedPath+".") && parentNctx.elemVar != "" {
+			relSubPath := t.nestedRelativeJSONPath(nq.Path, false, parentNctx.nestedPath)
+			subArrExpr := fmt.Sprintf("json_extract_string(%s, %s)", parentNctx.elemVar, quoteStr(relSubPath))
+			whereSQL = fmt.Sprintf("(%s IS NOT NULL AND %s != '[]' AND %s != 'null')", subArrExpr, subArrExpr, subArrExpr)
+		} else {
+			whereSQL = fmt.Sprintf("(`%s` IS NOT NULL AND array_size(`%s`) > 0)", corrCol, corrCol)
+		}
+		if pf := t.extractNestedPrefilterWithLambda(nq.Path, &nq.Query, true); pf != "" {
+			whereSQL = fmt.Sprintf("(%s AND %s)", whereSQL, pf)
+		}
+		scoreSQL := "1.0"
+		if strings.EqualFold(nq.ScoreMode, "none") {
+			scoreSQL = "0.0"
+		} else if scoring {
+			outerBoost := 1.0
+			if nq.Boost != nil {
+				outerBoost = *nq.Boost
+			}
+			scoreSQL = fmt.Sprintf("(CASE WHEN %s THEN %.4f ELSE 0.0 END)", whereSQL, outerBoost)
+		}
+		return CompiledQuery{
+			WhereSQL:     whereSQL,
+			SafeWhereSQL: whereSQL,
+			ScoreSQL:     scoreSQL,
+		}
 	}
 	if parentNctx == nil && queryHasDescendantNested(&nq.Query) {
 		idsExpr, usesFT := t.compileFlatNestedMatchingIDs(nq.Path, corrCol, &nq.Query)
@@ -4611,6 +4735,7 @@ func (t *Transpiler) compileNestedWithParent(nq *esast.NestedQuery, scoring bool
 	inner := t.CompileQuery(&nq.Query, false, &nestedCtx{
 		nestedPath: nq.Path,
 		elemVar:    elemVar,
+		inLambda:   true,
 	})
 	innerWhere := inner.WhereSQL
 	if innerWhere == "FALSE" {
@@ -4943,6 +5068,10 @@ func splitTopLevelScriptToken(s string, op string) []string {
 }
 
 func (t *Transpiler) extractNestedPrefilter(nestedPath string, q *esast.Query) string {
+	return t.extractNestedPrefilterWithLambda(nestedPath, q, false)
+}
+
+func (t *Transpiler) extractNestedPrefilterWithLambda(nestedPath string, q *esast.Query, inLambda bool) string {
 	if q == nil {
 		return ""
 	}
@@ -4962,18 +5091,24 @@ func (t *Transpiler) extractNestedPrefilter(nestedPath string, q *esast.Query) s
 				if b.ESType == "ip" {
 					rawStr := fmt.Sprintf("%v", entry.Value)
 					if startNum, endNum, isCIDR := parseCIDRBounds(rawStr); isCIDR {
-						parts = append(parts, fmt.Sprintf("array_exists(_x -> IPV4_STRING_TO_NUM_OR_NULL(_x) >= %d AND IPV4_STRING_TO_NUM_OR_NULL(_x) <= %d, `%s`)", startNum, endNum, arrCol))
+						if !inLambda {
+							parts = append(parts, fmt.Sprintf("array_exists(_x -> IPV4_STRING_TO_NUM_OR_NULL(_x) >= %d AND IPV4_STRING_TO_NUM_OR_NULL(_x) <= %d, `%s`)", startNum, endNum, arrCol))
+						}
 						continue
 					}
 					if startHex, endHex, isV6CIDR := parseIPv6CIDRHexBounds(rawStr); isV6CIDR {
-						parts = append(parts, fmt.Sprintf("array_exists(_x -> HEX(IPV6_STRING_TO_NUM_OR_NULL(_x)) >= %s AND HEX(IPV6_STRING_TO_NUM_OR_NULL(_x)) <= %s, `%s`)", quoteStr(startHex), quoteStr(endHex), arrCol))
+						if !inLambda {
+							parts = append(parts, fmt.Sprintf("array_exists(_x -> HEX(IPV6_STRING_TO_NUM_OR_NULL(_x)) >= %s AND HEX(IPV6_STRING_TO_NUM_OR_NULL(_x)) <= %s, `%s`)", quoteStr(startHex), quoteStr(endHex), arrCol))
+						}
 						continue
 					}
 				}
 				if b.ESType == "version" {
-					if strVal, ok := entry.Value.(string); ok && schema.ValidateSemver(strVal) {
-						cleanVer := strings.SplitN(strings.TrimSpace(strVal), "+", 2)[0]
-						parts = append(parts, fmt.Sprintf("array_exists(_x -> %s = %s, `%s`)", sqlStripSemverBuildExpr("_x"), quoteStr(cleanVer), arrCol))
+					if !inLambda {
+						if strVal, ok := entry.Value.(string); ok && schema.ValidateSemver(strVal) {
+							cleanVer := strings.SplitN(strings.TrimSpace(strVal), "+", 2)[0]
+							parts = append(parts, fmt.Sprintf("array_exists(_x -> %s = %s, `%s`)", sqlStripSemverBuildExpr("_x"), quoteStr(cleanVer), arrCol))
+						}
 					}
 					continue
 				}
@@ -4997,14 +5132,16 @@ func (t *Transpiler) extractNestedPrefilter(nestedPath string, q *esast.Query) s
 				}
 				arrCol := b.EffectiveArrayColumn(true)
 				if b.ESType == "version" {
-					var verQuoted []string
-					for _, v := range vals {
-						if s, ok := v.(string); ok && schema.ValidateSemver(s) {
-							verQuoted = append(verQuoted, quoteStr(strings.SplitN(strings.TrimSpace(s), "+", 2)[0]))
+					if !inLambda {
+						var verQuoted []string
+						for _, v := range vals {
+							if s, ok := v.(string); ok && schema.ValidateSemver(s) {
+								verQuoted = append(verQuoted, quoteStr(strings.SplitN(strings.TrimSpace(s), "+", 2)[0]))
+							}
 						}
-					}
-					if len(verQuoted) > 0 {
-						parts = append(parts, fmt.Sprintf("array_exists(_x -> %s IN (%s), `%s`)", sqlStripSemverBuildExpr("_x"), strings.Join(verQuoted, ", "), arrCol))
+						if len(verQuoted) > 0 {
+							parts = append(parts, fmt.Sprintf("array_exists(_x -> %s IN (%s), `%s`)", sqlStripSemverBuildExpr("_x"), strings.Join(verQuoted, ", "), arrCol))
+						}
 					}
 					continue
 				}
@@ -5065,12 +5202,12 @@ func (t *Transpiler) extractNestedPrefilter(nestedPath string, q *esast.Query) s
 	if q.Bool != nil {
 		var parts []string
 		for i := range q.Bool.Must {
-			if pf := t.extractNestedPrefilter(nestedPath, &q.Bool.Must[i]); pf != "" {
+			if pf := t.extractNestedPrefilterWithLambda(nestedPath, &q.Bool.Must[i], inLambda); pf != "" {
 				parts = append(parts, pf)
 			}
 		}
 		for i := range q.Bool.Filter {
-			if pf := t.extractNestedPrefilter(nestedPath, &q.Bool.Filter[i]); pf != "" {
+			if pf := t.extractNestedPrefilterWithLambda(nestedPath, &q.Bool.Filter[i], inLambda); pf != "" {
 				parts = append(parts, pf)
 			}
 		}
@@ -5607,9 +5744,17 @@ func (t *Transpiler) compileDecayFunction(decayType string, df *esast.DecayFunct
 			distExpr = fmt.Sprintf("COALESCE(ST_Distance_Sphere(%s, %s, %s, %s), 0.0)", lonExpr, latExpr, tLonStr, tLatStr)
 		} else if isArrayField {
 			arrCol := fmt.Sprintf("`%s`", b.EffectiveArrayColumn(true))
-			notNullCond = fmt.Sprintf("(%s IS NOT NULL AND array_size(%s) > 0)", arrCol, arrCol)
-			arrFn := resolveDecayArrayFn(df.MultiValueMode)
-			distExpr = fmt.Sprintf("COALESCE(%s(array_map(_x -> ST_Distance_Sphere(TRY_CAST(SPLIT_PART(_x, ',', 2) AS DOUBLE), TRY_CAST(SPLIT_PART(_x, ',', 1) AS DOUBLE), %s, %s), %s)), 0.0)", arrFn, tLonStr, tLatStr, arrCol)
+			if isInLambdaCtxR67(nctx) {
+				elemExpr := fmt.Sprintf("element_at(%s, 1)", arrCol)
+				latExpr := fmt.Sprintf("TRY_CAST(SPLIT_PART(%s, ',', 1) AS DOUBLE)", elemExpr)
+				lonExpr := fmt.Sprintf("TRY_CAST(SPLIT_PART(%s, ',', 2) AS DOUBLE)", elemExpr)
+				notNullCond = fmt.Sprintf("(%s IS NOT NULL AND array_size(%s) > 0)", arrCol, arrCol)
+				distExpr = fmt.Sprintf("COALESCE(ST_Distance_Sphere(%s, %s, %s, %s), 0.0)", lonExpr, latExpr, tLonStr, tLatStr)
+			} else {
+				notNullCond = fmt.Sprintf("(%s IS NOT NULL AND array_size(%s) > 0)", arrCol, arrCol)
+				arrFn := resolveDecayArrayFn(df.MultiValueMode)
+				distExpr = fmt.Sprintf("COALESCE(%s(array_map(_x -> ST_Distance_Sphere(TRY_CAST(SPLIT_PART(_x, ',', 2) AS DOUBLE), TRY_CAST(SPLIT_PART(_x, ',', 1) AS DOUBLE), %s, %s), %s)), 0.0)", arrFn, tLonStr, tLatStr, arrCol)
+			}
 		} else {
 			var latExpr, lonExpr string
 			latExpr, lonExpr, notNullCond = t.extractGeoPointExprs(resolvedField, b)
@@ -5638,8 +5783,13 @@ func (t *Transpiler) compileDecayFunction(decayType string, df *esast.DecayFunct
 		if isArrayField {
 			arrCol := fmt.Sprintf("`%s`", b.EffectiveArrayColumn(true))
 			notNullCond = fmt.Sprintf("(%s IS NOT NULL AND array_size(%s) > 0)", arrCol, arrCol)
-			arrFn := resolveDecayArrayFn(df.MultiValueMode)
-			distExpr = fmt.Sprintf("COALESCE(%s(array_map(_x -> ABS(TRY_CAST(_x AS DOUBLE) - %.4f), %s)), 0.0)", arrFn, float64(originMs), arrCol)
+			if isInLambdaCtxR67(nctx) {
+				elemExpr := fmt.Sprintf("TRY_CAST(element_at(%s, 1) AS DOUBLE)", arrCol)
+				distExpr = fmt.Sprintf("ABS(COALESCE(%s, %.4f) - %.4f)", elemExpr, float64(originMs), float64(originMs))
+			} else {
+				arrFn := resolveDecayArrayFn(df.MultiValueMode)
+				distExpr = fmt.Sprintf("COALESCE(%s(array_map(_x -> ABS(TRY_CAST(_x AS DOUBLE) - %.4f), %s)), 0.0)", arrFn, float64(originMs), arrCol)
+			}
 		} else {
 			col := t.sqlNumericColumnRef(df.Field, nctx)
 			notNullCond = fmt.Sprintf("%s IS NOT NULL", col)
@@ -5663,8 +5813,13 @@ func (t *Transpiler) compileDecayFunction(decayType string, df *esast.DecayFunct
 		if isArrayField {
 			arrCol := fmt.Sprintf("`%s`", b.EffectiveArrayColumn(true))
 			notNullCond = fmt.Sprintf("(%s IS NOT NULL AND array_size(%s) > 0)", arrCol, arrCol)
-			arrFn := resolveDecayArrayFn(df.MultiValueMode)
-			distExpr = fmt.Sprintf("COALESCE(%s(array_map(_x -> ABS(TRY_CAST(_x AS DOUBLE) - %.4f), %s)), 0.0)", arrFn, originNum, arrCol)
+			if isInLambdaCtxR67(nctx) {
+				elemExpr := fmt.Sprintf("TRY_CAST(element_at(%s, 1) AS DOUBLE)", arrCol)
+				distExpr = fmt.Sprintf("ABS(COALESCE(%s, %.4f) - %.4f)", elemExpr, originNum, originNum)
+			} else {
+				arrFn := resolveDecayArrayFn(df.MultiValueMode)
+				distExpr = fmt.Sprintf("COALESCE(%s(array_map(_x -> ABS(TRY_CAST(_x AS DOUBLE) - %.4f), %s)), 0.0)", arrFn, originNum, arrCol)
+			}
 		} else {
 			col := t.sqlNumericColumnRef(df.Field, nctx)
 			notNullCond = fmt.Sprintf("%s IS NOT NULL", col)
@@ -5936,13 +6091,17 @@ func (t *Transpiler) compileTermPredicate(field string, val any, caseInsensitive
 		if strVal, ok := val.(string); ok {
 			if startHex, endHex, isCIDR := parseCanonicalIPCIDRHexBounds(strVal); isCIDR {
 				sLit, eLit := quoteStr(startHex), quoteStr(endHex)
-				if b.Kind == schema.StorageNestedSubfield && nctx != nil && nctx.nestedPath == b.NestedPath && b.IsMultiValued {
+				if b.Kind == schema.StorageNestedSubfield && nctx != nil && nctx.nestedPath == b.NestedPath && b.IsMultiValued && !nctx.inLambda {
 					rawCol := t.sqlColumnRef(field, true, nctx)
 					hexElem := sqlCanonicalIPHexExpr("_x")
 					return fmt.Sprintf("array_exists(_x -> %s >= %s AND %s <= %s, TRY_CAST(%s AS ARRAY<STRING>))", hexElem, sLit, hexElem, eLit, rawCol)
 				}
 				if b.Kind == schema.StoragePromotedArray || (b.Kind == schema.StorageNestedSubfield && (nctx == nil || nctx.nestedPath != b.NestedPath)) {
 					colName := b.EffectiveArrayColumn(true)
+					if isInLambdaCtxR67(nctx) {
+						hexElem := sqlCanonicalIPHexExpr(fmt.Sprintf("element_at(`%s`, 1)", colName))
+						return fmt.Sprintf("(%s >= %s AND %s <= %s)", hexElem, sLit, hexElem, eLit)
+					}
 					hexElem := sqlCanonicalIPHexExpr("_x")
 					return fmt.Sprintf("array_exists(_x -> %s >= %s AND %s <= %s, `%s`)", hexElem, sLit, hexElem, eLit, colName)
 				}
@@ -5971,17 +6130,25 @@ func (t *Transpiler) compileTermPredicate(field string, val any, caseInsensitive
 		case schema.StoragePromotedVector:
 			return "FALSE"
 		case schema.StoragePromotedArray:
-			return fmt.Sprintf("array_exists(_x -> %s = %s, `%s`)", sqlStripSemverBuildExpr("_x"), qVer, b.EffectiveArrayColumn(true))
+			arrCol := b.EffectiveArrayColumn(true)
+			if isInLambdaCtxR67(nctx) {
+				return fmt.Sprintf("%s = %s", sqlStripSemverBuildExpr(fmt.Sprintf("element_at(`%s`, 1)", arrCol)), qVer)
+			}
+			return fmt.Sprintf("array_exists(_x -> %s = %s, `%s`)", sqlStripSemverBuildExpr("_x"), qVer, arrCol)
 		case schema.StorageNestedSubfield:
 			if nctx != nil && nctx.nestedPath == b.NestedPath {
 				rawCol := t.sqlColumnRef(field, true, nctx)
-				if b.IsMultiValued {
+				if b.IsMultiValued && !nctx.inLambda {
 					return fmt.Sprintf("array_exists(_x -> %s = %s, TRY_CAST(%s AS ARRAY<STRING>))", sqlStripSemverBuildExpr("_x"), qVer, rawCol)
 				}
 				return fmt.Sprintf("%s = %s", sqlStripSemverBuildExpr(rawCol), qVer)
 			}
 			if b.PrefilterArrayCol != "" {
-				return fmt.Sprintf("array_exists(_x -> %s = %s, `%s`)", sqlStripSemverBuildExpr("_x"), qVer, b.EffectiveArrayColumn(true))
+				arrCol := b.EffectiveArrayColumn(true)
+				if isInLambdaCtxR67(nctx) {
+					return fmt.Sprintf("%s = %s", sqlStripSemverBuildExpr(fmt.Sprintf("element_at(`%s`, 1)", arrCol)), qVer)
+				}
+				return fmt.Sprintf("array_exists(_x -> %s = %s, `%s`)", sqlStripSemverBuildExpr("_x"), qVer, arrCol)
 			}
 		}
 		rawCol := t.sqlColumnRef(field, true, nctx)
@@ -6147,6 +6314,9 @@ func (t *Transpiler) compileTermPredicate(field string, val any, caseInsensitive
 				return fmt.Sprintf("array_contains(`%s`, TRY_CAST(%s AS LARGEINT))", colName, quoteValue(val))
 			}
 			if caseInsensitive && !effLower {
+				if isInLambdaCtxR67(nctx) {
+					return flatArrayExactCISQLR67(fmt.Sprintf("`%s`", colName), fmt.Sprintf("%v", val))
+				}
 				return fmt.Sprintf("array_exists(_x -> lower(_x) = lower(%s), `%s`)", quoteStr(fmt.Sprintf("%v", val)), colName)
 			}
 			return fmt.Sprintf("array_contains(`%s`, %s)", colName, quoteStr(fmt.Sprintf("%v", val)))
@@ -6200,6 +6370,9 @@ func (t *Transpiler) compileTermPredicate(field string, val any, caseInsensitive
 		if b.PrefilterArrayCol != "" {
 			arrCol := b.EffectiveArrayColumn(true)
 			if caseInsensitive && !effLower {
+				if isInLambdaCtxR67(nctx) {
+					return flatArrayExactCISQLR67(fmt.Sprintf("`%s`", arrCol), fmt.Sprintf("%v", val))
+				}
 				return fmt.Sprintf("array_exists(_x -> lower(_x) = lower(%s), `%s`)", quoteStr(fmt.Sprintf("%v", val)), arrCol)
 			}
 			return fmt.Sprintf("array_contains(`%s`, %s)", arrCol, quoteStr(fmt.Sprintf("%v", val)))
@@ -6219,6 +6392,10 @@ func (t *Transpiler) compileTermPredicate(field string, val any, caseInsensitive
 			rawVar := t.flattenedRawVariantRef(field, b, nctx)
 			strLit := quoteStr(valStr)
 			if caseInsensitive {
+				if isInLambdaCtxR67(nctx) {
+					jsonLeafPat := quoteStr("%" + escapeLikeLiteral(`"`+valStr+`"`) + "%")
+					return fmt.Sprintf("(lower(%s) = lower(%s) OR lower(CAST(%s AS STRING)) LIKE lower(%s))", col, lit, rawVar, jsonLeafPat)
+				}
 				return fmt.Sprintf("(lower(%s) = lower(%s) OR array_exists(_x -> lower(_x) = lower(%s), TRY_CAST(%s AS ARRAY<STRING>)))", col, lit, strLit, rawVar)
 			}
 			return fmt.Sprintf("(%s = %s OR array_contains(TRY_CAST(%s AS ARRAY<STRING>), %s))", col, lit, rawVar, strLit)
@@ -6394,17 +6571,25 @@ func (t *Transpiler) compileTermsPredicateWithCI(field string, vals []any, caseI
 		case schema.StoragePromotedVector:
 			return "FALSE"
 		case schema.StoragePromotedArray:
-			return fmt.Sprintf("array_exists(_x -> %s IN (%s), `%s`)", sqlStripSemverBuildExpr("_x"), inList, b.EffectiveArrayColumn(true))
+			arrCol := b.EffectiveArrayColumn(true)
+			if isInLambdaCtxR67(nctx) {
+				return fmt.Sprintf("%s IN (%s)", sqlStripSemverBuildExpr(fmt.Sprintf("element_at(`%s`, 1)", arrCol)), inList)
+			}
+			return fmt.Sprintf("array_exists(_x -> %s IN (%s), `%s`)", sqlStripSemverBuildExpr("_x"), inList, arrCol)
 		case schema.StorageNestedSubfield:
 			if nctx != nil && nctx.nestedPath == b.NestedPath {
 				rawCol := t.sqlColumnRef(field, true, nctx)
-				if b.IsMultiValued {
+				if b.IsMultiValued && !nctx.inLambda {
 					return fmt.Sprintf("array_exists(_x -> %s IN (%s), TRY_CAST(%s AS ARRAY<STRING>))", sqlStripSemverBuildExpr("_x"), inList, rawCol)
 				}
 				return fmt.Sprintf("%s IN (%s)", sqlStripSemverBuildExpr(rawCol), inList)
 			}
 			if b.PrefilterArrayCol != "" {
-				return fmt.Sprintf("array_exists(_x -> %s IN (%s), `%s`)", sqlStripSemverBuildExpr("_x"), inList, b.EffectiveArrayColumn(true))
+				arrCol := b.EffectiveArrayColumn(true)
+				if isInLambdaCtxR67(nctx) {
+					return fmt.Sprintf("%s IN (%s)", sqlStripSemverBuildExpr(fmt.Sprintf("element_at(`%s`, 1)", arrCol)), inList)
+				}
+				return fmt.Sprintf("array_exists(_x -> %s IN (%s), `%s`)", sqlStripSemverBuildExpr("_x"), inList, arrCol)
 			}
 		}
 		rawCol := t.sqlColumnRef(field, true, nctx)
@@ -6586,6 +6771,13 @@ func (t *Transpiler) compileTermsPredicateWithCI(field string, vals []any, caseI
 	if isArrayCol {
 		colName := b.EffectiveArrayColumn(true)
 		if caseInsensitive && !b.EffectiveLowercase(true) {
+			if isInLambdaCtxR67(nctx) {
+				var disjuncts []string
+				for _, nv := range normalizedVals {
+					disjuncts = append(disjuncts, flatArrayExactCISQLR67(fmt.Sprintf("`%s`", colName), fmt.Sprintf("%v", nv)))
+				}
+				return "(" + strings.Join(disjuncts, " OR ") + ")"
+			}
 			return fmt.Sprintf("array_exists(_x -> lower(_x) IN (%s), `%s`)", strings.Join(quoted, ", "), colName)
 		}
 		return fmt.Sprintf("arrays_overlap(`%s`, [%s])", colName, strings.Join(quoted, ", "))
@@ -6664,6 +6856,13 @@ func (t *Transpiler) compilePrefixSingleField(field, val string, caseInsensitive
 	likePat := quoteStr(escapeLikeLiteral(val) + "%")
 	if !t.isBoundToNestedCtx(field, b, nctx) && (b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield) {
 		colName := b.EffectiveArrayColumn(true)
+		if isInLambdaCtxR67(nctx) {
+			jsonLeafPat := quoteStr("%" + escapeLikeLiteral(`"`+val) + "%")
+			if caseInsensitive {
+				return fmt.Sprintf("lower(CAST(`%s` AS STRING)) LIKE lower(%s)", colName, jsonLeafPat)
+			}
+			return fmt.Sprintf("CAST(`%s` AS STRING) LIKE %s", colName, jsonLeafPat)
+		}
 		if caseInsensitive {
 			return fmt.Sprintf("array_exists(_x -> lower(_x) LIKE lower(%s), `%s`)", likePat, colName)
 		}
@@ -6679,6 +6878,13 @@ func (t *Transpiler) compilePrefixSingleField(field, val string, caseInsensitive
 			return fmt.Sprintf("(%s LIKE %s OR %s LIKE %s)", col, likePat, col, jsonLeafPat)
 		} else if isSubKey {
 			rawVar := t.flattenedRawVariantRef(field, b, nctx)
+			if isInLambdaCtxR67(nctx) {
+				jsonLeafPat := quoteStr("%" + escapeLikeLiteral(`"`+val) + "%")
+				if caseInsensitive || (nctx != nil && effLower) {
+					return fmt.Sprintf("(lower(%s) LIKE lower(%s) OR lower(CAST(%s AS STRING)) LIKE lower(%s))", col, likePat, rawVar, jsonLeafPat)
+				}
+				return fmt.Sprintf("(%s LIKE %s OR CAST(%s AS STRING) LIKE %s)", col, likePat, rawVar, jsonLeafPat)
+			}
 			if caseInsensitive || (nctx != nil && effLower) {
 				return fmt.Sprintf("(lower(%s) LIKE lower(%s) OR array_exists(_x -> lower(_x) LIKE lower(%s), TRY_CAST(%s AS ARRAY<STRING>)))", col, likePat, likePat, rawVar)
 			}
@@ -6686,6 +6892,13 @@ func (t *Transpiler) compilePrefixSingleField(field, val string, caseInsensitive
 		}
 	}
 	if nctx != nil && b.Kind == schema.StorageNestedSubfield && nctx.nestedPath == b.NestedPath && b.IsMultiValued {
+		if nctx.inLambda {
+			jsonLeafPat := quoteStr("%" + escapeLikeLiteral(`"`+val) + "%")
+			if caseInsensitive || effLower {
+				return fmt.Sprintf("(lower(%s) LIKE lower(%s) OR lower(%s) LIKE lower(%s))", col, likePat, col, jsonLeafPat)
+			}
+			return fmt.Sprintf("(%s LIKE %s OR %s LIKE %s)", col, likePat, col, jsonLeafPat)
+		}
 		if caseInsensitive || effLower {
 			return fmt.Sprintf("array_exists(_x -> lower(_x) LIKE lower(%s), TRY_CAST(%s AS ARRAY<STRING>))", likePat, col)
 		}
@@ -6755,13 +6968,16 @@ func (t *Transpiler) compileWildcardSingleField(field, val string, caseInsensiti
 				qPat := quoteStr(rePat)
 				if !t.isBoundToNestedCtx(rawField, rawB, nctx) && (rawB.Kind == schema.StoragePromotedArray || rawB.Kind == schema.StorageNestedSubfield) {
 					arrCol := rawB.EffectiveArrayColumn(false)
+					if isInLambdaCtxR67(nctx) {
+						return flatArrayRegexpSQLR67(fmt.Sprintf("`%s`", arrCol), rePat)
+					}
 					return fmt.Sprintf("array_exists(_x -> _x IS NOT NULL AND _x REGEXP %s, `%s`)", qPat, arrCol)
 				}
 				col := t.sqlColumnRef(rawField, false, nctx)
-				if nctx != nil && rawB.Kind == schema.StorageNestedSubfield && nctx.nestedPath == rawB.NestedPath && rawB.IsMultiValued {
+				if nctx != nil && rawB.Kind == schema.StorageNestedSubfield && nctx.nestedPath == rawB.NestedPath && rawB.IsMultiValued && !nctx.inLambda {
 					return fmt.Sprintf("array_exists(_x -> _x IS NOT NULL AND _x REGEXP %s, TRY_CAST(%s AS ARRAY<STRING>))", qPat, col)
 				}
-				return fmt.Sprintf("%s REGEXP %s", col, qPat)
+				return fmt.Sprintf("(%s IS NOT NULL AND %s REGEXP %s)", col, col, qPat)
 			}
 		}
 	}
@@ -6776,6 +6992,13 @@ func (t *Transpiler) compileWildcardSingleField(field, val string, caseInsensiti
 	likePat := quoteStr(wildcardToLike(val))
 	if !t.isBoundToNestedCtx(field, b, nctx) && (b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield) {
 		colName := b.EffectiveArrayColumn(true)
+		if isInLambdaCtxR67(nctx) {
+			jsonLeafPat := quoteStr(`%"` + wildcardToLike(val) + `"%`)
+			if caseInsensitive {
+				return fmt.Sprintf("lower(CAST(`%s` AS STRING)) LIKE lower(%s)", colName, jsonLeafPat)
+			}
+			return fmt.Sprintf("CAST(`%s` AS STRING) LIKE %s", colName, jsonLeafPat)
+		}
 		if caseInsensitive {
 			return fmt.Sprintf("array_exists(_x -> lower(_x) LIKE lower(%s), `%s`)", likePat, colName)
 		}
@@ -6791,6 +7014,13 @@ func (t *Transpiler) compileWildcardSingleField(field, val string, caseInsensiti
 			return fmt.Sprintf("(%s LIKE %s OR %s LIKE %s)", col, likePat, col, jsonLeafPat)
 		} else if isSubKey {
 			rawVar := t.flattenedRawVariantRef(field, b, nctx)
+			if isInLambdaCtxR67(nctx) {
+				jsonLeafPat := quoteStr(`%"` + wildcardToLike(val) + `"%`)
+				if caseInsensitive || (nctx != nil && effLower) {
+					return fmt.Sprintf("(lower(%s) LIKE lower(%s) OR lower(CAST(%s AS STRING)) LIKE lower(%s))", col, likePat, rawVar, jsonLeafPat)
+				}
+				return fmt.Sprintf("(%s LIKE %s OR CAST(%s AS STRING) LIKE %s)", col, likePat, rawVar, jsonLeafPat)
+			}
 			if caseInsensitive || (nctx != nil && effLower) {
 				return fmt.Sprintf("(lower(%s) LIKE lower(%s) OR array_exists(_x -> lower(_x) LIKE lower(%s), TRY_CAST(%s AS ARRAY<STRING>)))", col, likePat, likePat, rawVar)
 			}
@@ -6798,6 +7028,13 @@ func (t *Transpiler) compileWildcardSingleField(field, val string, caseInsensiti
 		}
 	}
 	if nctx != nil && b.Kind == schema.StorageNestedSubfield && nctx.nestedPath == b.NestedPath && b.IsMultiValued {
+		if nctx.inLambda {
+			jsonLeafPat := quoteStr(`%"` + wildcardToLike(val) + `"%`)
+			if caseInsensitive || effLower {
+				return fmt.Sprintf("(lower(%s) LIKE lower(%s) OR lower(%s) LIKE lower(%s))", col, likePat, col, jsonLeafPat)
+			}
+			return fmt.Sprintf("(%s LIKE %s OR %s LIKE %s)", col, likePat, col, jsonLeafPat)
+		}
 		if caseInsensitive || effLower {
 			return fmt.Sprintf("array_exists(_x -> lower(_x) LIKE lower(%s), TRY_CAST(%s AS ARRAY<STRING>))", likePat, col)
 		}
@@ -7006,10 +7243,15 @@ func (t *Transpiler) compileRangeSingleField(field string, rc esast.RangeCond, n
 		return t.compileRangeOnRangeField(field, b, rc, nctx)
 	}
 	if b.ESType == "histogram" {
+		hArrExpr := t.histogramArrayExpr(field, b, nctx)
+		elemVar := "_x"
+		if isInLambdaCtxR67(nctx) {
+			elemVar = fmt.Sprintf("element_at(%s, 1)", hArrExpr)
+		}
 		conds := []string{
-			"_x IS NOT NULL",
-			"_x != ''",
-			"TRY_CAST(SPLIT_PART(_x, ',', 2) AS BIGINT) > 0",
+			fmt.Sprintf("%s IS NOT NULL", elemVar),
+			fmt.Sprintf("%s != ''", elemVar),
+			fmt.Sprintf("TRY_CAST(SPLIT_PART(%s, ',', 2) AS BIGINT) > 0", elemVar),
 		}
 		addHistBound := func(op string, cand any) bool {
 			if cand == nil {
@@ -7022,13 +7264,16 @@ func (t *Transpiler) compileRangeSingleField(field string, rc esast.RangeCond, n
 				}
 				return false
 			}
-			conds = append(conds, fmt.Sprintf("TRY_CAST(SPLIT_PART(_x, ',', 1) AS DOUBLE) %s %s", op, strconv.FormatFloat(fv, 'f', -1, 64)))
+			conds = append(conds, fmt.Sprintf("TRY_CAST(SPLIT_PART(%s, ',', 1) AS DOUBLE) %s %s", elemVar, op, strconv.FormatFloat(fv, 'f', -1, 64)))
 			return true
 		}
 		if !addHistBound(">", gt) || !addHistBound(">=", gte) || !addHistBound("<", lt) || !addHistBound("<=", lte) {
 			return "FALSE"
 		}
-		return fmt.Sprintf("array_exists(_x -> (%s), %s)", strings.Join(conds, " AND "), t.histogramArrayExpr(field, b, nctx))
+		if isInLambdaCtxR67(nctx) {
+			return "(" + strings.Join(conds, " AND ") + ")"
+		}
+		return fmt.Sprintf("array_exists(_x -> (%s), %s)", strings.Join(conds, " AND "), hArrExpr)
 	}
 	if b.ESType == "version" {
 		normVerBound := func(cand any) (string, bool) {
@@ -7076,9 +7321,14 @@ func (t *Transpiler) compileRangeSingleField(field string, rc esast.RangeCond, n
 			lte = lteVer
 		}
 		isNestedMultiVal := nctx != nil && b.Kind == schema.StorageNestedSubfield && nctx.nestedPath == b.NestedPath && b.IsMultiValued
-		if b.Kind == schema.StoragePromotedArray || (b.Kind == schema.StorageNestedSubfield && (nctx == nil || nctx.nestedPath != b.NestedPath)) || isNestedMultiVal {
+		if (!isInLambdaCtxR67(nctx) && (b.Kind == schema.StoragePromotedArray || (b.Kind == schema.StorageNestedSubfield && (nctx == nil || nctx.nestedPath != b.NestedPath)) || isNestedMultiVal)) ||
+			(isInLambdaCtxR67(nctx) && !t.isBoundToNestedCtx(field, b, nctx) && (b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield)) {
 			colName := b.EffectiveArrayColumn(true)
-			verElem := sqlSemverSortKeyExpr("_x")
+			elemTarget := "_x"
+			if isInLambdaCtxR67(nctx) {
+				elemTarget = fmt.Sprintf("element_at(`%s`, 1)", colName)
+			}
+			verElem := sqlSemverSortKeyExpr(elemTarget)
 			var elemParts []string
 			if gt != nil {
 				elemParts = append(elemParts, fmt.Sprintf("%s > %s", verElem, quoteStr(formatSemverBoundKey(fmt.Sprintf("%v", gt)))))
@@ -7094,6 +7344,9 @@ func (t *Transpiler) compileRangeSingleField(field string, rc esast.RangeCond, n
 			}
 			if len(elemParts) == 0 {
 				return "TRUE"
+			}
+			if isInLambdaCtxR67(nctx) {
+				return fmt.Sprintf("(%s IS NOT NULL AND %s)", elemTarget, strings.Join(elemParts, " AND "))
 			}
 			if isNestedMultiVal {
 				rawCol := t.sqlColumnRef(field, true, nctx)
@@ -7134,9 +7387,14 @@ func (t *Transpiler) compileRangeSingleField(field string, rc esast.RangeCond, n
 			}
 		}
 		isNestedMultiVal := nctx != nil && b.Kind == schema.StorageNestedSubfield && nctx.nestedPath == b.NestedPath && b.IsMultiValued
-		if b.Kind == schema.StoragePromotedArray || (b.Kind == schema.StorageNestedSubfield && (nctx == nil || nctx.nestedPath != b.NestedPath)) || isNestedMultiVal {
+		if (!isInLambdaCtxR67(nctx) && (b.Kind == schema.StoragePromotedArray || (b.Kind == schema.StorageNestedSubfield && (nctx == nil || nctx.nestedPath != b.NestedPath)) || isNestedMultiVal)) ||
+			(isInLambdaCtxR67(nctx) && !t.isBoundToNestedCtx(field, b, nctx) && (b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield)) {
 			colName := b.EffectiveArrayColumn(true)
-			hexElem := sqlCanonicalIPHexExpr("_x")
+			elemTarget := "_x"
+			if isInLambdaCtxR67(nctx) {
+				elemTarget = fmt.Sprintf("element_at(`%s`, 1)", colName)
+			}
+			hexElem := sqlCanonicalIPHexExpr(elemTarget)
 			var elemParts []string
 			if gt != nil {
 				if h, ok := parseIPToUpperHex16(gt); ok {
@@ -7160,6 +7418,9 @@ func (t *Transpiler) compileRangeSingleField(field string, rc esast.RangeCond, n
 			}
 			if len(elemParts) == 0 {
 				return "TRUE"
+			}
+			if isInLambdaCtxR67(nctx) {
+				return strings.Join(elemParts, " AND ")
 			}
 			if isNestedMultiVal {
 				rawCol := t.sqlColumnRef(field, true, nctx)
@@ -7483,38 +7744,50 @@ func (t *Transpiler) compileRangeSingleField(field string, rc esast.RangeCond, n
 	}
 
 	isNestedMultiVal := nctx != nil && b.Kind == schema.StorageNestedSubfield && nctx.nestedPath == b.NestedPath && b.IsMultiValued
-	if (!t.isBoundToNestedCtx(field, b, nctx) && (b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield)) || isNestedMultiVal {
-		elemExpr := "_x"
+	if (!isInLambdaCtxR67(nctx) && ((!t.isBoundToNestedCtx(field, b, nctx) && (b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield)) || isNestedMultiVal)) ||
+		(isInLambdaCtxR67(nctx) && !t.isBoundToNestedCtx(field, b, nctx) && (b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield)) {
+		var targetVar string
+		if isInLambdaCtxR67(nctx) {
+			arrCol := b.EffectiveArrayColumn(true)
+			if b.Kind == schema.StoragePromotedArray && (b.DorisType == schema.DorisLargeInt || b.DorisType == schema.DorisLargeIntArray) {
+				targetVar = fmt.Sprintf("element_at(TRY_CAST(`%s` AS ARRAY<LARGEINT>), 1)", arrCol)
+			} else {
+				targetVar = fmt.Sprintf("element_at(`%s`, 1)", arrCol)
+			}
+		} else {
+			targetVar = "_x"
+		}
+		elemExpr := targetVar
 		switch b.ESType {
 		case "boolean":
-			elemExpr = "TRY_CAST(_x AS BOOLEAN)"
+			elemExpr = fmt.Sprintf("TRY_CAST(%s AS BOOLEAN)", targetVar)
 		case "unsigned_long":
-			elemExpr = "TRY_CAST(_x AS LARGEINT)"
+			elemExpr = fmt.Sprintf("TRY_CAST(%s AS LARGEINT)", targetVar)
 		case "float", "half_float", "scaled_float", "double":
-			elemExpr = "TRY_CAST(_x AS DOUBLE)"
+			elemExpr = fmt.Sprintf("TRY_CAST(%s AS DOUBLE)", targetVar)
 		case "byte", "short", "integer", "long", "date", "date_nanos":
-			elemExpr = "TRY_CAST(_x AS BIGINT)"
+			elemExpr = fmt.Sprintf("TRY_CAST(%s AS BIGINT)", targetVar)
 		default:
 			switch sv := sampleBound.(type) {
 			case bool:
-				elemExpr = "TRY_CAST(_x AS BOOLEAN)"
+				elemExpr = fmt.Sprintf("TRY_CAST(%s AS BOOLEAN)", targetVar)
 			case uint64:
-				elemExpr = "TRY_CAST(_x AS LARGEINT)"
+				elemExpr = fmt.Sprintf("TRY_CAST(%s AS LARGEINT)", targetVar)
 			case int, int64:
-				elemExpr = "TRY_CAST(_x AS BIGINT)"
+				elemExpr = fmt.Sprintf("TRY_CAST(%s AS BIGINT)", targetVar)
 			case float64:
 				if sv == math.Trunc(sv) {
-					elemExpr = "TRY_CAST(_x AS BIGINT)"
+					elemExpr = fmt.Sprintf("TRY_CAST(%s AS BIGINT)", targetVar)
 				} else {
-					elemExpr = "TRY_CAST(_x AS DOUBLE)"
+					elemExpr = fmt.Sprintf("TRY_CAST(%s AS DOUBLE)", targetVar)
 				}
 			case json.Number:
 				if _, err := sv.Int64(); err == nil {
-					elemExpr = "TRY_CAST(_x AS BIGINT)"
+					elemExpr = fmt.Sprintf("TRY_CAST(%s AS BIGINT)", targetVar)
 				} else if _, errU := strconv.ParseUint(sv.String(), 10, 64); errU == nil {
-					elemExpr = "TRY_CAST(_x AS LARGEINT)"
+					elemExpr = fmt.Sprintf("TRY_CAST(%s AS LARGEINT)", targetVar)
 				} else {
-					elemExpr = "TRY_CAST(_x AS DOUBLE)"
+					elemExpr = fmt.Sprintf("TRY_CAST(%s AS DOUBLE)", targetVar)
 				}
 			}
 		}
@@ -7533,6 +7806,9 @@ func (t *Transpiler) compileRangeSingleField(field string, rc esast.RangeCond, n
 		}
 		if len(elemParts) == 0 {
 			return "TRUE"
+		}
+		if isInLambdaCtxR67(nctx) {
+			return strings.Join(elemParts, " AND ")
 		}
 		if isNestedMultiVal {
 			col := t.sqlColumnRef(field, true, nctx)
@@ -7609,6 +7885,9 @@ func (t *Transpiler) compileRangeSingleField(field string, rc esast.RangeCond, n
 				elemParts = append(elemParts, fmt.Sprintf("_x <= %s", quoteValue(lte)))
 			}
 			scalarCond := strings.Join(parts, " AND ")
+			if isInLambdaCtxR67(nctx) {
+				return scalarCond
+			}
 			if len(parts) > 1 {
 				scalarCond = "(" + scalarCond + ")"
 			}
@@ -7722,8 +8001,8 @@ func (t *Transpiler) buildAggsCTESQL(baseWhere, userWhere, aliasWhere, postFilte
 
 		return fmt.Sprintf(
 			"WITH `base_matched` AS (SELECT * FROM `%s`.`%s` WHERE `__DORIS_DELETE_SIGN__` = 0 AND (%s))\n%s",
-			t.Schema.DorisDB,
-			t.Schema.DorisTable,
+			escapeDorisBacktickIdent(t.Schema.DorisDB),
+			escapeDorisBacktickIdent(t.Schema.DorisTable),
 			baseWhere,
 			wrapUnionBranchesWithOuterOrderByR63(branches),
 		)
@@ -7767,8 +8046,8 @@ func (t *Transpiler) buildAggsCTESQL(baseWhere, userWhere, aliasWhere, postFilte
 	}
 	return fmt.Sprintf(
 		"WITH `base_matched` AS (SELECT * FROM `%s`.`%s` WHERE %s)\n%s",
-		t.Schema.DorisDB,
-		t.Schema.DorisTable,
+		escapeDorisBacktickIdent(t.Schema.DorisDB),
+		escapeDorisBacktickIdent(t.Schema.DorisTable),
 		cteWhere,
 		wrapUnionBranchesWithOuterOrderByR63(branches),
 	)
@@ -12888,7 +13167,7 @@ func (t *Transpiler) histogramArrayExpr(field string, b schema.FieldBinding, nct
 	}
 	if nctx != nil && nctx.elemVar != "" && ((b.Kind == schema.StorageNestedSubfield && nctx.nestedPath == b.NestedPath) || strings.HasPrefix(effField, nctx.nestedPath+".")) {
 		relPath := t.nestedRelativeJSONPath(field, false, nctx.nestedPath)
-		return fmt.Sprintf("TRY_CAST(json_extract_string(%s, %s) AS ARRAY<STRING>)", nctx.elemVar, quoteStr(relPath+"._h"))
+		return fmt.Sprintf("TRY_CAST(json_extract_string(%s, %s) AS ARRAY<STRING>)", nctx.elemVar, quoteStr(relPath+"."+QuoteDorisJSONPathSegment("_h")))
 	}
 	srcPath := b.SourceJSONPath
 	if len(srcPath) == 0 && effField != "" {
@@ -13425,7 +13704,7 @@ func (t *Transpiler) compileMetricScriptExprWithOverride(script any, defaultFiel
 	if !ok || compiled == "" {
 		return "", false
 	}
-	return fmt.Sprintf("CAST(%s AS DOUBLE)", compiled), true
+	return fmt.Sprintf("TRY_CAST(%s AS DOUBLE)", compiled), true
 }
 
 func stripLeadingScriptCast(s string) string {
@@ -14428,7 +14707,7 @@ func (t *Transpiler) compileGeoDistanceSortExpr(s esast.SortSpec) (string, bool)
 			if nestedPath == "" {
 				nestedPath = b.NestedPath
 			}
-			fCompiled := t.CompileQuery(s.Entry.Nested.Filter, false, &nestedCtx{nestedPath: nestedPath, elemVar: "_el"})
+			fCompiled := t.CompileQuery(s.Entry.Nested.Filter, false, &nestedCtx{nestedPath: nestedPath, elemVar: "_el", inLambda: true})
 			if fCompiled.WhereSQL != "" && fCompiled.WhereSQL != "TRUE" && t.Schema != nil {
 				corrCol, ok := t.Schema.NestedRoots[nestedPath]
 				if !ok {
@@ -15086,7 +15365,7 @@ func (t *Transpiler) sqlSortColumnRefWithType(field string, sampleVal any, desc 
 				if cur.Filter == nil {
 					continue
 				}
-				fCompiled := t.CompileQuery(cur.Filter, false, &nestedCtx{nestedPath: leafPath, elemVar: "_el"})
+				fCompiled := t.CompileQuery(cur.Filter, false, &nestedCtx{nestedPath: leafPath, elemVar: "_el", inLambda: true})
 				if fCompiled.WhereSQL != "" && fCompiled.WhereSQL != "TRUE" {
 					leafConds = append(leafConds, fCompiled.WhereSQL)
 				}
@@ -15095,7 +15374,7 @@ func (t *Transpiler) sqlSortColumnRefWithType(field string, sampleVal any, desc 
 				if !ok {
 					ancCorrCol = "n__" + schema.SanitizeDorisIdentifier(curPath)
 				}
-				fCompiled := t.CompileQuery(cur.Filter, false, &nestedCtx{nestedPath: curPath, elemVar: "_el"})
+				fCompiled := t.CompileQuery(cur.Filter, false, &nestedCtx{nestedPath: curPath, elemVar: "_el", inLambda: true})
 				ancIDs := flatNestedIDsExpr(ancCorrCol, fCompiled.WhereSQL, "$._nested_id")
 				idLookup := "json_extract_string(_el, '$._parent_id')"
 				hops := t.countNestedHops(curPath, leafPath)
@@ -15369,7 +15648,12 @@ func (t *Transpiler) nestedRelativeJSONPath(field string, preferKeyword bool, ne
 			}
 		}
 	}
-	return "$." + relKey
+	segs := strings.Split(relKey, ".")
+	quoted := make([]string, len(segs))
+	for i, seg := range segs {
+		quoted[i] = QuoteDorisJSONPathSegment(seg)
+	}
+	return "$." + strings.Join(quoted, ".")
 }
 
 func (t *Transpiler) resolveFieldInNestedCtx(field string, preferKeyword bool, nctx *nestedCtx) (string, schema.FieldBinding) {
@@ -16187,14 +16471,14 @@ func (t *Transpiler) rangeFieldBoundsAndRawSQL(field string, b schema.FieldBindi
 	}
 	if nctx != nil && nctx.elemVar != "" && (b.Kind == schema.StorageNestedSubfield || b.NestedPath == nctx.nestedPath) && nctx.nestedPath == b.NestedPath {
 		relPath := t.nestedRelativeJSONPath(field, false, b.NestedPath)
-		gtePath := strings.TrimSuffix(relPath, "") + "._gte"
-		ltePath := strings.TrimSuffix(relPath, "") + "._lte"
-		rawGtePath := strings.TrimSuffix(relPath, "") + ".gte"
-		rawLtePath := strings.TrimSuffix(relPath, "") + ".lte"
-		gtPath := strings.TrimSuffix(relPath, "") + "._gt"
-		ltPath := strings.TrimSuffix(relPath, "") + "._lt"
-		rawGtPath := strings.TrimSuffix(relPath, "") + ".gt"
-		rawLtPath := strings.TrimSuffix(relPath, "") + ".lt"
+		gtePath := relPath + "." + QuoteDorisJSONPathSegment("_gte")
+		ltePath := relPath + "." + QuoteDorisJSONPathSegment("_lte")
+		rawGtePath := relPath + "." + QuoteDorisJSONPathSegment("gte")
+		rawLtePath := relPath + "." + QuoteDorisJSONPathSegment("lte")
+		gtPath := relPath + "." + QuoteDorisJSONPathSegment("_gt")
+		ltPath := relPath + "." + QuoteDorisJSONPathSegment("_lt")
+		rawGtPath := relPath + "." + QuoteDorisJSONPathSegment("gt")
+		rawLtPath := relPath + "." + QuoteDorisJSONPathSegment("lt")
 		rawLower := fmt.Sprintf("COALESCE(TRY_CAST(json_extract_string(%s, %s) AS DOUBLE), TRY_CAST(json_extract_string(%s, %s) AS DOUBLE), TRY_CAST(json_extract_string(%s, %s) AS DOUBLE), TRY_CAST(json_extract_string(%s, %s) AS DOUBLE))",
 			nctx.elemVar, quoteStr(gtePath), nctx.elemVar, quoteStr(rawGtePath), nctx.elemVar, quoteStr(gtPath), nctx.elemVar, quoteStr(rawGtPath))
 		rawUpper := fmt.Sprintf("COALESCE(TRY_CAST(json_extract_string(%s, %s) AS DOUBLE), TRY_CAST(json_extract_string(%s, %s) AS DOUBLE), TRY_CAST(json_extract_string(%s, %s) AS DOUBLE), TRY_CAST(json_extract_string(%s, %s) AS DOUBLE))",
@@ -16559,10 +16843,13 @@ func (t *Transpiler) compileRangePredOnRangeField(field string, b schema.FieldBi
 	var rArrExpr string
 	if nctx != nil && nctx.elemVar != "" && (b.Kind == schema.StorageNestedSubfield || b.NestedPath == nctx.nestedPath) && nctx.nestedPath == b.NestedPath {
 		relPath := t.nestedRelativeJSONPath(field, false, b.NestedPath)
-		rArrExpr = fmt.Sprintf("TRY_CAST(json_extract_string(%s, %s) AS ARRAY<STRING>)", nctx.elemVar, quoteStr(relPath+"._r"))
+		rArrExpr = fmt.Sprintf("TRY_CAST(json_extract_string(%s, %s) AS ARRAY<STRING>)", nctx.elemVar, quoteStr(relPath+"."+QuoteDorisJSONPathSegment("_r")))
 	} else {
 		baseExpr := rangeDocBaseExpr(field, b)
 		rArrExpr = fmt.Sprintf("TRY_CAST(%s['_r'] AS ARRAY<STRING>)", baseExpr)
+	}
+	if isInLambdaCtxR67(nctx) {
+		return singlePred
 	}
 	elemLower := "TRY_CAST(SPLIT_PART(_x, ',', 1) AS DOUBLE)"
 	elemUpper := "TRY_CAST(SPLIT_PART(_x, ',', 2) AS DOUBLE)"
@@ -16614,9 +16901,16 @@ func (t *Transpiler) compileGeoPolygon(gp *esast.GeoPolygonQuery, scoring bool, 
 		whereSQL = fmt.Sprintf("(%s AND %s)", bboxQ.WhereSQL, buildPointInPolygonSQL(latExpr, lonExpr, gp.Points))
 	} else if b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield {
 		arrCol := fmt.Sprintf("`%s`", b.EffectiveArrayColumn(true))
-		latExpr := "TRY_CAST(SPLIT_PART(_x, ',', 1) AS DOUBLE)"
-		lonExpr := "TRY_CAST(SPLIT_PART(_x, ',', 2) AS DOUBLE)"
-		whereSQL = fmt.Sprintf("array_exists(_x -> _x IS NOT NULL AND %s, %s)", buildPointInPolygonSQL(latExpr, lonExpr, gp.Points), arrCol)
+		if isInLambdaCtxR67(nctx) {
+			elemExpr := fmt.Sprintf("element_at(%s, 1)", arrCol)
+			latExpr := fmt.Sprintf("TRY_CAST(SPLIT_PART(%s, ',', 1) AS DOUBLE)", elemExpr)
+			lonExpr := fmt.Sprintf("TRY_CAST(SPLIT_PART(%s, ',', 2) AS DOUBLE)", elemExpr)
+			whereSQL = fmt.Sprintf("(%s AND %s IS NOT NULL AND %s)", bboxQ.WhereSQL, elemExpr, buildPointInPolygonSQL(latExpr, lonExpr, gp.Points))
+		} else {
+			latExpr := "TRY_CAST(SPLIT_PART(_x, ',', 1) AS DOUBLE)"
+			lonExpr := "TRY_CAST(SPLIT_PART(_x, ',', 2) AS DOUBLE)"
+			whereSQL = fmt.Sprintf("array_exists(_x -> _x IS NOT NULL AND %s, %s)", buildPointInPolygonSQL(latExpr, lonExpr, gp.Points), arrCol)
+		}
 	} else {
 		latExpr, lonExpr, _ := t.extractGeoPointExprs(resolvedField, b)
 		whereSQL = fmt.Sprintf("(%s AND %s)", bboxQ.WhereSQL, buildPointInPolygonSQL(latExpr, lonExpr, gp.Points))
@@ -18297,7 +18591,14 @@ func (t *Transpiler) compileDistanceFeature(df *esast.DistanceFeatureQuery, inSc
 						distExpr = fmt.Sprintf("ST_Distance_Sphere(%s, %s, %s, %s)", lonExpr, latExpr, tLonStr, tLatStr)
 					} else if b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield {
 						arrCol := fmt.Sprintf("`%s`", b.EffectiveArrayColumn(true))
-						distExpr = fmt.Sprintf("array_min(array_map(_x -> ST_Distance_Sphere(TRY_CAST(SPLIT_PART(_x, ',', 2) AS DOUBLE), TRY_CAST(SPLIT_PART(_x, ',', 1) AS DOUBLE), %s, %s), %s))", tLonStr, tLatStr, arrCol)
+						if isInLambdaCtxR67(nctx) {
+							elemExpr := fmt.Sprintf("element_at(%s, 1)", arrCol)
+							latExpr := fmt.Sprintf("TRY_CAST(SPLIT_PART(%s, ',', 1) AS DOUBLE)", elemExpr)
+							lonExpr := fmt.Sprintf("TRY_CAST(SPLIT_PART(%s, ',', 2) AS DOUBLE)", elemExpr)
+							distExpr = fmt.Sprintf("ST_Distance_Sphere(%s, %s, %s, %s)", lonExpr, latExpr, tLonStr, tLatStr)
+						} else {
+							distExpr = fmt.Sprintf("array_min(array_map(_x -> ST_Distance_Sphere(TRY_CAST(SPLIT_PART(_x, ',', 2) AS DOUBLE), TRY_CAST(SPLIT_PART(_x, ',', 1) AS DOUBLE), %s, %s), %s))", tLonStr, tLatStr, arrCol)
+						}
 					} else {
 						latExpr, lonExpr, _ := t.extractGeoPointExprs(field, b)
 						distExpr = fmt.Sprintf("ST_Distance_Sphere(%s, %s, %s, %s)", lonExpr, latExpr, tLonStr, tLatStr)
@@ -18824,24 +19125,45 @@ func (t *Transpiler) compileSparseVectorQuery(sv *esast.SparseVectorQuerySpec, i
 	return CompiledQuery{WhereSQL: whereSQL, SafeWhereSQL: whereSQL, ScoreSQL: scoreSQL}
 }
 
+// hasASCIIFoldPrefixAt reports whether s[idx:] starts with upperPrefix (pure ASCII uppercase/spaces)
+// using byte-accurate ASCII case folding so non-ASCII Unicode case expansion/contraction never drifts offsets.
+func hasASCIIFoldPrefixAt(s string, idx int, upperPrefix string) bool {
+	if idx < 0 || idx+len(upperPrefix) > len(s) {
+		return false
+	}
+	for j := 0; j < len(upperPrefix); j++ {
+		b := s[idx+j]
+		if b >= 'a' && b <= 'z' {
+			b -= 'a' - 'A'
+		}
+		if b != upperPrefix[j] {
+			return false
+		}
+	}
+	return true
+}
+
+func isASCIIWhitespaceByteR67(b byte) bool {
+	return b == ' ' || b == '\t' || b == '\r' || b == '\n'
+}
+
 // appendLateralViewToFromClause inserts a LATERAL VIEW EXPLODE clause on the base relation
 // BEFORE the first top-level JOIN clause (Doris 4.1.3 Nereids forbids LATERAL VIEW after JOIN ON).
 func appendLateralViewToFromClause(fromClause, lateralView string) string {
 	trimmed := strings.TrimSpace(fromClause)
 	depth := 0
 	inSingle, inDouble, inBacktick := false, false, false
-	joinPfxes := []string{
-		" INNER JOIN ",
-		" LEFT OUTER JOIN ",
-		" LEFT JOIN ",
-		" RIGHT OUTER JOIN ",
-		" RIGHT JOIN ",
-		" FULL OUTER JOIN ",
-		" FULL JOIN ",
-		" CROSS JOIN ",
-		" JOIN ",
+	joinKeywords := []string{
+		"INNER JOIN",
+		"LEFT OUTER JOIN",
+		"LEFT JOIN",
+		"RIGHT OUTER JOIN",
+		"RIGHT JOIN",
+		"FULL OUTER JOIN",
+		"FULL JOIN",
+		"CROSS JOIN",
+		"JOIN",
 	}
-	upper := strings.ToUpper(trimmed)
 	for i := 0; i < len(trimmed); i++ {
 		c := trimmed[i]
 		if inSingle {
@@ -18892,9 +19214,9 @@ func appendLateralViewToFromClause(fromClause, lateralView string) string {
 				depth--
 			}
 		default:
-			if depth == 0 && c == ' ' {
-				for _, pfx := range joinPfxes {
-					if i+len(pfx) <= len(upper) && upper[i:i+len(pfx)] == pfx {
+			if depth == 0 && isASCIIWhitespaceByteR67(c) {
+				for _, kw := range joinKeywords {
+					if hasASCIIFoldPrefixAt(trimmed, i+1, kw) && i+1+len(kw) < len(trimmed) && isASCIIWhitespaceByteR67(trimmed[i+1+len(kw)]) {
 						left := strings.TrimRight(trimmed[:i], " \t\r\n")
 						right := strings.TrimLeft(trimmed[i:], " \t\r\n")
 						return left + " " + strings.TrimSpace(lateralView) + " " + right

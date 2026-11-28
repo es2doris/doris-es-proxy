@@ -184,8 +184,8 @@ func TestRound37_F5_F6_ShredderNullArrayNullValueAndNestedKwCompanionOrder(t *te
 	if err != nil {
 		t.Fatalf("BuildSearchPlan: %v", err)
 	}
-	if !strings.Contains(plan.HitsSQL, "$.name__keyword") {
-		t.Fatalf("expected nested SQL to reference $.name__keyword, got %s", plan.HitsSQL)
+	if !strings.Contains(plan.HitsSQL, "$.\"name__keyword\"") {
+		t.Fatalf("expected nested SQL to reference $.\"name__keyword\", got %s", plan.HitsSQL)
 	}
 }
 

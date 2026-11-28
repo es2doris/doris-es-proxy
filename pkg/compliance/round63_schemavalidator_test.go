@@ -161,6 +161,7 @@ func TestSpecSchemaValidatorHeadPlainTextBinaryAndNodesUsageRound63(t *testing.T
 	// 3. Live proxy schema validation for nodes.usage, nodes.info, cluster.stats, cluster.reroute
 	backend := proxy.NewMemoryBackend(false)
 	srv := proxy.NewServer("es_db", backend, transpiler.TranspilerOptions{})
+	srv.SetAllowTestFixtureAuth(true)
 	t.Cleanup(func() { _ = srv.Close(context.Background()) })
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
@@ -268,12 +269,15 @@ func TestRound63TargetedAdminYAMLSpecs(t *testing.T) {
 			opts := compliance.SuiteOptions{
 				CorpusName:                  corp.name,
 				TargetVersion:               corp.targetVer,
+				DefaultAuthUser:             compliance.DefaultFixtureAuthUser,
+				DefaultAuthPass:             compliance.DefaultFixtureAuthPass,
 				SupportedClusterFeatures:    compliance.DefaultSupportedClusterFeatures(),
 				SupportedTestRunnerFeatures: compliance.DefaultSupportedTestRunnerFeatures(),
 				FileFilter:                  matchFn,
 				NewSectionHandler: func() (http.Handler, func()) {
 					b := proxy.NewMemoryBackend(false)
 					s := proxy.NewServer("es_db", b, transpiler.TranspilerOptions{})
+					s.SetAllowTestFixtureAuth(true)
 					s.SetTargetESVersion(corp.targetVer)
 					s.SetRemoteReindexAllowPrivateIPs(true)
 					return s.Handler(), func() { _ = s.Close(context.Background()) }

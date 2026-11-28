@@ -333,33 +333,63 @@ func TestRound66CovFeatures_RolloverResolveExplainPainlessRankEvalAndDownsample(
 func TestRound66CovFeatures_SecurityDataStreamAutoscalingMLESQLSQLAndEQL(t *testing.T) {
 	_, h := newR66CovServer(t, "8.15.0")
 
-	// Security API routes.
-	mustR66CovHTTP(t, h, http.MethodGet, "/_security/user", "", http.StatusOK)
-	mustR66CovHTTP(t, h, http.MethodPut, "/_security/user/alice", `{"password":"pw1","roles":["superuser"],"full_name":"Alice"}`, http.StatusOK)
-	mustR66CovHTTP(t, h, http.MethodPost, "/_security/user/alice/_disable", "", http.StatusOK)
-	mustR66CovHTTP(t, h, http.MethodPost, "/_security/user/alice/_enable", "", http.StatusOK)
-	mustR66CovHTTP(t, h, http.MethodPut, "/_security/user/alice/_password", `{"password":"pw2"}`, http.StatusOK)
-	mustR66CovHTTP(t, h, http.MethodPost, "/_security/user/alice/_clear_cache", "", http.StatusOK)
-	mustR66CovHTTP(t, h, http.MethodPost, "/_security/user/_has_privileges", `{"cluster":["monitor"],"index":[{"names":["logs*"],"privileges":["read"]}]}`, http.StatusOK)
+	// Security API routes (isolated sub-server so creating dynamic users does not lock out later open-cluster feature routes).
+	_, secH := newR66CovServer(t, "8.15.0")
+	mustSec := func(method, path, body string, hdrs map[string]string, want int) map[string]any {
+		t.Helper()
+		st, _, resp, raw := doR66CovHTTP(t, secH, method, path, body, hdrs)
+		if st != want {
+			t.Fatalf("%s %s status=%d want=%d raw=%s", method, path, st, want, raw)
+		}
+		return resp
+	}
+	alicePW1Hdr := map[string]string{"Authorization": "Basic " + base64.StdEncoding.EncodeToString([]byte("alice:pw1"))}
+	alicePW2Hdr := map[string]string{"Authorization": "Basic " + base64.StdEncoding.EncodeToString([]byte("alice:pw2"))}
+	mustSec(http.MethodGet, "/_security/user", "", nil, http.StatusOK)
+	mustSec(http.MethodPut, "/_security/user/alice", `{"password":"pw1","roles":["superuser"],"full_name":"Alice"}`, nil, http.StatusOK)
+	mustSec(http.MethodPost, "/_security/user/alice/_disable", "", alicePW1Hdr, http.StatusOK)
+	// While alice is disabled, alice cannot authenticate with Basic auth; re-enable using admin-free sub-request on another admin or verify 401 first.
+	stDisabled, _, _, _ := doR66CovHTTP(t, secH, http.MethodGet, "/_security/user/alice", "", alicePW1Hdr)
+	if stDisabled != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for disabled alice, got %d", stDisabled)
+	}
+	// Configure an admin user on a separate security check or re-enable via handleSecurityAPI / static admin is covered elsewhere; create secadmin cleanly for enable/password/keys.
+	_, secH2 := newR66CovServer(t, "8.15.0")
+	adminHdr := map[string]string{"Authorization": "Basic " + base64.StdEncoding.EncodeToString([]byte("secadmin:adminpw"))}
+	mustSec2 := func(method, path, body string, hdrs map[string]string, want int) map[string]any {
+		t.Helper()
+		st, _, resp, raw := doR66CovHTTP(t, secH2, method, path, body, hdrs)
+		if st != want {
+			t.Fatalf("%s %s status=%d want=%d raw=%s", method, path, st, want, raw)
+		}
+		return resp
+	}
+	mustSec2(http.MethodPut, "/_security/user/secadmin", `{"password":"adminpw","roles":["superuser"]}`, nil, http.StatusOK)
+	mustSec2(http.MethodPut, "/_security/user/alice", `{"password":"pw1","roles":["superuser"],"full_name":"Alice"}`, adminHdr, http.StatusOK)
+	mustSec2(http.MethodPost, "/_security/user/alice/_disable", "", adminHdr, http.StatusOK)
+	mustSec2(http.MethodPost, "/_security/user/alice/_enable", "", adminHdr, http.StatusOK)
+	mustSec2(http.MethodPut, "/_security/user/alice/_password", `{"password":"pw2"}`, adminHdr, http.StatusOK)
+	mustSec2(http.MethodPost, "/_security/user/alice/_clear_cache", "", alicePW2Hdr, http.StatusOK)
+	mustSec2(http.MethodPost, "/_security/user/_has_privileges", `{"cluster":["monitor"],"index":[{"names":["logs*"],"privileges":["read"]}]}`, alicePW2Hdr, http.StatusOK)
 
-	mustR66CovHTTP(t, h, http.MethodPut, "/_security/role/cov_role", `{"cluster":["all"]}`, http.StatusOK)
-	mustR66CovHTTP(t, h, http.MethodGet, "/_security/role/cov_role", "", http.StatusOK)
-	mustR66CovHTTP(t, h, http.MethodPut, "/_security/role_mapping/cov_rm", `{"roles":["cov_role"],"rules":{"field":{"username":"alice"}}}`, http.StatusOK)
-	mustR66CovHTTP(t, h, http.MethodGet, "/_security/role_mapping/cov_rm", "", http.StatusOK)
-	mustR66CovHTTP(t, h, http.MethodGet, "/_security/role_mapping", "", http.StatusOK)
+	mustSec2(http.MethodPut, "/_security/role/cov_role", `{"cluster":["all"]}`, adminHdr, http.StatusOK)
+	mustSec2(http.MethodGet, "/_security/role/cov_role", "", adminHdr, http.StatusOK)
+	mustSec2(http.MethodPut, "/_security/role_mapping/cov_rm", `{"roles":["cov_role"],"rules":{"field":{"username":"alice"}}}`, adminHdr, http.StatusOK)
+	mustSec2(http.MethodGet, "/_security/role_mapping/cov_rm", "", adminHdr, http.StatusOK)
+	mustSec2(http.MethodGet, "/_security/role_mapping", "", adminHdr, http.StatusOK)
 
-	mustR66CovHTTP(t, h, http.MethodGet, "/_security/privilege/_builtin", "", http.StatusOK)
-	mustR66CovHTTP(t, h, http.MethodPut, "/_security/privilege", `{"app1":{"read":{"actions":["data:read/*"]}}}`, http.StatusOK)
-	mustR66CovHTTP(t, h, http.MethodPost, "/_security/api_key", `{"name":"ak1","expiration":"1d"}`, http.StatusOK)
-	mustR66CovHTTP(t, h, http.MethodPost, "/_security/api_key/_grant", `{"grant_type":"password","username":"alice","api_key":{"name":"ak2"}}`, http.StatusOK)
-	mustR66CovHTTP(t, h, http.MethodGet, "/_security/api_key?name=ak1", "", http.StatusOK)
-	mustR66CovHTTP(t, h, http.MethodGet, "/_security/service", "", http.StatusOK)
-	mustR66CovHTTP(t, h, http.MethodPost, "/_security/service/elastic/kibana/credential/token/t1", "", http.StatusOK)
-	mustR66CovHTTP(t, h, http.MethodGet, "/_security/service/elastic/kibana/credential", "", http.StatusOK)
-	mustR66CovHTTP(t, h, http.MethodDelete, "/_security/service/elastic/kibana/credential/token/t1", "", http.StatusOK)
-	mustR66CovHTTP(t, h, http.MethodPost, "/_security/oauth2/token", `{"grant_type":"client_credentials"}`, http.StatusOK)
-	mustR66CovHTTP(t, h, http.MethodDelete, "/_security/oauth2/token", `{"token":"dummy"}`, http.StatusOK)
-	mustR66CovHTTP(t, h, http.MethodDelete, "/_security/role/cov_role", "", http.StatusOK)
+	mustSec2(http.MethodGet, "/_security/privilege/_builtin", "", adminHdr, http.StatusOK)
+	mustSec2(http.MethodPut, "/_security/privilege", `{"app1":{"read":{"actions":["data:read/*"]}}}`, adminHdr, http.StatusOK)
+	mustSec2(http.MethodPost, "/_security/api_key", `{"name":"ak1","expiration":"1d"}`, alicePW2Hdr, http.StatusOK)
+	mustSec2(http.MethodPost, "/_security/api_key/_grant", `{"grant_type":"password","username":"alice","password":"pw2","api_key":{"name":"ak2"}}`, nil, http.StatusOK)
+	mustSec2(http.MethodGet, "/_security/api_key?name=ak1", "", adminHdr, http.StatusOK)
+	mustSec2(http.MethodGet, "/_security/service", "", adminHdr, http.StatusOK)
+	mustSec2(http.MethodPost, "/_security/service/elastic/kibana/credential/token/t1", "", adminHdr, http.StatusOK)
+	mustSec2(http.MethodGet, "/_security/service/elastic/kibana/credential", "", adminHdr, http.StatusOK)
+	mustSec2(http.MethodDelete, "/_security/service/elastic/kibana/credential/token/t1", "", adminHdr, http.StatusOK)
+	mustSec2(http.MethodPost, "/_security/oauth2/token", `{"grant_type":"client_credentials"}`, adminHdr, http.StatusOK)
+	mustSec2(http.MethodDelete, "/_security/oauth2/token", `{"token":"dummy"}`, adminHdr, http.StatusOK)
+	mustSec2(http.MethodDelete, "/_security/role/cov_role", "", adminHdr, http.StatusOK)
 
 	// Autoscaling policy + capacity.
 	mustR66CovHTTP(t, h, http.MethodPut, "/_autoscaling/policy/as_cov", `{"roles":["data_hot"],"deciders":{"fixed":{"storage":"10gb","memory":"4gb","processors":2,"nodes":1}}}`, http.StatusOK)
@@ -905,16 +935,22 @@ func TestRound66CovFeatures_DataStreamModifySynonymsSLMWatchLicenseMonitoringAnd
 	mustR66CovHTTP(t, h, http.MethodPost, "/_license", `{"license":{"type":"basic"}}`, http.StatusBadRequest)
 	mustR66CovHTTP(t, h, http.MethodPost, "/_license", `{"licenses":[{"type":"gold","uid":"u1","expiry_date_in_millis":4102444800000}]}`, http.StatusOK)
 
-	akResp := mustR66CovHTTP(t, h, http.MethodPost, "/_security/api_key", `{"name":"mon_key","role_descriptors":{"bad_role":{"cluster":["monitor"]}}}`, http.StatusOK)
+	monSrv, monH := newR66CovServer(t, "8.15.0")
+	monSrv.SetAuth("elastic", "r66-mon", "")
+	monAdminHdr := map[string]string{"Authorization": "Basic " + base64.StdEncoding.EncodeToString([]byte("elastic:r66-mon"))}
+	stAK, _, akResp, rawAK := doR66CovHTTP(t, monH, http.MethodPost, "/_security/api_key", `{"name":"mon_key","role_descriptors":{"bad_role":{"cluster":["monitor"]}}}`, monAdminHdr)
+	if stAK != http.StatusOK {
+		t.Fatalf("expected 200 creating mon_key, got %d %s", stAK, rawAK)
+	}
 	if id, _ := akResp["id"].(string); id != "" {
 		secret, _ := akResp["api_key"].(string)
 		tok := base64.StdEncoding.EncodeToString([]byte(id + ":" + secret))
-		stMon, _, _, _ := doR66CovHTTP(t, h, http.MethodPost, "/_monitoring/bulk", "", map[string]string{"Authorization": "ApiKey " + tok})
+		stMon, _, _, _ := doR66CovHTTP(t, monH, http.MethodPost, "/_monitoring/bulk", "", map[string]string{"Authorization": "ApiKey " + tok})
 		if stMon != http.StatusForbidden {
 			t.Fatalf("expected 403 monitoring ApiKey lacking manage priv, got %d", stMon)
 		}
 	}
-	stMonBad, _, _, _ := doR66CovHTTP(t, h, http.MethodPost, "/_monitoring/bulk", "", map[string]string{"Authorization": "ApiKey bad_token"})
+	stMonBad, _, _, _ := doR66CovHTTP(t, monH, http.MethodPost, "/_monitoring/bulk", "", map[string]string{"Authorization": "ApiKey bad_token"})
 	if stMonBad != http.StatusUnauthorized {
 		t.Fatalf("expected 401 bad ApiKey, got %d", stMonBad)
 	}

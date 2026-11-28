@@ -8296,10 +8296,10 @@ func emitRuntimeSignificantTextAggRowsR62Search(
 	}
 	var incRe, excRe *regexp.Regexp
 	if s, ok := incFilter.(string); ok {
-		incRe, _ = regexp.Compile("^(?:" + s + ")$")
+		incRe, _ = painless.CompileBoundedRawRegex("^(?:" + s + ")$")
 	}
 	if s, ok := excFilter.(string); ok {
-		excRe, _ = regexp.Compile("^(?:" + s + ")$")
+		excRe, _ = painless.CompileBoundedRawRegex("^(?:" + s + ")$")
 	}
 
 	heur := extractSigHeuristicForAggFromRawR63(scopeRawBodyR63(scope), fullAggName)

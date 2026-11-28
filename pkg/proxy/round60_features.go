@@ -70,7 +70,13 @@ func (s *Server) physicalDeleteDocs(ctx context.Context, idxSchema *schema.Index
 	if !ok {
 		return false, nil
 	}
-	_ = s.coalescer.FlushTable(ctx, idxSchema.DorisTable)
+	if len(ids) <= 16 {
+		for _, id := range ids {
+			_ = s.coalescer.FlushTableIfDocPending(ctx, idxSchema.DorisTable, id)
+		}
+	} else {
+		_ = s.coalescer.FlushTable(ctx, idxSchema.DorisTable)
+	}
 	if err := pdb.DeleteDocsByIDs(ctx, idxSchema.DorisDB, idxSchema.DorisTable, ids); err != nil {
 		return true, err
 	}

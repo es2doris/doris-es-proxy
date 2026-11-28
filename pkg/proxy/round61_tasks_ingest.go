@@ -1452,6 +1452,14 @@ func (s *Server) applyWritePipelinesFullRound61(
 	rawDoc json.RawMessage,
 	requireAlias bool,
 ) (IngestWriteResultRound61, int, string, string) {
+	return s.applyWritePipelinesFullWithTypeR67(rawTargetIndex, "", docID, reqPipeline, defaultPipeline, initialRouting, rawDoc, requireAlias)
+}
+
+func (s *Server) applyWritePipelinesFullWithTypeR67(
+	rawTargetIndex, docType, docID, reqPipeline, defaultPipeline, initialRouting string,
+	rawDoc json.RawMessage,
+	requireAlias bool,
+) (IngestWriteResultRound61, int, string, string) {
 	res := IngestWriteResultRound61{
 		Doc:         rawDoc,
 		TargetIndex: rawTargetIndex,
@@ -1462,8 +1470,8 @@ func (s *Server) applyWritePipelinesFullRound61(
 	if hookErr != nil {
 		return res, http.StatusBadRequest, "illegal_argument_exception", cleanIngestErrorReasonRound60(hookErr.Error())
 	}
-	cur, curIdx, curID, curRouting, dropped, execPipes, ingestMeta, err := s.applyEffectiveAndFinalPipelinesWithMetaRound61(
-		rawTargetIndex, docID, reqPipeline, defaultPipeline, initialRouting, rawDoc,
+	cur, curIdx, curID, curRouting, dropped, execPipes, ingestMeta, err := s.applyEffectiveAndFinalPipelinesWithMetaAndTypeR67(
+		rawTargetIndex, docType, docID, reqPipeline, defaultPipeline, initialRouting, rawDoc,
 	)
 	res.ExecutedPipelines = execPipes
 	if err != nil {

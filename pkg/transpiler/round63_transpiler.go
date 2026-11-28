@@ -683,9 +683,13 @@ func (t *Transpiler) compileBM25PhraseScoreR63(
 }
 
 func (t *Transpiler) singleAnalyzedTokenWhereOnlyR63(field string, b schema.FieldBinding, tok string, caseSensitive bool, nctx *nestedCtx) string {
-	rePat := quoteStr(buildAnalyzedTokenRegex(tok, caseSensitive))
+	rawPat := buildAnalyzedTokenRegex(tok, caseSensitive)
+	rePat := quoteStr(rawPat)
 	if !t.isBoundToNestedCtx(field, b, nctx) && (b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield) {
 		arrCol := b.EffectiveArrayColumn(false)
+		if isInLambdaCtxR67(nctx) {
+			return flatArrayRegexpSQLR67(fmt.Sprintf("`%s`", arrCol), rawPat)
+		}
 		return fmt.Sprintf("array_exists(_x -> _x IS NOT NULL AND _x REGEXP %s, `%s`)", rePat, arrCol)
 	}
 	col := t.sqlColumnRef(field, false, nctx)
@@ -736,18 +740,26 @@ func (t *Transpiler) compileAnalyzedTextTermPredicateR63(
 			return "FALSE", "", false, true
 		}
 		tok := strings.ToLower(rawStr)
-		rePat := quoteStr(buildAnalyzedTokenRegexExactR63(tok, false, isWS))
+		rawPat := buildAnalyzedTokenRegexExactR63(tok, false, isWS)
+		rePat := quoteStr(rawPat)
 		if !t.isBoundToNestedCtx(resolvedField, b, nctx) && (b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield) {
 			arrCol := b.EffectiveArrayColumn(false)
+			if isInLambdaCtxR67(nctx) {
+				return flatArrayRegexpSQLR67(fmt.Sprintf("`%s`", arrCol), rawPat), tok, false, true
+			}
 			return fmt.Sprintf("array_exists(_x -> _x IS NOT NULL AND _x REGEXP %s, `%s`)", rePat, arrCol), tok, false, true
 		}
 		col := t.sqlColumnRef(resolvedField, false, nctx)
 		return fmt.Sprintf("(%s IS NOT NULL AND %s REGEXP %s)", col, col, rePat), tok, false, true
 	}
 	cs := !caseInsensitive
-	rePat := quoteStr(buildAnalyzedTokenRegexExactR63(rawStr, cs, isWS))
+	rawPat := buildAnalyzedTokenRegexExactR63(rawStr, cs, isWS)
+	rePat := quoteStr(rawPat)
 	if !t.isBoundToNestedCtx(resolvedField, b, nctx) && (b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield) {
 		arrCol := b.EffectiveArrayColumn(false)
+		if isInLambdaCtxR67(nctx) {
+			return flatArrayRegexpSQLR67(fmt.Sprintf("`%s`", arrCol), rawPat), rawStr, cs, true
+		}
 		return fmt.Sprintf("array_exists(_x -> _x IS NOT NULL AND _x REGEXP %s, `%s`)", rePat, arrCol), rawStr, cs, true
 	}
 	col := t.sqlColumnRef(resolvedField, false, nctx)
@@ -1601,6 +1613,11 @@ func (t *Transpiler) evalGeoPointPredForFieldWithRelationR63(field, rel string, 
 	}
 	if b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield {
 		arrCol := fmt.Sprintf("`%s`", b.EffectiveArrayColumn(true))
+		if isInLambdaCtxR67(nctx) {
+			elemExpr := fmt.Sprintf("element_at(%s, 1)", arrCol)
+			latExpr, lonExpr := buildSingleGeoScalarLatLonSQLR63(elemExpr)
+			return fmt.Sprintf("(%s IS NOT NULL AND %s IS NOT NULL AND %s IS NOT NULL AND %s)", elemExpr, latExpr, lonExpr, buildCond(latExpr, lonExpr))
+		}
 		latExpr, lonExpr := buildSingleGeoScalarLatLonSQLR63("_x")
 		validX := fmt.Sprintf("(_x IS NOT NULL AND %s IS NOT NULL AND %s IS NOT NULL)", latExpr, lonExpr)
 		if isWithin {
@@ -1727,6 +1744,11 @@ func (t *Transpiler) queryReferencesNestedPathR63(q *esast.Query, nestedPath str
 	}
 	if q.Boosting != nil {
 		if t.queryReferencesNestedPathR63(&q.Boosting.Positive, nestedPath) || t.queryReferencesNestedPathR63(&q.Boosting.Negative, nestedPath) {
+			return true
+		}
+	}
+	if q.Nested != nil {
+		if q.Nested.Path == nestedPath || strings.HasPrefix(q.Nested.Path, nestedPath+".") {
 			return true
 		}
 	}
@@ -1993,7 +2015,7 @@ func (t *Transpiler) compileNestedKNNQueryR63(nq *esast.NestedQuery, scoring boo
 	for i := range kq.Filter {
 		fq := &kq.Filter[i]
 		if t.queryReferencesNestedPathR63(fq, nq.Path) {
-			fc := t.CompileQuery(fq, false, &nestedCtx{nestedPath: nq.Path, elemVar: "_nel"})
+			fc := t.CompileQuery(fq, false, &nestedCtx{nestedPath: nq.Path, elemVar: "_nel", inLambda: true})
 			if fc.WhereSQL != "" && fc.WhereSQL != "TRUE" {
 				childConds = append(childConds, fmt.Sprintf("(%s)", fc.WhereSQL))
 			}
@@ -2031,7 +2053,7 @@ func (t *Transpiler) compileNestedKNNQueryR63(nq *esast.NestedQuery, scoring boo
 	for i := range postClauses {
 		pq := &postClauses[i]
 		if t.queryReferencesNestedPathR63(pq, nq.Path) {
-			pc := t.CompileQuery(pq, false, &nestedCtx{nestedPath: nq.Path, elemVar: "_nel"})
+			pc := t.CompileQuery(pq, false, &nestedCtx{nestedPath: nq.Path, elemVar: "_nel", inLambda: true})
 			if pc.WhereSQL != "" && pc.WhereSQL != "TRUE" {
 				postChildConds = append(postChildConds, fmt.Sprintf("(%s)", pc.WhereSQL))
 				hasNestedPostFilter = true
@@ -2048,7 +2070,7 @@ func (t *Transpiler) compileNestedKNNQueryR63(nq *esast.NestedQuery, scoring boo
 	for i := range postMustNot {
 		pq := &postMustNot[i]
 		if t.queryReferencesNestedPathR63(pq, nq.Path) {
-			pc := t.CompileQuery(pq, false, &nestedCtx{nestedPath: nq.Path, elemVar: "_nel"})
+			pc := t.CompileQuery(pq, false, &nestedCtx{nestedPath: nq.Path, elemVar: "_nel", inLambda: true})
 			if pc.WhereSQL != "" && pc.WhereSQL != "FALSE" {
 				postChildConds = append(postChildConds, fmt.Sprintf("NOT (%s)", pc.WhereSQL))
 				hasNestedPostFilter = true
@@ -2100,7 +2122,7 @@ func (t *Transpiler) compileNestedKNNQueryR63(nq *esast.NestedQuery, scoring boo
 
 	if t.Schema != nil && t.Schema.DorisDB != "" && t.Schema.DorisTable != "" && topLimit > 0 {
 		topSubquery := fmt.Sprintf("`_id` IN (SELECT `_id` FROM (SELECT `_id`, ROW_NUMBER() OVER (ORDER BY %s DESC, `_id` ASC) AS `_rn` FROM `%s`.`%s` WHERE `__DORIS_DELETE_SIGN__` = 0 AND %s) `_knn_top` WHERE `_rn` <= %d)",
-			knnBestChildExpr, t.Schema.DorisDB, t.Schema.DorisTable, preFilter, topLimit)
+			knnBestChildExpr, escapeDorisBacktickIdent(t.Schema.DorisDB), escapeDorisBacktickIdent(t.Schema.DorisTable), preFilter, topLimit)
 		conds = append(conds, topSubquery)
 		safeConds = append(safeConds, topSubquery)
 	}

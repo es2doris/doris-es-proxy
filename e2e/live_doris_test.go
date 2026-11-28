@@ -71,6 +71,7 @@ func TestLiveApacheDoris_E2E(t *testing.T) {
 	backend := proxy.NewDorisSQLBackend(db, slClient)
 	backend.SetLogSQL(true)
 	srv := proxy.NewServer(dorisDB, backend, transpiler.TranspilerOptions{})
+	srv.SetAllowTestFixtureAuth(true)
 	if err := srv.BootstrapCatalog(context.Background()); err != nil {
 		t.Logf("initial BootstrapCatalog note: %v", err)
 	}
@@ -402,6 +403,7 @@ func TestLiveApacheDoris_E2E(t *testing.T) {
 
 	// 7. Stateless _es_catalog Rehydration across a fresh Server instance
 	srv2 := proxy.NewServer(dorisDB, backend, transpiler.TranspilerOptions{})
+	srv2.SetAllowTestFixtureAuth(true)
 	if err := srv2.BootstrapCatalog(context.Background()); err != nil {
 		t.Fatalf("srv2.BootstrapCatalog failed: %v", err)
 	}
@@ -2220,6 +2222,234 @@ func TestLiveApacheDoris_E2E(t *testing.T) {
 		var segs []map[string]any
 		if err := json.Unmarshal(jsRaw, &segs); err != nil || len(segs) == 0 {
 			st.Fatalf("expected non-empty JSON segment list for r62_quantiles, err=%v body=%s", err, string(jsRaw))
+		}
+	})
+
+	t.Run("Round67_InternalEndpoints_BM25Auto_And_CatalogSync", func(st *testing.T) {
+		ctx := context.Background()
+		srvR67 := proxy.NewServer(dorisDB, backend, transpiler.TranspilerOptions{})
+		srvR67.SetAllowTestFixtureAuth(true)
+		srvR67.SetTargetESVersion("8.15.5")
+		srvR67.SetBM25Mode(proxy.BM25ModeAuto)
+		srvR67.SetBM25MaxRows(10000)
+		if err := srvR67.BootstrapCatalog(ctx); err != nil {
+			st.Fatalf("srvR67.BootstrapCatalog failed: %v", err)
+		}
+		defer func() { _ = srvR67.Close(context.Background()) }()
+
+		if srvR67.BM25Mode() != proxy.BM25ModeAuto {
+			st.Fatalf("BM25Mode() = %q, want %q", srvR67.BM25Mode(), proxy.BM25ModeAuto)
+		}
+		if srvR67.BM25MaxRows() != 10000 {
+			st.Fatalf("BM25MaxRows() = %d, want 10000", srvR67.BM25MaxRows())
+		}
+
+		tsR67 := httptest.NewServer(srvR67.Handler())
+		defer tsR67.Close()
+
+		doR67Req := func(tSub *testing.T, base, method, reqPath, body string) (int, []byte) {
+			tSub.Helper()
+			var rdr io.Reader
+			if body != "" {
+				rdr = strings.NewReader(body)
+			}
+			req, reqErr := http.NewRequest(method, base+reqPath, rdr)
+			if reqErr != nil {
+				tSub.Fatalf("%s %s NewRequest failed: %v", method, reqPath, reqErr)
+			}
+			if body != "" {
+				if strings.Contains(reqPath, "/_bulk") {
+					req.Header.Set("Content-Type", "application/x-ndjson")
+				} else {
+					req.Header.Set("Content-Type", "application/json")
+				}
+			}
+			res, doErr := http.DefaultClient.Do(req)
+			if doErr != nil {
+				tSub.Fatalf("%s %s Do failed: %v", method, reqPath, doErr)
+			}
+			raw, _ := io.ReadAll(res.Body)
+			_ = res.Body.Close()
+			return res.StatusCode, raw
+		}
+
+		// 1. _internal/* cluster management endpoints
+		if code, raw := doR67Req(st, tsR67.URL, http.MethodGet, "/_internal/desired_balance", ""); code != http.StatusOK {
+			st.Fatalf("GET /_internal/desired_balance failed: status=%d body=%s", code, string(raw))
+		} else {
+			var bal map[string]any
+			if err := json.Unmarshal(raw, &bal); err != nil || bal["stats"] == nil || bal["routing_table"] == nil {
+				st.Fatalf("unexpected desired_balance payload: err=%v body=%s", err, string(raw))
+			}
+		}
+		if code, raw := doR67Req(st, tsR67.URL, http.MethodDelete, "/_internal/desired_balance", ""); code != http.StatusOK {
+			st.Fatalf("DELETE /_internal/desired_balance failed: status=%d body=%s", code, string(raw))
+		}
+
+		if code, raw := doR67Req(st, tsR67.URL, http.MethodGet, "/_internal/desired_nodes/_latest", ""); code != http.StatusNotFound {
+			st.Fatalf("expected 404 before desired_nodes created, got %d body=%s", code, string(raw))
+		}
+		dryPayload := `{"nodes":[{"settings":{"node.name":"instance-r67-1"},"processors":8.5,"memory":"64gb","storage":"128gb"}]}`
+		if code, raw := doR67Req(st, tsR67.URL, http.MethodPut, "/_internal/desired_nodes/r67_hist/1?dry_run=true", dryPayload); code != http.StatusOK {
+			st.Fatalf("dry_run PUT desired_nodes failed: status=%d body=%s", code, string(raw))
+		} else {
+			var res map[string]any
+			_ = json.Unmarshal(raw, &res)
+			if res["dry_run"] != true || res["replaced_existing_history_id"] != false {
+				st.Fatalf("unexpected dry_run response: %s", string(raw))
+			}
+		}
+		if code, _ := doR67Req(st, tsR67.URL, http.MethodGet, "/_internal/desired_nodes/_latest", ""); code != http.StatusNotFound {
+			st.Fatalf("dry_run must not persist desired_nodes, got status=%d", code)
+		}
+		if code, raw := doR67Req(st, tsR67.URL, http.MethodPut, "/_internal/desired_nodes/r67_hist/1", dryPayload); code != http.StatusOK {
+			st.Fatalf("PUT desired_nodes v1 failed: status=%d body=%s", code, string(raw))
+		}
+		if code, raw := doR67Req(st, tsR67.URL, http.MethodGet, "/_internal/desired_nodes/_latest", ""); code != http.StatusOK {
+			st.Fatalf("GET /_internal/desired_nodes/_latest v1 failed: status=%d body=%s", code, string(raw))
+		} else if !strings.Contains(string(raw), `"history_id":"r67_hist"`) || !strings.Contains(string(raw), `"version":1`) {
+			st.Fatalf("unexpected desired_nodes v1 body: %s", string(raw))
+		}
+		v2Payload := `{"nodes":[{"settings":{"node.name":"instance-r67-1"},"processors":8.5,"memory":"64gb","storage":"128gb"},{"settings":{"node.name":"instance-r67-2"},"processors":16.0,"memory":"128gb","storage":"1tb"}]}`
+		if code, raw := doR67Req(st, tsR67.URL, http.MethodPut, "/_internal/desired_nodes/r67_hist/2", v2Payload); code != http.StatusOK {
+			st.Fatalf("PUT desired_nodes v2 failed: status=%d body=%s", code, string(raw))
+		}
+		if code, raw := doR67Req(st, tsR67.URL, http.MethodGet, "/_internal/desired_nodes/_latest", ""); code != http.StatusOK || !strings.Contains(string(raw), `"version":2`) {
+			st.Fatalf("GET /_internal/desired_nodes/_latest v2 failed: status=%d body=%s", code, string(raw))
+		}
+		if code, raw := doR67Req(st, tsR67.URL, http.MethodDelete, "/_internal/desired_nodes", ""); code != http.StatusOK {
+			st.Fatalf("DELETE /_internal/desired_nodes failed: status=%d body=%s", code, string(raw))
+		}
+		if code, _ := doR67Req(st, tsR67.URL, http.MethodGet, "/_internal/desired_nodes/_latest", ""); code != http.StatusNotFound {
+			st.Fatalf("expected 404 after DELETE /_internal/desired_nodes, got %d", code)
+		}
+
+		if code, raw := doR67Req(st, tsR67.URL, http.MethodPost, "/_internal/prevalidate_node_removal?ids=doris-fe-1", ""); code != http.StatusOK || !strings.Contains(string(raw), `"is_safe":true`) {
+			st.Fatalf("prevalidate_node_removal failed: status=%d body=%s", code, string(raw))
+		}
+		if code, _ := doR67Req(st, tsR67.URL, http.MethodPost, "/_internal/prevalidate_node_removal?external_ids=non-existent-r67", ""); code != http.StatusNotFound {
+			st.Fatalf("expected 404 for missing external_id in prevalidate_node_removal, got %d", code)
+		}
+		if code, raw := doR67Req(st, tsR67.URL, http.MethodPost, "/_internal/prevalidate_node_removal", ""); code != http.StatusBadRequest || !strings.Contains(string(raw), "action_request_validation_exception") {
+			st.Fatalf("expected 400 action_request_validation_exception for empty prevalidate_node_removal, got %d %s", code, string(raw))
+		}
+
+		// 2. --bm25-mode=auto + BM25 cache invalidation on write against live Doris
+		if code, raw := doR67Req(st, tsR67.URL, http.MethodPut, "/r67_bm25_idx", `{
+			"mappings": {"properties": {"title": {"type": "text"}}}
+		}`); code != http.StatusOK {
+			st.Fatalf("PUT /r67_bm25_idx failed: status=%d body=%s", code, string(raw))
+		}
+		bulkDocs := strings.Join([]string{
+			`{"index":{"_index":"r67_bm25_idx","_id":"1"}}`,
+			`{"title":"doris bm25 alpha"}`,
+			`{"index":{"_index":"r67_bm25_idx","_id":"2"}}`,
+			`{"title":"doris search beta"}`,
+			`{"index":{"_index":"r67_bm25_idx","_id":"3"}}`,
+			`{"title":"gamma delta epsilon"}`,
+		}, "\n") + "\n"
+		if code, raw := doR67Req(st, tsR67.URL, http.MethodPost, "/_bulk?refresh=true", bulkDocs); code != http.StatusOK {
+			st.Fatalf("bulk index r67_bm25_idx failed: status=%d body=%s", code, string(raw))
+		}
+		alphaQuery := `{"query":{"match":{"title":"alpha"}}}`
+		if code, raw := doR67Req(st, tsR67.URL, http.MethodPost, "/r67_bm25_idx/_search?rest_total_hits_as_int=true", alphaQuery); code != http.StatusOK {
+			st.Fatalf("BM25 initial search failed: status=%d body=%s", code, string(raw))
+		} else if !strings.Contains(string(raw), `"total":1`) {
+			st.Fatalf("expected 1 hit for alpha before write, got %s", string(raw))
+		}
+		// Second identical query exercises BM25 cache_hit path.
+		if code, raw := doR67Req(st, tsR67.URL, http.MethodPost, "/r67_bm25_idx/_search?rest_total_hits_as_int=true", alphaQuery); code != http.StatusOK {
+			st.Fatalf("BM25 cached search failed: status=%d body=%s", code, string(raw))
+		}
+		// Write new doc with higher TF -> invalidates BM25 cache for r67_bm25_idx and updates scores.
+		if code, raw := doR67Req(st, tsR67.URL, http.MethodPut, "/r67_bm25_idx/_doc/4?refresh=true", `{"title":"alpha rare alpha"}`); code != http.StatusCreated && code != http.StatusOK {
+			st.Fatalf("PUT /r67_bm25_idx/_doc/4 failed: status=%d body=%s", code, string(raw))
+		}
+		if code, raw := doR67Req(st, tsR67.URL, http.MethodPost, "/r67_bm25_idx/_search?rest_total_hits_as_int=true", alphaQuery); code != http.StatusOK {
+			st.Fatalf("BM25 post-write search failed: status=%d body=%s", code, string(raw))
+		} else {
+			var sr struct {
+				Hits struct {
+					Total int `json:"total"`
+					Hits  []struct {
+						ID string `json:"_id"`
+					} `json:"hits"`
+				} `json:"hits"`
+			}
+			_ = json.Unmarshal(raw, &sr)
+			if sr.Hits.Total != 2 || len(sr.Hits.Hits) != 2 || sr.Hits.Hits[0].ID != "4" {
+				st.Fatalf("expected 2 hits ranked with doc 4 first after BM25 cache invalidation, got %s", string(raw))
+			}
+		}
+		// Trigger auto over_row_cap bypass on a fresh term when totalRows (4) > maxRows (1).
+		srvR67.SetBM25MaxRows(1)
+		if code, raw := doR67Req(st, tsR67.URL, http.MethodPost, "/r67_bm25_idx/_search?rest_total_hits_as_int=true", `{"query":{"match":{"title":"beta"}}}`); code != http.StatusOK || !strings.Contains(string(raw), `"total":1`) {
+			st.Fatalf("BM25 over_row_cap search failed: status=%d body=%s", code, string(raw))
+		}
+		srvR67.SetBM25MaxRows(10000)
+
+		if code, mRaw := doR67Req(st, tsR67.URL, http.MethodGet, "/metrics", ""); code != http.StatusOK ||
+			!strings.Contains(string(mRaw), `doris_es_proxy_bm25_corpus_scans_total{outcome="scanned"}`) ||
+			!strings.Contains(string(mRaw), `doris_es_proxy_bm25_corpus_scans_total{outcome="cache_hit"}`) ||
+			!strings.Contains(string(mRaw), `doris_es_proxy_bm25_corpus_scans_total{outcome="over_row_cap"}`) {
+			st.Fatalf("expected BM25 scanned/cache_hit/over_row_cap metrics, got status=%d body=%s", code, string(mRaw))
+		}
+
+		// 3. Health/version probing (SHOW BACKENDS, ProbeDorisVersion, /readyz) + CatalogSyncer incremental sync via _es_catalog
+		ver, err := backend.ProbeDorisVersion(ctx)
+		if err != nil || ver == "" {
+			st.Fatalf("ProbeDorisVersion failed: ver=%q err=%v", ver, err)
+		}
+		aliveBEs, feHTTPOK, err := backend.CheckClusterHealth(ctx)
+		if err != nil || aliveBEs < 1 || !feHTTPOK {
+			st.Fatalf("CheckClusterHealth unhealthy: aliveBEs=%d feHTTPOK=%v err=%v", aliveBEs, feHTTPOK, err)
+		}
+		beNodes, err := backend.ShowBackendsTelemetry(ctx)
+		if err != nil || len(beNodes) < 1 || !beNodes[0].Alive {
+			st.Fatalf("ShowBackendsTelemetry invalid: nodes=%+v err=%v", beNodes, err)
+		}
+		if code, rRaw := doR67Req(st, tsR67.URL, http.MethodGet, "/readyz", ""); code != http.StatusOK {
+			st.Fatalf("GET /readyz failed: status=%d body=%s", code, string(rRaw))
+		} else if !strings.Contains(string(rRaw), `"status":"ready"`) || !strings.Contains(string(rRaw), `"fe_http_ok":true`) {
+			st.Fatalf("unexpected /readyz response: %s", string(rRaw))
+		}
+
+		entries, err := backend.LoadCatalogEntries(ctx, dorisDB)
+		if err != nil || len(entries) == 0 {
+			st.Fatalf("LoadCatalogEntries failed: len=%d err=%v", len(entries), err)
+		}
+		sinceEntries, err := backend.LoadCatalogEntriesSince(ctx, dorisDB, entries[len(entries)-1].UpdatedEpochMs)
+		if err != nil || len(sinceEntries) == 0 {
+			st.Fatalf("LoadCatalogEntriesSince failed: len=%d err=%v", len(sinceEntries), err)
+		}
+
+		srvSync2 := proxy.NewServer(dorisDB, backend, transpiler.TranspilerOptions{})
+		srvSync2.SetAllowTestFixtureAuth(true)
+		if err := srvSync2.BootstrapCatalog(ctx); err != nil {
+			st.Fatalf("srvSync2.BootstrapCatalog failed: %v", err)
+		}
+		srvSync2.SetCatalogSyncInterval(150 * time.Millisecond)
+		defer func() { _ = srvSync2.Close(context.Background()) }()
+		tsSync2 := httptest.NewServer(srvSync2.Handler())
+		defer tsSync2.Close()
+
+		if code, raw := doR67Req(st, tsR67.URL, http.MethodPut, "/r67_sync_idx", `{"mappings":{"properties":{"msg":{"type":"keyword"}}}}`); code != http.StatusOK {
+			st.Fatalf("PUT /r67_sync_idx failed: status=%d body=%s", code, string(raw))
+		}
+		synced := false
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			if code, _ := doR67Req(st, tsSync2.URL, http.MethodGet, "/r67_sync_idx/_mapping", ""); code == http.StatusOK {
+				synced = true
+				break
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		if !synced {
+			st.Fatalf("srvSync2 failed to incrementally sync r67_sync_idx via _es_catalog within 5s")
+		}
+		if code, mRaw := doR67Req(st, tsSync2.URL, http.MethodGet, "/metrics", ""); code != http.StatusOK || !strings.Contains(string(mRaw), "doris_es_proxy_catalog_syncs_total") {
+			st.Fatalf("expected catalog_syncs_total metric on srvSync2, got status=%d body=%s", code, string(mRaw))
 		}
 	})
 

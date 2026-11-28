@@ -21,6 +21,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/hmac"
 	// #nosec G501 -- Elasticsearch ingest fingerprint processor supports MD5
 	"crypto/md5"
 	// #nosec G505 -- Community ID v1 network flow hashing and ingest fingerprint processor support SHA-1
@@ -28,6 +29,7 @@ import (
 	"crypto/sha256"
 	"crypto/sha512"
 	"crypto/subtle"
+	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -686,6 +688,32 @@ func (vw *vendorMediaTypeGuardWriterR64) Flush() {
 // 4. Optional `Accept-Encoding: gzip` outbound response compression
 func (s *Server) withWireMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reqStart := time.Now()
+		reqPath := "/"
+		if r != nil && r.URL != nil && r.URL.Path != "" {
+			reqPath = r.URL.Path
+		}
+		sw := &statusCaptureWriterR67{ResponseWriter: w}
+		w = sw
+		var reqID string
+		r, reqID = ensureRequestIDWireR67(w, r)
+		r, qv := withCachedQueryValuesR67(r)
+		defer func() {
+			st := sw.status
+			if st == 0 {
+				st = http.StatusOK
+			}
+			method := http.MethodGet
+			if r != nil && r.Method != "" {
+				method = r.Method
+			}
+			dur := time.Since(reqStart)
+			if s.metrics != nil {
+				s.metrics.RecordHTTPRequest(method, reqPath, st, dur)
+			}
+			s.logAccess(r, st, dur, reqID)
+		}()
+
 		setESCompatHeadersWireR64(w, r)
 
 		if r.Method == http.MethodOptions {
@@ -696,7 +724,7 @@ func (s *Server) withWireMiddleware(next http.Handler) http.Handler {
 		trimmedPath := strings.Trim(r.URL.Path, "/")
 		wantYAML := false
 		if r.URL != nil {
-			fmtQ := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("format")))
+			fmtQ := strings.ToLower(strings.TrimSpace(qv.Get("format")))
 			if (fmtQ == "yaml" || fmtQ == "yml") &&
 				trimmedPath != "_cat" && !strings.HasPrefix(trimmedPath, "_cat/") &&
 				!strings.HasPrefix(trimmedPath, "_sql") &&
@@ -759,19 +787,13 @@ func (s *Server) withWireMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
-		if !s.checkInboundAuth(authW, r) {
+		if r2, okAuth := s.checkInboundAuthWithRequestR67(authW, r); !okAuth {
 			if authFW != nil && wantYAML {
 				authFW.Finalize()
 			}
 			return
-		}
-
-		if tp, opq, reqID := r.Header.Get("traceparent"), r.Header.Get("X-Opaque-Id"), r.Header.Get("X-Request-ID"); tp != "" || opq != "" || reqID != "" {
-			r = r.WithContext(WithTraceMeta(r.Context(), TraceMeta{
-				Traceparent: tp,
-				OpaqueID:    opq,
-				RequestID:   reqID,
-			}))
+		} else {
+			r = r2
 		}
 
 		maxBytes := atomic.LoadInt64(&s.maxBodyBytes)
@@ -839,7 +861,7 @@ func (s *Server) withWireMiddleware(next http.Handler) http.Handler {
 		if s.tryHandleAdminWireR63(wireW, r, next) {
 			return
 		}
-		next.ServeHTTP(w, r)
+		next.ServeHTTP(wireW, r)
 	})
 }
 
@@ -879,7 +901,1000 @@ func matchConfiguredAPIKey(provided, expected string) bool {
 	return false
 }
 
-func (s *Server) checkInboundAuth(w http.ResponseWriter, r *http.Request) bool {
+type securityPrincipalCtxKeyR67 struct{}
+
+type securityPrincipalR67 struct {
+	username        string
+	roles           []string
+	fullName        string
+	email           string
+	metadata        map[string]any
+	authType        string
+	realm           string
+	roleDescriptors map[string]any
+	isStaticAdmin   bool
+	isServiceToken  bool
+}
+
+func pbkdf2HMACSHA256R67(password, salt []byte, iter, keyLen int) []byte {
+	if iter <= 0 || keyLen <= 0 {
+		return nil
+	}
+	prf := func(key, data []byte) []byte {
+		m := hmac.New(sha256.New, key)
+		_, _ = m.Write(data)
+		return m.Sum(nil)
+	}
+	numBlocks := (keyLen + sha256.Size - 1) / sha256.Size
+	var dk []byte
+	var blockBuf [4]byte
+	for block := 1; block <= numBlocks; block++ {
+		blockBuf[0] = byte(block >> 24)
+		blockBuf[1] = byte(block >> 16)
+		blockBuf[2] = byte(block >> 8)
+		blockBuf[3] = byte(block)
+		u := prf(password, append(append([]byte(nil), salt...), blockBuf[:]...))
+		t := append([]byte(nil), u...)
+		for i := 2; i <= iter; i++ {
+			u = prf(password, u)
+			for j := range t {
+				t[j] ^= u[j]
+			}
+		}
+		dk = append(dk, t...)
+	}
+	return dk[:keyLen]
+}
+
+func decodePBKDF2SegmentR67(s string) ([]byte, bool) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil, false
+	}
+	if b, err := base64.RawStdEncoding.DecodeString(s); err == nil {
+		return b, true
+	}
+	if b, err := base64.StdEncoding.DecodeString(s); err == nil {
+		return b, true
+	}
+	if b, err := hex.DecodeString(s); err == nil {
+		return b, true
+	}
+	return nil, false
+}
+
+func verifyPBKDF2SHA256R67(encoded, secret string) bool {
+	if secret == "" || !strings.HasPrefix(encoded, "$pbkdf2-sha256$") {
+		return false
+	}
+	parts := strings.Split(encoded, "$")
+	// Format: $pbkdf2-sha256$<iterations>$<salt>$<hash>
+	if len(parts) != 5 {
+		return false
+	}
+	iter, err := strconv.Atoi(parts[2])
+	if err != nil || iter < 1 || iter > 1000000 {
+		return false
+	}
+	salt, okSalt := decodePBKDF2SegmentR67(parts[3])
+	want, okWant := decodePBKDF2SegmentR67(parts[4])
+	if !okSalt || !okWant || len(want) == 0 {
+		return false
+	}
+	got := pbkdf2HMACSHA256R67([]byte(secret), salt, iter, len(want))
+	return len(got) == len(want) && subtle.ConstantTimeCompare(got, want) == 1
+}
+
+func verifyStoredSecretR67(rec map[string]any, pbkdf2Field, sha256Field string, plainFields []string, candidate string) bool {
+	if rec == nil || candidate == "" {
+		return false
+	}
+	if pbkdf2Field != "" {
+		if storedPBKDF2, ok := rec[pbkdf2Field].(string); ok && storedPBKDF2 != "" {
+			return verifyPBKDF2SHA256R67(storedPBKDF2, candidate)
+		}
+	}
+	if sha256Field != "" {
+		if storedHash, ok := rec[sha256Field].(string); ok && storedHash != "" {
+			if strings.HasPrefix(storedHash, "$pbkdf2-sha256$") {
+				return verifyPBKDF2SHA256R67(storedHash, candidate)
+			}
+			sum := sha256.Sum256([]byte(candidate))
+			candHash := hex.EncodeToString(sum[:])
+			return len(storedHash) == len(candHash) && subtle.ConstantTimeCompare([]byte(candHash), []byte(storedHash)) == 1
+		}
+	}
+	for _, pf := range plainFields {
+		if storedPlain, ok := rec[pf].(string); ok && storedPlain != "" {
+			if strings.HasPrefix(storedPlain, "$pbkdf2-sha256$") {
+				return verifyPBKDF2SHA256R67(storedPlain, candidate)
+			}
+			return len(storedPlain) == len(candidate) && subtle.ConstantTimeCompare([]byte(storedPlain), []byte(candidate)) == 1
+		}
+	}
+	return false
+}
+
+func extractRolesListFromAnyR67(raw any) []string {
+	var out []string
+	switch v := raw.(type) {
+	case []string:
+		for _, item := range v {
+			if item = strings.TrimSpace(item); item != "" {
+				out = append(out, item)
+			}
+		}
+	case []any:
+		for _, item := range v {
+			if s, ok := item.(string); ok {
+				if s = strings.TrimSpace(s); s != "" {
+					out = append(out, s)
+				}
+			}
+		}
+	}
+	return out
+}
+
+func cloneStringAnyMapR67(in map[string]any) map[string]any {
+	if len(in) == 0 {
+		return map[string]any{}
+	}
+	out := make(map[string]any, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+
+func (s *Server) resolveDynamicPrincipalLockedR67(r *http.Request, basicUser, basicPass, apiKey string) (*securityPrincipalR67, bool, int, string) {
+	hasBasic := basicUser != "" && basicPass != ""
+	hasAPIKey := apiKey != ""
+	hasStaticAuth := hasBasic || hasAPIKey
+
+	authHdr := strings.TrimSpace(r.Header.Get("Authorization"))
+	if authHdr == "" {
+		return nil, false, http.StatusUnauthorized, "missing authentication credentials for REST request [" + r.URL.Path + "]"
+	}
+	parts := strings.SplitN(authHdr, " ", 2)
+	if len(parts) != 2 {
+		return nil, false, http.StatusUnauthorized, "unable to authenticate credentials for REST request [" + r.URL.Path + "]"
+	}
+	scheme := strings.ToLower(strings.TrimSpace(parts[0]))
+	rawTok := strings.TrimSpace(parts[1])
+
+	switch scheme {
+	case "basic":
+		dec, err := base64.StdEncoding.DecodeString(rawTok)
+		if err != nil {
+			return nil, false, http.StatusUnauthorized, "unable to authenticate credentials for REST request [" + r.URL.Path + "]"
+		}
+		u, p, okCut := strings.Cut(string(dec), ":")
+		if !okCut || u == "" {
+			return nil, false, http.StatusUnauthorized, "unable to authenticate credentials for REST request [" + r.URL.Path + "]"
+		}
+		if hasBasic && u == basicUser && s.securityUsers[basicUser] == nil {
+			uMatch := subtle.ConstantTimeCompare([]byte(u), []byte(basicUser))
+			pMatch := subtle.ConstantTimeCompare([]byte(p), []byte(basicPass))
+			if (uMatch & pMatch) == 1 {
+				return &securityPrincipalR67{
+					username:      basicUser,
+					roles:         []string{"superuser"},
+					fullName:      "doris-es-proxy",
+					metadata:      map[string]any{},
+					authType:      "REALM",
+					realm:         "default_native",
+					isStaticAdmin: true,
+				}, true, 0, ""
+			}
+		}
+		if !hasStaticAuth && s.AllowTestFixtureAuth() && (u == "test_admin" || u == "x_pack_rest_user") && s.securityUsers[u] == nil {
+			const fixturePass = "x-pack-test-password"
+			if len(p) == len(fixturePass) && subtle.ConstantTimeCompare([]byte(p), []byte(fixturePass)) == 1 {
+				return &securityPrincipalR67{
+					username:      u,
+					roles:         []string{"superuser"},
+					fullName:      u,
+					metadata:      map[string]any{},
+					authType:      "REALM",
+					realm:         "default_native",
+					isStaticAdmin: true,
+				}, true, 0, ""
+			}
+		}
+		uObj := s.securityUsers[u]
+		if uObj == nil {
+			return nil, false, http.StatusUnauthorized, fmt.Sprintf("unable to authenticate user [%s] for REST request [%s]", u, r.URL.Path)
+		}
+		if enabled, hasEnabled := uObj["enabled"].(bool); hasEnabled && !enabled {
+			return nil, false, http.StatusUnauthorized, fmt.Sprintf("unable to authenticate user [%s] for REST request [%s]", u, r.URL.Path)
+		}
+		if !verifyStoredSecretR67(uObj, "__password_pbkdf2", "__password_sha256", []string{"password"}, p) {
+			return nil, false, http.StatusUnauthorized, fmt.Sprintf("unable to authenticate user [%s] for REST request [%s]", u, r.URL.Path)
+		}
+		roles := extractRolesListFromAnyR67(uObj["roles"])
+		if roles == nil {
+			roles = []string{}
+		}
+		fullName, _ := uObj["full_name"].(string)
+		email, _ := uObj["email"].(string)
+		meta, _ := uObj["metadata"].(map[string]any)
+		return &securityPrincipalR67{
+			username: u,
+			roles:    roles,
+			fullName: fullName,
+			email:    email,
+			metadata: cloneStringAnyMapR67(meta),
+			authType: "REALM",
+			realm:    "default_native",
+		}, true, 0, ""
+
+	case "apikey":
+		if hasAPIKey && matchConfiguredAPIKey(rawTok, apiKey) {
+			return &securityPrincipalR67{
+				username:      "elastic",
+				roles:         []string{"superuser"},
+				fullName:      "doris-es-proxy",
+				metadata:      map[string]any{},
+				authType:      "API_KEY",
+				realm:         "default_native",
+				isStaticAdmin: true,
+			}, true, 0, ""
+		}
+		dec, err := base64.StdEncoding.DecodeString(rawTok)
+		if err != nil {
+			dec, err = base64.RawStdEncoding.DecodeString(rawTok)
+		}
+		if err != nil {
+			return nil, false, http.StatusUnauthorized, "unable to authenticate ApiKey for REST request [" + r.URL.Path + "]"
+		}
+		keyID, secret, okCut := strings.Cut(string(dec), ":")
+		if !okCut || keyID == "" || secret == "" {
+			return nil, false, http.StatusUnauthorized, "unable to authenticate ApiKey for REST request [" + r.URL.Path + "]"
+		}
+		kObj := s.securityAPIKeys[keyID]
+		if kObj == nil {
+			return nil, false, http.StatusUnauthorized, "unable to authenticate ApiKey for REST request [" + r.URL.Path + "]"
+		}
+		if inv, _ := kObj["invalidated"].(bool); inv {
+			return nil, false, http.StatusUnauthorized, "unable to authenticate ApiKey for REST request [" + r.URL.Path + "]"
+		}
+		if expVal, hasExp := kObj["expiration"]; hasExp && expVal != nil {
+			if expMs, okE := toInt64(expVal); okE && expMs > 0 && expMs <= time.Now().UnixMilli() {
+				return nil, false, http.StatusUnauthorized, "unable to authenticate ApiKey for REST request [" + r.URL.Path + "]"
+			}
+		}
+		if !verifyStoredSecretR67(kObj, "__secret_pbkdf2", "__secret_sha256", []string{"api_key", "secret"}, secret) {
+			return nil, false, http.StatusUnauthorized, "unable to authenticate ApiKey for REST request [" + r.URL.Path + "]"
+		}
+		owner, _ := kObj["username"].(string)
+		if owner == "" {
+			owner = "elastic"
+		}
+		var ownerRoles []string
+		if ownerObj := s.securityUsers[owner]; ownerObj != nil {
+			if enabled, hasEnabled := ownerObj["enabled"].(bool); hasEnabled && !enabled {
+				return nil, false, http.StatusUnauthorized, "unable to authenticate ApiKey owner [" + owner + "] for REST request [" + r.URL.Path + "]"
+			}
+			ownerRoles = extractRolesListFromAnyR67(ownerObj["roles"])
+		} else if owner == "elastic" {
+			ownerRoles = []string{"superuser"}
+		}
+		var roleDescs map[string]any
+		if rd, okRD := kObj["role_descriptors"].(map[string]any); okRD && len(rd) > 0 {
+			roleDescs = cloneStringAnyMapR67(rd)
+			rolesFromRD := make([]string, 0, len(rd))
+			for rn := range rd {
+				rolesFromRD = append(rolesFromRD, rn)
+			}
+			sort.Strings(rolesFromRD)
+			ownerRoles = rolesFromRD
+		}
+		if ownerRoles == nil {
+			ownerRoles = []string{}
+		}
+		meta, _ := kObj["metadata"].(map[string]any)
+		return &securityPrincipalR67{
+			username:        owner,
+			roles:           ownerRoles,
+			metadata:        cloneStringAnyMapR67(meta),
+			authType:        "API_KEY",
+			realm:           "_api_key",
+			roleDescriptors: roleDescs,
+		}, true, 0, ""
+
+	case "bearer":
+		if hasAPIKey && matchConfiguredAPIKey(rawTok, apiKey) {
+			return &securityPrincipalR67{
+				username:      "elastic",
+				roles:         []string{"superuser"},
+				fullName:      "doris-es-proxy",
+				metadata:      map[string]any{},
+				authType:      "API_KEY",
+				realm:         "default_native",
+				isStaticAdmin: true,
+			}, true, 0, ""
+		}
+		for fullKey, tObj := range s.securityServiceTokens {
+			if tObj == nil {
+				continue
+			}
+			if verifyStoredSecretR67(tObj, "__token_pbkdf2", "__token_sha256", []string{"value"}, rawTok) {
+				acct := fullKey
+				if idxSlash := strings.LastIndex(fullKey, "/"); idxSlash > 0 {
+					acct = fullKey[:idxSlash]
+				}
+				return &securityPrincipalR67{
+					username:       acct,
+					roles:          []string{"superuser"},
+					metadata:       map[string]any{"service_account": acct},
+					authType:       "TOKEN",
+					realm:          "_service_account",
+					isServiceToken: true,
+				}, true, 0, ""
+			}
+		}
+		return nil, false, http.StatusUnauthorized, "unable to authenticate Bearer token for REST request [" + r.URL.Path + "]"
+
+	default:
+		return nil, false, http.StatusUnauthorized, "unsupported authentication scheme for REST request [" + r.URL.Path + "]"
+	}
+}
+
+func securityPrincipalFromRequestR67(r *http.Request) *securityPrincipalR67 {
+	if r == nil || r.Context() == nil {
+		return nil
+	}
+	p, _ := r.Context().Value(securityPrincipalCtxKeyR67{}).(*securityPrincipalR67)
+	return p
+}
+
+func (s *Server) handleSecurityAuthenticateR67(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
+		return
+	}
+	s.authMu.RLock()
+	basicUser := s.basicAuthUser
+	basicPass := s.basicAuthPass
+	apiKey := s.apiKey
+	s.authMu.RUnlock()
+
+	hasStaticAuth := (basicUser != "" && basicPass != "") || apiKey != ""
+	authHdr := strings.TrimSpace(r.Header.Get("Authorization"))
+
+	s.mu.RLock()
+	hasDynamicUsersOrKeys := len(s.securityUsers) > 0 || len(s.securityAPIKeys) > 0 || len(s.securityServiceTokens) > 0
+	if !hasStaticAuth && !hasDynamicUsersOrKeys && authHdr == "" {
+		s.mu.RUnlock()
+		realmInfo := map[string]any{"name": "default_native", "type": "native"}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"username":             "elastic",
+			"roles":                []string{"superuser"},
+			"full_name":            "doris-es-proxy",
+			"email":                "",
+			"metadata":             map[string]any{},
+			"enabled":              true,
+			"authentication_realm": realmInfo,
+			"lookup_realm":         realmInfo,
+			"authentication_type":  "REALM",
+		})
+		return
+	}
+	principal, ok, errSt, errMsg := s.resolveDynamicPrincipalLockedR67(r, basicUser, basicPass, apiKey)
+	s.mu.RUnlock()
+	if !ok || principal == nil {
+		w.Header().Set("WWW-Authenticate", `Basic realm="security" charset="UTF-8", ApiKey`)
+		writeESError(w, errSt, "security_exception", errMsg)
+		return
+	}
+	var realmType string
+	switch principal.realm {
+	case "_api_key":
+		realmType = "api_key"
+	case "_service_account":
+		realmType = "service_account"
+	default:
+		realmType = "native"
+	}
+	realmInfo := map[string]any{"name": principal.realm, "type": realmType}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"username":             principal.username,
+		"roles":                principal.roles,
+		"full_name":            principal.fullName,
+		"email":                principal.email,
+		"metadata":             principal.metadata,
+		"enabled":              true,
+		"authentication_realm": realmInfo,
+		"lookup_realm":         realmInfo,
+		"authentication_type":  principal.authType,
+	})
+}
+
+func (s *Server) collectEffectiveRoleMapsLockedR67(p *securityPrincipalR67) ([]map[string]any, bool) {
+	if p == nil || p.isStaticAdmin {
+		return nil, true
+	}
+	var out []map[string]any
+	for _, rn := range p.roles {
+		if rn == "superuser" || rn == "admin" {
+			return nil, true
+		}
+		if p.roleDescriptors != nil {
+			if rm, ok := p.roleDescriptors[rn].(map[string]any); ok && rm != nil {
+				out = append(out, rm)
+				continue
+			}
+		}
+		if rm := s.securityRoles[rn]; rm != nil {
+			out = append(out, rm)
+		}
+	}
+	if len(out) == 0 && len(p.roleDescriptors) > 0 {
+		for _, v := range p.roleDescriptors {
+			if rm, ok := v.(map[string]any); ok && rm != nil {
+				out = append(out, rm)
+			}
+		}
+	}
+	return out, false
+}
+
+func roleHasClusterPrivilegeR67(role map[string]any, needed []string) bool {
+	if role == nil {
+		return false
+	}
+	privs := extractRolesListFromAnyR67(role["cluster"])
+	for _, p := range privs {
+		if p == "all" {
+			return true
+		}
+		for _, want := range needed {
+			if p == want || (strings.HasSuffix(p, "*") && strings.HasPrefix(want, strings.TrimSuffix(p, "*"))) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func roleIndexEntriesMatchingTargetLockedR67(role map[string]any, targetIdx string, aliases map[string][]string, neededPrivs []string) ([]map[string]any, bool) {
+	if role == nil {
+		return nil, false
+	}
+	var rawEntries []any
+	switch v := role["indices"].(type) {
+	case []any:
+		rawEntries = v
+	case []map[string]any:
+		for _, m := range v {
+			rawEntries = append(rawEntries, m)
+		}
+	}
+	var matched []map[string]any
+	for _, item := range rawEntries {
+		ent, ok := item.(map[string]any)
+		if !ok || ent == nil {
+			continue
+		}
+		privs := extractRolesListFromAnyR67(ent["privileges"])
+		privOK := len(neededPrivs) == 0
+		if !privOK {
+			for _, p := range privs {
+				if p == "all" {
+					privOK = true
+					break
+				}
+				for _, want := range neededPrivs {
+					if p == want {
+						privOK = true
+						break
+					}
+				}
+				if privOK {
+					break
+				}
+			}
+		}
+		if !privOK {
+			continue
+		}
+		names := extractRolesListFromAnyR67(ent["names"])
+		nameMatched := false
+		for _, pat := range names {
+			if matchWildcardPattern(pat, targetIdx) {
+				nameMatched = true
+				break
+			}
+			for alName, alTargets := range aliases {
+				if matchWildcardPattern(pat, alName) {
+					for _, alt := range alTargets {
+						if alt == targetIdx {
+							nameMatched = true
+							break
+						}
+					}
+				}
+				if nameMatched {
+					break
+				}
+			}
+			if nameMatched {
+				break
+			}
+		}
+		if nameMatched {
+			matched = append(matched, ent)
+		}
+	}
+	return matched, len(matched) > 0
+}
+
+func resolveRBACTargetsLockedR67(indices map[string]*schema.IndexSchema, aliases map[string][]string, pattern string) []string {
+	if pattern == "" || pattern == "_all" || pattern == "*" {
+		out := make([]string, 0, len(indices))
+		for idx := range indices {
+			out = append(out, idx)
+		}
+		return out
+	}
+	seen := make(map[string]struct{})
+	var out []string
+	addTarget := func(t string) {
+		if t == "" {
+			return
+		}
+		if _, dup := seen[t]; !dup {
+			seen[t] = struct{}{}
+			out = append(out, t)
+		}
+	}
+	for _, tok := range strings.Split(pattern, ",") {
+		tok = strings.TrimSpace(tok)
+		if tok == "" || strings.HasPrefix(tok, "-") {
+			continue
+		}
+		if tok == "_all" || tok == "*" {
+			for idx := range indices {
+				addTarget(idx)
+			}
+			continue
+		}
+		if strings.ContainsAny(tok, "*?") {
+			for idx := range indices {
+				if matchWildcardPattern(tok, idx) {
+					addTarget(idx)
+				}
+			}
+			for al, targets := range aliases {
+				if matchWildcardPattern(tok, al) {
+					for _, t := range targets {
+						addTarget(t)
+					}
+				}
+			}
+			continue
+		}
+		if targets, ok := aliases[tok]; ok && len(targets) > 0 {
+			for _, t := range targets {
+				addTarget(t)
+			}
+			continue
+		}
+		addTarget(tok)
+	}
+	return out
+}
+
+func isDynamicRBACSelfAllowedPathR67(method, path string) bool {
+	trimmed := strings.Trim(path, "/")
+	if trimmed == "_security/_authenticate" || trimmed == "_xpack/security/_authenticate" {
+		return true
+	}
+	if (trimmed == "_security/user/_has_privileges" || trimmed == "_xpack/security/user/_has_privileges") && (method == http.MethodPost || method == http.MethodGet) {
+		return true
+	}
+	if (trimmed == "_security/user/_privileges" || trimmed == "_xpack/security/user/_privileges") && method == http.MethodGet {
+		return true
+	}
+	if (trimmed == "_security/api_key" || trimmed == "_xpack/security/api_key") && (method == http.MethodPost || method == http.MethodPut) {
+		return true
+	}
+	if strings.HasSuffix(trimmed, "/_terms_enum") || trimmed == "_terms_enum" {
+		return true
+	}
+	if strings.HasPrefix(trimmed, "_monitoring/") || strings.HasPrefix(trimmed, "_xpack/monitoring/") {
+		return true
+	}
+	return false
+}
+
+func (s *Server) checkDynamicRBACR67(w http.ResponseWriter, r *http.Request, p *securityPrincipalR67) bool {
+	if s == nil || r == nil || p == nil || p.isStaticAdmin {
+		return true
+	}
+	if isDynamicRBACSelfAllowedPathR67(r.Method, r.URL.Path) {
+		return true
+	}
+	s.mu.RLock()
+	roleMaps, isSuper := s.collectEffectiveRoleMapsLockedR67(p)
+	if isSuper {
+		s.mu.RUnlock()
+		return true
+	}
+	// If none of the user's roles are defined in s.securityRoles and no role_descriptors were attached, preserve compat.
+	if len(roleMaps) == 0 && len(s.securityRoles) == 0 && len(p.roleDescriptors) == 0 {
+		s.mu.RUnlock()
+		return true
+	}
+	if len(p.roles) == 0 && len(p.roleDescriptors) == 0 {
+		s.mu.RUnlock()
+		writeESError(w, http.StatusForbidden, "security_exception",
+			fmt.Sprintf("action [%s %s] is unauthorized for user [%s] with no assigned roles", r.Method, r.URL.Path, p.username))
+		return false
+	}
+	if len(roleMaps) == 0 {
+		s.mu.RUnlock()
+		return true
+	}
+
+	trimmed := strings.Trim(r.URL.Path, "/")
+	segs := strings.Split(trimmed, "/")
+	if len(segs) > 0 && strings.HasPrefix(segs[0], "_") {
+		// Top-level system/cluster/security route.
+		switch segs[0] {
+		case "_security", "_xpack", "_internal", "_cluster", "_nodes", "_snapshot", "_ilm", "_slm", "_ingest", "_transform", "_enrich":
+			needed := []string{"manage", "manage_security"}
+			if r.Method == http.MethodGet || r.Method == http.MethodHead {
+				needed = append(needed, "monitor", "manage_security", "manage")
+			}
+			for _, rm := range roleMaps {
+				if roleHasClusterPrivilegeR67(rm, needed) {
+					s.mu.RUnlock()
+					return true
+				}
+			}
+			s.mu.RUnlock()
+			writeESError(w, http.StatusForbidden, "security_exception",
+				fmt.Sprintf("action [%s %s] is unauthorized for user [%s] with effective roles [%s]", r.Method, r.URL.Path, p.username, strings.Join(p.roles, ",")))
+			return false
+		case "_search", "_msearch", "_count", "_validate", "_field_caps", "_mget":
+			for _, rm := range roleMaps {
+				if _, ok := roleIndexEntriesMatchingTargetLockedR67(rm, "*", s.aliases, []string{"read", "view_index_metadata"}); ok || roleHasClusterPrivilegeR67(rm, []string{"monitor"}) {
+					s.mu.RUnlock()
+					return true
+				}
+			}
+			// Check if any index entry exists on the role for wildcard reads; otherwise deny.
+			hasAnyRead := false
+			for _, rm := range roleMaps {
+				for idxName := range s.indices {
+					if _, ok := roleIndexEntriesMatchingTargetLockedR67(rm, idxName, s.aliases, []string{"read", "view_index_metadata"}); ok {
+						hasAnyRead = true
+						break
+					}
+				}
+				if hasAnyRead {
+					break
+				}
+			}
+			s.mu.RUnlock()
+			if !hasAnyRead {
+				writeESError(w, http.StatusForbidden, "security_exception",
+					fmt.Sprintf("action [%s %s] is unauthorized for user [%s]", r.Method, r.URL.Path, p.username))
+				return false
+			}
+			return true
+		}
+		s.mu.RUnlock()
+		return true
+	}
+
+	// Index-scoped operation.
+	if len(segs) == 0 || segs[0] == "" {
+		s.mu.RUnlock()
+		return true
+	}
+	rawTarget := segs[0]
+	isReadOp := (r.Method == http.MethodGet || r.Method == http.MethodHead) ||
+		(len(segs) >= 2 && (segs[1] == "_search" || segs[1] == "_msearch" || segs[1] == "_count" || segs[1] == "_field_caps" || segs[1] == "_mget" || segs[1] == "_explain"))
+	needed := []string{"write", "index", "create_index", "delete", "delete_index", "manage"}
+	if isReadOp {
+		needed = []string{"read", "view_index_metadata"}
+	}
+
+	resolvedTargets := resolveRBACTargetsLockedR67(s.indices, s.aliases, rawTarget)
+	if len(resolvedTargets) == 0 {
+		resolvedTargets = []string{rawTarget}
+	}
+	for _, tgt := range resolvedTargets {
+		tgtAllowed := false
+		for _, rm := range roleMaps {
+			if _, ok := roleIndexEntriesMatchingTargetLockedR67(rm, tgt, s.aliases, needed); ok {
+				tgtAllowed = true
+				break
+			}
+		}
+		if !tgtAllowed {
+			s.mu.RUnlock()
+			writeESError(w, http.StatusForbidden, "security_exception",
+				fmt.Sprintf("action [indices:%s] is unauthorized for user [%s] on index [%s]", r.Method, p.username, tgt))
+			return false
+		}
+	}
+	s.mu.RUnlock()
+	return true
+}
+
+func (s *Server) applyDynamicDLSFiltersR67(r *http.Request, targets []string, aliasFilters map[string]*esast.Query) map[string]*esast.Query {
+	p := securityPrincipalFromRequestR67(r)
+	if s == nil || p == nil || p.isStaticAdmin || len(targets) == 0 {
+		return aliasFilters
+	}
+	s.mu.RLock()
+	roleMaps, isSuper := s.collectEffectiveRoleMapsLockedR67(p)
+	if isSuper || len(roleMaps) == 0 {
+		s.mu.RUnlock()
+		return aliasFilters
+	}
+	var out map[string]*esast.Query
+	copyBase := func() {
+		if out != nil {
+			return
+		}
+		out = make(map[string]*esast.Query, len(aliasFilters)+len(targets))
+		for k, v := range aliasFilters {
+			out[k] = v
+		}
+	}
+	for _, tgt := range targets {
+		hasUnrestricted := false
+		var dlsClauses []esast.Query
+		for _, rm := range roleMaps {
+			entries, ok := roleIndexEntriesMatchingTargetLockedR67(rm, tgt, s.aliases, []string{"read", "view_index_metadata"})
+			if !ok {
+				continue
+			}
+			for _, ent := range entries {
+				rawQ, hasQ := ent["query"]
+				if !hasQ || rawQ == nil {
+					hasUnrestricted = true
+					break
+				}
+				qb, err := json.Marshal(rawQ)
+				if err != nil {
+					continue
+				}
+				var parsedQ esast.Query
+				if err := json.Unmarshal(qb, &parsedQ); err == nil {
+					dlsClauses = append(dlsClauses, parsedQ)
+				}
+			}
+			if hasUnrestricted {
+				break
+			}
+		}
+		if hasUnrestricted || len(dlsClauses) == 0 {
+			continue
+		}
+		var dlsQuery esast.Query
+		if len(dlsClauses) == 1 {
+			dlsQuery = dlsClauses[0]
+		} else {
+			dlsQuery = esast.Query{
+				Bool: &esast.BoolQuery{
+					Should:             dlsClauses,
+					MinimumShouldMatch: 1,
+				},
+			}
+		}
+		copyBase()
+		if existing := out[tgt]; existing != nil {
+			merged := esast.Query{
+				Bool: &esast.BoolQuery{
+					Must:   []esast.Query{*existing},
+					Filter: []esast.Query{dlsQuery},
+				},
+			}
+			out[tgt] = &merged
+		} else {
+			qCopy := dlsQuery
+			out[tgt] = &qCopy
+		}
+	}
+	s.mu.RUnlock()
+	if out != nil {
+		return out
+	}
+	return aliasFilters
+}
+
+func fieldAllowedByFLSRulesR67(fieldPath string, grants, excepts []string) bool {
+	for _, pat := range excepts {
+		if matchWildcardPattern(pat, fieldPath) {
+			return false
+		}
+	}
+	if grants != nil {
+		for _, pat := range grants {
+			if matchWildcardPattern(pat, fieldPath) {
+				return true
+			}
+		}
+		return false
+	}
+	return true
+}
+
+func filterMapByFLSR67(m map[string]any, prefix string, grants, excepts []string) map[string]any {
+	if len(m) == 0 {
+		return m
+	}
+	out := make(map[string]any, len(m))
+	for k, v := range m {
+		full := k
+		if prefix != "" {
+			full = prefix + "." + k
+		}
+		if !fieldAllowedByFLSRulesR67(full, grants, excepts) {
+			// Check if any sub-path could be explicitly granted inside nested object when except doesn't match parent.
+			if subMap, okSub := v.(map[string]any); okSub {
+				if filteredSub := filterMapByFLSR67(subMap, full, grants, excepts); len(filteredSub) > 0 {
+					out[k] = filteredSub
+				}
+			}
+			continue
+		}
+		if subMap, okSub := v.(map[string]any); okSub {
+			out[k] = filterMapByFLSR67(subMap, full, grants, excepts)
+			continue
+		}
+		out[k] = v
+	}
+	return out
+}
+
+func (s *Server) applyDynamicFLSOnResponseR67(r *http.Request, targets []string, resp map[string]any) {
+	p := securityPrincipalFromRequestR67(r)
+	if s == nil || p == nil || p.isStaticAdmin || resp == nil {
+		return
+	}
+	s.mu.RLock()
+	roleMaps, isSuper := s.collectEffectiveRoleMapsLockedR67(p)
+	if isSuper || len(roleMaps) == 0 {
+		s.mu.RUnlock()
+		return
+	}
+	type flsRule struct {
+		hasGrant bool
+		grants   []string
+		excepts  []string
+	}
+	rulesByIdx := make(map[string]flsRule)
+	for _, tgt := range targets {
+		hasUnrestricted := false
+		var mergedGrants []string
+		hasGrant := false
+		var mergedExcepts []string
+		foundRule := false
+		for _, rm := range roleMaps {
+			entries, ok := roleIndexEntriesMatchingTargetLockedR67(rm, tgt, s.aliases, []string{"read", "view_index_metadata"})
+			if !ok {
+				continue
+			}
+			for _, ent := range entries {
+				rawFS, hasFS := ent["field_security"]
+				if !hasFS || rawFS == nil {
+					hasUnrestricted = true
+					break
+				}
+				fsMap, okFS := rawFS.(map[string]any)
+				if !okFS {
+					hasUnrestricted = true
+					break
+				}
+				foundRule = true
+				if rawGr, okGr := fsMap["grant"]; okGr && rawGr != nil {
+					hasGrant = true
+					mergedGrants = append(mergedGrants, extractRolesListFromAnyR67(rawGr)...)
+				}
+				if rawEx, okEx := fsMap["except"]; okEx && rawEx != nil {
+					mergedExcepts = append(mergedExcepts, extractRolesListFromAnyR67(rawEx)...)
+				}
+			}
+			if hasUnrestricted {
+				break
+			}
+		}
+		if !hasUnrestricted && foundRule {
+			var grSlice []string
+			if hasGrant {
+				grSlice = mergedGrants
+				if grSlice == nil {
+					grSlice = []string{}
+				}
+			}
+			rulesByIdx[tgt] = flsRule{hasGrant: hasGrant, grants: grSlice, excepts: mergedExcepts}
+		}
+	}
+	s.mu.RUnlock()
+	if len(rulesByIdx) == 0 {
+		return
+	}
+	hitsEnv, okH := resp["hits"].(map[string]any)
+	if !okH {
+		return
+	}
+	hitsSlice, okHS := hitsEnv["hits"].([]map[string]any)
+	if !okHS {
+		return
+	}
+	for _, hm := range hitsSlice {
+		idxName, _ := hm["_index"].(string)
+		rule, okR := rulesByIdx[idxName]
+		if !okR && len(targets) == 1 {
+			rule, okR = rulesByIdx[targets[0]]
+		}
+		if !okR {
+			continue
+		}
+		switch sv := hm["_source"].(type) {
+		case map[string]any:
+			hm["_source"] = filterMapByFLSR67(sv, "", rule.grants, rule.excepts)
+		case json.RawMessage:
+			var srcMap map[string]any
+			if len(sv) > 0 && json.Unmarshal(sv, &srcMap) == nil && srcMap != nil {
+				filtered := filterMapByFLSR67(srcMap, "", rule.grants, rule.excepts)
+				if b, err := json.Marshal(filtered); err == nil {
+					hm["_source"] = json.RawMessage(b)
+				}
+			}
+		case []byte:
+			var srcMap map[string]any
+			if len(sv) > 0 && json.Unmarshal(sv, &srcMap) == nil && srcMap != nil {
+				filtered := filterMapByFLSR67(srcMap, "", rule.grants, rule.excepts)
+				if b, err := json.Marshal(filtered); err == nil {
+					hm["_source"] = json.RawMessage(b)
+				}
+			}
+		}
+		if fMap, okF := hm["fields"].(map[string][]any); okF {
+			filteredF := make(map[string][]any, len(fMap))
+			for fk, fv := range fMap {
+				if fieldAllowedByFLSRulesR67(fk, rule.grants, rule.excepts) {
+					filteredF[fk] = fv
+				}
+			}
+			hm["fields"] = filteredF
+		}
+	}
+}
+
+func (s *Server) hasDynamicSecurityLockedR67() bool {
+	return len(s.securityUsers) > 0 || len(s.securityAPIKeys) > 0 || len(s.securityServiceTokens) > 0
+}
+
+func isAnonymousTokenExchangePathR67(method, path string) bool {
+	if method != http.MethodPost && method != http.MethodPut {
+		return false
+	}
+	switch strings.Trim(path, "/") {
+	case "_security/oauth2/token",
+		"_xpack/security/oauth2/token",
+		"_security/api_key/grant",
+		"_security/api_key/_grant",
+		"_xpack/security/api_key/grant",
+		"_xpack/security/api_key/_grant":
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Server) checkInboundAuthWithRequestR67(w http.ResponseWriter, r *http.Request) (*http.Request, bool) {
+	if isPublicHealthProbePath(r.URL.Path) {
+		return r, true
+	}
 	s.authMu.RLock()
 	basicUser := s.basicAuthUser
 	basicPass := s.basicAuthPass
@@ -888,46 +1903,52 @@ func (s *Server) checkInboundAuth(w http.ResponseWriter, r *http.Request) bool {
 
 	hasBasic := basicUser != "" && basicPass != ""
 	hasAPIKey := apiKey != ""
-	if !hasBasic && !hasAPIKey {
-		return true
+	hasStaticAuth := hasBasic || hasAPIKey
+
+	s.mu.RLock()
+	hasDynamicSec := s.hasDynamicSecurityLockedR67()
+	if !hasStaticAuth && !hasDynamicSec {
+		s.mu.RUnlock()
+		return r, true
 	}
-	if isPublicHealthProbePath(r.URL.Path) {
-		return true
+	if strings.TrimSpace(r.Header.Get("Authorization")) == "" && isAnonymousTokenExchangePathR67(r.Method, r.URL.Path) {
+		s.mu.RUnlock()
+		return r, true
 	}
 
-	authHeader := strings.TrimSpace(r.Header.Get("Authorization"))
-	if authHeader != "" {
-		if hasBasic && strings.HasPrefix(strings.ToLower(authHeader), "basic ") {
-			if u, p, ok := r.BasicAuth(); ok {
-				uMatch := subtle.ConstantTimeCompare([]byte(u), []byte(basicUser))
-				pMatch := subtle.ConstantTimeCompare([]byte(p), []byte(basicPass))
-				if (uMatch & pMatch) == 1 {
-					return true
+	principal, ok, errSt, errMsg := s.resolveDynamicPrincipalLockedR67(r, basicUser, basicPass, apiKey)
+	if ok && principal != nil {
+		if runAs := strings.TrimSpace(r.Header.Get("es-security-runas-user")); runAs != "" {
+			if runAsObj := s.securityUsers[runAs]; runAsObj != nil {
+				if enabled, hasEnabled := runAsObj["enabled"].(bool); hasEnabled && !enabled {
+					s.mu.RUnlock()
+					writeESError(w, http.StatusUnauthorized, "security_exception", fmt.Sprintf("unable to authenticate user [%s] via run_as", runAs))
+					return r, false
 				}
+				cp := *principal
+				cp.username = runAs
+				cp.roles = extractRolesListFromAnyR67(runAsObj["roles"])
+				if cp.roles == nil {
+					cp.roles = []string{}
+				}
+				cp.isStaticAdmin = false
+				principal = &cp
 			}
 		}
-		if hasAPIKey {
-			lower := strings.ToLower(authHeader)
-			var token string
-			switch {
-			case strings.HasPrefix(lower, "apikey "):
-				token = strings.TrimSpace(authHeader[len("apikey "):])
-			case strings.HasPrefix(lower, "bearer "):
-				token = strings.TrimSpace(authHeader[len("bearer "):])
-			}
-			if token != "" && matchConfiguredAPIKey(token, apiKey) {
-				return true
-			}
-		}
+	}
+	s.mu.RUnlock()
+
+	if !ok || principal == nil {
+		w.Header().Set("WWW-Authenticate", `Basic realm="security" charset="UTF-8", ApiKey`)
+		writeESError(w, errSt, "security_exception", errMsg)
+		return r, false
 	}
 
-	w.Header().Set("WWW-Authenticate", `Basic realm="security" charset="UTF-8", ApiKey`)
-	reason := "missing authentication credentials for REST request [" + r.URL.Path + "]"
-	if authHeader != "" {
-		reason = "unable to authenticate credentials for REST request [" + r.URL.Path + "]"
+	r = r.WithContext(context.WithValue(r.Context(), securityPrincipalCtxKeyR67{}, principal))
+	if !s.checkDynamicRBACR67(w, r, principal) {
+		return r, false
 	}
-	writeESError(w, http.StatusUnauthorized, "security_exception", reason)
-	return false
+	return r, true
 }
 
 // SlowQueryEntry records a search execution and any unpromoted `_doc[...]` VARIANT fields it touched.
@@ -3066,6 +4087,10 @@ func (s *Server) applyEffectiveAndFinalPipelinesWithRoutingAndExecuted(indexName
 }
 
 func (s *Server) applyEffectiveAndFinalPipelinesWithMetaRound61(indexName, docID, reqPipeline, defaultPipeline, initialRouting string, raw json.RawMessage) (json.RawMessage, string, string, string, bool, []string, map[string]any, error) {
+	return s.applyEffectiveAndFinalPipelinesWithMetaAndTypeR67(indexName, "", docID, reqPipeline, defaultPipeline, initialRouting, raw)
+}
+
+func (s *Server) applyEffectiveAndFinalPipelinesWithMetaAndTypeR67(indexName, docType, docID, reqPipeline, defaultPipeline, initialRouting string, raw json.RawMessage) (json.RawMessage, string, string, string, bool, []string, map[string]any, error) {
 	resolveSettingDef := func(target string) (val string, explicitNone bool) {
 		if s == nil || target == "" {
 			return "", false
@@ -3218,6 +4243,14 @@ func (s *Server) applyEffectiveAndFinalPipelinesWithMetaRound61(indexName, docID
 			}
 		}
 		stepStart := time.Now()
+		if docType != "" {
+			nextMeta := make(map[string]any, len(inMeta)+1)
+			for mk, mv := range inMeta {
+				nextMeta[mk] = mv
+			}
+			nextMeta["_doc_type"] = docType
+			inMeta = nextMeta
+		}
 		out, outIdx, outID, outRouting, dropped, outMeta, err := s.applyIngestPipelineForWriteWithRoutingAndIngestMeta(pipeID, inIdx, inID, inRouting, inRaw, inMeta)
 		if pEntry != nil {
 			pEntry.current.Add(-1)
@@ -4337,7 +5370,7 @@ func compileIngestJavaRegexUncachedRound61(pattern string) (*regexp.Regexp, erro
 		b.WriteByte(ch)
 		i++
 	}
-	return regexp.Compile(b.String())
+	return painless.CompileBoundedRawRegex(b.String())
 }
 
 func applyIngestGsubReplacement(re *regexp.Regexp, src, repl string) (string, error) {
@@ -9324,6 +10357,13 @@ func snapshotIngestDoc(doc map[string]any) map[string]any {
 				delete(cp, "_index")
 			}
 		}
+		if b, ok := im["_had_orig_type"].(bool); ok {
+			if b {
+				cp["_type"] = im["_orig_type_val"]
+			} else {
+				delete(cp, "_type")
+			}
+		}
 		if b, ok := im["_had_orig_id"].(bool); ok {
 			if b {
 				cp["_id"] = im["_orig_id_val"]
@@ -9680,7 +10720,7 @@ func applyIngestPipelineSpecWithNameAndRoutingAndIngestMeta(s *Server, pipe map[
 		}
 		out := make(map[string]any, len(initialIngestMeta))
 		for k, v := range initialIngestMeta {
-			if k == "_subst_pipes" || k == "_inline_sim_pipeline" || k == "_is_es8_mode" || k == "pipeline" {
+			if k == "_subst_pipes" || k == "_inline_sim_pipeline" || k == "_is_es8_mode" || k == "pipeline" || k == "_doc_type" {
 				continue
 			}
 			out[k] = v
@@ -9711,6 +10751,7 @@ func applyIngestPipelineSpecWithNameAndRoutingAndIngestMeta(s *Server, pipe map[
 		return raw, indexName, docID, "", initialRouting, false, nil, cloneInitialMeta(), err
 	}
 	origIndexVal, hadOrigIndex := doc["_index"]
+	origTypeVal, hadOrigType := doc["_type"]
 	origIDVal, hadOrigID := doc["_id"]
 	origRoutingVal, hadOrigRouting := doc["_routing"]
 	origVersionVal, hadOrigVersion := doc["_version"]
@@ -9742,6 +10783,11 @@ func applyIngestPipelineSpecWithNameAndRoutingAndIngestMeta(s *Server, pipe map[
 	} else {
 		delete(doc, "_routing")
 	}
+	if seedDocType, _ := initialIngestMeta["_doc_type"].(string); seedDocType != "" {
+		doc["_type"] = seedDocType
+	} else if !hadOrigType {
+		doc["_type"] = "_doc"
+	}
 	ingestMeta, _ := doc["_ingest"].(map[string]any)
 	if ingestMeta == nil {
 		ingestMeta = make(map[string]any)
@@ -9765,6 +10811,8 @@ func applyIngestPipelineSpecWithNameAndRoutingAndIngestMeta(s *Server, pipe map[
 			seedInlineSim, _ = v.(bool)
 		case "_is_es8_mode":
 			seedES8Mode, seedHasES8 = v.(bool)
+		case "_doc_type":
+			continue
 		default:
 			if _, exists := ingestMeta[k]; !exists {
 				ingestMeta[k] = v
@@ -9775,6 +10823,7 @@ func applyIngestPipelineSpecWithNameAndRoutingAndIngestMeta(s *Server, pipe map[
 	delete(ingestMeta, "_subst_pipes")
 	delete(ingestMeta, "_inline_sim_pipeline")
 	delete(ingestMeta, "_is_es8_mode")
+	delete(ingestMeta, "_doc_type")
 	if _, hasTS := ingestMeta["timestamp"]; !hasTS {
 		ingestMeta["timestamp"] = time.Now().UTC().Format(time.RFC3339Nano)
 	}
@@ -9789,6 +10838,8 @@ func applyIngestPipelineSpecWithNameAndRoutingAndIngestMeta(s *Server, pipe map[
 	origMeta := map[string]any{
 		"_had_orig_index":      hadOrigIndex,
 		"_orig_index_val":      origIndexVal,
+		"_had_orig_type":       hadOrigType,
+		"_orig_type_val":       origTypeVal,
 		"_had_orig_id":         hadOrigID,
 		"_orig_id_val":         origIDVal,
 		"_had_orig_routing":    hadOrigRouting,
@@ -9811,7 +10862,7 @@ func applyIngestPipelineSpecWithNameAndRoutingAndIngestMeta(s *Server, pipe map[
 		outIngestTS := ""
 		if curIngest, ok := doc["_ingest"].(map[string]any); ok {
 			for k, v := range curIngest {
-				if k == "pipeline" || k == "_subst_pipes" || k == "_inline_sim_pipeline" || k == "_is_es8_mode" {
+				if k == "pipeline" || k == "_subst_pipes" || k == "_inline_sim_pipeline" || k == "_is_es8_mode" || k == "_doc_type" {
 					continue
 				}
 				outIngestMeta[k] = v
@@ -9952,6 +11003,11 @@ func applyIngestPipelineSpecWithNameAndRoutingAndIngestMeta(s *Server, pipe map[
 		doc["_index"] = origIndexVal
 	} else {
 		delete(doc, "_index")
+	}
+	if hadOrigType {
+		doc["_type"] = origTypeVal
+	} else {
+		delete(doc, "_type")
 	}
 	if hadOrigID {
 		doc["_id"] = origIDVal
@@ -10361,6 +11417,7 @@ func (s *Server) handleSimulateIngestPipeline(w http.ResponseWriter, r *http.Req
 			"_subst_pipes":         substPipes,
 			"_inline_sim_pipeline": effIsInline,
 			"_is_es8_mode":         isES8,
+			"_doc_type":            inType,
 		}
 		outBytes, outIdx, outID, outIngestTS, outRouting, dropped, trace, outIngestMeta, procErr := applyIngestPipelineSpecWithNameAndRoutingAndIngestMeta(s, effPipe, effPipeName, idx, id, inRouting, rawSrc, verbose, initMeta)
 		if outIngestTS != "" {
@@ -13066,13 +14123,17 @@ func (s *Server) handleDorisPromoteField(w http.ResponseWriter, r *http.Request)
 		req.Type = "keyword"
 	}
 
-	ddls, err := s.promoteFieldInternal(r.Context(), idxName, req.Field, req.Type)
+	ddls, err := s.promoteFieldWithOptionsR67(r.Context(), idxName, req.Field, req.Type, false)
 	if err != nil {
-		if strings.Contains(err.Error(), "cannot promote field") {
-			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", err.Error())
+		errStr := err.Error()
+		if strings.Contains(errStr, "cannot promote field") ||
+			strings.Contains(errStr, "Limit of") ||
+			strings.Contains(errStr, "illegal_argument_exception") ||
+			strings.Contains(errStr, "mapper_parsing_exception") {
+			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", errStr)
 			return
 		}
-		writeESError(w, http.StatusInternalServerError, "doris_ddl_exception", err.Error())
+		writeESError(w, http.StatusInternalServerError, "doris_ddl_exception", errStr)
 		return
 	}
 
@@ -13087,7 +14148,41 @@ func (s *Server) handleDorisPromoteField(w http.ResponseWriter, r *http.Request)
 	})
 }
 
+func docMapHasFieldPathR67(doc any, segs []string) bool {
+	if len(segs) == 0 {
+		return false
+	}
+	cur := doc
+	for idx, seg := range segs {
+		switch tv := cur.(type) {
+		case map[string]any:
+			next, ok := tv[seg]
+			if !ok {
+				return false
+			}
+			if idx == len(segs)-1 {
+				return next != nil
+			}
+			cur = next
+		case []any:
+			for _, elem := range tv {
+				if docMapHasFieldPathR67(elem, segs[idx:]) {
+					return true
+				}
+			}
+			return false
+		default:
+			return false
+		}
+	}
+	return false
+}
+
 func (s *Server) promoteFieldInternal(ctx context.Context, idxName, field, esType string) ([]string, error) {
+	return s.promoteFieldWithOptionsR67(ctx, idxName, field, esType, true)
+}
+
+func (s *Server) promoteFieldWithOptionsR67(ctx context.Context, idxName, field, esType string, requireSamplePresence bool) ([]string, error) {
 	if esType == "" {
 		esType = "keyword"
 	}
@@ -13103,6 +14198,10 @@ func (s *Server) promoteFieldInternal(ctx context.Context, idxName, field, esTyp
 		}
 		s.slowTracker.mu.Unlock()
 	}
+
+	unlockDDL := s.LockIndexDDL(idxName)
+	defer unlockDDL()
+
 	idxSchema := s.ensureWritableIndexSchema(ctx, idxName)
 	if existing, ok := idxSchema.Fields[cleanField]; ok && existing.Kind != schema.StorageDynamicVariant {
 		clearTrackerFreq()
@@ -13110,23 +14209,73 @@ func (s *Server) promoteFieldInternal(ctx context.Context, idxName, field, esTyp
 	}
 
 	isMultiValued := schema.DefaultMultiValuedPaths[cleanField]
-	if !isMultiValued && s.backend != nil {
+	fieldPresentInSample := false
+	sampledAnyDocs := false
+	if s.backend != nil && (requireSamplePresence || !isMultiValued) {
 		_ = s.coalescer.FlushTable(ctx, idxSchema.DorisTable)
 		tr := transpiler.NewTranspiler(idxSchema, s.transpileOpts)
 		sampleSize := 16
 		if plan, err := tr.BuildSearchPlan(&esast.SearchRequest{Size: &sampleSize, TrackTotalHits: false}); err == nil {
 			if hits, err := s.backend.QueryHits(ctx, plan.HitsSQL); err == nil && len(hits) > 0 {
+				sampledAnyDocs = true
 				var sampleDocs []json.RawMessage
+				pathSegs := strings.Split(cleanField, ".")
 				for _, h := range hits {
 					sampleDocs = append(sampleDocs, h.Source)
+					if requireSamplePresence && !fieldPresentInSample && len(h.Source) > 0 {
+						var dm map[string]any
+						if json.Unmarshal(h.Source, &dm) == nil && docMapHasFieldPathR67(dm, pathSegs) {
+							fieldPresentInSample = true
+						}
+					}
 				}
-				if inferred := schema.InferMappingFromSampleDocs(sampleDocs); inferred != nil {
-					if fp, found := lookupFieldPropertyByPath(inferred.Properties, strings.Split(cleanField, ".")); found && fp.MultiValued {
-						isMultiValued = true
+				if !isMultiValued {
+					if inferred := schema.InferMappingFromSampleDocs(sampleDocs); inferred != nil {
+						if fp, found := lookupFieldPropertyByPath(inferred.Properties, pathSegs); found && fp.MultiValued {
+							isMultiValued = true
+						}
 					}
 				}
 			}
 		}
+	}
+	if requireSamplePresence && (!sampledAnyDocs || !fieldPresentInSample) {
+		clearTrackerFreq()
+		return []string{}, nil
+	}
+
+	patchSpec := &esast.MappingSpec{
+		Properties: buildNestedMappingProps(strings.Split(cleanField, "."), esast.FieldProperty{Type: esType, MultiValued: isMultiValued}),
+	}
+	s.mu.RLock()
+	curSchema := s.indices[idxName]
+	var oldRaw *esast.MappingSpec
+	if curSchema != nil {
+		oldRaw = curSchema.RawMapping
+	}
+	s.mu.RUnlock()
+
+	mergedSpec := schema.MergeMappingSpecs(oldRaw, patchSpec)
+	if mergedSpec != nil && len(mergedSpec.Runtime) > 0 {
+		rtCopy := make(map[string]esast.FieldProperty, len(mergedSpec.Runtime))
+		for k, v := range mergedSpec.Runtime {
+			if k != cleanField {
+				rtCopy[k] = v
+			}
+		}
+		if len(rtCopy) == 0 {
+			mergedSpec.Runtime = nil
+		} else {
+			mergedSpec.Runtime = rtCopy
+		}
+	}
+	limitAnchor := curSchema
+	if limitAnchor == nil {
+		limitAnchor = idxSchema
+	}
+	if err := schema.ValidateMappingLimits(limitAnchor, mergedSpec); err != nil {
+		clearTrackerFreq()
+		return nil, err
 	}
 
 	ddlType := esType
@@ -13143,33 +14292,16 @@ func (s *Server) promoteFieldInternal(ctx context.Context, idxName, field, esTyp
 		}
 	}
 
-	patchSpec := &esast.MappingSpec{
-		Properties: buildNestedMappingProps(strings.Split(cleanField, "."), esast.FieldProperty{Type: esType, MultiValued: isMultiValued}),
-	}
-	s.mu.Lock()
-	var oldRaw *esast.MappingSpec
-	if cur := s.indices[idxName]; cur != nil {
-		oldRaw = cur.RawMapping
-	}
-	mergedSpec := schema.MergeMappingSpecs(oldRaw, patchSpec)
-	if mergedSpec != nil && len(mergedSpec.Runtime) > 0 {
-		rtCopy := make(map[string]esast.FieldProperty, len(mergedSpec.Runtime))
-		for k, v := range mergedSpec.Runtime {
-			if k != cleanField {
-				rtCopy[k] = v
-			}
-		}
-		if len(rtCopy) == 0 {
-			mergedSpec.Runtime = nil
-		} else {
-			mergedSpec.Runtime = rtCopy
-		}
-	}
 	compiled := schema.CompileIndexSchema(s.dorisDB, idxName, mergedSpec)
+	s.mu.Lock()
+	if cur := s.indices[idxName]; cur != nil {
+		compiled.CopyIndexMappingSettingsFrom(cur)
+	}
 	s.indices[idxName] = compiled
 	s.mu.Unlock()
 	s.persistIndex(ctx, idxName, compiled)
 	s.backfillIndexSchema(ctx, compiled)
+	s.invalidateBM25ForIndexR67(idxName)
 	s.queryCache.InvalidateAll()
 	clearTrackerFreq()
 	return ddls, nil
@@ -13644,7 +14776,7 @@ func (s *Server) handleRollover(w http.ResponseWriter, r *http.Request) {
 		}
 
 		compiled := schema.CompileIndexSchema(s.dorisDB, newIdx, baseMapping)
-		if err := s.backend.ExecDDL(r.Context(), schema.GenerateCreateTableDDL(compiled)); err != nil {
+		if err := s.backend.ExecDDL(r.Context(), schema.GenerateCreateTableDDLWithOptions(compiled, s.DorisDDLOptions())); err != nil {
 			writeESError(w, http.StatusInternalServerError, "doris_ddl_exception", err.Error())
 			return
 		}
@@ -13796,19 +14928,10 @@ func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
 }
 
-// handleReadyz implements `GET /readyz` backend readiness probe.
+// handleReadyz implements `GET /readyz` backend readiness probe with short-TTL caching.
 func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
-	if err := s.backend.Ping(r.Context()); err != nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
-			"status": "not_ready",
-			"error":  err.Error(),
-		})
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"status":   "ready",
-		"doris_db": s.dorisDB,
-	})
+	status, payload := s.readyzCache.check(r.Context(), s)
+	writeJSON(w, status, payload)
 }
 
 // handleMetrics implements `GET /metrics` and `GET /_doris/metrics` in Prometheus text exposition format.
@@ -13891,6 +15014,16 @@ func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 	sb.WriteString("# HELP doris_es_proxy_query_cache_misses_total Search requests that missed the TTL query cache.\n")
 	sb.WriteString("# TYPE doris_es_proxy_query_cache_misses_total counter\n")
 	_, _ = fmt.Fprintf(&sb, "doris_es_proxy_query_cache_misses_total %d\n", cacheMisses)
+
+	var dbStatsPtr *sql.DBStats
+	if dbProv, ok := s.backend.(DBStatsBackend); ok {
+		if st, okSt := dbProv.DBStats(); okSt {
+			dbStatsPtr = &st
+		}
+	}
+	if s.metrics != nil {
+		s.metrics.WritePrometheusMetrics(&sb, dbStatsPtr)
+	}
 
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
@@ -16219,7 +17352,7 @@ func (s *Server) handleResizeOrCloneIndex(w http.ResponseWriter, r *http.Request
 	compiled.CopyIndexMappingSettingsFrom(srcSchema)
 	compiled.ES8Mode = srcSchema.ES8Mode
 	schema.ApplyIndexModeDefaults(compiled)
-	ddl := schema.GenerateCreateTableDDL(compiled)
+	ddl := schema.GenerateCreateTableDDLWithOptions(compiled, s.DorisDDLOptions())
 	if err := s.backend.ExecDDL(r.Context(), ddl); err != nil {
 		writeESError(w, http.StatusInternalServerError, "doris_ddl_exception", err.Error())
 		return

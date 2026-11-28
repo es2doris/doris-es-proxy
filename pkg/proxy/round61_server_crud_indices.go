@@ -2116,63 +2116,93 @@ func (s *Server) handlePutMappingR61CRUD(w http.ResponseWriter, r *http.Request)
 	s.mu.RUnlock()
 
 	for _, indexName := range validTargets {
-		s.mu.Lock()
-		oldSchema := s.indices[indexName]
-		var oldRaw *esast.MappingSpec
-		if oldSchema != nil {
-			oldRaw = oldSchema.RawMapping
-		}
-		mergedSpec := schema.MergeMappingSpecs(oldRaw, &spec)
-		normalizeMappingScriptsInPlaceR62Search(mergedSpec)
-		newSchema := schema.CompileIndexSchema(s.dorisDB, indexName, mergedSpec)
-		newSchema.ES8Mode = isES8
-		if oldSchema != nil {
-			newSchema.CopyIndexMappingSettingsFrom(oldSchema)
-		}
-		if custom := s.indexCustomSettings[indexName]; len(custom) > 0 {
-			if oldSchema == nil {
-				_ = parseAndApplyIndexMappingSettingsRound59(custom, newSchema)
-			}
-			_ = newSchema.SetAnalysisSettings(normalizeJSONNumbersForAnalysisR65(custom))
-		}
-		if newSchema.IndexMode == "time_series" {
-			schema.ApplyIndexModeDefaults(newSchema)
-			if newSchema.RawMapping == nil {
-				newSchema.RawMapping = &esast.MappingSpec{}
-			}
-			if newSchema.RawMapping.Source == nil && !newSchema.SourceDisabled() {
-				newSchema.RawMapping.Source = map[string]any{"mode": "synthetic"}
-			}
-		}
-		if effectivePutType != "" && newSchema.LegacyTypeName == "" {
-			newSchema.LegacyTypeName = effectivePutType
-		}
-		var nextSeq int64
-		if s.indexNextSeqNo != nil {
-			nextSeq = s.indexNextSeqNo[indexName]
-		}
-		recordNewPutMappingFieldsSeqNoR61CRUD(oldSchema, newSchema, nextSeq)
-		s.indices[indexName] = newSchema
-		s.mu.Unlock()
-		s.persistIndex(r.Context(), indexName, newSchema)
-
-		if oldSchema == nil {
-			ddl := schema.GenerateCreateTableDDL(newSchema)
-			if err := s.backend.ExecDDL(r.Context(), ddl); err != nil {
-				writeESError(w, http.StatusInternalServerError, "doris_ddl_exception", err.Error())
-				return
-			}
-		} else {
-			for _, stmt := range schema.GenerateAlterTableDDL(oldSchema, newSchema) {
-				if err := s.backend.ExecDDL(r.Context(), stmt); err != nil {
-					writeESError(w, http.StatusInternalServerError, "doris_ddl_exception", err.Error())
-					return
-				}
-			}
+		st, eType, eReason := s.applyPutMappingTargetR67(r.Context(), indexName, &spec, isES8, effectivePutType)
+		if st != 0 {
+			writeESError(w, st, eType, eReason)
+			return
 		}
 	}
 	s.queryCache.InvalidateAll()
 	writeJSONWithRequest(w, r, http.StatusOK, map[string]any{"acknowledged": true})
+}
+
+func (s *Server) applyPutMappingTargetR67(
+	ctx context.Context,
+	indexName string,
+	spec *esast.MappingSpec,
+	isES8 bool,
+	effectivePutType string,
+) (int, string, string) {
+	unlockDDL := s.LockIndexDDL(indexName)
+	defer unlockDDL()
+
+	s.mu.RLock()
+	oldSchema := s.indices[indexName]
+	var oldRaw *esast.MappingSpec
+	if oldSchema != nil {
+		oldRaw = oldSchema.RawMapping
+	}
+	var customCopy map[string]any
+	if custom := s.indexCustomSettings[indexName]; len(custom) > 0 {
+		customCopy = deepCloneDocMap(custom)
+	}
+	var nextSeq int64
+	if s.indexNextSeqNo != nil {
+		nextSeq = s.indexNextSeqNo[indexName]
+	}
+	s.mu.RUnlock()
+
+	if err := schema.ValidateMappingUpdateCompatibility(oldRaw, spec); err != nil {
+		return http.StatusBadRequest, "illegal_argument_exception", err.Error()
+	}
+	mergedSpec := schema.MergeMappingSpecs(oldRaw, spec)
+	normalizeMappingScriptsInPlaceR62Search(mergedSpec)
+	if err := schema.ValidateMappingLimits(oldSchema, mergedSpec); err != nil {
+		return http.StatusBadRequest, "illegal_argument_exception", err.Error()
+	}
+	newSchema := schema.CompileIndexSchema(s.dorisDB, indexName, mergedSpec)
+	newSchema.ES8Mode = isES8
+	if oldSchema != nil {
+		newSchema.CopyIndexMappingSettingsFrom(oldSchema)
+	}
+	if len(customCopy) > 0 {
+		if oldSchema == nil {
+			_ = parseAndApplyIndexMappingSettingsRound59(customCopy, newSchema)
+		}
+		_ = newSchema.SetAnalysisSettings(normalizeJSONNumbersForAnalysisR65(customCopy))
+	}
+	if newSchema.IndexMode == "time_series" {
+		schema.ApplyIndexModeDefaults(newSchema)
+		if newSchema.RawMapping == nil {
+			newSchema.RawMapping = &esast.MappingSpec{}
+		}
+		if newSchema.RawMapping.Source == nil && !newSchema.SourceDisabled() {
+			newSchema.RawMapping.Source = map[string]any{"mode": "synthetic"}
+		}
+	}
+	if effectivePutType != "" && newSchema.LegacyTypeName == "" {
+		newSchema.LegacyTypeName = effectivePutType
+	}
+	recordNewPutMappingFieldsSeqNoR61CRUD(oldSchema, newSchema, nextSeq)
+
+	if oldSchema == nil {
+		ddl := schema.GenerateCreateTableDDLWithOptions(newSchema, s.DorisDDLOptions())
+		if err := s.backend.ExecDDL(ctx, ddl); err != nil {
+			return http.StatusInternalServerError, "doris_ddl_exception", err.Error()
+		}
+	} else {
+		for _, stmt := range schema.GenerateAlterTableDDL(oldSchema, newSchema) {
+			if err := s.backend.ExecDDL(ctx, stmt); err != nil {
+				return http.StatusInternalServerError, "doris_ddl_exception", err.Error()
+			}
+		}
+	}
+
+	s.mu.Lock()
+	s.indices[indexName] = newSchema
+	s.mu.Unlock()
+	s.persistIndex(ctx, indexName, newSchema)
+	return 0, "", ""
 }
 
 // ============================================================================
@@ -3924,55 +3954,41 @@ func (s *Server) validateAndEvolveExistingIndexR61CRUD(
 	if idx == nil || len(sampleDocs) == 0 {
 		return idx, nil
 	}
-	if idx.AnalysisConfig == nil {
+	evolvedIdx, err := func() (*schema.IndexSchema, error) {
+		unlockDDL := s.LockIndexDDL(indexName)
+		defer unlockDDL()
+
 		s.mu.RLock()
-		cs := s.indexCustomSettings[indexName]
-		var csCopy map[string]any
-		if len(cs) > 0 {
-			csCopy = deepCloneDocMap(cs)
+		if cur := s.indices[indexName]; cur != nil {
+			idx = cur
 		}
 		s.mu.RUnlock()
-		if len(csCopy) > 0 {
-			restored := idx.CloneIndexSchema()
-			if err := restored.SetAnalysisSettings(normalizeJSONNumbersForAnalysisR65(csCopy)); err == nil && restored.AnalysisConfig != nil {
-				s.mu.Lock()
-				s.indices[indexName] = restored
-				s.mu.Unlock()
-				idx = restored
+
+		if idx.AnalysisConfig == nil {
+			s.mu.RLock()
+			cs := s.indexCustomSettings[indexName]
+			var csCopy map[string]any
+			if len(cs) > 0 {
+				csCopy = deepCloneDocMap(cs)
+			}
+			s.mu.RUnlock()
+			if len(csCopy) > 0 {
+				restored := idx.CloneIndexSchema()
+				if err := restored.SetAnalysisSettings(normalizeJSONNumbersForAnalysisR65(csCopy)); err == nil && restored.AnalysisConfig != nil {
+					s.mu.Lock()
+					s.indices[indexName] = restored
+					s.mu.Unlock()
+					idx = restored
+				}
 			}
 		}
-	}
-	effES8 := es8Mode || idx.ES8Mode
-	if nextRaw, added := applyDynamicRuntimeInferenceRound59(sampleDocs, idx.RawMapping); added {
-		cand := schema.CompileIndexSchema(s.dorisDB, indexName, nextRaw)
-		cand.CopyIndexMappingSettingsFrom(idx)
-		cand.ES8Mode = effES8
-		if err := schema.ValidateMappingLimits(cand, nextRaw); err != nil {
-			return nil, err
-		}
-		s.mu.Lock()
-		s.indices[indexName] = cand
-		s.mu.Unlock()
-		s.persistIndex(ctx, indexName, cand)
-		s.queryCache.InvalidateAll()
-		idx = cand
-	} else if idx.RawMapping == nil || idx.RawMapping.Dynamic == nil || idx.RawMapping.Dynamic == true || idx.RawMapping.Dynamic == "true" {
-		inferred := schema.InferMappingFromSampleDocsWithES8(sampleDocs, effES8, idx.RawMapping)
-		s.recordDynamicallyInferredFieldsWave3R63(indexName, idx.RawMapping, inferred, sampleDocs)
-		mergedPreview := schema.MergeMappingSpecs(inferred, idx.RawMapping)
-		if err := schema.ValidateMappingSpec(mergedPreview); err != nil {
-			return nil, err
-		}
-		if err := schema.ValidateMappingLimits(idx, mergedPreview); err != nil {
-			return nil, err
-		}
-		cand := schema.CompileIndexSchema(s.dorisDB, indexName, mergedPreview)
-		cand.CopyIndexMappingSettingsFrom(idx)
-		cand.ES8Mode = effES8
-		alterStmts := schema.GenerateAlterTableDDL(idx, cand)
-		if len(cand.Fields) > len(idx.Fields) || len(alterStmts) > 0 {
-			for _, stmt := range alterStmts {
-				_ = s.backend.ExecDDL(ctx, stmt)
+		effES8 := es8Mode || idx.ES8Mode
+		if nextRaw, added := applyDynamicRuntimeInferenceRound59(sampleDocs, idx.RawMapping); added {
+			cand := schema.CompileIndexSchema(s.dorisDB, indexName, nextRaw)
+			cand.CopyIndexMappingSettingsFrom(idx)
+			cand.ES8Mode = effES8
+			if err := schema.ValidateMappingLimits(cand, nextRaw); err != nil {
+				return nil, err
 			}
 			s.mu.Lock()
 			s.indices[indexName] = cand
@@ -3980,19 +3996,51 @@ func (s *Server) validateAndEvolveExistingIndexR61CRUD(
 			s.persistIndex(ctx, indexName, cand)
 			s.queryCache.InvalidateAll()
 			idx = cand
+		} else if idx.RawMapping == nil || idx.RawMapping.Dynamic == nil || idx.RawMapping.Dynamic == true || idx.RawMapping.Dynamic == "true" {
+			inferred := schema.InferMappingFromSampleDocsWithES8(sampleDocs, effES8, idx.RawMapping)
+			s.recordDynamicallyInferredFieldsWave3R63(indexName, idx.RawMapping, inferred, sampleDocs)
+			mergedPreview := schema.MergeMappingSpecs(inferred, idx.RawMapping)
+			if err := schema.ValidateMappingSpec(mergedPreview); err != nil {
+				return nil, err
+			}
+			if err := schema.ValidateMappingLimits(idx, mergedPreview); err != nil {
+				return nil, err
+			}
+			cand := schema.CompileIndexSchema(s.dorisDB, indexName, mergedPreview)
+			cand.CopyIndexMappingSettingsFrom(idx)
+			cand.ES8Mode = effES8
+			alterStmts := schema.GenerateAlterTableDDL(idx, cand)
+			if len(cand.Fields) > len(idx.Fields) || len(alterStmts) > 0 {
+				for _, stmt := range alterStmts {
+					if err := s.backend.ExecDDL(ctx, stmt); err != nil {
+						return nil, err
+					}
+				}
+				s.mu.Lock()
+				s.indices[indexName] = cand
+				s.mu.Unlock()
+				s.persistIndex(ctx, indexName, cand)
+				s.queryCache.InvalidateAll()
+				idx = cand
+			}
 		}
-	}
-	idxCloneForCK := idx.CloneIndexSchema()
-	if updated, err := adoptConstantKeywordValuesFromDocsRound59(idxCloneForCK, sampleDocs); err != nil {
+		idxCloneForCK := idx.CloneIndexSchema()
+		if updated, err := adoptConstantKeywordValuesFromDocsRound59(idxCloneForCK, sampleDocs); err != nil {
+			return nil, err
+		} else if updated {
+			s.mu.Lock()
+			s.indices[indexName] = idxCloneForCK
+			s.mu.Unlock()
+			idx = idxCloneForCK
+			s.persistIndex(ctx, indexName, idx)
+			s.queryCache.InvalidateAll()
+		}
+		return idx, nil
+	}()
+	if err != nil {
 		return nil, err
-	} else if updated {
-		s.mu.Lock()
-		s.indices[indexName] = idxCloneForCK
-		s.mu.Unlock()
-		idx = idxCloneForCK
-		s.persistIndex(ctx, indexName, idx)
-		s.queryCache.InvalidateAll()
 	}
+	idx = evolvedIdx
 	if delta := detectArrayPromotions(idx, sampleDocs); delta != nil {
 		idx = s.applyArrayPromotionDelta(ctx, indexName, idx, delta)
 	}
@@ -4026,6 +4074,19 @@ func (s *Server) ensureWritableIndexSchemaWithDocsErrR61CRUD(
 
 	_ = s.syncCatalogFromBackend(ctx)
 
+	var unlockDDL func()
+	if len(sampleDocs) > 0 {
+		unlockDDL = s.LockIndexDDL(indexName)
+	}
+	releaseDDL := func() {
+		if unlockDDL != nil {
+			fn := unlockDDL
+			unlockDDL = nil
+			fn()
+		}
+	}
+	defer releaseDDL()
+
 	s.mu.RLock()
 	if targets, ok := s.aliases[indexName]; ok && len(targets) > 0 {
 		indexName = targets[0]
@@ -4033,6 +4094,7 @@ func (s *Server) ensureWritableIndexSchemaWithDocsErrR61CRUD(
 	idx, ok = s.indices[indexName]
 	if ok && (len(idx.Fields) > 0 || len(idx.NestedRoots) > 0 || len(sampleDocs) == 0) {
 		s.mu.RUnlock()
+		releaseDDL()
 		return s.validateAndEvolveExistingIndexR61CRUD(ctx, es8Mode, indexName, idx, sampleDocs)
 	}
 	var existingEmptySchema *schema.IndexSchema
@@ -4164,16 +4226,21 @@ func (s *Server) ensureWritableIndexSchemaWithDocsErrR61CRUD(
 		}
 	}
 
-	_ = s.backend.ExecDDL(ctx, schema.GenerateCreateTableDDL(compiled))
+	if err := s.backend.ExecDDL(ctx, schema.GenerateCreateTableDDLWithOptions(compiled, s.DorisDDLOptions())); err != nil {
+		return nil, err
+	}
 	if existingEmptySchema != nil {
 		for _, stmt := range schema.GenerateAlterTableDDL(existingEmptySchema, compiled) {
-			_ = s.backend.ExecDDL(ctx, stmt)
+			if err := s.backend.ExecDDL(ctx, stmt); err != nil {
+				return nil, err
+			}
 		}
 	}
 	aliasesToPersist := make(map[string][]string)
 	s.mu.Lock()
 	if existing, exists := s.indices[indexName]; exists && (len(existing.Fields) > 0 || len(existing.NestedRoots) > 0) {
 		s.mu.Unlock()
+		releaseDDL()
 		return s.validateAndEvolveExistingIndexR61CRUD(ctx, es8Mode, indexName, existing, sampleDocs)
 	}
 	s.indices[indexName] = compiled

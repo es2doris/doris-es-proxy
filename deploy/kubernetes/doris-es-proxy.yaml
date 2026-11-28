@@ -39,7 +39,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: doris-es-proxy
-          image: ghcr.io/es2doris/doris-es-proxy:latest
+          image: ghcr.io/es2doris/doris-es-proxy:v0.23.0
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -98,7 +98,7 @@ spec:
               memory: 64Mi
             limits:
               cpu: 1000m
-              memory: 256Mi
+              memory: 1Gi
 ---
 apiVersion: v1
 kind: Service

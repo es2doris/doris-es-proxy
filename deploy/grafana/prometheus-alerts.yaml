@@ -54,3 +54,94 @@ spec:
           annotations:
             summary: "High rate of unindexed _doc[...] VARIANT field queries"
             description: "Enable --auto-promote or inspect GET /_doris/slowlog to promote hot VARIANT fields to f__* USING INVERTED columns."
+
+        - alert: DorisESProxyHighHTTPErrorRate
+          expr: >
+            (sum(rate(doris_es_proxy_http_requests_by_route_total[5m])) > 0.1)
+            and
+            ((sum(rate(doris_es_proxy_http_requests_by_route_total{status_class="5xx"}[5m])) / clamp_min(sum(rate(doris_es_proxy_http_requests_by_route_total[5m])), 0.001)) > 0.05)
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "doris-es-proxy HTTP 5xx error rate exceeded 5%"
+            description: "Over 5% of HTTP requests returned 5xx over the last 5 minutes."
+
+        - alert: DorisESProxyHighHTTPLatencyP99
+          expr: histogram_quantile(0.99, sum(rate(doris_es_proxy_http_request_duration_seconds_bucket[5m])) by (le)) > 2.0
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "doris-es-proxy HTTP p99 latency above 2s"
+            description: "HTTP request p99 latency has exceeded 2 seconds for 5 minutes."
+
+        - alert: DorisESProxyHighDorisSQLLatencyP95
+          expr: histogram_quantile(0.95, sum(rate(doris_es_proxy_doris_sql_duration_seconds_bucket[5m])) by (le)) > 1.0
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Doris SQL execution p95 latency above 1s"
+            description: "Apache Doris SQL query p95 duration has exceeded 1 second for 5 minutes."
+
+        - alert: DorisESProxyDorisSQLErrors
+          expr: sum(rate(doris_es_proxy_doris_sql_errors_total[5m])) > 0.5
+          for: 3m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Elevated Doris SQL execution error rate"
+            description: "doris-es-proxy is observing >0.5 failed Doris SQL queries/sec."
+
+        - alert: DorisESProxyStreamLoadFailures
+          expr: sum(rate(doris_es_proxy_stream_load_errors_total[5m])) > 0
+          for: 3m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Doris Stream Load failures or filtered rows detected"
+            description: "One or more Doris Stream Load batches failed (including filtered rows) over the last 3 minutes."
+
+        - alert: DorisESProxyStreamLoadRetryStorm
+          expr: sum(rate(doris_es_proxy_stream_load_retries_total[5m])) > 1
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "High Doris Stream Load retry rate"
+            description: "Stream Load retries exceed 1/sec; check Doris BE tablet version compaction (-235) or BE health."
+
+        - alert: DorisESProxyBM25ScanErrors
+          expr: sum(rate(doris_es_proxy_bm25_corpus_scans_total{outcome="error"}[5m])) > 0.1
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "BM25 corpus stats scan errors detected"
+            description: "BM25 corpus statistics queries are failing; consider checking Doris FE/BE load or --bm25-mode."
+
+        - alert: DorisESProxyCatalogSyncFailures
+          expr: sum(rate(doris_es_proxy_catalog_syncs_total{outcome="error"}[5m])) > 0
+          for: 3m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Doris _es_catalog background sync errors"
+            description: "Periodic _es_catalog metadata synchronization is failing across proxy replicas."
+
+        - alert: DorisESProxyDBPoolSaturation
+          expr: >
+            (sum(doris_es_proxy_db_pool_connections{state="open"}) > 0)
+            and
+            (
+              (sum(doris_es_proxy_db_pool_connections{state="in_use"}) / clamp_min(sum(doris_es_proxy_db_pool_connections{state="open"}), 1)) > 0.9
+              or
+              sum(rate(doris_es_proxy_db_pool_connections{state="wait_count"}[5m])) > 1
+            )
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Doris MySQL connection pool saturation"
+            description: "More than 90% of open MySQL connections are in use or queries are waiting for pool slots; consider increasing --doris-max-open-conns."

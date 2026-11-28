@@ -123,8 +123,8 @@ func TestRound62_F10_RawValuesKNNAndRangeHistogramFixes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BuildSearchPlan nested knn failed: %v", err)
 	}
-	if !strings.Contains(planKNN.HitsSQL, "json_extract_string(_nel, '$.emb')") {
-		t.Fatalf("expected json_extract_string(_nel, '$.emb') in nested knn SQL, got:\n%s", planKNN.HitsSQL)
+	if !strings.Contains(planKNN.HitsSQL, `json_extract_string(_nel, '$."emb"')`) {
+		t.Fatalf(`expected json_extract_string(_nel, '$."emb"') in nested knn SQL, got:`+"\n%s", planKNN.HitsSQL)
 	}
 	if strings.Count(planKNN.HitsSQL, "ROW_NUMBER() OVER") != 1 {
 		t.Fatalf("expected ROW_NUMBER() OVER window subquery only once (not duplicated in ScoreSQL), got count=%d:\n%s",
@@ -133,7 +133,7 @@ func TestRound62_F10_RawValuesKNNAndRangeHistogramFixes(t *testing.T) {
 	if !strings.Contains(planKNN.HitsSQL, "1e-05") {
 		t.Fatalf("expected small boost 1e-05 preserved without %%.4f truncation, got:\n%s", planKNN.HitsSQL)
 	}
-	if !strings.Contains(planKNN.AggsSQL, "json_extract_string(`_nel`, '$.hist._h')") {
+	if !strings.Contains(planKNN.AggsSQL, "json_extract_string(`_nel`, '$."+`"hist"."_h"`+"')") {
 		t.Fatalf("expected json_extract_string for nested histogramArrayExpr, got:\n%s", planKNN.AggsSQL)
 	}
 

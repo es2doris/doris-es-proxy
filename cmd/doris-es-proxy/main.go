@@ -28,6 +28,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
@@ -38,6 +39,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unicode"
 
 	_ "github.com/go-sql-driver/mysql"
 
@@ -47,7 +49,10 @@ import (
 	"github.com/es2doris/doris-es-proxy/pkg/transpiler"
 )
 
-var version = "v0.22.0"
+var (
+	version  = "v0.23.0"
+	osExitFn = os.Exit
+)
 
 func envOrDefault(key, fallback string) string {
 	if val := strings.TrimSpace(os.Getenv(key)); val != "" {
@@ -103,10 +108,177 @@ func redactURLCredentials(rawURL string) string {
 	if trimmed == "" {
 		return ""
 	}
+	if strings.Contains(trimmed, ",") {
+		parts := strings.Split(trimmed, ",")
+		multiURL := true
+		for _, part := range parts {
+			if !strings.Contains(strings.TrimSpace(part), "://") {
+				multiURL = false
+				break
+			}
+		}
+		if multiURL {
+			redacted := make([]string, 0, len(parts))
+			for _, part := range parts {
+				redacted = append(redacted, redactURLCredentials(part))
+			}
+			return strings.Join(redacted, ",")
+		}
+	}
 	if u, err := url.Parse(trimmed); err == nil && u.Scheme != "" && u.Host != "" {
-		return u.Redacted()
+		if u.User != nil {
+			if uname := u.User.Username(); uname != "" {
+				u.User = url.User(uname)
+			} else {
+				u.User = nil
+			}
+		}
+		return u.String()
 	}
 	return redactDSN(trimmed)
+}
+
+func buildSlogLogger(format, level string, out io.Writer) (*slog.Logger, error) {
+	if out == nil {
+		out = os.Stderr
+	}
+	var slogLevel slog.Level
+	switch strings.ToLower(strings.TrimSpace(level)) {
+	case "", "info":
+		slogLevel = slog.LevelInfo
+	case "debug":
+		slogLevel = slog.LevelDebug
+	case "warn":
+		slogLevel = slog.LevelWarn
+	case "error":
+		slogLevel = slog.LevelError
+	default:
+		return nil, fmt.Errorf("invalid --log-level %q: must be one of debug, info, warn, error", level)
+	}
+	opts := &slog.HandlerOptions{Level: slogLevel}
+	switch strings.ToLower(strings.TrimSpace(format)) {
+	case "", "json":
+		return slog.New(slog.NewJSONHandler(out, opts)), nil
+	case "text":
+		return slog.New(slog.NewTextHandler(out, opts)), nil
+	default:
+		return nil, fmt.Errorf("invalid --log-format %q: must be one of json, text", format)
+	}
+}
+
+func normalizeBM25ModeCLI(mode string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "", proxy.BM25ModeAuto:
+		return proxy.BM25ModeAuto, nil
+	case proxy.BM25ModeDorisScore:
+		return proxy.BM25ModeDorisScore, nil
+	case proxy.BM25ModeExactCorpusScan:
+		return proxy.BM25ModeExactCorpusScan, nil
+	case proxy.BM25ModeApprox:
+		return proxy.BM25ModeApprox, nil
+	default:
+		return "", fmt.Errorf("invalid --bm25-mode %q: must be one of auto, doris-score, exact-corpus-scan, approx", mode)
+	}
+}
+
+func parseDorisSemver(raw string) (major, minor, patch int, ok bool) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return 0, 0, 0, false
+	}
+	lower := strings.ToLower(trimmed)
+	search := trimmed
+	hasDorisMarker := false
+	if idx := strings.LastIndex(lower, "doris"); idx >= 0 {
+		hasDorisMarker = true
+		search = trimmed[idx+len("doris"):]
+	}
+
+	// Scan for the first X.Y[.Z] numeric tuple in search.
+	for i := 0; i < len(search); i++ {
+		if !unicode.IsDigit(rune(search[i])) {
+			continue
+		}
+		j := i
+		for j < len(search) && (unicode.IsDigit(rune(search[j])) || search[j] == '.') {
+			j++
+		}
+		tok := strings.Trim(search[i:j], ".")
+		parts := strings.Split(tok, ".")
+		if len(parts) < 2 || len(parts) > 3 {
+			i = j
+			continue
+		}
+		maj, err1 := strconv.Atoi(parts[0])
+		min, err2 := strconv.Atoi(parts[1])
+		pat := 0
+		var err3 error
+		if len(parts) == 3 {
+			pat, err3 = strconv.Atoi(parts[2])
+		}
+		if err1 != nil || err2 != nil || err3 != nil {
+			i = j
+			continue
+		}
+		// Without an explicit "doris" marker, ignore bare MySQL wire-protocol versions (5.7.x / 8.0.x).
+		if !hasDorisMarker && ((maj == 5 && min == 7) || (maj == 8 && min == 0)) {
+			return 0, 0, 0, false
+		}
+		return maj, min, pat, true
+	}
+	return 0, 0, 0, false
+}
+
+func dorisSupportsUniqueKeyANN(rawVersion string) bool {
+	maj, min, pat, ok := parseDorisSemver(rawVersion)
+	if !ok {
+		return false
+	}
+	if maj > 4 {
+		return true
+	}
+	if maj < 4 {
+		return false
+	}
+	if min > 1 {
+		return true
+	}
+	if min < 1 {
+		return false
+	}
+	return pat >= 4
+}
+
+func resolveVectorANNConfig(requestedMode string, allowUniqueKeyANN bool, tableKeyModel string) (ddlMode, transpileMode string, allowANNPushdown, ddlAllowUniqueANN bool, err error) {
+	norm := strings.ToLower(strings.TrimSpace(requestedMode))
+	isDupKey := strings.EqualFold(strings.TrimSpace(tableKeyModel), "duplicate")
+	switch norm {
+	case "", "off":
+		return "off", "off", false, false, nil
+	case "auto":
+		if allowUniqueKeyANN || isDupKey {
+			return "hnsw", "hnsw", true, allowUniqueKeyANN, nil
+		}
+		return "off", "off", false, false, nil
+	case "hnsw", "ivf":
+		return norm, norm, allowUniqueKeyANN || isDupKey, allowUniqueKeyANN, nil
+	default:
+		return "", "", false, false, fmt.Errorf("invalid --doris-vector-ann %q: must be one of off, auto, hnsw, ivf", requestedMode)
+	}
+}
+
+func isDoctorMissingCatalogError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "error 1049") ||
+		strings.Contains(msg, "unknown database") ||
+		strings.Contains(msg, "error 1146") ||
+		strings.Contains(msg, "42s02") ||
+		strings.Contains(msg, "doesn't exist") ||
+		strings.Contains(msg, "does not exist") ||
+		strings.Contains(msg, "unknown table")
 }
 
 func escapeDorisBacktickIdent(name string) string {
@@ -153,9 +325,57 @@ func runCLI(ctx context.Context, args []string, stdin io.Reader, stdout, stderr 
 			return runDoctorSubcommandErr(args[1:], stdout, stderr)
 		case "migrate-schema":
 			return runMigrateSchemaSubcommandErr(args[1:], stdout, stderr)
+		case "sleep":
+			return runSleepSubcommandErr(ctx, args[1:])
 		}
 	}
 	return runServerErr(ctx, args, stderr, listenFn)
+}
+
+func runSleepSubcommandErr(ctx context.Context, args []string) error {
+	dur := 5 * time.Second
+	if len(args) > 0 && strings.TrimSpace(args[0]) != "" {
+		raw := strings.TrimSpace(args[0])
+		if secs, err := strconv.Atoi(raw); err == nil {
+			dur = time.Duration(secs) * time.Second
+		} else if parsed, err := time.ParseDuration(raw); err == nil {
+			dur = parsed
+		} else {
+			return fmt.Errorf("invalid sleep duration %q: %w", raw, err)
+		}
+	}
+	if dur <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(dur)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return nil
+	case <-timer.C:
+		return nil
+	}
+}
+
+func probeDorisStartupVersion(ctx context.Context, sqlDB *sql.DB, sqlBackend *proxy.DorisSQLBackend) (string, error) {
+	if sqlBackend == nil {
+		return "", nil
+	}
+	ver, err := sqlBackend.ProbeDorisVersion(ctx)
+	if err != nil {
+		return "", err
+	}
+	if sqlDB != nil && !strings.Contains(strings.ToLower(ver), "doris") &&
+		(strings.HasPrefix(ver, "5.7.") || strings.HasPrefix(ver, "8.0.")) {
+		var verComment sql.NullString
+		if cErr := sqlDB.QueryRowContext(ctx, "SELECT @@version_comment").Scan(&verComment); cErr == nil {
+			comment := strings.TrimSpace(verComment.String)
+			if comment != "" {
+				return ver + " (" + comment + ")", nil
+			}
+		}
+	}
+	return ver, nil
 }
 
 func runServerErr(ctx context.Context, args []string, flagOut io.Writer, listenFn serverListenFunc) error {
@@ -186,6 +406,20 @@ func runServerErr(ctx context.Context, args []string, flagOut io.Writer, listenF
 		pathRepo                   = fs.String("path-repo", envOrDefault("DORIS_ES_PATH_REPO", ""), "Static comma-separated root directories for snapshot path.repo (env: DORIS_ES_PATH_REPO)")
 		repositoriesURLAllowedURLs = fs.String("repositories-url-allowed-urls", envOrDefault("DORIS_ES_REPOSITORIES_URL_ALLOWED_URLS", ""), "Static comma-separated URL patterns for snapshot repositories.url.allowed_urls (env: DORIS_ES_REPOSITORIES_URL_ALLOWED_URLS)")
 		esTargetVersion            = fs.String("es-version", envOrDefault("ES_TARGET_VERSION", ""), "Optional explicit Elasticsearch compatibility version (e.g. 8.15.5 or 7.10.2, env: ES_TARGET_VERSION)")
+		bm25Mode                   = fs.String("bm25-mode", envOrDefault("BM25_MODE", "auto"), "BM25 corpus stats mode: auto|doris-score|exact-corpus-scan|approx (env: BM25_MODE)")
+		bm25MaxRows                = fs.Int("bm25-max-rows", envIntOrDefault("BM25_MAX_ROWS", 50000), "Row-count threshold above which --bm25-mode=auto skips full-table BM25 scans (env: BM25_MAX_ROWS)")
+		dorisReplicationNum        = fs.Int("doris-replication-num", envIntOrDefault("DORIS_REPLICATION_NUM", 1), "Default Apache Doris table replication_num property (env: DORIS_REPLICATION_NUM)")
+		dorisReplicationAlloc      = fs.String("doris-replication-allocation", envOrDefault("DORIS_REPLICATION_ALLOCATION", ""), "Optional Apache Doris table replication_allocation property (env: DORIS_REPLICATION_ALLOCATION)")
+		dorisCloud                 = fs.Bool("doris-cloud", envBoolOrDefault("DORIS_CLOUD", false), "Omit replication properties for Apache Doris Cloud / storage-compute separation (env: DORIS_CLOUD)")
+		dorisBucketsAuto           = fs.Bool("doris-buckets-auto", envBoolOrDefault("DORIS_BUCKETS_AUTO", false), "Emit DISTRIBUTED BY HASH(`_id`) BUCKETS AUTO when explicit shards/buckets are unset (env: DORIS_BUCKETS_AUTO)")
+		dorisStoreRowColumn        = fs.Bool("doris-store-row-column", envBoolOrDefault("DORIS_STORE_ROW_COLUMN", true), "Set Apache Doris store_row_column table property for point lookups (env: DORIS_STORE_ROW_COLUMN)")
+		dorisVectorANN             = fs.String("doris-vector-ann", envOrDefault("DORIS_VECTOR_ANN", "off"), "Vector ANN index/pushdown mode: off|auto|hnsw|ivf (env: DORIS_VECTOR_ANN)")
+		catalogSyncInterval        = fs.Duration("catalog-sync-interval", envDurationOrDefault("CATALOG_SYNC_INTERVAL", 5*time.Second), "Periodic _es_catalog sync interval across proxy replicas (0s disables, env: CATALOG_SYNC_INTERVAL)")
+		dorisMaxOpenConns          = fs.Int("doris-max-open-conns", envIntOrDefault("DORIS_MAX_OPEN_CONNS", 50), "Maximum open Doris MySQL connections in pool (must be > 0, env: DORIS_MAX_OPEN_CONNS)")
+		dorisMaxIdleConns          = fs.Int("doris-max-idle-conns", envIntOrDefault("DORIS_MAX_IDLE_CONNS", 10), "Maximum idle Doris MySQL connections in pool (env: DORIS_MAX_IDLE_CONNS)")
+		dorisConnMaxLifetime       = fs.Duration("doris-conn-max-lifetime", envDurationOrDefault("DORIS_CONN_MAX_LIFETIME", 5*time.Minute), "Maximum lifetime of a pooled Doris MySQL connection (env: DORIS_CONN_MAX_LIFETIME)")
+		logFormat                  = fs.String("log-format", envOrDefault("LOG_FORMAT", "json"), "Structured log format: json|text (env: LOG_FORMAT)")
+		logLevel                   = fs.String("log-level", envOrDefault("LOG_LEVEL", "info"), "Structured log level: debug|info|warn|error (env: LOG_LEVEL)")
 		inMemoryMode               = fs.Bool("in-memory", envBoolOrDefault("IN_MEMORY", false), "Run with in-memory shredded Doris emulator (env: IN_MEMORY)")
 		logSQL                     = fs.Bool("log-sql", envBoolOrDefault("LOG_SQL", false), "Log transpiled Apache Doris DDL, Stream Load, HitsSQL, and AggsSQL (env: LOG_SQL)")
 	)
@@ -203,11 +437,57 @@ func runServerErr(ctx context.Context, args []string, flagOut io.Writer, listenF
 	if (*tlsCertFile != "") != (*tlsKeyFile != "") {
 		return fmt.Errorf("both --tls-cert and --tls-key must be provided together when TLS is enabled")
 	}
+	normBM25Mode, err := normalizeBM25ModeCLI(*bm25Mode)
+	if err != nil {
+		return err
+	}
+	if *bm25MaxRows <= 0 {
+		return fmt.Errorf("--bm25-max-rows must be > 0, got %d", *bm25MaxRows)
+	}
+	if *dorisReplicationNum <= 0 {
+		return fmt.Errorf("--doris-replication-num must be > 0, got %d", *dorisReplicationNum)
+	}
+	if _, _, _, _, err := resolveVectorANNConfig(*dorisVectorANN, false, ""); err != nil {
+		return err
+	}
+	if *catalogSyncInterval < 0 {
+		return fmt.Errorf("--catalog-sync-interval must be >= 0, got %s", *catalogSyncInterval)
+	}
+	if *dorisMaxOpenConns <= 0 {
+		return fmt.Errorf("--doris-max-open-conns must be > 0, got %d", *dorisMaxOpenConns)
+	}
+	if *dorisMaxIdleConns < 0 {
+		return fmt.Errorf("--doris-max-idle-conns must be >= 0, got %d", *dorisMaxIdleConns)
+	}
+	if *dorisConnMaxLifetime < 0 {
+		return fmt.Errorf("--doris-conn-max-lifetime must be >= 0, got %s", *dorisConnMaxLifetime)
+	}
+	logger, err := buildSlogLogger(*logFormat, *logLevel, flagOut)
+	if err != nil {
+		return err
+	}
 
-	var backend proxy.DorisBackend
+	storeRowCol := *dorisStoreRowColumn
+	ddlOpts := schema.DorisDDLOptions{
+		ReplicationNum:        *dorisReplicationNum,
+		ReplicationAllocation: strings.TrimSpace(*dorisReplicationAlloc),
+		CloudMode:             *dorisCloud,
+		BucketsAuto:           *dorisBucketsAuto,
+		StoreRowColumn:        &storeRowCol,
+	}
+
+	var (
+		backend           proxy.DorisBackend
+		allowUniqueKeyANN bool
+		dorisVer          string
+	)
 	if *inMemoryMode {
 		backend = proxy.NewMemoryBackend(*logSQL)
-		log.Printf("doris-es-proxy starting in --in-memory emulator mode on %s (Doris DB=%q, log-sql=%v)", *listenAddr, *dorisDB, *logSQL)
+		logger.Info("doris-es-proxy starting in --in-memory emulator mode",
+			slog.String("listen", *listenAddr),
+			slog.String("doris_db", *dorisDB),
+			slog.Bool("log_sql", *logSQL),
+		)
 	} else {
 		effectiveDSN := proxy.ApplyDSNAuth(*dorisDSN, *dorisUser, *dorisPassword)
 		var sqlDB *sql.DB
@@ -216,20 +496,8 @@ func runServerErr(ctx context.Context, args []string, flagOut io.Writer, listenF
 			if err != nil {
 				return fmt.Errorf("failed to configure Doris MySQL driver: %w", err)
 			}
-			db.SetMaxOpenConns(64)
-			db.SetMaxIdleConns(16)
-			db.SetConnMaxIdleTime(2 * time.Minute)
-			db.SetConnMaxLifetime(5 * time.Minute)
 			sqlDB = db
 			defer func() { _ = sqlDB.Close() }()
-
-			dbCtx, dbCancel := context.WithTimeout(ctx, 5*time.Second)
-			// #nosec G201 -- identifier is strictly sanitized via schema.SanitizeDorisIdentifier and backtick-escaped
-			createDBSQL := fmt.Sprintf("CREATE DATABASE IF NOT EXISTS `%s`", escapeDorisBacktickIdent(*dorisDB))
-			if _, err := sqlDB.ExecContext(dbCtx, createDBSQL); err != nil {
-				log.Printf("warning: initial Doris database bootstrap (%s) deferred until cluster is reachable: %v", createDBSQL, err)
-			}
-			dbCancel()
 		}
 
 		slClient := proxy.NewStreamLoadClient(proxy.StreamLoadConfig{
@@ -241,14 +509,72 @@ func runServerErr(ctx context.Context, args []string, flagOut io.Writer, listenF
 		})
 
 		sqlBackend := proxy.NewDorisSQLBackend(sqlDB, slClient)
+		if sqlDB != nil {
+			sqlDB.SetMaxOpenConns(*dorisMaxOpenConns)
+			sqlDB.SetMaxIdleConns(*dorisMaxIdleConns)
+			sqlDB.SetConnMaxIdleTime(2 * time.Minute)
+			sqlDB.SetConnMaxLifetime(*dorisConnMaxLifetime)
+
+			dbCtx, dbCancel := context.WithTimeout(ctx, 5*time.Second)
+			// #nosec G201 -- identifier is strictly sanitized via schema.SanitizeDorisIdentifier and backtick-escaped
+			createDBSQL := fmt.Sprintf("CREATE DATABASE IF NOT EXISTS `%s`", escapeDorisBacktickIdent(*dorisDB))
+			if _, err := sqlDB.ExecContext(dbCtx, createDBSQL); err != nil {
+				logger.Warn("initial Doris database bootstrap deferred until cluster is reachable",
+					slog.String("sql", createDBSQL),
+					slog.String("error", err.Error()),
+				)
+			}
+			dbCancel()
+
+			verCtx, verCancel := context.WithTimeout(ctx, 3*time.Second)
+			probedVer, verErr := probeDorisStartupVersion(verCtx, sqlDB, sqlBackend)
+			verCancel()
+			if verErr != nil {
+				logger.Warn("startup Doris version probe failed; assuming Unique Key ANN unsupported until reachable",
+					slog.String("error", verErr.Error()),
+				)
+			} else {
+				dorisVer = probedVer
+				allowUniqueKeyANN = dorisSupportsUniqueKeyANN(dorisVer)
+				logger.Info("probed Apache Doris version",
+					slog.String("version", dorisVer),
+					slog.Bool("allow_unique_key_ann", allowUniqueKeyANN),
+				)
+			}
+		}
+
+		ddlANNMode, _, _, ddlAllowUniqueANN, _ := resolveVectorANNConfig(*dorisVectorANN, allowUniqueKeyANN, ddlOpts.TableKeyModel)
+		ddlOpts.VectorANNMode = ddlANNMode
+		ddlOpts.AllowUniqueKeyANN = ddlAllowUniqueANN
+		sqlBackend.SetDDLOptions(ddlOpts)
 		sqlBackend.SetLogSQL(*logSQL)
 		backend = sqlBackend
-		log.Printf("doris-es-proxy listening on %s (Doris DB=%q, MySQL DSN=%q, FE HTTP=%q, log-sql=%v)", *listenAddr, *dorisDB, redactDSN(effectiveDSN), *dorisHTTP, *logSQL)
+		// #nosec G706 -- DSN and FE HTTP URL credentials and CR/LF are stripped via redactDSN/redactURLCredentials
+		logger.Info("doris-es-proxy listening",
+			slog.String("listen", *listenAddr),
+			slog.String("doris_db", *dorisDB),
+			slog.String("mysql_dsn", redactDSN(effectiveDSN)),
+			slog.String("fe_http", redactURLCredentials(*dorisHTTP)),
+			slog.Bool("log_sql", *logSQL),
+			slog.Int("max_open_conns", *dorisMaxOpenConns),
+			slog.Int("max_idle_conns", *dorisMaxIdleConns),
+			slog.Duration("conn_max_lifetime", *dorisConnMaxLifetime),
+		)
 	}
+
+	ddlANNMode, transpileANNMode, allowANNPushdown, ddlAllowUniqueANN, _ := resolveVectorANNConfig(*dorisVectorANN, allowUniqueKeyANN, ddlOpts.TableKeyModel)
+	ddlOpts.VectorANNMode = ddlANNMode
+	ddlOpts.AllowUniqueKeyANN = ddlAllowUniqueANN
 
 	srv := proxy.NewServer(*dorisDB, backend, transpiler.TranspilerOptions{
 		UseDoris4SearchFunc: *useDoris4SearchFunc,
+		VectorANNMode:       transpileANNMode,
+		AllowANNPushdown:    allowANNPushdown,
 	})
+	srv.SetLogger(logger)
+	srv.SetDorisDDLOptions(ddlOpts)
+	srv.SetBM25Mode(normBM25Mode)
+	srv.SetBM25MaxRows(int64(*bm25MaxRows))
 	if strings.TrimSpace(*esTargetVersion) != "" {
 		srv.SetTargetESVersion(strings.TrimSpace(*esTargetVersion))
 	}
@@ -263,29 +589,46 @@ func runServerErr(ctx context.Context, args []string, flagOut io.Writer, listenF
 	if *shadowESURL != "" {
 		srv.SetShadowESURL(*shadowESURL)
 		// #nosec G706 -- shadow URL credentials and CR/LF are stripped via redactURLCredentials
-		log.Printf("shadow dual-read verification enabled against %s (metrics at GET /_doris/shadow_stats)", redactURLCredentials(*shadowESURL))
+		logger.Info("shadow dual-read verification enabled",
+			slog.String("shadow_es_url", redactURLCredentials(*shadowESURL)),
+			slog.String("metrics_endpoint", "GET /_doris/shadow_stats"),
+		)
 	}
 	if *autoPromote {
 		srv.SetAutoPromoteThreshold(3)
-		log.Printf("auto-promote enabled: unindexed _doc[...] fields queried >= 3 times will be promoted to f__* columns")
+		logger.Info("auto-promote enabled: unindexed _doc[...] fields queried >= 3 times will be promoted to f__* columns")
 	}
 	if *bulkCoalesceMs > 0 {
 		srv.SetBulkCoalesce(time.Duration(*bulkCoalesceMs)*time.Millisecond, *bulkCoalesceBytes)
-		log.Printf("group-commit Stream Load coalescer enabled (window=%dms, max-bytes=%d)", *bulkCoalesceMs, *bulkCoalesceBytes)
+		logger.Info("group-commit Stream Load coalescer enabled",
+			slog.Int("window_ms", *bulkCoalesceMs),
+			slog.Int("max_bytes", *bulkCoalesceBytes),
+		)
 	}
 	if *queryCacheTTL > 0 {
 		srv.SetQueryCacheTTL(*queryCacheTTL, proxy.DefaultQueryCacheMaxEntries)
-		log.Printf("search query result cache enabled (ttl=%s, max-entries=%d)", *queryCacheTTL, proxy.DefaultQueryCacheMaxEntries)
+		logger.Info("search query result cache enabled",
+			slog.Duration("ttl", *queryCacheTTL),
+			slog.Int("max_entries", proxy.DefaultQueryCacheMaxEntries),
+		)
 	}
 	if *basicAuthUser != "" || *basicAuthPass != "" || *apiKey != "" {
 		srv.SetAuth(*basicAuthUser, *basicAuthPass, *apiKey)
-		log.Printf("inbound HTTP authentication enabled (basic_auth=%v, api_key=%v)", *basicAuthUser != "" || *basicAuthPass != "", *apiKey != "")
+		logger.Info("inbound HTTP authentication enabled",
+			slog.Bool("basic_auth", *basicAuthUser != "" || *basicAuthPass != ""),
+			slog.Bool("api_key", *apiKey != ""),
+		)
 	}
 	bootCtx, bootCancel := context.WithTimeout(ctx, 5*time.Second)
 	if err := srv.BootstrapCatalog(bootCtx); err != nil {
-		log.Printf("warning: initial _es_catalog bootstrap deferred: %v", err)
+		logger.Warn("initial _es_catalog bootstrap deferred", slog.String("error", err.Error()))
 	}
 	bootCancel()
+
+	if *catalogSyncInterval > 0 {
+		srv.SetCatalogSyncInterval(*catalogSyncInterval)
+		logger.Info("background catalog sync loop enabled", slog.Duration("interval", *catalogSyncInterval))
+	}
 
 	httpServer := &http.Server{
 		Addr:              *listenAddr,
@@ -307,7 +650,7 @@ func runServerErr(ctx context.Context, args []string, flagOut io.Writer, listenF
 	go func() {
 		defer close(shutdownDone)
 		<-sigCtx.Done()
-		log.Printf("shutting down doris-es-proxy gracefully...")
+		logger.Info("shutting down doris-es-proxy gracefully...")
 		shutCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
 		defer cancel()
 		_ = httpServer.Shutdown(shutCtx)
@@ -323,7 +666,7 @@ func runServerErr(ctx context.Context, args []string, flagOut io.Writer, listenF
 		}
 	}
 	if *tlsCertFile != "" && *tlsKeyFile != "" {
-		log.Printf("HTTPS TLS listener enabled (cert=%s)", *tlsCertFile)
+		logger.Info("HTTPS TLS listener enabled", slog.String("cert", *tlsCertFile))
 	}
 	serveErr := listenFn(httpServer, *tlsCertFile, *tlsKeyFile)
 	stop()
@@ -471,11 +814,15 @@ func runDDLSubcommandErr(args []string, stdin io.Reader, stdout, stderr io.Write
 
 func runDoctorSubcommand(args []string) {
 	if err := runDoctorSubcommandErr(args, os.Stdout, os.Stderr); err != nil {
-		os.Exit(1)
+		osExitFn(1)
 	}
 }
 
 func runDoctorSubcommandErr(args []string, stdout, stderr io.Writer) error {
+	return runDoctorSubcommandWithDriver("mysql", args, stdout, stderr)
+}
+
+func runDoctorSubcommandWithDriver(sqlDriver string, args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
 	if stderr != nil {
 		fs.SetOutput(stderr)
@@ -484,43 +831,193 @@ func runDoctorSubcommandErr(args []string, stdout, stderr io.Writer) error {
 	dorisHTTP := fs.String("doris-http", envOrDefault("DORIS_HTTP", "http://127.0.0.1:8030"), "Apache Doris FE HTTP endpoint")
 	dorisUser := fs.String("doris-user", envOrDefault("DORIS_USER", "root"), "Apache Doris username")
 	dorisPassword := fs.String("doris-password", envOrDefault("DORIS_PASSWORD", ""), "Apache Doris password")
+	dorisDB := fs.String("doris-db", envOrDefault("DORIS_DB", "es_compat"), "Target Apache Doris database name")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	if stdout == nil {
+		stdout = io.Discard
 	}
 
 	effectiveDSN := proxy.ApplyDSNAuth(*dorisDSN, *dorisUser, *dorisPassword)
 	_, _ = fmt.Fprintf(stdout, "==> doris-es-proxy %s Connectivity Doctor\n", version)
+
+	var failures []string
+	mysqlOK := false
+
 	_, _ = fmt.Fprintf(stdout, "  1. Checking Doris FE MySQL (%s)... ", redactDSN(effectiveDSN))
-	db, err := sql.Open("mysql", effectiveDSN)
+	db, err := sql.Open(sqlDriver, effectiveDSN)
 	if err != nil {
 		_, _ = fmt.Fprintf(stdout, "FAIL (%v)\n", err)
-		return err
-	}
-	defer func() { _ = db.Close() }()
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	var verComment string
-	if err := db.QueryRowContext(ctx, "SELECT @@version_comment").Scan(&verComment); err != nil {
-		_, _ = fmt.Fprintf(stdout, "UNREACHABLE (%v)\n", err)
+		failures = append(failures, fmt.Sprintf("FE MySQL open failed: %v", err))
 	} else {
-		_, _ = fmt.Fprintf(stdout, "OK (%s)\n", verComment)
+		defer func() { _ = db.Close() }()
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+
+		if pingErr := db.PingContext(ctx); pingErr != nil {
+			_, _ = fmt.Fprintf(stdout, "UNREACHABLE (%v)\n", pingErr)
+			failures = append(failures, fmt.Sprintf("FE MySQL unreachable: %v", pingErr))
+		} else {
+			var ver, verComment sql.NullString
+			verErr := db.QueryRowContext(ctx, "SELECT VERSION()").Scan(&ver)
+			commentErr := db.QueryRowContext(ctx, "SELECT @@version_comment").Scan(&verComment)
+			if verErr != nil && commentErr != nil {
+				_, _ = fmt.Fprintf(stdout, "FAIL (%v)\n", verErr)
+				failures = append(failures, fmt.Sprintf("FE MySQL version query failed: %v", verErr))
+			} else {
+				mysqlOK = true
+				vStr := strings.TrimSpace(ver.String)
+				cStr := strings.TrimSpace(verComment.String)
+				var summary string
+				switch {
+				case vStr != "" && cStr != "" && !strings.EqualFold(vStr, cStr):
+					summary = vStr + " / " + cStr
+				case vStr != "":
+					summary = vStr
+				default:
+					summary = cStr
+				}
+				_, _ = fmt.Fprintf(stdout, "OK (%s)\n", summary)
+			}
+		}
+
+		// 2. FE HTTP /api/bootstrap
+		_, _ = fmt.Fprintf(stdout, "  2. Checking Doris FE HTTP (%s)... ", redactURLCredentials(*dorisHTTP))
+		httpStatus, httpErr := checkDoctorFEHTTP(ctx, *dorisHTTP, *dorisUser, *dorisPassword)
+		if httpErr != nil {
+			if httpStatus >= 400 {
+				_, _ = fmt.Fprintf(stdout, "FAIL (HTTP %d)\n", httpStatus)
+			} else {
+				_, _ = fmt.Fprintf(stdout, "UNREACHABLE (%v)\n", httpErr)
+			}
+			failures = append(failures, fmt.Sprintf("FE HTTP check failed: %v", httpErr))
+		} else {
+			_, _ = fmt.Fprintf(stdout, "OK (HTTP %d)\n", httpStatus)
+		}
+
+		// 3. SHOW BACKENDS (require >= 1 alive BE)
+		_, _ = fmt.Fprintf(stdout, "  3. Checking Doris Backends (SHOW BACKENDS)... ")
+		if !mysqlOK {
+			_, _ = fmt.Fprintf(stdout, "SKIPPED (MySQL unreachable)\n")
+		} else {
+			nodes, beErr := proxy.NewDorisSQLBackend(db, nil).ShowBackendsTelemetry(ctx)
+			if beErr != nil {
+				_, _ = fmt.Fprintf(stdout, "FAIL (%v)\n", beErr)
+				failures = append(failures, fmt.Sprintf("SHOW BACKENDS failed: %v", beErr))
+			} else {
+				aliveBEs := 0
+				for _, node := range nodes {
+					if node.Alive {
+						aliveBEs++
+					}
+				}
+				if aliveBEs < 1 {
+					_, _ = fmt.Fprintf(stdout, "FAIL (0/%d alive)\n", len(nodes))
+					failures = append(failures, fmt.Sprintf("no alive Doris backends (0/%d alive)", len(nodes)))
+				} else {
+					_, _ = fmt.Fprintf(stdout, "OK (%d/%d alive)\n", aliveBEs, len(nodes))
+				}
+			}
+		}
+
+		// 4. _es_catalog readability (non-fatal if fresh uninitialized cluster)
+		safeDB := escapeDorisBacktickIdent(*dorisDB)
+		_, _ = fmt.Fprintf(stdout, "  4. Checking Doris catalog (`%s`.`_es_catalog`)... ", safeDB)
+		if !mysqlOK {
+			_, _ = fmt.Fprintf(stdout, "SKIPPED (MySQL unreachable)\n")
+		} else if strings.TrimSpace(*dorisDB) == "" {
+			_, _ = fmt.Fprintf(stdout, "SKIPPED (--doris-db empty)\n")
+		} else {
+			// #nosec G201 -- identifier is strictly sanitized via schema.SanitizeDorisIdentifier and backtick-escaped
+			catalogSQL := fmt.Sprintf("SELECT COUNT(*) FROM `%s`.`_es_catalog`", safeDB)
+			var catalogCount int64
+			if catErr := db.QueryRowContext(ctx, catalogSQL).Scan(&catalogCount); catErr != nil {
+				if isDoctorMissingCatalogError(catErr) {
+					_, _ = fmt.Fprintf(stdout, "NOT_INITIALIZED (ok)\n")
+				} else {
+					_, _ = fmt.Fprintf(stdout, "FAIL (%v)\n", catErr)
+					failures = append(failures, fmt.Sprintf("_es_catalog check failed: %v", catErr))
+				}
+			} else {
+				_, _ = fmt.Fprintf(stdout, "OK (%d entries)\n", catalogCount)
+			}
+		}
+
+		if len(failures) > 0 {
+			return fmt.Errorf("doris-es-proxy doctor failed: %s", strings.Join(failures, "; "))
+		}
+		return nil
 	}
 
-	_, _ = fmt.Fprintf(stdout, "  2. Checking Doris FE HTTP (%s)... ", *dorisHTTP)
-	client := &http.Client{Timeout: 3 * time.Second}
-	// #nosec G704 -- operator-supplied --doris-http endpoint in CLI doctor subcommand
-	resp, err := client.Get(strings.TrimRight(*dorisHTTP, "/") + "/api/bootstrap")
-	if err != nil {
-		_, _ = fmt.Fprintf(stdout, "UNREACHABLE (%v)\n", err)
-	} else {
-		_ = resp.Body.Close()
-		if resp.StatusCode >= 400 {
-			_, _ = fmt.Fprintf(stdout, "FAIL (HTTP %d)\n", resp.StatusCode)
+	// Only reached when sql.Open itself failed: still report FE HTTP check.
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	_, _ = fmt.Fprintf(stdout, "  2. Checking Doris FE HTTP (%s)... ", redactURLCredentials(*dorisHTTP))
+	httpStatus, httpErr := checkDoctorFEHTTP(ctx, *dorisHTTP, *dorisUser, *dorisPassword)
+	if httpErr != nil {
+		if httpStatus >= 400 {
+			_, _ = fmt.Fprintf(stdout, "FAIL (HTTP %d)\n", httpStatus)
 		} else {
-			_, _ = fmt.Fprintf(stdout, "OK (HTTP %d)\n", resp.StatusCode)
+			_, _ = fmt.Fprintf(stdout, "UNREACHABLE (%v)\n", httpErr)
+		}
+		failures = append(failures, fmt.Sprintf("FE HTTP check failed: %v", httpErr))
+	} else {
+		_, _ = fmt.Fprintf(stdout, "OK (HTTP %d)\n", httpStatus)
+	}
+	return fmt.Errorf("doris-es-proxy doctor failed: %s", strings.Join(failures, "; "))
+}
+
+func checkDoctorFEHTTP(ctx context.Context, rawEndpoints, defaultUser, defaultPass string) (int, error) {
+	endpoints := splitCommaTrimmedCLI(rawEndpoints)
+	if len(endpoints) == 0 {
+		return 0, fmt.Errorf("empty --doris-http endpoint")
+	}
+	client := &http.Client{
+		Timeout: 3 * time.Second,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	lastStatus := 0
+	for _, rawEP := range endpoints {
+		u, err := url.Parse(rawEP)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return 0, fmt.Errorf("invalid FE HTTP URL %q", redactURLCredentials(rawEP))
+		}
+		reqUser, reqPass := defaultUser, defaultPass
+		hasAuth := defaultPass != ""
+		if u.User != nil {
+			if uname := u.User.Username(); uname != "" {
+				reqUser = uname
+			}
+			if pw, ok := u.User.Password(); ok {
+				reqPass = pw
+				hasAuth = true
+			}
+			u.User = nil
+		}
+		target := strings.TrimRight(u.String(), "/") + "/api/bootstrap"
+		// #nosec G704 -- operator-supplied --doris-http endpoint in CLI doctor subcommand
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+		if err != nil {
+			return 0, err
+		}
+		if hasAuth && (reqUser != "" || reqPass != "") {
+			req.SetBasicAuth(reqUser, reqPass)
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			return 0, err
+		}
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+		_ = resp.Body.Close()
+		lastStatus = resp.StatusCode
+		if resp.StatusCode >= 400 {
+			return resp.StatusCode, fmt.Errorf("HTTP %d from %s", resp.StatusCode, redactURLCredentials(rawEP))
 		}
 	}
-	return nil
+	return lastStatus, nil
 }
 
 func runMigrateSchemaSubcommand(args []string) {
@@ -561,7 +1058,7 @@ func runMigrateSchemaSubcommandErr(args []string, stdout, stderr io.Writer) erro
 	}
 	httpReq, err := http.NewRequest(http.MethodGet, endpoint, nil)
 	if err != nil {
-		return fmt.Errorf("invalid endpoint %s: %w", endpoint, err)
+		return fmt.Errorf("invalid endpoint %s: %w", redactURLCredentials(endpoint), err)
 	}
 	if *esAPIKey != "" {
 		if strings.HasPrefix(strings.ToLower(*esAPIKey), "apikey ") || strings.HasPrefix(strings.ToLower(*esAPIKey), "bearer ") {
@@ -575,15 +1072,15 @@ func runMigrateSchemaSubcommandErr(args []string, stdout, stderr io.Writer) erro
 	// #nosec G704 -- operator-supplied --es-url in CLI migrate-schema subcommand
 	resp, err := client.Do(httpReq)
 	if err != nil {
-		return fmt.Errorf("failed to fetch mappings from %s: %w", endpoint, err)
+		return fmt.Errorf("failed to fetch mappings from %s: %w", redactURLCredentials(endpoint), err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 50*1024*1024))
 	if err != nil {
-		return fmt.Errorf("failed to read mapping response: %w", err)
+		return fmt.Errorf("failed to read mapping response from %s: %w", redactURLCredentials(endpoint), err)
 	}
 	if resp.StatusCode >= 300 {
-		return fmt.Errorf("mapping endpoint %s returned HTTP %d: %s", endpoint, resp.StatusCode, strings.TrimSpace(string(raw)))
+		return fmt.Errorf("mapping endpoint %s returned HTTP %d: %s", redactURLCredentials(endpoint), resp.StatusCode, strings.TrimSpace(string(raw)))
 	}
 
 	var byIndex map[string]struct {

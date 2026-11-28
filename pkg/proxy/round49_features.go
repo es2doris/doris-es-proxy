@@ -3,7 +3,9 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -923,31 +925,29 @@ func persistFSSnapshotsDiskPayloadR65(repoObj map[string]any, payload []byte, pa
 	if lErr != nil || lfi.Mode()&os.ModeSymlink != 0 || !lfi.IsDir() {
 		return
 	}
-	finalPath := filepath.Join(resolvedLoc, proxySnapshotCatalogFileR64)
-	if ffi, fErr := os.Lstat(finalPath); fErr == nil {
-		if ffi.Mode()&os.ModeSymlink != 0 {
-			return
-		}
-		resolvedFinal, rfErr := resolveSymlinkBestEffortR65(finalPath)
-		if rfErr != nil || !isPathContainedR65(resolvedFinal, resolvedLoc) {
-			return
-		}
-	}
-	tmpFile, err := os.CreateTemp(resolvedLoc, ".proxy_snapshots_*.tmp")
+	root, err := os.OpenRoot(resolvedLoc)
 	if err != nil {
 		return
 	}
-	tmpPath := tmpFile.Name()
+	defer func() {
+		_ = root.Close()
+	}()
+	if ffi, fErr := root.Lstat(proxySnapshotCatalogFileR64); fErr == nil {
+		if ffi.Mode()&os.ModeSymlink != 0 {
+			return
+		}
+	}
+	tmpName := fmt.Sprintf(".proxy_snapshots_%s.tmp", randomCryptoTokenB64R67(12))
+	tmpFile, err := root.OpenFile(tmpName, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return
+	}
 	cleanupTmp := true
 	defer func() {
 		if cleanupTmp {
-			_ = os.Remove(tmpPath)
+			_ = root.Remove(tmpName)
 		}
 	}()
-	if err := tmpFile.Chmod(0o600); err != nil {
-		_ = tmpFile.Close()
-		return
-	}
 	if _, err := tmpFile.Write(payload); err != nil {
 		_ = tmpFile.Close()
 		return
@@ -955,7 +955,7 @@ func persistFSSnapshotsDiskPayloadR65(repoObj map[string]any, payload []byte, pa
 	if err := tmpFile.Close(); err != nil {
 		return
 	}
-	if err := os.Rename(tmpPath, finalPath); err != nil {
+	if err := root.Rename(tmpName, proxySnapshotCatalogFileR64); err != nil {
 		return
 	}
 	cleanupTmp = false
@@ -2319,7 +2319,7 @@ func (s *Server) handleSnapshotItemAction(w http.ResponseWriter, r *http.Request
 		renameReplacement, _ := reqMap["rename_replacement"].(string)
 		if renamePattern != "" {
 			var err error
-			renameRe, err = regexp.Compile(renamePattern)
+			renameRe, err = painless.CompileBoundedRawRegex(renamePattern)
 			if err != nil {
 				writeESError(w, http.StatusBadRequest, "illegal_argument_exception", err.Error())
 				return
@@ -3737,6 +3737,10 @@ func (s *Server) handleWatcherWatch(w http.ResponseWriter, r *http.Request) {
 			if v, okV := toInt64(existing["_version"]); okV && v > 0 {
 				ver = v + 1
 			}
+		} else if len(s.watches) >= maxAdminStoreEntriesR67 {
+			s.mu.Unlock()
+			writeESError(w, http.StatusTooManyRequests, "es_rejected_execution_exception", "watch store limit reached")
+			return
 		}
 		statusObj := map[string]any{
 			"state": map[string]any{
@@ -4725,6 +4729,11 @@ func (s *Server) handleTransform(w http.ResponseWriter, r *http.Request) {
 			s.mu.Unlock()
 			writeESError(w, http.StatusBadRequest, "resource_already_exists_exception",
 				fmt.Sprintf("transform [%s] already exists", id))
+			return
+		}
+		if len(s.transforms) >= maxAdminStoreEntriesR67 {
+			s.mu.Unlock()
+			writeESError(w, http.StatusTooManyRequests, "es_rejected_execution_exception", "transform store limit reached")
 			return
 		}
 		nowMs := time.Now().UTC().UnixMilli()
@@ -7497,6 +7506,11 @@ func (s *Server) handleRollup(w http.ResponseWriter, r *http.Request, segs []str
 				fmt.Sprintf("Cannot create rollup job [%s] because job was previously created (existing metadata)", jobID))
 			return
 		}
+		if len(s.rollupJobs) >= maxAdminStoreEntriesR67 {
+			s.mu.Unlock()
+			writeESError(w, http.StatusTooManyRequests, "es_rejected_execution_exception", "rollup job store limit reached")
+			return
+		}
 		if existingRSchema := s.indices[rollupIdx]; existingRSchema != nil {
 			hasRollupMeta := false
 			if existingRSchema.RawMapping != nil && existingRSchema.RawMapping.Meta != nil {
@@ -8368,11 +8382,355 @@ func hashSecuritySecretR66(secret string) string {
 	return hex.EncodeToString(sum[:])
 }
 
+const maxAdminStoreEntriesR67 = 4096
+
+func randomCryptoTokenB64R67(numBytes int) string {
+	if numBytes <= 0 {
+		numBytes = 24
+	}
+	buf := make([]byte, numBytes)
+	if _, err := rand.Read(buf); err != nil {
+		panic(fmt.Sprintf("crypto/rand failure: %v", err))
+	}
+	return base64.RawURLEncoding.EncodeToString(buf)
+}
+
+func sha256HexStrR67(s string) string {
+	sum := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(sum[:])
+}
+
+func hashSecuritySecretPBKDF2R67(secret string) string {
+	salt := make([]byte, 16)
+	if _, err := rand.Read(salt); err != nil {
+		panic(fmt.Sprintf("crypto/rand failure: %v", err))
+	}
+	dk := pbkdf2HMACSHA256R67([]byte(secret), salt, 4096, 32)
+	return "$pbkdf2-sha256$4096$" + base64.RawStdEncoding.EncodeToString(salt) + "$" + base64.RawStdEncoding.EncodeToString(dk)
+}
+
+func sliceContainsStrR67(items []string, target string) bool {
+	for _, it := range items {
+		if it == target {
+			return true
+		}
+	}
+	return false
+}
+
+func evictFIFOEntriesLockedR67(m map[string]map[string]any, limit int) {
+	if len(m) < limit || limit <= 0 {
+		return
+	}
+	type fifoEntry struct {
+		key       string
+		createdAt string
+	}
+	all := make([]fifoEntry, 0, len(m))
+	for k, v := range m {
+		ca, _ := v["created_at"].(string)
+		all = append(all, fifoEntry{key: k, createdAt: ca})
+	}
+	sort.Slice(all, func(i, j int) bool {
+		if all[i].createdAt != all[j].createdAt {
+			return all[i].createdAt < all[j].createdAt
+		}
+		return all[i].key < all[j].key
+	})
+	excess := len(m) - (limit - 1)
+	for i := 0; i < excess && i < len(all); i++ {
+		delete(m, all[i].key)
+	}
+}
+
+func (s *Server) requestPrincipalAndConfiguredR67(r *http.Request) (*securityPrincipalR67, bool, int, string) {
+	if s == nil {
+		return nil, false, 0, ""
+	}
+	s.authMu.RLock()
+	basicUser := strings.TrimSpace(s.basicAuthUser)
+	basicPass := s.basicAuthPass
+	proxyAPIKey := strings.TrimSpace(s.apiKey)
+	s.authMu.RUnlock()
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	configured := basicUser != "" || proxyAPIKey != "" ||
+		len(s.securityUsers) > 0 || len(s.securityAPIKeys) > 0 || len(s.securityServiceTokens) > 0
+	p := securityPrincipalFromRequestR67(r)
+	if p != nil {
+		return p, configured, 0, ""
+	}
+	if r == nil || strings.TrimSpace(r.Header.Get("Authorization")) == "" {
+		if configured {
+			return nil, true, http.StatusUnauthorized, "missing authentication credentials for REST request [" + r.URL.Path + "]"
+		}
+		return nil, false, 0, ""
+	}
+	dp, ok, st, reason := s.resolveDynamicPrincipalLockedR67(r, basicUser, basicPass, proxyAPIKey)
+	if !ok {
+		if st == 0 {
+			st = http.StatusUnauthorized
+		}
+		return nil, configured, st, reason
+	}
+	return dp, configured, 0, ""
+}
+
+func (s *Server) requestPrincipalIdentityR67(r *http.Request) (string, bool) {
+	p, _, _, _ := s.requestPrincipalAndConfiguredR67(r)
+	if p == nil {
+		return "", false
+	}
+	return p.username, p.isStaticAdmin || sliceContainsStrR67(p.roles, "superuser")
+}
+
+func (s *Server) principalHasClusterPrivLockedR67(p *securityPrincipalR67, needed ...string) bool {
+	if p == nil {
+		return false
+	}
+	if p.isStaticAdmin || sliceContainsStrR67(p.roles, "superuser") {
+		return true
+	}
+	roleMaps, isSuper := s.collectEffectiveRoleMapsLockedR67(p)
+	if isSuper {
+		return true
+	}
+	for _, rm := range roleMaps {
+		if roleHasClusterPrivilegeR67(rm, needed) {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Server) principalRunAsAllowedLockedR67(p *securityPrincipalR67, targetUser string) bool {
+	if p == nil || targetUser == "" {
+		return false
+	}
+	if p.username == targetUser || p.isStaticAdmin || sliceContainsStrR67(p.roles, "superuser") {
+		return true
+	}
+	roleMaps, isSuper := s.collectEffectiveRoleMapsLockedR67(p)
+	if isSuper {
+		return true
+	}
+	for _, rm := range roleMaps {
+		for _, pat := range extractRolesListFromAnyR67(rm["run_as"]) {
+			if matchWildcardPattern(pat, targetUser) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (s *Server) isRoleGrantedIndexPrivLockedR67(rm map[string]any, targetPat, priv string) bool {
+	if rm == nil {
+		return false
+	}
+	var rawEntries []any
+	switch v := rm["indices"].(type) {
+	case []any:
+		rawEntries = v
+	case []map[string]any:
+		for _, m := range v {
+			rawEntries = append(rawEntries, m)
+		}
+	}
+	targets := resolveRBACTargetsLockedR67(s.indices, s.aliases, targetPat)
+	for _, item := range rawEntries {
+		ent, ok := item.(map[string]any)
+		if !ok || ent == nil {
+			continue
+		}
+		privs := extractRolesListFromAnyR67(ent["privileges"])
+		privOK := false
+		for _, p := range privs {
+			if p == "all" || p == priv {
+				privOK = true
+				break
+			}
+		}
+		if !privOK {
+			continue
+		}
+		names := extractRolesListFromAnyR67(ent["names"])
+		for _, pat := range names {
+			if pat == "*" || pat == "_all" || pat == targetPat || matchWildcardPattern(pat, targetPat) {
+				return true
+			}
+			for _, tgt := range targets {
+				if matchWildcardPattern(pat, tgt) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func (s *Server) isRoleGrantedAppPrivLockedR67(rm map[string]any, appName, resName, priv string) bool {
+	if rm == nil {
+		return false
+	}
+	rawApps, _ := rm["applications"].([]any)
+	for _, item := range rawApps {
+		am, ok := item.(map[string]any)
+		if !ok || am == nil {
+			continue
+		}
+		appPat, _ := am["application"].(string)
+		if !matchWildcardPattern(appPat, appName) {
+			continue
+		}
+		resources := extractRolesListFromAnyR67(am["resources"])
+		resOK := len(resources) == 0 && resName == "*"
+		for _, rp := range resources {
+			if rp == "*" || matchWildcardPattern(rp, resName) {
+				resOK = true
+				break
+			}
+		}
+		if !resOK {
+			continue
+		}
+		privs := extractRolesListFromAnyR67(am["privileges"])
+		for _, p := range privs {
+			if p == "all" || p == "*" || p == priv {
+				return true
+			}
+			if appDefs := s.securityPrivileges[appName]; appDefs != nil {
+				if spec := appDefs[p]; spec != nil {
+					for _, act := range extractRolesListFromAnyR67(spec["actions"]) {
+						if act == priv || act == "*" || matchWildcardPattern(act, priv) {
+							return true
+						}
+					}
+				}
+			}
+		}
+	}
+	return false
+}
+
+func (s *Server) evaluatePrincipalPrivilegesLockedR67(p *securityPrincipalR67, allowOpenDefault bool, body map[string]any) (bool, map[string]any, map[string]any, map[string]any) {
+	var roleMaps []map[string]any
+	isSuper := false
+	if allowOpenDefault {
+		isSuper = true
+	} else if p != nil {
+		if p.isStaticAdmin || sliceContainsStrR67(p.roles, "superuser") {
+			isSuper = true
+		} else {
+			roleMaps, isSuper = s.collectEffectiveRoleMapsLockedR67(p)
+		}
+	}
+
+	hasAll := true
+	clusterOut := make(map[string]any)
+	if cList, ok := body["cluster"].([]any); ok {
+		for _, item := range cList {
+			cPriv := fmt.Sprintf("%v", item)
+			allowed := isSuper
+			if !allowed {
+				for _, rm := range roleMaps {
+					if roleHasClusterPrivilegeR67(rm, []string{cPriv}) {
+						allowed = true
+						break
+					}
+				}
+			}
+			clusterOut[cPriv] = allowed
+			if !allowed {
+				hasAll = false
+			}
+		}
+	}
+	indexOut := make(map[string]any)
+	if iList, ok := body["index"].([]any); ok {
+		for _, item := range iList {
+			if im, okM := item.(map[string]any); okM {
+				names, _ := im["names"].([]any)
+				privs, _ := im["privileges"].([]any)
+				for _, n := range names {
+					nStr := fmt.Sprintf("%v", n)
+					pm, _ := indexOut[nStr].(map[string]any)
+					if pm == nil {
+						pm = make(map[string]any, len(privs))
+					}
+					for _, pv := range privs {
+						pStr := fmt.Sprintf("%v", pv)
+						allowed := isSuper
+						if !allowed {
+							for _, rm := range roleMaps {
+								if s.isRoleGrantedIndexPrivLockedR67(rm, nStr, pStr) {
+									allowed = true
+									break
+								}
+							}
+						}
+						pm[pStr] = allowed
+						if !allowed {
+							hasAll = false
+						}
+					}
+					indexOut[nStr] = pm
+				}
+			}
+		}
+	}
+	appOut := make(map[string]any)
+	if aList, ok := body["application"].([]any); ok {
+		for _, item := range aList {
+			if am, okM := item.(map[string]any); okM {
+				appName := fmt.Sprintf("%v", am["application"])
+				privs, _ := am["privileges"].([]any)
+				resList, _ := am["resources"].([]any)
+				if len(resList) == 0 {
+					resList = []any{"*"}
+				}
+				rmOut, _ := appOut[appName].(map[string]any)
+				if rmOut == nil {
+					rmOut = make(map[string]any, len(resList))
+				}
+				for _, rn := range resList {
+					resStr := fmt.Sprintf("%v", rn)
+					pm, _ := rmOut[resStr].(map[string]any)
+					if pm == nil {
+						pm = make(map[string]any, len(privs))
+					}
+					for _, pv := range privs {
+						pStr := fmt.Sprintf("%v", pv)
+						allowed := isSuper
+						if !allowed {
+							for _, rm := range roleMaps {
+								if s.isRoleGrantedAppPrivLockedR67(rm, appName, resStr, pStr) {
+									allowed = true
+									break
+								}
+							}
+						}
+						pm[pStr] = allowed
+						if !allowed {
+							hasAll = false
+						}
+					}
+					rmOut[resStr] = pm
+				}
+				appOut[appName] = rmOut
+			}
+		}
+	}
+	return hasAll, clusterOut, indexOut, appOut
+}
+
 func cloneSanitizedSecurityUserR66(u map[string]any) map[string]any {
 	if u == nil {
 		return nil
 	}
 	cp := deepCloneDocMap(u)
+	delete(cp, "__password_pbkdf2")
 	delete(cp, "__password_sha256")
 	delete(cp, "password")
 	return cp
@@ -8383,8 +8741,80 @@ func cloneSanitizedSecurityAPIKeyR66(k map[string]any) map[string]any {
 		return nil
 	}
 	cp := deepCloneDocMap(k)
+	delete(cp, "__secret_pbkdf2")
 	delete(cp, "__secret_sha256")
 	delete(cp, "api_key")
+	delete(cp, "secret")
+	return cp
+}
+
+func sanitizeServiceTokenCopyR67(tObj map[string]any) map[string]any {
+	if tObj == nil {
+		return nil
+	}
+	cp := deepCloneDocMap(tObj)
+	delete(cp, "__token_pbkdf2")
+	delete(cp, "__token_sha256")
+	delete(cp, "value")
+	delete(cp, "secret")
+	return cp
+}
+
+func sanitizeConnectorSecretCopyR67(entry map[string]any) map[string]any {
+	if entry == nil {
+		return nil
+	}
+	cp := deepCloneDocMap(entry)
+	delete(cp, "value")
+	delete(cp, "__value")
+	cp["has_value"] = true
+	return cp
+}
+
+func isSensitiveSettingKeyR67(k string) bool {
+	lk := strings.ToLower(strings.TrimSpace(k))
+	switch lk {
+	case "api_key", "secret_key", "access_key", "token", "password", "client_secret", "private_key", "secret":
+		return true
+	}
+	return false
+}
+
+func redactSensitiveAnyR67(v any) any {
+	switch tv := v.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(tv))
+		for k, val := range tv {
+			if isSensitiveSettingKeyR67(k) {
+				if val != nil && fmt.Sprintf("%v", val) != "" {
+					out[k] = "****"
+				} else {
+					out[k] = ""
+				}
+			} else {
+				out[k] = redactSensitiveAnyR67(val)
+			}
+		}
+		return out
+	case []any:
+		out := make([]any, len(tv))
+		for i, item := range tv {
+			out[i] = redactSensitiveAnyR67(item)
+		}
+		return out
+	default:
+		return deepCloneIngestValue(v)
+	}
+}
+
+func redactInferenceEndpointCopyR67(ep map[string]any) map[string]any {
+	if ep == nil {
+		return nil
+	}
+	cp := deepCloneDocMap(ep)
+	if ss, ok := cp["service_settings"]; ok && ss != nil {
+		cp["service_settings"] = redactSensitiveAnyR67(ss)
+	}
 	return cp
 }
 
@@ -8435,36 +8865,58 @@ func (s *Server) handleSecurityAPI(w http.ResponseWriter, r *http.Request, segs 
 			}
 			var body map[string]any
 			if len(bytes.TrimSpace(bodyBytes)) > 0 {
-				_ = json.Unmarshal(bodyBytes, &body)
-			}
-			clusterOut := make(map[string]any)
-			if cList, ok := body["cluster"].([]any); ok {
-				for _, item := range cList {
-					clusterOut[fmt.Sprintf("%v", item)] = true
+				if err := json.Unmarshal(bodyBytes, &body); err != nil {
+					writeESError(w, http.StatusBadRequest, "parse_exception", err.Error())
+					return
 				}
 			}
-			indexOut := make(map[string]any)
-			if iList, ok := body["index"].([]any); ok {
-				for _, item := range iList {
-					if im, ok := item.(map[string]any); ok {
-						names, _ := im["names"].([]any)
-						privs, _ := im["privileges"].([]any)
-						privMap := make(map[string]any, len(privs))
-						for _, p := range privs {
-							privMap[fmt.Sprintf("%v", p)] = true
+			if body == nil {
+				body = map[string]any{}
+			}
+			callerP, configured, authSt, authReason := s.requestPrincipalAndConfiguredR67(r)
+			if configured && callerP == nil {
+				writeESError(w, authSt, "security_exception", authReason)
+				return
+			}
+
+			s.mu.RLock()
+			evalName := "elastic"
+			var evalPrincipal *securityPrincipalR67
+			allowOpenDefault := false
+			if len(segs) == 4 && segs[3] == "_has_privileges" && target != "" && target != "_has_privileges" {
+				evalName = target
+				if uObj := s.securityUsers[target]; uObj != nil {
+					if en, hasEn := uObj["enabled"].(bool); !hasEn || en {
+						evalPrincipal = &securityPrincipalR67{
+							username: target,
+							roles:    extractRolesListFromAnyR67(uObj["roles"]),
 						}
-						for _, n := range names {
-							indexOut[fmt.Sprintf("%v", n)] = privMap
+					}
+				} else if target == "elastic" {
+					evalPrincipal = &securityPrincipalR67{username: "elastic", roles: []string{"superuser"}}
+				}
+			} else if callerP != nil {
+				evalPrincipal = callerP
+				evalName = callerP.username
+				if evalName != "" && !callerP.isStaticAdmin && !callerP.isServiceToken && callerP.roleDescriptors == nil {
+					if uObj := s.securityUsers[evalName]; uObj != nil {
+						if en, hasEn := uObj["enabled"].(bool); hasEn && !en {
+							evalPrincipal = nil
 						}
 					}
 				}
+			} else if !configured && len(s.securityRoles) == 0 && len(s.securityPrivileges) == 0 {
+				allowOpenDefault = true
 			}
+			hasAll, clusterOut, indexOut, appOut := s.evaluatePrincipalPrivilegesLockedR67(evalPrincipal, allowOpenDefault, body)
+			s.mu.RUnlock()
+
 			writeJSON(w, http.StatusOK, map[string]any{
-				"username":          "elastic",
-				"has_all_requested": true,
+				"username":          evalName,
+				"has_all_requested": hasAll,
 				"cluster":           clusterOut,
 				"index":             indexOut,
-				"application":       map[string]any{},
+				"application":       appOut,
 			})
 			return
 		}
@@ -8487,12 +8939,14 @@ func (s *Server) handleSecurityAPI(w http.ResponseWriter, r *http.Request, segs 
 					userObj["enabled"] = true
 				}
 				s.mu.Unlock()
+				s.bumpSecurityEpoch()
 				writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
 			case "_disable":
 				if userObj != nil {
 					userObj["enabled"] = false
 				}
 				s.mu.Unlock()
+				s.bumpSecurityEpoch()
 				writeJSON(w, http.StatusOK, map[string]any{"acknowledged": true})
 			case "_password":
 				s.mu.Unlock()
@@ -8501,19 +8955,23 @@ func (s *Server) handleSecurityAPI(w http.ResponseWriter, r *http.Request, segs 
 					return
 				}
 				var body map[string]any
-				_ = json.Unmarshal(bodyBytes, &body)
+				if err := json.Unmarshal(bodyBytes, &body); err != nil {
+					writeESError(w, http.StatusBadRequest, "parse_exception", err.Error())
+					return
+				}
 				pw, _ := body["password"].(string)
 				if strings.TrimSpace(pw) == "" {
 					writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "[password] is required")
 					return
 				}
-				pwHash := hashSecuritySecretR66(pw)
+				pwHash := hashSecuritySecretPBKDF2R67(pw)
 				s.mu.Lock()
 				if s.securityUsers == nil {
 					s.securityUsers = make(map[string]map[string]any)
 				}
 				if cur, okU := s.securityUsers[target]; okU && cur != nil {
-					cur["__password_sha256"] = pwHash
+					cur["__password_pbkdf2"] = pwHash
+					delete(cur, "__password_sha256")
 					delete(cur, "password")
 				} else if target == "elastic" {
 					s.securityUsers["elastic"] = map[string]any{
@@ -8523,13 +8981,15 @@ func (s *Server) handleSecurityAPI(w http.ResponseWriter, r *http.Request, segs 
 						"email":             "",
 						"metadata":          map[string]any{},
 						"enabled":           true,
-						"__password_sha256": pwHash,
+						"__password_pbkdf2": pwHash,
 					}
 				}
 				s.mu.Unlock()
+				s.bumpSecurityEpoch()
 				writeJSON(w, http.StatusOK, map[string]any{})
 			case "_clear_cache":
 				s.mu.Unlock()
+				s.bumpSecurityEpoch()
 				writeJSON(w, http.StatusOK, map[string]any{
 					"_nodes":       map[string]any{"total": 1, "successful": 1, "failed": 0},
 					"cluster_name": "apache-doris-search-cluster",
@@ -8559,11 +9019,21 @@ func (s *Server) handleSecurityAPI(w http.ResponseWriter, r *http.Request, segs 
 				writeESError(w, http.StatusBadRequest, "action_request_validation_exception", "Validation Failed: 1: roles are missing;")
 				return
 			}
+			pw, hasPW := body["password"].(string)
+			var pwPBKDF2 string
+			if hasPW && pw != "" {
+				pwPBKDF2 = hashSecuritySecretPBKDF2R67(pw)
+			}
 			s.mu.Lock()
 			if s.securityUsers == nil {
 				s.securityUsers = make(map[string]map[string]any)
 			}
 			_, existed := s.securityUsers[target]
+			if !existed && len(s.securityUsers) >= maxAdminStoreEntriesR67 {
+				s.mu.Unlock()
+				writeESError(w, http.StatusTooManyRequests, "es_rejected_execution_exception", "security user store limit reached")
+				return
+			}
 			enabled := true
 			if b, ok := body["enabled"].(bool); ok {
 				enabled = b
@@ -8582,15 +9052,18 @@ func (s *Server) handleSecurityAPI(w http.ResponseWriter, r *http.Request, segs 
 				"metadata":  meta,
 				"enabled":   enabled,
 			}
-			if pw, okPW := body["password"].(string); okPW && pw != "" {
-				userRecord["__password_sha256"] = hashSecuritySecretR66(pw)
+			if pwPBKDF2 != "" {
+				userRecord["__password_pbkdf2"] = pwPBKDF2
 			} else if existed && s.securityUsers[target] != nil {
-				if prevHash, okPH := s.securityUsers[target]["__password_sha256"].(string); okPH && prevHash != "" {
+				if prevPB, okPB := s.securityUsers[target]["__password_pbkdf2"].(string); okPB && prevPB != "" {
+					userRecord["__password_pbkdf2"] = prevPB
+				} else if prevHash, okPH := s.securityUsers[target]["__password_sha256"].(string); okPH && prevHash != "" {
 					userRecord["__password_sha256"] = prevHash
 				}
 			}
 			s.securityUsers[target] = userRecord
 			s.mu.Unlock()
+			s.bumpSecurityEpoch()
 			writeJSON(w, http.StatusOK, map[string]any{
 				"created": !existed,
 				"user":    map[string]any{"created": !existed},
@@ -8626,6 +9099,9 @@ func (s *Server) handleSecurityAPI(w http.ResponseWriter, r *http.Request, segs 
 				delete(s.securityUsers, target)
 			}
 			s.mu.Unlock()
+			if exists {
+				s.bumpSecurityEpoch()
+			}
 			writeJSON(w, http.StatusOK, map[string]any{"found": exists})
 
 		default:
@@ -8706,6 +9182,11 @@ func (s *Server) handleSecurityAPI(w http.ResponseWriter, r *http.Request, segs 
 					nextObj := deepCloneDocMap(descMap)
 					prevObj, existed := s.securityRoles[trimmedRN]
 					if !existed {
+						if len(s.securityRoles) >= maxAdminStoreEntriesR67 {
+							s.mu.Unlock()
+							writeESError(w, http.StatusTooManyRequests, "es_rejected_execution_exception", "security role store limit reached")
+							return
+						}
 						s.securityRoles[trimmedRN] = nextObj
 						created = append(created, trimmedRN)
 						continue
@@ -8720,6 +9201,9 @@ func (s *Server) handleSecurityAPI(w http.ResponseWriter, r *http.Request, segs 
 					updated = append(updated, trimmedRN)
 				}
 				s.mu.Unlock()
+				if len(created) > 0 || len(updated) > 0 {
+					s.bumpSecurityEpoch()
+				}
 				resp := map[string]any{
 					"created": created,
 					"updated": updated,
@@ -8782,6 +9266,9 @@ func (s *Server) handleSecurityAPI(w http.ResponseWriter, r *http.Request, segs 
 					}
 				}
 				s.mu.Unlock()
+				if len(deleted) > 0 {
+					s.bumpSecurityEpoch()
+				}
 				writeJSON(w, http.StatusOK, map[string]any{
 					"deleted":   deleted,
 					"not_found": notFound,
@@ -8799,6 +9286,7 @@ func (s *Server) handleSecurityAPI(w http.ResponseWriter, r *http.Request, segs 
 				writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
 				return
 			}
+			s.bumpSecurityEpoch()
 			writeJSON(w, http.StatusOK, map[string]any{
 				"_nodes":       map[string]any{"total": 1, "successful": 1, "failed": 0},
 				"cluster_name": "apache-doris-search-cluster",
@@ -8828,6 +9316,11 @@ func (s *Server) handleSecurityAPI(w http.ResponseWriter, r *http.Request, segs 
 				s.securityRoles = make(map[string]map[string]any)
 			}
 			_, existed := s.securityRoles[roleName]
+			if !existed && len(s.securityRoles) >= maxAdminStoreEntriesR67 {
+				s.mu.Unlock()
+				writeESError(w, http.StatusTooManyRequests, "es_rejected_execution_exception", "security role store limit reached")
+				return
+			}
 			roleStore := deepCloneDocMap(body)
 			for _, arrKey := range []string{"cluster", "indices", "run_as", "applications"} {
 				if roleStore[arrKey] == nil {
@@ -8839,6 +9332,7 @@ func (s *Server) handleSecurityAPI(w http.ResponseWriter, r *http.Request, segs 
 			}
 			s.securityRoles[roleName] = roleStore
 			s.mu.Unlock()
+			s.bumpSecurityEpoch()
 			writeJSON(w, http.StatusOK, map[string]any{
 				"role": map[string]any{"created": !existed},
 			})
@@ -8870,6 +9364,9 @@ func (s *Server) handleSecurityAPI(w http.ResponseWriter, r *http.Request, segs 
 				delete(s.securityRoles, roleName)
 			}
 			s.mu.Unlock()
+			if exists {
+				s.bumpSecurityEpoch()
+			}
 			writeJSON(w, http.StatusOK, map[string]any{"found": exists})
 
 		default:
@@ -8930,6 +9427,7 @@ func (s *Server) handleSecurityAPI(w http.ResponseWriter, r *http.Request, segs 
 				out[appName] = appRes
 			}
 			s.mu.Unlock()
+			s.bumpSecurityEpoch()
 			writeJSON(w, http.StatusOK, out)
 
 		case http.MethodGet, http.MethodHead:
@@ -8986,6 +9484,9 @@ func (s *Server) handleSecurityAPI(w http.ResponseWriter, r *http.Request, segs 
 				}
 			}
 			s.mu.Unlock()
+			if found {
+				s.bumpSecurityEpoch()
+			}
 			writeJSON(w, http.StatusOK, map[string]any{
 				appName: map[string]any{
 					privName: map[string]any{"found": found},
@@ -9002,6 +9503,7 @@ func (s *Server) handleSecurityAPI(w http.ResponseWriter, r *http.Request, segs 
 				writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
 				return
 			}
+			s.bumpSecurityEpoch()
 			writeJSON(w, http.StatusOK, securityNodesCacheClearResponse())
 			return
 		}
@@ -9018,32 +9520,51 @@ func (s *Server) handleSecurityAPI(w http.ResponseWriter, r *http.Request, segs 
 					return
 				}
 			}
-			grantOwner := ""
-			if len(segs) == 3 && (segs[2] == "_grant" || segs[2] == "grant") {
-				if gt, hasGT := body["grant_type"].(string); hasGT && strings.TrimSpace(gt) != "" {
-					switch strings.TrimSpace(gt) {
-					case "access_token", "password":
-					default:
-						writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "unsupported grant_type ["+gt+"]")
+			if body == nil {
+				body = map[string]any{}
+			}
+			isGrant := len(segs) == 3 && (segs[2] == "_grant" || segs[2] == "grant")
+			grantType, _ := body["grant_type"].(string)
+			grantType = strings.TrimSpace(grantType)
+			grantUser, _ := body["username"].(string)
+			grantUser = strings.TrimSpace(grantUser)
+			grantPassword, _ := body["password"].(string)
+			grantAccessToken, _ := body["access_token"].(string)
+			grantAccessToken = strings.TrimSpace(grantAccessToken)
+			grantRunAs, _ := body["run_as"].(string)
+			grantRunAs = strings.TrimSpace(grantRunAs)
+
+			if isGrant {
+				switch grantType {
+				case "password":
+					if grantUser == "" || grantPassword == "" {
+						writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "[username] and [password] are required for password grant")
 						return
 					}
+				case "access_token":
+					if grantAccessToken == "" {
+						writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "[access_token] is required for access_token grant")
+						return
+					}
+				default:
+					writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "unsupported grant_type ["+grantType+"]")
+					return
 				}
-				if u, okU := body["username"].(string); okU && strings.TrimSpace(u) != "" {
-					grantOwner = strings.TrimSpace(u)
-				}
-				if runAs, okRA := body["run_as"].(string); okRA && strings.TrimSpace(runAs) != "" {
-					grantOwner = strings.TrimSpace(runAs)
-				}
-				if subKey, ok := body["api_key"].(map[string]any); ok {
+				if subKey, ok := body["api_key"].(map[string]any); ok && subKey != nil {
 					body = subKey
+				} else {
+					writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "[api_key] object is required for grant")
+					return
 				}
 			}
+
 			name, _ := body["name"].(string)
 			if strings.TrimSpace(name) == "" {
 				writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "api_key [name] is required")
 				return
 			}
-			nowMS := time.Now().UTC().UnixMilli()
+			now := time.Now().UTC()
+			nowMS := now.UnixMilli()
 			var expVal any
 			if expStr, okE := body["expiration"].(string); okE && strings.TrimSpace(expStr) != "" {
 				durMS, valid := parsePositiveESDurationMillis(expStr)
@@ -9053,27 +9574,154 @@ func (s *Server) handleSecurityAPI(w http.ResponseWriter, r *http.Request, segs 
 				}
 				expVal = nowMS + durMS
 			}
-			ownerUsername := "elastic"
-			if grantOwner != "" {
-				ownerUsername = grantOwner
-			} else if basicUser, _, okBasic := r.BasicAuth(); okBasic && strings.TrimSpace(basicUser) != "" {
-				ownerUsername = strings.TrimSpace(basicUser)
-			}
+
+			s.authMu.RLock()
+			basicUser := strings.TrimSpace(s.basicAuthUser)
+			basicPass := s.basicAuthPass
+			proxyAPIKey := strings.TrimSpace(s.apiKey)
+			s.authMu.RUnlock()
+
+			callerP := securityPrincipalFromRequestR67(r)
+
 			s.mu.Lock()
 			if s.securityAPIKeys == nil {
 				s.securityAPIKeys = make(map[string]map[string]any)
 			}
-			if ownerUsername == "elastic" && grantOwner == "" {
-				if authHdr := strings.TrimSpace(r.Header.Get("Authorization")); strings.HasPrefix(strings.ToLower(authHdr), "apikey ") {
-					// Resolve owning user from calling ApiKey when creating nested keys.
-					if decOwner := resolveAPIKeyUsernameFromHeaderR64(authHdr[7:], s.securityAPIKeys); decOwner != "" {
-						ownerUsername = decOwner
+			hasDynamicSecurity := len(s.securityUsers) > 0 || len(s.securityAPIKeys) > 0 || len(s.securityServiceTokens) > 0
+			hasAnySecurity := basicUser != "" || proxyAPIKey != "" || hasDynamicSecurity
+
+			if callerP == nil && !isGrant && r != nil && strings.TrimSpace(r.Header.Get("Authorization")) != "" {
+				dp, okDP, dpSt, dpReason := s.resolveDynamicPrincipalLockedR67(r, basicUser, basicPass, proxyAPIKey)
+				if !okDP {
+					s.mu.Unlock()
+					if dpSt == 0 {
+						dpSt = http.StatusUnauthorized
+					}
+					writeESError(w, dpSt, "security_exception", dpReason)
+					return
+				}
+				callerP = dp
+			}
+
+			ownerUsername := "elastic"
+			if isGrant {
+				var grantPrincipal *securityPrincipalR67
+				if grantType == "password" {
+					if hasAnySecurity {
+						if basicUser != "" && grantUser == basicUser && s.securityUsers[basicUser] == nil {
+							if len(grantPassword) != len(basicPass) || subtle.ConstantTimeCompare([]byte(grantPassword), []byte(basicPass)) != 1 {
+								s.mu.Unlock()
+								writeESError(w, http.StatusUnauthorized, "security_exception", fmt.Sprintf("unable to authenticate user [%s] for REST request [%s]", grantUser, r.URL.Path))
+								return
+							}
+							grantPrincipal = &securityPrincipalR67{
+								username:      grantUser,
+								roles:         []string{"superuser"},
+								isStaticAdmin: true,
+							}
+						} else {
+							uObj := s.securityUsers[grantUser]
+							if uObj == nil {
+								s.mu.Unlock()
+								writeESError(w, http.StatusUnauthorized, "security_exception", fmt.Sprintf("unable to authenticate user [%s] for REST request [%s]", grantUser, r.URL.Path))
+								return
+							}
+							if en, hasEn := uObj["enabled"].(bool); hasEn && !en {
+								s.mu.Unlock()
+								writeESError(w, http.StatusUnauthorized, "security_exception", fmt.Sprintf("unable to authenticate user [%s] for REST request [%s]", grantUser, r.URL.Path))
+								return
+							}
+							if !verifySecurityUserPasswordR66(uObj, grantPassword) {
+								s.mu.Unlock()
+								writeESError(w, http.StatusUnauthorized, "security_exception", fmt.Sprintf("unable to authenticate user [%s] for REST request [%s]", grantUser, r.URL.Path))
+								return
+							}
+							grantPrincipal = &securityPrincipalR67{
+								username: grantUser,
+								roles:    extractRolesListFromAnyR67(uObj["roles"]),
+							}
+						}
+					} else {
+						grantPrincipal = &securityPrincipalR67{
+							username: grantUser,
+							roles:    []string{"superuser"},
+						}
+					}
+				} else {
+					tokHash := sha256HexStrR67(grantAccessToken)
+					for _, sess := range s.securitySessions {
+						if sess == nil || sess["type"] != "oauth2_token" {
+							continue
+						}
+						ah, _ := sess["access_hash"].(string)
+						if len(ah) == len(tokHash) && subtle.ConstantTimeCompare([]byte(ah), []byte(tokHash)) == 1 {
+							if expMS, okExp := toInt64(sess["expires_at"]); !okExp || expMS <= nowMS {
+								continue
+							}
+							uName, _ := sess["username"].(string)
+							if uName == "" {
+								uName = "elastic"
+							}
+							grantPrincipal = &securityPrincipalR67{
+								username: uName,
+								roles:    extractRolesListFromAnyR67(sess["roles"]),
+							}
+							break
+						}
+					}
+					if grantPrincipal == nil {
+						for fullKey, tObj := range s.securityServiceTokens {
+							if tObj != nil && verifyStoredSecretR67(tObj, "__token_pbkdf2", "__token_sha256", []string{"value"}, grantAccessToken) {
+								acct := fullKey
+								if idxSlash := strings.LastIndex(fullKey, "/"); idxSlash > 0 {
+									acct = fullKey[:idxSlash]
+								}
+								grantPrincipal = &securityPrincipalR67{
+									username:       acct,
+									roles:          []string{"superuser"},
+									isServiceToken: true,
+								}
+								break
+							}
+						}
+					}
+					if grantPrincipal == nil {
+						s.mu.Unlock()
+						writeESError(w, http.StatusUnauthorized, "security_exception", "unable to authenticate access_token for REST request ["+r.URL.Path+"]")
+						return
 					}
 				}
+				ownerUsername = grantPrincipal.username
+				if grantRunAs != "" && grantRunAs != grantPrincipal.username {
+					if hasAnySecurity && !s.principalRunAsAllowedLockedR67(grantPrincipal, grantRunAs) {
+						s.mu.Unlock()
+						writeESError(w, http.StatusForbidden, "security_exception", fmt.Sprintf("user [%s] cannot run_as [%s]", grantPrincipal.username, grantRunAs))
+						return
+					}
+					ownerUsername = grantRunAs
+				}
+			} else {
+				if hasAnySecurity && callerP == nil {
+					s.mu.Unlock()
+					writeESError(w, http.StatusUnauthorized, "security_exception", "missing authentication credentials for REST request ["+r.URL.Path+"]")
+					return
+				}
+				if callerP != nil && callerP.username != "" {
+					ownerUsername = callerP.username
+				}
 			}
-			keyID := fmt.Sprintf("key-%d", len(s.securityAPIKeys)+1)
-			secret := "secret-" + keyID
-			encoded := base64EncodeStr(keyID + ":" + secret)
+
+			if len(s.securityAPIKeys) >= maxAdminStoreEntriesR67 {
+				s.mu.Unlock()
+				writeESError(w, http.StatusTooManyRequests, "es_rejected_execution_exception", "api_key store limit reached")
+				return
+			}
+			keyID := "key_" + randomCryptoTokenB64R67(16)
+			for s.securityAPIKeys[keyID] != nil {
+				keyID = "key_" + randomCryptoTokenB64R67(16)
+			}
+			secret := randomCryptoTokenB64R67(32)
+			encoded := base64.StdEncoding.EncodeToString([]byte(keyID + ":" + secret))
 			s.securityAPIKeys[keyID] = map[string]any{
 				"id":               keyID,
 				"name":             name,
@@ -9082,11 +9730,12 @@ func (s *Server) handleSecurityAPI(w http.ResponseWriter, r *http.Request, segs 
 				"invalidated":      false,
 				"creation":         nowMS,
 				"expiration":       expVal,
-				"metadata":         body["metadata"],
-				"role_descriptors": body["role_descriptors"],
-				"__secret_sha256":  hashSecuritySecretR66(secret),
+				"metadata":         deepCloneIngestValue(body["metadata"]),
+				"role_descriptors": deepCloneIngestValue(body["role_descriptors"]),
+				"__secret_pbkdf2":  hashSecuritySecretPBKDF2R67(secret),
 			}
 			s.mu.Unlock()
+			s.bumpSecurityEpoch()
 			respObj := map[string]any{
 				"id":      keyID,
 				"name":    name,
@@ -9122,7 +9771,10 @@ func (s *Server) handleSecurityAPI(w http.ResponseWriter, r *http.Request, segs 
 			}
 			var body map[string]any
 			if len(bytes.TrimSpace(bodyBytes)) > 0 {
-				_ = json.Unmarshal(bodyBytes, &body)
+				if err := json.Unmarshal(bodyBytes, &body); err != nil {
+					writeESError(w, http.StatusBadRequest, "parse_exception", err.Error())
+					return
+				}
 			}
 			var invalidated []string
 			s.mu.Lock()
@@ -9143,6 +9795,9 @@ func (s *Server) handleSecurityAPI(w http.ResponseWriter, r *http.Request, segs 
 				}
 			}
 			s.mu.Unlock()
+			if len(invalidated) > 0 {
+				s.bumpSecurityEpoch()
+			}
 			if invalidated == nil {
 				invalidated = []string{}
 			}
@@ -9174,6 +9829,7 @@ func (s *Server) handleSecurityAPI(w http.ResponseWriter, r *http.Request, segs 
 		writeESError(w, http.StatusNotFound, "invalid_index_name_exception", "unknown endpoint: "+r.URL.Path)
 
 	case "_clear_api_key_cache":
+		s.bumpSecurityEpoch()
 		writeJSON(w, http.StatusOK, securityNodesCacheClearResponse())
 
 	case "oauth2":
@@ -9191,27 +9847,216 @@ func (s *Server) handleSecurityAPI(w http.ResponseWriter, r *http.Request, segs 
 						return
 					}
 				}
+				if body == nil {
+					body = map[string]any{}
+				}
 				grantType, _ := body["grant_type"].(string)
-				if strings.TrimSpace(grantType) == "" {
+				grantType = strings.TrimSpace(grantType)
+				if grantType == "" {
 					writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "[grant_type] is required")
 					return
 				}
-				authUser, _ := body["username"].(string)
-				if strings.TrimSpace(authUser) == "" {
-					authUser = "elastic"
+
+				s.authMu.RLock()
+				basicUser := strings.TrimSpace(s.basicAuthUser)
+				basicPass := s.basicAuthPass
+				proxyAPIKey := strings.TrimSpace(s.apiKey)
+				s.authMu.RUnlock()
+
+				callerP := securityPrincipalFromRequestR67(r)
+				now := time.Now().UTC()
+				nowMS := now.UnixMilli()
+
+				s.mu.Lock()
+				if s.securitySessions == nil {
+					s.securitySessions = make(map[string]map[string]any)
 				}
-				// #nosec G101 -- synthetic OAuth2 token response for Elasticsearch REST API compatibility
+				hasAnySecurity := basicUser != "" || proxyAPIKey != "" ||
+					len(s.securityUsers) > 0 || len(s.securityAPIKeys) > 0 || len(s.securityServiceTokens) > 0
+
+				authUser := "elastic"
+				authRoles := []string{"superuser"}
+				authFullName := "Built-in Superuser"
+				authEmail := ""
+				authMeta := map[string]any{}
+
+				switch grantType {
+				case "password":
+					u, _ := body["username"].(string)
+					u = strings.TrimSpace(u)
+					pw, _ := body["password"].(string)
+					if u == "" || pw == "" {
+						s.mu.Unlock()
+						writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "[username] and [password] are required")
+						return
+					}
+					if hasAnySecurity || s.securityUsers[u] != nil {
+						if basicUser != "" && u == basicUser && s.securityUsers[basicUser] == nil {
+							if len(pw) != len(basicPass) || subtle.ConstantTimeCompare([]byte(pw), []byte(basicPass)) != 1 {
+								s.mu.Unlock()
+								writeESError(w, http.StatusUnauthorized, "security_exception", fmt.Sprintf("unable to authenticate user [%s] for REST request [%s]", u, r.URL.Path))
+								return
+							}
+						} else {
+							uObj := s.securityUsers[u]
+							if uObj == nil {
+								s.mu.Unlock()
+								writeESError(w, http.StatusUnauthorized, "security_exception", fmt.Sprintf("unable to authenticate user [%s] for REST request [%s]", u, r.URL.Path))
+								return
+							}
+							if en, hasEn := uObj["enabled"].(bool); hasEn && !en {
+								s.mu.Unlock()
+								writeESError(w, http.StatusUnauthorized, "security_exception", fmt.Sprintf("unable to authenticate user [%s] for REST request [%s]", u, r.URL.Path))
+								return
+							}
+							if !verifySecurityUserPasswordR66(uObj, pw) {
+								s.mu.Unlock()
+								writeESError(w, http.StatusUnauthorized, "security_exception", fmt.Sprintf("unable to authenticate user [%s] for REST request [%s]", u, r.URL.Path))
+								return
+							}
+							authRoles = extractRolesListFromAnyR67(uObj["roles"])
+							authFullName, _ = uObj["full_name"].(string)
+							authEmail, _ = uObj["email"].(string)
+							if m, okM := uObj["metadata"].(map[string]any); okM {
+								authMeta = deepCloneDocMap(m)
+							}
+						}
+					}
+					authUser = u
+
+				case "client_credentials":
+					if callerP == nil && r != nil && strings.TrimSpace(r.Header.Get("Authorization")) != "" {
+						dp, okDP, dpSt, dpReason := s.resolveDynamicPrincipalLockedR67(r, basicUser, basicPass, proxyAPIKey)
+						if !okDP {
+							s.mu.Unlock()
+							if dpSt == 0 {
+								dpSt = http.StatusUnauthorized
+							}
+							writeESError(w, dpSt, "security_exception", dpReason)
+							return
+						}
+						callerP = dp
+					}
+					if callerP == nil {
+						cid, _ := body["client_id"].(string)
+						cid = strings.TrimSpace(cid)
+						csec, _ := body["client_secret"].(string)
+						if cid != "" && csec != "" {
+							if basicUser != "" && cid == basicUser && s.securityUsers[basicUser] == nil &&
+								len(csec) == len(basicPass) && subtle.ConstantTimeCompare([]byte(csec), []byte(basicPass)) == 1 {
+								callerP = &securityPrincipalR67{username: cid, roles: []string{"superuser"}, isStaticAdmin: true}
+							} else if uObj := s.securityUsers[cid]; uObj != nil {
+								en, hasEn := uObj["enabled"].(bool)
+								if (!hasEn || en) && verifySecurityUserPasswordR66(uObj, csec) {
+									fn, _ := uObj["full_name"].(string)
+									em, _ := uObj["email"].(string)
+									callerP = &securityPrincipalR67{
+										username: cid,
+										roles:    extractRolesListFromAnyR67(uObj["roles"]),
+										fullName: fn,
+										email:    em,
+									}
+								}
+							}
+						}
+					}
+					if hasAnySecurity && callerP == nil {
+						s.mu.Unlock()
+						writeESError(w, http.StatusUnauthorized, "security_exception", "unable to authenticate client_credentials for REST request ["+r.URL.Path+"]")
+						return
+					}
+					if callerP != nil {
+						authUser = callerP.username
+						if len(callerP.roles) > 0 {
+							authRoles = append([]string(nil), callerP.roles...)
+						} else {
+							authRoles = []string{}
+						}
+						if callerP.fullName != "" {
+							authFullName = callerP.fullName
+						}
+						authEmail = callerP.email
+						if len(callerP.metadata) > 0 {
+							authMeta = deepCloneDocMap(callerP.metadata)
+						}
+					}
+
+				case "refresh_token":
+					refTok, _ := body["refresh_token"].(string)
+					refTok = strings.TrimSpace(refTok)
+					if refTok == "" {
+						s.mu.Unlock()
+						writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "[refresh_token] is required")
+						return
+					}
+					refHash := sha256HexStrR67(refTok)
+					matchedKey := ""
+					var matchedSess map[string]any
+					for sk, sess := range s.securitySessions {
+						if sess == nil || sess["type"] != "oauth2_token" {
+							continue
+						}
+						rh, _ := sess["refresh_hash"].(string)
+						if len(rh) == len(refHash) && subtle.ConstantTimeCompare([]byte(rh), []byte(refHash)) == 1 {
+							if expMS, okExp := toInt64(sess["expires_at"]); okExp && expMS > nowMS {
+								matchedKey = sk
+								matchedSess = sess
+							}
+							break
+						}
+					}
+					if matchedSess == nil {
+						s.mu.Unlock()
+						writeESError(w, http.StatusUnauthorized, "security_exception", "invalid or expired [refresh_token]")
+						return
+					}
+					delete(s.securitySessions, matchedKey)
+					if u, _ := matchedSess["username"].(string); u != "" {
+						authUser = u
+					}
+					authRoles = extractRolesListFromAnyR67(matchedSess["roles"])
+					authFullName, _ = matchedSess["full_name"].(string)
+					authEmail, _ = matchedSess["email"].(string)
+					if m, okM := matchedSess["metadata"].(map[string]any); okM {
+						authMeta = deepCloneDocMap(m)
+					}
+
+				default:
+					s.mu.Unlock()
+					writeESError(w, http.StatusBadRequest, "illegal_argument_exception", "unsupported grant_type ["+grantType+"]")
+					return
+				}
+
+				accessTok := "oauth2_" + randomCryptoTokenB64R67(32)
+				refreshTok := "oauth2ref_" + randomCryptoTokenB64R67(32)
+				accessHash := sha256HexStrR67(accessTok)
+				refreshHash := sha256HexStrR67(refreshTok)
+				evictFIFOEntriesLockedR67(s.securitySessions, maxAdminStoreEntriesR67)
+				s.securitySessions["oauth2:"+accessHash] = map[string]any{
+					"type":         "oauth2_token",
+					"access_hash":  accessHash,
+					"refresh_hash": refreshHash,
+					"username":     authUser,
+					"roles":        append([]string(nil), authRoles...),
+					"full_name":    authFullName,
+					"email":        authEmail,
+					"metadata":     deepCloneDocMap(authMeta),
+					"created_at":   now.Format("2006-01-02T15:04:05.000Z"),
+					"expires_at":   nowMS + int64(1200*1000),
+				}
+				s.mu.Unlock()
+				s.bumpSecurityEpoch()
 				writeJSON(w, http.StatusOK, map[string]any{
-					"access_token":  "doris-oauth2-access-token",
+					"access_token":  accessTok,
 					"type":          "Bearer",
 					"expires_in":    1200,
-					"refresh_token": "doris-oauth2-refresh-token",
+					"refresh_token": refreshTok,
 					"authentication": map[string]any{
 						"username":             authUser,
-						"roles":                []string{"superuser"},
-						"full_name":            "Built-in Superuser",
-						"email":                "",
-						"metadata":             map[string]any{},
+						"roles":                authRoles,
+						"full_name":            authFullName,
+						"email":                authEmail,
+						"metadata":             authMeta,
 						"enabled":              true,
 						"authentication_realm": map[string]any{"name": "default_native", "type": "native"},
 						"lookup_realm":         map[string]any{"name": "default_native", "type": "native"},
@@ -9219,8 +10064,48 @@ func (s *Server) handleSecurityAPI(w http.ResponseWriter, r *http.Request, segs 
 					},
 				})
 			case http.MethodDelete:
+				bodyBytes, ok := readRequestBody(w, r)
+				if !ok {
+					return
+				}
+				var body map[string]any
+				if len(bytes.TrimSpace(bodyBytes)) > 0 {
+					if err := json.Unmarshal(bodyBytes, &body); err != nil {
+						writeESError(w, http.StatusBadRequest, "parse_exception", err.Error())
+						return
+					}
+				}
+				rawTok, _ := body["token"].(string)
+				if strings.TrimSpace(rawTok) == "" {
+					rawTok, _ = body["refresh_token"].(string)
+				}
+				rawTok = strings.TrimSpace(rawTok)
+				tokHash := ""
+				if rawTok != "" {
+					tokHash = sha256HexStrR67(rawTok)
+				}
+				invCount := 0
+				s.mu.Lock()
+				if tokHash != "" && s.securitySessions != nil {
+					for sk, sess := range s.securitySessions {
+						if sess == nil || sess["type"] != "oauth2_token" {
+							continue
+						}
+						ah, _ := sess["access_hash"].(string)
+						rh, _ := sess["refresh_hash"].(string)
+						if (len(ah) == len(tokHash) && subtle.ConstantTimeCompare([]byte(ah), []byte(tokHash)) == 1) ||
+							(len(rh) == len(tokHash) && subtle.ConstantTimeCompare([]byte(rh), []byte(tokHash)) == 1) {
+							delete(s.securitySessions, sk)
+							invCount++
+						}
+					}
+				}
+				s.mu.Unlock()
+				if invCount > 0 {
+					s.bumpSecurityEpoch()
+				}
 				writeJSON(w, http.StatusOK, map[string]any{
-					"invalidated_tokens":            1,
+					"invalidated_tokens":            invCount,
 					"previously_invalidated_tokens": 0,
 					"error_count":                   0,
 				})
@@ -9256,25 +10141,46 @@ func (s *Server) handleSecurityAPI(w http.ResponseWriter, r *http.Request, segs 
 			if len(segs) >= 7 {
 				tokenName = segs[6]
 			}
+			callerP, configured, authSt, authReason := s.requestPrincipalAndConfiguredR67(r)
+			if configured && callerP == nil {
+				writeESError(w, authSt, "security_exception", authReason)
+				return
+			}
 			switch r.Method {
 			case http.MethodPost, http.MethodPut:
 				if tokenName == "" {
-					tokenName = "token-1"
+					tokenName = "token-" + randomCryptoTokenB64R67(8)
 				}
+				rawTokenVal := "aae_" + randomCryptoTokenB64R67(32)
+				tokHash := hashSecuritySecretPBKDF2R67(rawTokenVal)
+				nowISO := time.Now().UTC().Format("2006-01-02T15:04:05.000Z")
 				s.mu.Lock()
+				if configured && !s.principalHasClusterPrivLockedR67(callerP, "manage_security", "manage") {
+					s.mu.Unlock()
+					writeESError(w, http.StatusForbidden, "security_exception", fmt.Sprintf("action [cluster:admin/xpack/security/service/credential/token/create] is unauthorized for user [%s]", callerP.username))
+					return
+				}
 				if s.securityServiceTokens == nil {
 					s.securityServiceTokens = make(map[string]map[string]any)
 				}
-				s.securityServiceTokens[acct+"/"+tokenName] = map[string]any{
-					"name":       tokenName,
-					"created_at": "2026-01-01T00:00:00.000Z",
+				fullKey := acct + "/" + tokenName
+				if _, existed := s.securityServiceTokens[fullKey]; !existed && len(s.securityServiceTokens) >= maxAdminStoreEntriesR67 {
+					s.mu.Unlock()
+					writeESError(w, http.StatusTooManyRequests, "es_rejected_execution_exception", "service token store limit reached")
+					return
+				}
+				s.securityServiceTokens[fullKey] = map[string]any{
+					"name":           tokenName,
+					"created_at":     nowISO,
+					"__token_pbkdf2": tokHash,
 				}
 				s.mu.Unlock()
+				s.bumpSecurityEpoch()
 				writeJSON(w, http.StatusOK, map[string]any{
 					"created": true,
 					"token": map[string]any{
 						"name":  tokenName,
-						"value": "aae_doris_service_token_" + tokenName,
+						"value": rawTokenVal,
 					},
 				})
 			case http.MethodGet:
@@ -9284,7 +10190,7 @@ func (s *Server) handleSecurityAPI(w http.ResponseWriter, r *http.Request, segs 
 				for k, v := range s.securityServiceTokens {
 					if strings.HasPrefix(k, prefix) {
 						tName := strings.TrimPrefix(k, prefix)
-						tokens[tName] = deepCloneDocMap(v)
+						tokens[tName] = sanitizeServiceTokenCopyR67(v)
 					}
 				}
 				s.mu.RUnlock()
@@ -9295,10 +10201,18 @@ func (s *Server) handleSecurityAPI(w http.ResponseWriter, r *http.Request, segs 
 				})
 			case http.MethodDelete:
 				s.mu.Lock()
+				if configured && !s.principalHasClusterPrivLockedR67(callerP, "manage_security", "manage") {
+					s.mu.Unlock()
+					writeESError(w, http.StatusForbidden, "security_exception", fmt.Sprintf("action [cluster:admin/xpack/security/service/credential/token/delete] is unauthorized for user [%s]", callerP.username))
+					return
+				}
 				key := acct + "/" + tokenName
 				_, existed := s.securityServiceTokens[key]
 				delete(s.securityServiceTokens, key)
 				s.mu.Unlock()
+				if existed {
+					s.bumpSecurityEpoch()
+				}
 				writeJSON(w, http.StatusOK, map[string]any{"found": existed})
 			default:
 				writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
@@ -9322,7 +10236,7 @@ func (s *Server) handleSecurityAPI(w http.ResponseWriter, r *http.Request, segs 
 			for k, v := range s.securityServiceTokens {
 				if strings.HasPrefix(k, prefix) {
 					tName := strings.TrimPrefix(k, prefix)
-					tokens[tName] = deepCloneDocMap(v)
+					tokens[tName] = sanitizeServiceTokenCopyR67(v)
 				}
 			}
 			s.mu.RUnlock()
@@ -9396,8 +10310,14 @@ func (s *Server) handleSecurityAPI(w http.ResponseWriter, r *http.Request, segs 
 				s.securityRoleMappings = make(map[string]map[string]any)
 			}
 			_, existed := s.securityRoleMappings[mappingName]
+			if !existed && len(s.securityRoleMappings) >= maxAdminStoreEntriesR67 {
+				s.mu.Unlock()
+				writeESError(w, http.StatusTooManyRequests, "es_rejected_execution_exception", "role_mapping store limit reached")
+				return
+			}
 			s.securityRoleMappings[mappingName] = deepCloneDocMap(entry)
 			s.mu.Unlock()
+			s.bumpSecurityEpoch()
 			writeJSON(w, http.StatusOK, map[string]any{
 				"role_mapping": map[string]any{"created": !existed},
 			})
@@ -9446,6 +10366,9 @@ func (s *Server) handleSecurityAPI(w http.ResponseWriter, r *http.Request, segs 
 				delete(s.securityRoleMappings, mappingName)
 			}
 			s.mu.Unlock()
+			if exists {
+				s.bumpSecurityEpoch()
+			}
 			writeJSON(w, http.StatusOK, map[string]any{"found": exists})
 		default:
 			writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
@@ -9465,7 +10388,7 @@ func (s *Server) handleSecurityAPI(w http.ResponseWriter, r *http.Request, segs 
 				writeJSON(w, http.StatusOK, map[string]any{
 					"token": map[string]any{
 						"name":  "doris-enrollment-kibana",
-						"value": "doris-enrollment-token-kibana",
+						"value": "doris-enrollment-token-kibana-" + randomCryptoTokenB64R67(16),
 					},
 					"http_ca": "-----BEGIN CERTIFICATE-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8A\n-----END CERTIFICATE-----\n",
 				})
@@ -9490,6 +10413,7 @@ func (s *Server) handleSecurityAPI(w http.ResponseWriter, r *http.Request, segs 
 				writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
 				return
 			}
+			s.bumpSecurityEpoch()
 			writeJSON(w, http.StatusOK, map[string]any{
 				"_nodes":       map[string]any{"total": 1, "successful": 1, "failed": 0},
 				"cluster_name": "apache-doris-search-cluster",
@@ -9762,12 +10686,13 @@ func (s *Server) handleInferenceAPI(w http.ResponseWriter, r *http.Request, segs
 				writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("Inference endpoint not found [%s]", inferenceID))
 				return
 			} else {
+				epCopy := redactInferenceEndpointCopyR67(ep)
 				s.mu.RUnlock()
 				if r.Method == http.MethodHead {
 					w.WriteHeader(http.StatusOK)
 					return
 				}
-				writeJSON(w, http.StatusOK, map[string]any{"endpoints": []any{ep}})
+				writeJSON(w, http.StatusOK, map[string]any{"endpoints": []any{epCopy}})
 				return
 			}
 		}
@@ -9785,7 +10710,7 @@ func (s *Server) handleInferenceAPI(w http.ResponseWriter, r *http.Request, segs
 			if taskType != "" && taskType != "_all" && !matchSimpleWildcard(taskType, fmt.Sprintf("%v", ep["task_type"])) {
 				continue
 			}
-			endpoints = append(endpoints, ep)
+			endpoints = append(endpoints, redactInferenceEndpointCopyR67(ep))
 		}
 		s.mu.RUnlock()
 		if r.Method == http.MethodHead {
@@ -9827,19 +10752,25 @@ func (s *Server) handleInferenceAPI(w http.ResponseWriter, r *http.Request, segs
 			"inference_id":     inferenceID,
 			"task_type":        taskType,
 			"service":          service,
-			"service_settings": serviceSettings,
-			"task_settings":    taskSettings,
+			"service_settings": deepCloneDocMap(serviceSettings),
+			"task_settings":    deepCloneDocMap(taskSettings),
 		}
 		if chunking, hasChunk := body["chunking_settings"]; hasChunk && chunking != nil {
-			ep["chunking_settings"] = chunking
+			ep["chunking_settings"] = deepCloneIngestValue(chunking)
 		}
 		s.mu.Lock()
 		if s.inferenceEndpoints == nil {
 			s.inferenceEndpoints = make(map[string]map[string]any)
 		}
+		if _, exists := s.inferenceEndpoints[inferenceID]; !exists && len(s.inferenceEndpoints) >= maxAdminStoreEntriesR67 {
+			s.mu.Unlock()
+			writeESError(w, http.StatusTooManyRequests, "es_rejected_execution_exception", "inference endpoint store limit reached")
+			return
+		}
 		s.inferenceEndpoints[inferenceID] = ep
+		epResp := redactInferenceEndpointCopyR67(ep)
 		s.mu.Unlock()
-		writeJSON(w, http.StatusOK, ep)
+		writeJSON(w, http.StatusOK, epResp)
 
 	case http.MethodPost:
 		if inferenceID == "" {
@@ -9856,12 +10787,15 @@ func (s *Server) handleInferenceAPI(w http.ResponseWriter, r *http.Request, segs
 		}
 		s.mu.RLock()
 		ep, exists := s.inferenceEndpoints[inferenceID]
+		var epTaskType string
+		if exists && ep != nil {
+			epTaskType, _ = ep["task_type"].(string)
+		}
 		s.mu.RUnlock()
 		if !exists {
 			writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("Inference endpoint not found [%s]", inferenceID))
 			return
 		}
-		epTaskType, _ := ep["task_type"].(string)
 		isChunkingAction := taskType == "chunking" && (epTaskType == "text_embedding" || epTaskType == "sparse_embedding")
 		if taskType != "" && taskType != "_inference" && taskType != epTaskType && !isChunkingAction {
 			writeESError(w, http.StatusBadRequest, "illegal_argument_exception", fmt.Sprintf("Inference endpoint [%s] is for task [%s], not [%s]", inferenceID, epTaskType, taskType))
@@ -10037,18 +10971,23 @@ func (s *Server) handleConnectorSecretsR66(w http.ResponseWriter, r *http.Reques
 			return
 		}
 		if secID == "" {
-			secID = fmt.Sprintf("connector-secret-%d", len(secStore)+1)
+			secID = "connector-secret-" + randomCryptoTokenB64R67(12)
 			for secStore[secID] != nil {
-				secID = fmt.Sprintf("connector-secret-%d-%d", len(secStore)+1, time.Now().UTC().UnixNano()%10000)
+				secID = "connector-secret-" + randomCryptoTokenB64R67(12)
 			}
 		} else if secStore[secID] != nil {
 			s.mu.Unlock()
 			writeESError(w, http.StatusConflict, "resource_already_exists_exception", fmt.Sprintf("Connector secret [%s] already exists", secID))
 			return
 		}
+		if len(secStore) >= maxAdminStoreEntriesR67 {
+			s.mu.Unlock()
+			writeESError(w, http.StatusTooManyRequests, "es_rejected_execution_exception", "connector secret store limit reached")
+			return
+		}
 		entry := map[string]any{
 			"id":         secID,
-			"value":      valStr,
+			"__value":    valStr,
 			"created_at": nowISO,
 			"updated_at": nowISO,
 		}
@@ -10084,6 +11023,11 @@ func (s *Server) handleConnectorSecretsR66(w http.ResponseWriter, r *http.Reques
 			s.mu.Lock()
 			secStore := ensureSecretStoreLocked()
 			prevEntry, existed := secStore[secID].(map[string]any)
+			if !existed && len(secStore) >= maxAdminStoreEntriesR67 {
+				s.mu.Unlock()
+				writeESError(w, http.StatusTooManyRequests, "es_rejected_execution_exception", "connector secret store limit reached")
+				return
+			}
 			createdAt := nowISO
 			if existed && prevEntry != nil {
 				if ca, okCA := prevEntry["created_at"].(string); okCA && ca != "" {
@@ -10092,7 +11036,7 @@ func (s *Server) handleConnectorSecretsR66(w http.ResponseWriter, r *http.Reques
 			}
 			entry := map[string]any{
 				"id":         secID,
-				"value":      valStr,
+				"__value":    valStr,
 				"created_at": createdAt,
 				"updated_at": nowISO,
 			}
@@ -10118,7 +11062,7 @@ func (s *Server) handleConnectorSecretsR66(w http.ResponseWriter, r *http.Reques
 			var entryCopy map[string]any
 			if secStore := s.connectors[connectorSecretsStoreKeyR66]; secStore != nil {
 				if entry, okE := secStore[secID].(map[string]any); okE && entry != nil {
-					entryCopy = deepCloneDocMap(entry)
+					entryCopy = sanitizeConnectorSecretCopyR67(entry)
 				}
 			}
 			s.mu.RUnlock()
@@ -10223,7 +11167,13 @@ func (s *Server) handleConnectorAPI(w http.ResponseWriter, r *http.Request, segs
 			}
 			newID, _ := body["id"].(string)
 			if newID == "" {
-				newID = fmt.Sprintf("sync-job-%d", len(s.connectorSyncJobs)+1)
+				newID = "sync-job-" + randomCryptoTokenB64R67(12)
+				for s.connectorSyncJobs[newID] != nil {
+					newID = "sync-job-" + randomCryptoTokenB64R67(12)
+				}
+			}
+			if _, existedJob := s.connectorSyncJobs[newID]; !existedJob {
+				evictFIFOEntriesLockedR67(s.connectorSyncJobs, maxAdminStoreEntriesR67)
 			}
 			jobObj := map[string]any{
 				"id":           newID,
@@ -10441,6 +11391,15 @@ func (s *Server) handleConnectorAPI(w http.ResponseWriter, r *http.Request, segs
 			return
 		}
 		_, existed := s.connectors[connID]
+		connCountExisting := len(s.connectors)
+		if s.connectors[connectorSecretsStoreKeyR66] != nil {
+			connCountExisting--
+		}
+		if !existed && connCountExisting >= maxAdminStoreEntriesR67 {
+			s.mu.Unlock()
+			writeESError(w, http.StatusTooManyRequests, "es_rejected_execution_exception", "connector store limit reached")
+			return
+		}
 		isNative, _ := body["is_native"].(bool)
 		status, _ := body["status"].(string)
 		if status == "" {
@@ -10628,8 +11587,18 @@ func (s *Server) handleConnectorAPI(w http.ResponseWriter, r *http.Request, segs
 				conn["pipeline"] = body
 			}
 		case "_last_sync":
-			for k, v := range body {
-				conn[k] = v
+			for _, allowedKey := range []string{
+				"last_sync_status",
+				"last_synced",
+				"last_sync_error",
+				"last_sync_scheduled_at",
+				"last_sync_doc_count",
+				"last_sync_indexed_count",
+				"last_sync_deleted_count",
+			} {
+				if v, has := body[allowedKey]; has {
+					conn[allowedKey] = deepCloneIngestValue(v)
+				}
 			}
 		case "_check_in":
 			conn["last_seen"] = nowISO
@@ -10890,7 +11859,7 @@ func (s *Server) handleApplicationAPI(w http.ResponseWriter, r *http.Request, se
 			s.mu.RLock()
 			colls := make(map[string]any, len(s.analyticsCollections))
 			for k, v := range s.analyticsCollections {
-				colls[k] = v
+				colls[k] = deepCloneDocMap(v)
 			}
 			s.mu.RUnlock()
 			if r.Method == http.MethodHead {
@@ -10915,6 +11884,10 @@ func (s *Server) handleApplicationAPI(w http.ResponseWriter, r *http.Request, se
 		case collName != "" && eventLit == "" && (r.Method == http.MethodGet || r.Method == http.MethodHead):
 			s.mu.RLock()
 			coll, exists := s.analyticsCollections[collName]
+			var collCopy map[string]any
+			if exists && coll != nil {
+				collCopy = deepCloneDocMap(coll)
+			}
 			s.mu.RUnlock()
 			if !exists {
 				writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("Analytics collection [%s] not found", collName))
@@ -10924,7 +11897,7 @@ func (s *Server) handleApplicationAPI(w http.ResponseWriter, r *http.Request, se
 				w.WriteHeader(http.StatusOK)
 				return
 			}
-			writeJSON(w, http.StatusOK, map[string]any{collName: coll})
+			writeJSON(w, http.StatusOK, map[string]any{collName: collCopy})
 
 		case collName != "" && eventLit == "" && r.Method == http.MethodDelete:
 			s.mu.Lock()
@@ -13140,7 +14113,17 @@ func (s *Server) handleSQLAPI(w http.ResponseWriter, r *http.Request, segs []str
 			writeESError(w, http.StatusBadRequest, "verification_exception", "cursor is required")
 			return
 		}
+		caller, callerIsAdmin := s.requestPrincipalIdentityR67(r)
 		s.mu.Lock()
+		for _, k := range []string{cursor, cursor + "_cursor"} {
+			if entry, exists := s.sqlAsyncSearches[k]; exists && entry != nil {
+				if owner, _ := entry["__owner_principal"].(string); owner != "" && !callerIsAdmin && caller != owner {
+					s.mu.Unlock()
+					writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("sql cursor [%s] not found", cursor))
+					return
+				}
+			}
+		}
 		delete(s.sqlAsyncSearches, cursor)
 		delete(s.sqlAsyncSearches, cursor+"_cursor")
 		s.mu.Unlock()
@@ -13160,10 +14143,17 @@ func (s *Server) handleSQLAPI(w http.ResponseWriter, r *http.Request, segs []str
 				return
 			}
 			id := strings.TrimSpace(segs[3])
+			caller, callerIsAdmin := s.requestPrincipalIdentityR67(r)
 			s.mu.RLock()
-			_, exists := s.sqlAsyncSearches[id]
+			entry, exists := s.sqlAsyncSearches[id]
+			authorized := exists && entry != nil
+			if authorized {
+				if owner, _ := entry["__owner_principal"].(string); owner != "" && !callerIsAdmin && caller != owner {
+					authorized = false
+				}
+			}
 			s.mu.RUnlock()
-			if !exists {
+			if !authorized {
 				if r.Method == http.MethodHead {
 					w.WriteHeader(http.StatusNotFound)
 					return
@@ -13189,12 +14179,20 @@ func (s *Server) handleSQLAPI(w http.ResponseWriter, r *http.Request, segs []str
 		if len(segs) == 4 && segs[2] == "delete" {
 			id = strings.TrimSpace(segs[3])
 		}
+		caller, callerIsAdmin := s.requestPrincipalIdentityR67(r)
 		switch r.Method {
 		case http.MethodGet, http.MethodHead:
 			s.mu.RLock()
 			resp, exists := s.sqlAsyncSearches[id]
+			var respCopy map[string]any
+			if exists && resp != nil {
+				if owner, _ := resp["__owner_principal"].(string); owner == "" || callerIsAdmin || caller == owner {
+					respCopy = deepCloneDocMap(resp)
+					delete(respCopy, "__owner_principal")
+				}
+			}
 			s.mu.RUnlock()
-			if !exists {
+			if respCopy == nil {
 				if r.Method == http.MethodHead {
 					w.WriteHeader(http.StatusNotFound)
 					return
@@ -13206,13 +14204,21 @@ func (s *Server) handleSQLAPI(w http.ResponseWriter, r *http.Request, segs []str
 				w.WriteHeader(http.StatusOK)
 				return
 			}
-			writeJSON(w, http.StatusOK, resp)
+			writeJSON(w, http.StatusOK, respCopy)
 		case http.MethodDelete:
 			s.mu.Lock()
-			_, exists := s.sqlAsyncSearches[id]
-			delete(s.sqlAsyncSearches, id)
+			entry, exists := s.sqlAsyncSearches[id]
+			allowedDelete := exists && entry != nil
+			if allowedDelete {
+				if owner, _ := entry["__owner_principal"].(string); owner != "" && !callerIsAdmin && caller != owner {
+					allowedDelete = false
+				}
+			}
+			if allowedDelete {
+				delete(s.sqlAsyncSearches, id)
+			}
 			s.mu.Unlock()
-			if !exists {
+			if !allowedDelete {
 				writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("sql async search [%s] not found", id))
 				return
 			}
@@ -13232,17 +14238,32 @@ func (s *Server) handleSQLAPI(w http.ResponseWriter, r *http.Request, segs []str
 		return
 	}
 	if cursorStr, _ := body["cursor"].(string); strings.TrimSpace(cursorStr) != "" {
+		caller, callerIsAdmin := s.requestPrincipalIdentityR67(r)
 		s.mu.Lock()
 		curEntry, exists := s.sqlAsyncSearches[cursorStr+"_cursor"]
-		delete(s.sqlAsyncSearches, cursorStr+"_cursor")
+		var curCopy map[string]any
+		forbidden := false
+		if exists && curEntry != nil {
+			if owner, _ := curEntry["__owner_principal"].(string); owner != "" && !callerIsAdmin && caller != owner {
+				forbidden = true
+			} else {
+				curCopy = deepCloneDocMap(curEntry)
+				delete(curCopy, "__owner_principal")
+				delete(s.sqlAsyncSearches, cursorStr+"_cursor")
+			}
+		}
 		s.mu.Unlock()
-		if !exists {
+		if forbidden {
+			writeESError(w, http.StatusNotFound, "resource_not_found_exception", fmt.Sprintf("sql cursor [%s] not found", cursorStr))
+			return
+		}
+		if curCopy == nil {
 			writeJSONWithRequest(w, r, http.StatusOK, map[string]any{
 				"rows": []any{},
 			})
 			return
 		}
-		writeJSONWithRequest(w, r, http.StatusOK, curEntry)
+		writeJSONWithRequest(w, r, http.StatusOK, curCopy)
 		return
 	}
 	s.handleSQLQueryRound57(w, r, body)
@@ -13895,6 +14916,11 @@ func (s *Server) handleMLAnomalyDetectors(w http.ResponseWriter, r *http.Request
 		if s.mlJobs == nil {
 			s.mlJobs = make(map[string]map[string]any)
 		}
+		if _, exists := s.mlJobs[jobID]; !exists && len(s.mlJobs) >= maxAdminStoreEntriesR67 {
+			s.mu.Unlock()
+			writeESError(w, http.StatusTooManyRequests, "es_rejected_execution_exception", "ml job store limit reached")
+			return
+		}
 		s.mlJobs[jobID] = entry
 		cp := stripInternalUnderscoreKeys(entry)
 		s.mu.Unlock()
@@ -14126,6 +15152,11 @@ func (s *Server) handleMLDatafeeds(w http.ResponseWriter, r *http.Request, segs 
 		if s.mlDatafeeds == nil {
 			s.mlDatafeeds = make(map[string]map[string]any)
 		}
+		if _, exists := s.mlDatafeeds[dfID]; !exists && len(s.mlDatafeeds) >= maxAdminStoreEntriesR67 {
+			s.mu.Unlock()
+			writeESError(w, http.StatusTooManyRequests, "es_rejected_execution_exception", "ml datafeed store limit reached")
+			return
+		}
 		s.mlDatafeeds[dfID] = entry
 		cp := deepCloneDocMap(entry)
 		s.mu.Unlock()
@@ -14321,6 +15352,11 @@ func (s *Server) handleMLTrainedModels(w http.ResponseWriter, r *http.Request, s
 		s.mu.Lock()
 		if s.mlTrainedModels == nil {
 			s.mlTrainedModels = make(map[string]map[string]any)
+		}
+		if _, exists := s.mlTrainedModels[modelID]; !exists && len(s.mlTrainedModels) >= maxAdminStoreEntriesR67 {
+			s.mu.Unlock()
+			writeESError(w, http.StatusTooManyRequests, "es_rejected_execution_exception", "ml trained model store limit reached")
+			return
 		}
 		s.mlTrainedModels[modelID] = entry
 		cp := s.formatTrainedModelConfigLocked(modelID, entry)

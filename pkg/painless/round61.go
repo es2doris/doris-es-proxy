@@ -29,6 +29,7 @@ import (
 	"net"
 	"net/netip"
 	"regexp"
+	"regexp/syntax"
 	"sort"
 	"strconv"
 	"strings"
@@ -50,6 +51,15 @@ const (
 	MaxRegexPatternLen = 4096
 	// RegexCacheCapacity is the maximum number of compiled *regexp.Regexp entries cached globally.
 	RegexCacheCapacity = 1024
+	// maxRegexRepeatExpansion caps worst-case OpRepeat expansion cost / repetition product
+	// so compact RE2 bombs like `((a{1000}){1000}){100}` are rejected before regexp.Compile.
+	maxRegexRepeatExpansion = 10_000
+	// maxRegexProgramWeight caps total expanded AST program weight across an entire pattern.
+	maxRegexProgramWeight = 65_536
+	// maxRegexASTNodes caps parsed *syntax.Regexp AST nodes walked during validation.
+	maxRegexASTNodes = 32_768
+	// maxRegexASTDepth caps parsed *syntax.Regexp AST nesting depth.
+	maxRegexASTDepth = 256
 )
 
 type boundedRegexCacheItem struct {
@@ -64,11 +74,18 @@ type boundedRegexLRUCache struct {
 	items map[string]*list.Element
 }
 
-var globalBoundedRegexCache = &boundedRegexLRUCache{
-	cap:   RegexCacheCapacity,
-	ll:    list.New(),
-	items: make(map[string]*list.Element, 128),
-}
+var (
+	globalBoundedRegexCache = &boundedRegexLRUCache{
+		cap:   RegexCacheCapacity,
+		ll:    list.New(),
+		items: make(map[string]*list.Element, 128),
+	}
+	globalBoundedRawRegexCache = &boundedRegexLRUCache{
+		cap:   RegexCacheCapacity,
+		ll:    list.New(),
+		items: make(map[string]*list.Element, 128),
+	}
+)
 
 func (c *boundedRegexLRUCache) get(key string) (*regexp.Regexp, bool) {
 	c.mu.Lock()
@@ -101,9 +118,144 @@ func (c *boundedRegexLRUCache) put(key string, re *regexp.Regexp) {
 	c.items[key] = elem
 }
 
-// CompileBoundedRegex enforces MaxRegexPatternLen (4096) and compiles (with Java named-group
-// normalization) using a thread-safe bounded 1,024-entry LRU cache. Exported so pkg/proxy
-// Grok and ingest processors can reuse the bounded cache.
+// validateBoundedRegexSyntaxR67 parses norm with syntax.Perl and walks the AST to bound
+// worst-case repeat expansion, AST node count, nesting depth, and total program weight
+// before regexp.Compile can allocate large NFA/DFA tables.
+func validateBoundedRegexSyntaxR67(norm string) error {
+	ast, err := syntax.Parse(norm, syntax.Perl)
+	if err != nil {
+		if se, ok := err.(*syntax.Error); ok && se.Code == syntax.ErrInvalidRepeatSize {
+			return &painlessExceptionError{
+				exType:  "IllegalArgumentException",
+				message: err.Error(),
+			}
+		}
+		return err
+	}
+	var astNodes int64
+	_, _, err = walkBoundedRegexSyntaxR67(ast, 0, &astNodes)
+	return err
+}
+
+func walkBoundedRegexSyntaxR67(re *syntax.Regexp, depth int, astNodes *int64) (int64, int64, error) {
+	if re == nil {
+		return 1, 1, nil
+	}
+	if depth > maxRegexASTDepth {
+		return 0, 0, &painlessExceptionError{
+			exType:  "IllegalArgumentException",
+			message: fmt.Sprintf("regex syntax tree depth exceeds maximum (%d)", maxRegexASTDepth),
+		}
+	}
+	*astNodes++
+	if *astNodes > maxRegexASTNodes {
+		return 0, 0, &painlessExceptionError{
+			exType:  "IllegalArgumentException",
+			message: fmt.Sprintf("regex AST node count exceeds maximum (%d)", maxRegexASTNodes),
+		}
+	}
+	switch re.Op {
+	case syntax.OpRepeat:
+		factor := int64(re.Max)
+		if re.Max < 0 {
+			factor = int64(re.Min)
+		}
+		if factor < 1 {
+			factor = 1
+		}
+		var subWeight, subRepeat int64 = 1, 1
+		if len(re.Sub) > 0 {
+			var err error
+			subWeight, subRepeat, err = walkBoundedRegexSyntaxR67(re.Sub[0], depth+1, astNodes)
+			if err != nil {
+				return 0, 0, err
+			}
+		}
+		if subRepeat > maxRegexRepeatExpansion/factor {
+			return 0, 0, &painlessExceptionError{
+				exType:  "IllegalArgumentException",
+				message: fmt.Sprintf("regex repetition expansion exceeds maximum (%d)", maxRegexRepeatExpansion),
+			}
+		}
+		repeatProd := subRepeat * factor
+		if subWeight > maxRegexRepeatExpansion/factor {
+			return 0, 0, &painlessExceptionError{
+				exType:  "IllegalArgumentException",
+				message: fmt.Sprintf("regex expanded repeat cost exceeds maximum (%d)", maxRegexRepeatExpansion),
+			}
+		}
+		return subWeight * factor, repeatProd, nil
+
+	case syntax.OpConcat, syntax.OpAlternate:
+		var totalWeight int64
+		var maxRepeat int64 = 1
+		for _, sub := range re.Sub {
+			sw, sr, err := walkBoundedRegexSyntaxR67(sub, depth+1, astNodes)
+			if err != nil {
+				return 0, 0, err
+			}
+			if sr > maxRepeat {
+				maxRepeat = sr
+			}
+			if totalWeight > maxRegexProgramWeight-sw {
+				return 0, 0, &painlessExceptionError{
+					exType:  "IllegalArgumentException",
+					message: fmt.Sprintf("regex program weight exceeds maximum (%d)", maxRegexProgramWeight),
+				}
+			}
+			totalWeight += sw
+		}
+		if totalWeight < 1 {
+			totalWeight = 1
+		}
+		return totalWeight, maxRepeat, nil
+
+	case syntax.OpCapture, syntax.OpStar, syntax.OpPlus, syntax.OpQuest:
+		var subWeight, subRepeat int64 = 1, 1
+		if len(re.Sub) > 0 {
+			var err error
+			subWeight, subRepeat, err = walkBoundedRegexSyntaxR67(re.Sub[0], depth+1, astNodes)
+			if err != nil {
+				return 0, 0, err
+			}
+		}
+		if subWeight >= maxRegexProgramWeight {
+			return 0, 0, &painlessExceptionError{
+				exType:  "IllegalArgumentException",
+				message: fmt.Sprintf("regex program weight exceeds maximum (%d)", maxRegexProgramWeight),
+			}
+		}
+		return subWeight + 1, subRepeat, nil
+
+	case syntax.OpLiteral:
+		w := int64(len(re.Rune))
+		if w < 1 {
+			w = 1
+		}
+		return w, 1, nil
+
+	case syntax.OpCharClass:
+		w := int64(len(re.Rune)) / 32
+		if w < 1 {
+			w = 1
+		}
+		return w, 1, nil
+
+	default:
+		return 1, 1, nil
+	}
+}
+
+func compileSyntaxGuardedRegexR67(expr string) (*regexp.Regexp, error) {
+	if err := validateBoundedRegexSyntaxR67(expr); err != nil {
+		return nil, err
+	}
+	return regexp.Compile(expr)
+}
+
+// CompileBoundedRegex enforces MaxRegexPatternLen (4096), validates AST expansion bounds,
+// and compiles (with Java named-group normalization) using a thread-safe bounded 1,024-entry
+// LRU cache. Exported so pkg/proxy Grok and ingest processors can reuse the bounded cache.
 func CompileBoundedRegex(pattern string) (*regexp.Regexp, error) {
 	if len(pattern) > MaxRegexPatternLen {
 		return nil, &painlessExceptionError{
@@ -115,11 +267,32 @@ func CompileBoundedRegex(pattern string) (*regexp.Regexp, error) {
 		return cached, nil
 	}
 	norm := normalizeJavaNamedGroupsPainless(pattern)
-	re, err := regexp.Compile(norm)
+	re, err := compileSyntaxGuardedRegexR67(norm)
 	if err != nil {
 		return nil, err
 	}
 	globalBoundedRegexCache.put(pattern, re)
+	return re, nil
+}
+
+// CompileBoundedRawRegex enforces MaxRegexPatternLen (4096), validates AST expansion bounds,
+// and compiles raw Go RE2 patterns (without Java named-group normalization) using a thread-safe
+// bounded 1,024-entry LRU cache. Exported for pkg/proxy ES|QL RLIKE, EQL, terms filters, and shredder.
+func CompileBoundedRawRegex(pattern string) (*regexp.Regexp, error) {
+	if len(pattern) > MaxRegexPatternLen {
+		return nil, &painlessExceptionError{
+			exType:  "IllegalArgumentException",
+			message: fmt.Sprintf("Regex pattern length %d exceeds maximum allowed length (%d)", len(pattern), MaxRegexPatternLen),
+		}
+	}
+	if cached, ok := globalBoundedRawRegexCache.get(pattern); ok {
+		return cached, nil
+	}
+	re, err := compileSyntaxGuardedRegexR67(pattern)
+	if err != nil {
+		return nil, err
+	}
+	globalBoundedRawRegexCache.put(pattern, re)
 	return re, nil
 }
 
@@ -135,7 +308,7 @@ func compileBoundedWrappedRegexRound61(prefix, innerPattern, suffix string) (*re
 		return cached, nil
 	}
 	norm := normalizeJavaNamedGroupsPainless(full)
-	re, err := regexp.Compile(norm)
+	re, err := compileSyntaxGuardedRegexR67(norm)
 	if err != nil {
 		return nil, err
 	}

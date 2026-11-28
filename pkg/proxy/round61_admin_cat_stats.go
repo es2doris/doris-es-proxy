@@ -4495,7 +4495,10 @@ func (s *Server) authorizeMonitoringBulkRequestR66(r *http.Request) (int, string
 
 	authHdr := strings.TrimSpace(r.Header.Get("Authorization"))
 	if authHdr == "" {
-		if basicAuthUser != "" || proxyAPIKey != "" {
+		s.mu.RLock()
+		hasDynamicAuth := len(s.securityUsers) > 0 || len(s.securityAPIKeys) > 0 || len(s.securityServiceTokens) > 0
+		s.mu.RUnlock()
+		if basicAuthUser != "" || proxyAPIKey != "" || hasDynamicAuth {
 			return http.StatusUnauthorized, "security_exception", "missing authentication credentials for REST request [/_monitoring/bulk]"
 		}
 		return 0, "", ""
@@ -4620,6 +4623,9 @@ func (s *Server) handleMonitoringBulkR65(w http.ResponseWriter, r *http.Request)
 		writeESError(w, status, errType, errReason)
 		return
 	}
+	if r.URL != nil && strings.HasPrefix(r.URL.Path, "/_xpack/monitoring/") {
+		emitESDeprecationWarningRound61(w, s, r, fmt.Sprintf("[%s %s] is deprecated! Use [%s /_monitoring/bulk] instead.", r.Method, r.URL.Path, r.Method))
+	}
 
 	q := r.URL.Query()
 	systemID := strings.TrimSpace(q.Get("system_id"))
@@ -4663,8 +4669,10 @@ func (s *Server) handleMonitoringBulkR65(w http.ResponseWriter, r *http.Request)
 				segs = append(segs, seg)
 			}
 		}
-		if len(segs) == 3 && segs[0] == "_monitoring" && segs[2] == "bulk" {
+		if len(segs) == 3 && segs[0] == "_monitoring" && (segs[2] == "bulk" || segs[2] == "_bulk") {
 			defaultType = segs[1]
+		} else if len(segs) == 4 && segs[0] == "_xpack" && segs[1] == "monitoring" && (segs[3] == "bulk" || segs[3] == "_bulk") {
+			defaultType = segs[2]
 		}
 	}
 	safeSysID := strings.ToLower(systemID)

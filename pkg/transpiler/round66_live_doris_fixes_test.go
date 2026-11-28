@@ -233,7 +233,7 @@ func TestRound66FlatMultiLevelNestedAndSortSQL(t *testing.T) {
 	assertNoNestedLambdaSQLR66(t, plan.HitsSQL)
 	for _, want := range []string{
 		"ARRAY_INTERSECT(", "ARRAY_UNION(", "ARRAY_EXCEPT(", "ARRAY_REMOVE(", "SPLIT_BY_STRING(",
-		"TRY_CAST(json_extract_string(_el, '$.price') AS DOUBLE)", "TRY_CAST(NULL AS DOUBLE)",
+		`TRY_CAST(json_extract_string(_el, '$."price"') AS DOUBLE)`, "TRY_CAST(NULL AS DOUBLE)",
 	} {
 		if !strings.Contains(plan.HitsSQL, want) {
 			t.Fatalf("expected flat nested operator %q in SQL:\n%s", want, plan.HitsSQL)

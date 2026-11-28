@@ -380,6 +380,7 @@ func (s *IndexSchema) LockAutoDims(fieldPath string, dims int) error {
 		}
 	}
 	LockAutoDimsInMapping(s.RawMapping, fieldPath, dims)
+	s.RefreshMappingHash()
 	return nil
 }
 

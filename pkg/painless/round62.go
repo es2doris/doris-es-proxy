@@ -1534,11 +1534,11 @@ func CompileGrokPattern(pattern string) (*GrokExtractor, error) {
 	if len(regexBody) > MaxExpandedGrokRegexLen {
 		return nil, newGrokExpandedLenErrorRound63(len(regexBody))
 	}
-	re, rErr := regexp.Compile(regexBody)
+	re, rErr := compileSyntaxGuardedRegexR67(regexBody)
 	if rErr != nil {
 		return nil, &painlessExceptionError{
 			exType:  "IllegalArgumentException",
-			message: fmt.Sprintf("error compiling grok pattern [%s]: %v", pattern, rErr),
+			message: fmt.Sprintf("error compiling grok pattern [%s]: %v", truncatePatternForErrRound63(pattern, 128), rErr),
 		}
 	}
 	ext := &GrokExtractor{

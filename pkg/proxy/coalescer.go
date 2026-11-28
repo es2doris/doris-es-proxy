@@ -21,6 +21,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -39,14 +41,18 @@ const (
 	DefaultQueryCacheMaxEntryBytes = 1 * 1024 * 1024
 )
 
+const maxConcurrentCoalescerFlushes = 16
+
 type coalesceSubmission struct {
 	data     []byte
 	canceled bool
+	docIDs   []string
 }
 
 type coalesceBatch struct {
 	buf           bytes.Buffer
 	submissions   []*coalesceSubmission
+	pendingDocIDs map[string]int
 	totalBytes    int
 	flushing      bool
 	done          chan struct{}
@@ -55,40 +61,59 @@ type coalesceBatch struct {
 	activeWaiters int64
 }
 
-// StreamLoadCoalescer implements group-commit micro-batching across concurrent `/_bulk` and
-// single-document `PUT /{index}/_doc/{id}` requests targeting the same Apache Doris table,
-// preventing tablet version exhaustion (`-235 TOO_MANY_VERSIONS`) under high-concurrency writes.
+type tableCoalesceShard struct {
+	mu       sync.Mutex
+	batch    *coalesceBatch
+	inflight map[*coalesceBatch]struct{}
+}
+
+// StreamLoadCoalescer implements per-table sharded group-commit micro-batching across concurrent
+// `/_bulk` and single-document `PUT /{index}/_doc/{id}` requests targeting Apache Doris tables,
+// preventing tablet version exhaustion (`-235 TOO_MANY_VERSIONS`) without cross-table lock contention.
 type StreamLoadCoalescer struct {
+	shardsMu sync.RWMutex
+	shards   map[string]*tableCoalesceShard
+
+	// Legacy lock and maps retained only so white-box unit tests (e.g. round8_test.go) setting
+	// c.batches directly continue to work; hot-path operations lock only the target table shard.
 	mu                sync.Mutex
 	window            time.Duration
 	maxBytes          int
 	closed            bool
 	batches           map[string]*coalesceBatch
 	inflight          map[*coalesceBatch]string
+	windowNs          atomic.Int64
+	maxBytesAtom      atomic.Int64
+	closedFlag        atomic.Bool
 	loadFn            func(ctx context.Context, table string, ndjson []byte, syncRefresh bool) error
 	coalescedRequests int64
 	coalescedFlushes  int64
 }
 
 func newStreamLoadCoalescer(loadFn func(ctx context.Context, table string, ndjson []byte, syncRefresh bool) error) *StreamLoadCoalescer {
-	return &StreamLoadCoalescer{
+	c := &StreamLoadCoalescer{
+		shards:   make(map[string]*tableCoalesceShard),
 		maxBytes: DefaultBulkCoalesceMaxBytes,
 		batches:  make(map[string]*coalesceBatch),
 		inflight: make(map[*coalesceBatch]string),
 		loadFn:   loadFn,
 	}
+	c.maxBytesAtom.Store(int64(DefaultBulkCoalesceMaxBytes))
+	return c
 }
 
 // Configure sets the group-commit time window and maximum batch byte threshold.
 // Setting `window <= 0` disables micro-batch coalescing (each write executes immediately).
 func (c *StreamLoadCoalescer) Configure(window time.Duration, maxBytes int) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.window = window
 	if maxBytes <= 0 {
 		maxBytes = DefaultBulkCoalesceMaxBytes
 	}
+	c.windowNs.Store(int64(window))
+	c.maxBytesAtom.Store(int64(maxBytes))
+	c.mu.Lock()
+	c.window = window
 	c.maxBytes = maxBytes
+	c.mu.Unlock()
 }
 
 // Stats returns the total number of coalesced write requests and executed backend Stream Load flushes.
@@ -96,9 +121,95 @@ func (c *StreamLoadCoalescer) Stats() (requests, flushes int64) {
 	return atomic.LoadInt64(&c.coalescedRequests), atomic.LoadInt64(&c.coalescedFlushes)
 }
 
+func (c *StreamLoadCoalescer) getShard(table string) *tableCoalesceShard {
+	c.shardsMu.RLock()
+	sh := c.shards[table]
+	c.shardsMu.RUnlock()
+	return sh
+}
+
+func (c *StreamLoadCoalescer) getOrCreateShard(table string) *tableCoalesceShard {
+	c.shardsMu.RLock()
+	sh := c.shards[table]
+	c.shardsMu.RUnlock()
+	if sh != nil {
+		return sh
+	}
+	c.shardsMu.Lock()
+	defer c.shardsMu.Unlock()
+	if c.shards == nil {
+		c.shards = make(map[string]*tableCoalesceShard)
+	}
+	if sh = c.shards[table]; sh == nil {
+		sh = &tableCoalesceShard{
+			inflight: make(map[*coalesceBatch]struct{}),
+		}
+		c.shards[table] = sh
+	}
+	return sh
+}
+
+type coalesceShardSnapshot struct {
+	table string
+	shard *tableCoalesceShard
+}
+
+func (c *StreamLoadCoalescer) snapshotShards() []coalesceShardSnapshot {
+	c.shardsMu.RLock()
+	defer c.shardsMu.RUnlock()
+	if len(c.shards) == 0 {
+		return nil
+	}
+	out := make([]coalesceShardSnapshot, 0, len(c.shards))
+	for tbl, sh := range c.shards {
+		out = append(out, coalesceShardSnapshot{table: tbl, shard: sh})
+	}
+	return out
+}
+
+func extractDocIDsFromNDJSON(ndjson []byte) []string {
+	var docIDs []string
+	var probe struct {
+		ID string `json:"_id"`
+	}
+	start := 0
+	for start < len(ndjson) {
+		end := bytes.IndexByte(ndjson[start:], '\n')
+		var line []byte
+		if end < 0 {
+			line = ndjson[start:]
+			start = len(ndjson)
+		} else {
+			line = ndjson[start : start+end]
+			start += end + 1
+		}
+		line = bytes.TrimSpace(line)
+		if len(line) == 0 || !bytes.Contains(line, []byte(`"_id"`)) {
+			continue
+		}
+		probe.ID = ""
+		if json.Unmarshal(line, &probe) == nil && probe.ID != "" {
+			docIDs = append(docIDs, probe.ID)
+		}
+	}
+	return docIDs
+}
+
+func deriveCoalescerFlushContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	now := time.Now()
+	defaultDL := now.Add(30 * time.Second)
+	if dl, hasDL := ctx.Deadline(); hasDL {
+		if dl.Before(defaultDL) {
+			defaultDL = dl
+		}
+		return context.WithDeadline(context.WithoutCancel(ctx), defaultDL)
+	}
+	return context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+}
+
 // Submit enqueues `ndjson` for `table`. When coalescing is disabled (`window <= 0`), it executes
 // `loadFn` directly. When coalescing is enabled, concurrent callers within `window` share a single
-// Doris Stream Load transaction and receive the shared commit result.
+// Doris Stream Load transaction and receive the shared commit result without blocking other tables.
 func (c *StreamLoadCoalescer) Submit(ctx context.Context, table string, ndjson []byte, syncRefresh bool) error {
 	if len(bytes.TrimSpace(ndjson)) == 0 {
 		return nil
@@ -106,70 +217,95 @@ func (c *StreamLoadCoalescer) Submit(ctx context.Context, table string, ndjson [
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	c.mu.Lock()
-	window := c.window
-	maxBytes := c.maxBytes
-	if window <= 0 || c.closed {
-		c.mu.Unlock()
+	window := time.Duration(c.windowNs.Load())
+	maxBytes := int(c.maxBytesAtom.Load())
+	if maxBytes <= 0 {
+		maxBytes = DefaultBulkCoalesceMaxBytes
+	}
+	if window <= 0 || c.closedFlag.Load() {
 		return c.loadFn(ctx, table, ndjson, syncRefresh)
 	}
 
-	atomic.AddInt64(&c.coalescedRequests, 1)
-	b, exists := c.batches[table]
-	if !exists {
-		b = &coalesceBatch{
-			done: make(chan struct{}),
-		}
-		c.batches[table] = b
-	}
+	docIDs := extractDocIDsFromNDJSON(ndjson)
 	entryBytes := make([]byte, len(ndjson), len(ndjson)+1)
 	copy(entryBytes, ndjson)
 	if entryBytes[len(entryBytes)-1] != '\n' {
 		entryBytes = append(entryBytes, '\n')
 	}
-	sub := &coalesceSubmission{data: entryBytes}
+
+	sh := c.getOrCreateShard(table)
+	sh.mu.Lock()
+	if c.closedFlag.Load() {
+		sh.mu.Unlock()
+		return c.loadFn(ctx, table, ndjson, syncRefresh)
+	}
+
+	atomic.AddInt64(&c.coalescedRequests, 1)
+	b := sh.batch
+	if b == nil {
+		b = &coalesceBatch{
+			pendingDocIDs: make(map[string]int),
+			done:          make(chan struct{}),
+		}
+		sh.batch = b
+	}
+	if b.pendingDocIDs == nil {
+		b.pendingDocIDs = make(map[string]int)
+	}
+	sub := &coalesceSubmission{data: entryBytes, docIDs: docIDs}
 	b.submissions = append(b.submissions, sub)
 	b.totalBytes += len(entryBytes)
+	for _, id := range docIDs {
+		b.pendingDocIDs[id]++
+	}
 
 	if syncRefresh || b.totalBytes >= maxBytes {
 		if b.timer != nil {
 			b.timer.Stop()
 		}
 		b.flushing = true
-		delete(c.batches, table)
-		c.inflight[b] = table
-		c.mu.Unlock()
+		sh.batch = nil
+		sh.inflight[b] = struct{}{}
+		sh.mu.Unlock()
 		defer func() {
-			c.mu.Lock()
-			delete(c.inflight, b)
-			c.mu.Unlock()
+			sh.mu.Lock()
+			delete(sh.inflight, b)
+			sh.mu.Unlock()
 		}()
-		flushCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		flushCtx, cancel := deriveCoalescerFlushContext(ctx)
 		defer cancel()
-		c.executeBatch(flushCtx, table, b, syncRefresh)
+		c.executeBatch(flushCtx, sh, table, b, syncRefresh)
 		return b.err
 	}
 	atomic.AddInt64(&b.activeWaiters, 1)
 	if b.timer == nil {
 		batchRef := b
+		shardRef := sh
 		b.timer = time.AfterFunc(window, func() {
-			c.onTimerFlush(table, batchRef)
+			c.onTimerFlush(shardRef, table, batchRef)
 		})
 	}
 	doneCh := b.done
-	c.mu.Unlock()
+	sh.mu.Unlock()
 
 	select {
 	case <-doneCh:
 		return b.err
 	case <-ctx.Done():
-		c.mu.Lock()
-		if !b.flushing {
+		sh.mu.Lock()
+		if !b.flushing && !sub.canceled {
 			sub.canceled = true
 			b.totalBytes -= len(sub.data)
+			for _, id := range sub.docIDs {
+				if cnt := b.pendingDocIDs[id]; cnt <= 1 {
+					delete(b.pendingDocIDs, id)
+				} else {
+					b.pendingDocIDs[id] = cnt - 1
+				}
+			}
 		}
 		atomic.AddInt64(&b.activeWaiters, -1)
-		c.mu.Unlock()
+		sh.mu.Unlock()
 		return ctx.Err()
 	}
 }
@@ -178,6 +314,10 @@ func batchContainsDocID(b *coalesceBatch, docID string) bool {
 	if b == nil || docID == "" {
 		return false
 	}
+	if b.pendingDocIDs != nil {
+		return b.pendingDocIDs[docID] > 0
+	}
+	// Legacy fallback only when a synthetic batch bypassed Submit.
 	idNeedle, err := json.Marshal(docID)
 	if err != nil {
 		return true
@@ -203,26 +343,29 @@ func batchContainsDocID(b *coalesceBatch, docID string) bool {
 }
 
 // FlushTableIfDocPending flushes any buffered or in-flight batch for `table` only when `docID`
-// is present in that batch, preserving group-commit coalescing across distinct document IDs while
-// guaranteeing linearizable `_version` / OCC reads on same-`_id` concurrent writes.
+// is present in that batch, using O(1) tracked `_id` membership under the table's shard lock.
 func (c *StreamLoadCoalescer) FlushTableIfDocPending(ctx context.Context, table, docID string) error {
 	if docID == "" {
 		return c.FlushTable(ctx, table)
 	}
-	c.mu.Lock()
+	sh := c.getShard(table)
+	if sh == nil {
+		return nil
+	}
 	needFlush := false
-	if b, exists := c.batches[table]; exists && batchContainsDocID(b, docID) {
+	sh.mu.Lock()
+	if sh.batch != nil && batchContainsDocID(sh.batch, docID) {
 		needFlush = true
 	}
 	if !needFlush {
-		for ib, tbl := range c.inflight {
-			if tbl == table && batchContainsDocID(ib, docID) {
+		for ib := range sh.inflight {
+			if batchContainsDocID(ib, docID) {
 				needFlush = true
 				break
 			}
 		}
 	}
-	c.mu.Unlock()
+	sh.mu.Unlock()
 	if !needFlush {
 		return nil
 	}
@@ -233,40 +376,68 @@ func (c *StreamLoadCoalescer) FlushTableIfDocPending(ctx context.Context, table,
 // batch, and waits for any in-flight flush to complete so subsequent point-lookups observe all
 // previously submitted writes.
 func (c *StreamLoadCoalescer) FlushTable(ctx context.Context, table string) error {
-	c.mu.Lock()
+	var firstErr error
 	var waitBatches []*coalesceBatch
+
+	if sh := c.getShard(table); sh != nil {
+		sh.mu.Lock()
+		for ib := range sh.inflight {
+			waitBatches = append(waitBatches, ib)
+		}
+		b := sh.batch
+		if b != nil {
+			if b.timer != nil {
+				b.timer.Stop()
+			}
+			b.flushing = true
+			sh.batch = nil
+			sh.inflight[b] = struct{}{}
+		}
+		sh.mu.Unlock()
+
+		if b != nil {
+			flushCtx, cancel := deriveCoalescerFlushContext(ctx)
+			c.executeBatch(flushCtx, sh, table, b, true)
+			cancel()
+			sh.mu.Lock()
+			delete(sh.inflight, b)
+			sh.mu.Unlock()
+			if b.err != nil {
+				firstErr = b.err
+			}
+		}
+	}
+
+	// Drain any legacy direct test batch (e.g. round8_test.go).
+	c.mu.Lock()
 	for ib, tbl := range c.inflight {
 		if tbl == table {
 			waitBatches = append(waitBatches, ib)
 		}
 	}
-	b, exists := c.batches[table]
-	if exists {
-		if b.timer != nil {
-			b.timer.Stop()
+	legacyBatch, legacyExists := c.batches[table]
+	if legacyExists {
+		if legacyBatch.timer != nil {
+			legacyBatch.timer.Stop()
 		}
-		b.flushing = true
+		legacyBatch.flushing = true
 		delete(c.batches, table)
-		c.inflight[b] = table
+		c.inflight[legacyBatch] = table
 	}
 	c.mu.Unlock()
 
-	if exists {
-		func() {
-			defer func() {
-				c.mu.Lock()
-				delete(c.inflight, b)
-				c.mu.Unlock()
-			}()
-			flushCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
-			defer cancel()
-			c.executeBatch(flushCtx, table, b, true)
-		}()
+	if legacyExists {
+		flushCtx, cancel := deriveCoalescerFlushContext(ctx)
+		c.executeBatch(flushCtx, nil, table, legacyBatch, true)
+		cancel()
+		c.mu.Lock()
+		delete(c.inflight, legacyBatch)
+		c.mu.Unlock()
+		if legacyBatch.err != nil && firstErr == nil {
+			firstErr = legacyBatch.err
+		}
 	}
-	var firstErr error
-	if exists && b.err != nil {
-		firstErr = b.err
-	}
+
 	for _, ib := range waitBatches {
 		select {
 		case <-ib.done:
@@ -280,62 +451,131 @@ func (c *StreamLoadCoalescer) FlushTable(ctx context.Context, table string) erro
 	return firstErr
 }
 
-// FlushAll stops any pending group-commit timers and synchronously flushes all buffered batches.
+type pendingFlushWork struct {
+	shard *tableCoalesceShard
+	table string
+	batch *coalesceBatch
+}
+
+// FlushAll stops all pending group-commit timers and flushes all pending table batches concurrently
+// with a bounded worker pool while respecting `ctx`'s deadline when set.
 func (c *StreamLoadCoalescer) FlushAll(ctx context.Context) error {
-	c.mu.Lock()
+	_, hasDL := ctx.Deadline()
+	if hasDL && ctx.Err() != nil {
+		return ctx.Err()
+	}
+
+	var pending []pendingFlushWork
 	var waitBatches []*coalesceBatch
+
+	for _, item := range c.snapshotShards() {
+		sh := item.shard
+		sh.mu.Lock()
+		for ib := range sh.inflight {
+			waitBatches = append(waitBatches, ib)
+		}
+		if b := sh.batch; b != nil {
+			if b.timer != nil {
+				b.timer.Stop()
+			}
+			b.flushing = true
+			sh.batch = nil
+			sh.inflight[b] = struct{}{}
+			pending = append(pending, pendingFlushWork{shard: sh, table: item.table, batch: b})
+		}
+		sh.mu.Unlock()
+	}
+
+	// Also drain any legacy test batches in c.batches.
+	c.mu.Lock()
 	for ib := range c.inflight {
 		waitBatches = append(waitBatches, ib)
 	}
-	if len(c.batches) == 0 {
-		c.mu.Unlock()
-		var firstErr error
-		for _, ib := range waitBatches {
-			select {
-			case <-ib.done:
-				if ib.err != nil && firstErr == nil {
-					firstErr = ib.err
-				}
-			case <-ctx.Done():
-				return ctx.Err()
-			}
-		}
-		return firstErr
-	}
-	pending := make(map[string]*coalesceBatch, len(c.batches))
 	for tbl, b := range c.batches {
 		if b.timer != nil {
 			b.timer.Stop()
 		}
 		b.flushing = true
-		pending[tbl] = b
 		c.inflight[b] = tbl
+		pending = append(pending, pendingFlushWork{shard: nil, table: tbl, batch: b})
 	}
-	c.batches = make(map[string]*coalesceBatch)
+	if len(c.batches) > 0 {
+		c.batches = make(map[string]*coalesceBatch)
+	}
 	c.mu.Unlock()
 
-	var firstErr error
-	for tbl, b := range pending {
-		flushCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
-		c.executeBatch(flushCtx, tbl, b, true)
-		cancel()
-		c.mu.Lock()
-		delete(c.inflight, b)
-		c.mu.Unlock()
-		if b.err != nil && firstErr == nil {
-			firstErr = b.err
+	var (
+		errMu    sync.Mutex
+		firstErr error
+		wg       sync.WaitGroup
+	)
+	recordErr := func(err error) {
+		if err == nil {
+			return
 		}
+		errMu.Lock()
+		if firstErr == nil {
+			firstErr = err
+		}
+		errMu.Unlock()
 	}
+
+	if len(pending) > 0 {
+		sem := make(chan struct{}, maxConcurrentCoalescerFlushes)
+	flushLoop:
+		for _, w := range pending {
+			if hasDL {
+				select {
+				case sem <- struct{}{}:
+				case <-ctx.Done():
+					recordErr(ctx.Err())
+					w.batch.err = ctx.Err()
+					if w.batch.done != nil {
+						close(w.batch.done)
+					}
+					if w.shard != nil {
+						w.shard.mu.Lock()
+						delete(w.shard.inflight, w.batch)
+						w.shard.mu.Unlock()
+					} else {
+						c.mu.Lock()
+						delete(c.inflight, w.batch)
+						c.mu.Unlock()
+					}
+					continue flushLoop
+				}
+			} else {
+				sem <- struct{}{}
+			}
+
+			wg.Add(1)
+			go func(work pendingFlushWork) {
+				defer wg.Done()
+				defer func() { <-sem }()
+				flushCtx, cancel := deriveCoalescerFlushContext(ctx)
+				c.executeBatch(flushCtx, work.shard, work.table, work.batch, true)
+				cancel()
+				if work.shard != nil {
+					work.shard.mu.Lock()
+					delete(work.shard.inflight, work.batch)
+					work.shard.mu.Unlock()
+				} else {
+					c.mu.Lock()
+					delete(c.inflight, work.batch)
+					c.mu.Unlock()
+				}
+				recordErr(work.batch.err)
+			}(w)
+		}
+		wg.Wait()
+	}
+
 	for _, ib := range waitBatches {
 		select {
 		case <-ib.done:
-			if ib.err != nil && firstErr == nil {
-				firstErr = ib.err
-			}
+			recordErr(ib.err)
 		case <-ctx.Done():
-			if firstErr == nil {
-				firstErr = ctx.Err()
-			}
+			recordErr(ctx.Err())
 		}
 	}
 	return firstErr
@@ -344,43 +584,49 @@ func (c *StreamLoadCoalescer) FlushAll(ctx context.Context) error {
 // Close marks the coalescer as closed, flushes all pending batches, and waits for any in-flight
 // timer or byte-threshold flushes to finish before returning.
 func (c *StreamLoadCoalescer) Close(ctx context.Context) error {
+	c.closedFlag.Store(true)
 	c.mu.Lock()
 	c.closed = true
 	c.mu.Unlock()
 	return c.FlushAll(ctx)
 }
 
-func (c *StreamLoadCoalescer) onTimerFlush(table string, target *coalesceBatch) {
-	c.mu.Lock()
-	cur, ok := c.batches[table]
-	if !ok || cur != target {
-		c.mu.Unlock()
+func (c *StreamLoadCoalescer) onTimerFlush(sh *tableCoalesceShard, table string, target *coalesceBatch) {
+	sh.mu.Lock()
+	if sh.batch != target {
+		sh.mu.Unlock()
 		return
 	}
-	delete(c.batches, table)
+	sh.batch = nil
 	if atomic.LoadInt64(&target.activeWaiters) <= 0 {
 		target.err = context.Canceled
 		close(target.done)
-		c.mu.Unlock()
+		sh.mu.Unlock()
 		return
 	}
 	target.flushing = true
-	c.inflight[target] = table
-	c.mu.Unlock()
+	sh.inflight[target] = struct{}{}
+	sh.mu.Unlock()
 	defer func() {
-		c.mu.Lock()
-		delete(c.inflight, target)
-		c.mu.Unlock()
+		sh.mu.Lock()
+		delete(sh.inflight, target)
+		sh.mu.Unlock()
 	}()
 
 	flushCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	c.executeBatch(flushCtx, table, target, false)
+	c.executeBatch(flushCtx, sh, table, target, false)
 }
 
-func (c *StreamLoadCoalescer) executeBatch(ctx context.Context, table string, b *coalesceBatch, syncRefresh bool) {
-	defer close(b.done)
-	c.mu.Lock()
+func (c *StreamLoadCoalescer) executeBatch(ctx context.Context, sh *tableCoalesceShard, table string, b *coalesceBatch, syncRefresh bool) {
+	if b.done != nil {
+		defer close(b.done)
+	}
+	if sh != nil {
+		sh.mu.Lock()
+	} else {
+		c.mu.Lock()
+	}
 	var buf bytes.Buffer
 	if b.buf.Len()+b.totalBytes > 0 {
 		buf.Grow(b.buf.Len() + b.totalBytes)
@@ -393,7 +639,11 @@ func (c *StreamLoadCoalescer) executeBatch(ctx context.Context, table string, b 
 			buf.Write(sub.data)
 		}
 	}
-	c.mu.Unlock()
+	if sh != nil {
+		sh.mu.Unlock()
+	} else {
+		c.mu.Unlock()
+	}
 	if buf.Len() == 0 {
 		return
 	}
@@ -410,12 +660,13 @@ type queryCacheEntry struct {
 // QueryResultCache caches compiled Elasticsearch `/_search` responses for a configurable TTL
 // and automatically invalidates all cached entries whenever any write or DDL operation occurs.
 type QueryResultCache struct {
-	mu         sync.RWMutex
-	ttl        time.Duration
-	maxEntries int
-	entries    map[string]queryCacheEntry
-	hits       int64
-	misses     int64
+	mu              sync.RWMutex
+	ttl             time.Duration
+	maxEntries      int
+	entries         map[string]queryCacheEntry
+	hits            int64
+	misses          int64
+	securityEpochFn func() uint64
 }
 
 func newQueryResultCache() *QueryResultCache {
@@ -423,6 +674,30 @@ func newQueryResultCache() *QueryResultCache {
 		maxEntries: DefaultQueryCacheMaxEntries,
 		entries:    make(map[string]queryCacheEntry),
 	}
+}
+
+// SetSecurityEpochFunc registers a provider returning the current security state epoch
+// so QueryResultCache keys stay isolated across security configuration mutations.
+func (qc *QueryResultCache) SetSecurityEpochFunc(fn func() uint64) {
+	if qc == nil {
+		return
+	}
+	qc.mu.Lock()
+	qc.securityEpochFn = fn
+	qc.mu.Unlock()
+}
+
+func (qc *QueryResultCache) currentSecurityEpoch() uint64 {
+	if qc == nil {
+		return 0
+	}
+	qc.mu.RLock()
+	fn := qc.securityEpochFn
+	qc.mu.RUnlock()
+	if fn == nil {
+		return 0
+	}
+	return fn()
 }
 
 // Configure sets the cache TTL and maximum entry capacity. Setting `ttl <= 0` disables caching.
@@ -792,11 +1067,51 @@ func queryContainsNow(q *esast.Query) bool {
 	return false
 }
 
+var queryCacheResponseShapingURLParamsR67 = []string{
+	"typed_keys",
+	"rest_total_hits_as_int",
+	"search_type",
+	"preference",
+	"filter_path",
+	"pretty",
+	"human",
+	"format",
+	"source",
+	"source_content_type",
+}
+
+func formatResponseShapingQueryParamsForCacheR67(q url.Values) string {
+	if len(q) == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	for _, k := range queryCacheResponseShapingURLParamsR67 {
+		if vals, has := q[k]; has {
+			sb.WriteString("qp:")
+			sb.WriteString(k)
+			sb.WriteByte('=')
+			sb.WriteString(strings.Join(vals, "\x1f"))
+			sb.WriteByte(';')
+		}
+	}
+	return sb.String()
+}
+
 func buildQueryCacheKey(targets []string, req *esast.SearchRequest) (string, bool) {
 	return buildQueryCacheKeyWithAuth(targets, req, "")
 }
 
 func buildQueryCacheKeyWithAuth(targets []string, req *esast.SearchRequest, authScope string) (string, bool) {
+	return buildQueryCacheKeyWithAuthAndParams(targets, req, authScope, 0, nil)
+}
+
+func buildQueryCacheKeyWithAuthAndParams(
+	targets []string,
+	req *esast.SearchRequest,
+	authScope string,
+	securityEpoch uint64,
+	urlParams url.Values,
+) (string, bool) {
 	if req == nil || req.PIT != nil {
 		return "", false
 	}
@@ -825,7 +1140,15 @@ func buildQueryCacheKeyWithAuth(targets []string, req *esast.SearchRequest, auth
 	if authScope != "" {
 		authSuffix = "\x00auth:" + authScope
 	}
-	return strings.Join(targets, ",") + "\x00" + string(reqBytes) + afSuffix + rtSuffix + authSuffix, true
+	var epochSuffix string
+	if securityEpoch > 0 {
+		epochSuffix = fmt.Sprintf("\x00se:%d", securityEpoch)
+	}
+	var qpSuffix string
+	if qp := formatResponseShapingQueryParamsForCacheR67(urlParams); qp != "" {
+		qpSuffix = "\x00qp:" + qp
+	}
+	return strings.Join(targets, ",") + "\x00" + string(reqBytes) + afSuffix + rtSuffix + authSuffix + epochSuffix + qpSuffix, true
 }
 
 // Get looks up a cached search response for `(targets, req)` and returns a fresh unmarshaled copy.
@@ -841,10 +1164,15 @@ func (qc *QueryResultCache) GetWithMeta(targets []string, req *esast.SearchReque
 
 // GetWithMetaForAuth looks up a cached search response isolated by resolved auth scope.
 func (qc *QueryResultCache) GetWithMetaForAuth(targets []string, req *esast.SearchRequest, authScope string) (map[string]any, []string, bool) {
+	return qc.GetWithMetaForAuthWithParams(targets, req, authScope, nil)
+}
+
+// GetWithMetaForAuthWithParams looks up a cached search response isolated by auth scope, security epoch, and response-shaping URL parameters.
+func (qc *QueryResultCache) GetWithMetaForAuthWithParams(targets []string, req *esast.SearchRequest, authScope string, urlParams url.Values) (map[string]any, []string, bool) {
 	if !qc.Enabled() {
 		return nil, nil, false
 	}
-	key, ok := buildQueryCacheKeyWithAuth(targets, req, authScope)
+	key, ok := buildQueryCacheKeyWithAuthAndParams(targets, req, authScope, qc.currentSecurityEpoch(), urlParams)
 	if !ok {
 		return nil, nil, false
 	}
@@ -884,10 +1212,15 @@ func (qc *QueryResultCache) PutWithMeta(targets []string, req *esast.SearchReque
 
 // PutWithMetaForAuth stores a serialized snapshot of `resp` isolated by resolved auth scope.
 func (qc *QueryResultCache) PutWithMetaForAuth(targets []string, req *esast.SearchRequest, authScope string, resp map[string]any, unindexedFields []string) {
+	qc.PutWithMetaForAuthWithParams(targets, req, authScope, nil, resp, unindexedFields)
+}
+
+// PutWithMetaForAuthWithParams stores a serialized snapshot of `resp` isolated by auth scope, security epoch, and response-shaping URL parameters.
+func (qc *QueryResultCache) PutWithMetaForAuthWithParams(targets []string, req *esast.SearchRequest, authScope string, urlParams url.Values, resp map[string]any, unindexedFields []string) {
 	if resp == nil || !qc.Enabled() {
 		return
 	}
-	key, ok := buildQueryCacheKeyWithAuth(targets, req, authScope)
+	key, ok := buildQueryCacheKeyWithAuthAndParams(targets, req, authScope, qc.currentSecurityEpoch(), urlParams)
 	if !ok {
 		return
 	}

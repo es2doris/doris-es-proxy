@@ -24,6 +24,7 @@ spec:
         {{- toYaml . | nindent 8 }}
         {{- end }}
     spec:
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532
@@ -33,13 +34,34 @@ spec:
         - name: {{ .Chart.Name }}
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- $dorisHTTP := .Values.doris.httpEndpoint | default (printf "%s://%s:%d" (.Values.doris.httpScheme | default "http") .Values.doris.feHost (int .Values.doris.httpPort)) }}
           args:
             - "--listen=:{{ .Values.service.port }}"
-            - "--doris-dsn={{ .Values.doris.user }}:$(DORIS_PASSWORD)@tcp({{ .Values.doris.feHost }}:{{ .Values.doris.mysqlPort }})/?interpolateParams=true&timeout=5s&readTimeout=30s&writeTimeout=30s"
-            - "--doris-http=http://{{ .Values.doris.feHost }}:{{ .Values.doris.httpPort }}"
+            - "--doris-dsn={{ .Values.doris.user }}:$(DORIS_PASSWORD)@tcp({{ .Values.doris.feHost }}:{{ .Values.doris.mysqlPort }})/?interpolateParams=true&timeout=5s&readTimeout=30s&writeTimeout=30s{{ if .Values.doris.dsnParams }}&{{ .Values.doris.dsnParams }}{{ end }}"
+            - "--doris-http={{ $dorisHTTP }}"
             - "--doris-db={{ .Values.doris.database }}"
             - "--doris-user={{ .Values.doris.user }}"
             - "--doris-password=$(DORIS_PASSWORD)"
+            - "--bm25-mode={{ .Values.bm25.mode }}"
+            - "--bm25-max-rows={{ int .Values.bm25.maxRows }}"
+            - "--doris-replication-num={{ int .Values.doris.replicationNum }}"
+            {{- if .Values.doris.replicationAllocation }}
+            - "--doris-replication-allocation={{ .Values.doris.replicationAllocation }}"
+            {{- end }}
+            {{- if .Values.doris.cloudMode }}
+            - "--doris-cloud=true"
+            {{- end }}
+            {{- if .Values.doris.bucketsAuto }}
+            - "--doris-buckets-auto=true"
+            {{- end }}
+            - "--doris-store-row-column={{ .Values.doris.storeRowColumn }}"
+            - "--doris-vector-ann={{ .Values.doris.vectorANN }}"
+            - "--catalog-sync-interval={{ .Values.catalogSync.interval }}"
+            - "--doris-max-open-conns={{ int .Values.doris.maxOpenConns }}"
+            - "--doris-max-idle-conns={{ int .Values.doris.maxIdleConns }}"
+            - "--doris-conn-max-lifetime={{ .Values.doris.connMaxLifetime }}"
+            - "--log-format={{ .Values.logging.format }}"
+            - "--log-level={{ .Values.logging.level }}"
             {{- if .Values.doris.useDoris4SearchFunc }}
             - "--doris4-search-fn=true"
             {{- end }}
@@ -74,25 +96,38 @@ spec:
               valueFrom:
                 secretKeyRef:
                   name: {{ .Values.auth.existingSecret | default (include "doris-es-proxy.fullname" .) }}
-                  key: BASIC_AUTH_USER
+                  key: {{ .Values.auth.existingSecretBasicAuthUserKey | default "BASIC_AUTH_USER" }}
                   optional: true
             - name: BASIC_AUTH_PASS
               valueFrom:
                 secretKeyRef:
                   name: {{ .Values.auth.existingSecret | default (include "doris-es-proxy.fullname" .) }}
-                  key: BASIC_AUTH_PASS
+                  key: {{ .Values.auth.existingSecretBasicAuthPassKey | default "BASIC_AUTH_PASS" }}
                   optional: true
             - name: API_KEY
               valueFrom:
                 secretKeyRef:
                   name: {{ .Values.auth.existingSecret | default (include "doris-es-proxy.fullname" .) }}
-                  key: API_KEY
+                  key: {{ .Values.auth.existingSecretApiKeyKey | default "API_KEY" }}
                   optional: true
             {{- end }}
           ports:
             - name: http
               containerPort: {{ .Values.service.port }}
               protocol: TCP
+          {{- if .Values.startupProbe.enabled }}
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+              {{- if .Values.tls.enabled }}
+              scheme: HTTPS
+              {{- end }}
+            initialDelaySeconds: {{ .Values.startupProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.startupProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.startupProbe.timeoutSeconds }}
+            failureThreshold: {{ .Values.startupProbe.failureThreshold }}
+          {{- end }}
           livenessProbe:
             httpGet:
               path: /healthz
@@ -111,6 +146,12 @@ spec:
               {{- end }}
             initialDelaySeconds: 3
             periodSeconds: 5
+          {{- if and .Values.lifecycle (gt (int .Values.lifecycle.preStopSleepSeconds) 0) }}
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/doris-es-proxy", "sleep", "{{ int .Values.lifecycle.preStopSleepSeconds }}s"]
+          {{- end }}
           {{- if .Values.tls.enabled }}
           volumeMounts:
             - name: tls-certs

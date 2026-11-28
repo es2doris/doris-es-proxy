@@ -1604,6 +1604,9 @@ func (t *Transpiler) compileAnalyzedTokenOrPhrasePrefixRegex(field string, b sch
 
 	if !t.isBoundToNestedCtx(field, b, nctx) && (b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield) {
 		arrCol := b.EffectiveArrayColumn(false)
+		if isInLambdaCtxR67(nctx) {
+			return flatArrayRegexpSQLR67(fmt.Sprintf("`%s`", arrCol), rePat)
+		}
 		return fmt.Sprintf("array_exists(_x -> _x IS NOT NULL AND _x REGEXP %s, `%s`)", qPat, arrCol)
 	}
 	col := t.sqlColumnRef(field, false, nctx)
@@ -2134,11 +2137,16 @@ func (t *Transpiler) singleAnalyzedTokenWithStemFlagsR66(field string, b schema.
 		}
 		return CompiledQuery{WhereSQL: pred, SafeWhereSQL: pred, ScoreSQL: sc}
 	}
-	rePat := quoteStr(buildAnalyzedTokenRegexWithStemR66(tok, caseSensitive, isWhitespace, stemmed))
+	rawPat := buildAnalyzedTokenRegexWithStemR66(tok, caseSensitive, isWhitespace, stemmed)
+	rePat := quoteStr(rawPat)
 	var safePred string
 	if !t.isBoundToNestedCtx(field, b, nctx) && (b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield) {
 		arrCol := b.EffectiveArrayColumn(false)
-		safePred = fmt.Sprintf("array_exists(_x -> _x IS NOT NULL AND _x REGEXP %s, `%s`)", rePat, arrCol)
+		if isInLambdaCtxR67(nctx) {
+			safePred = flatArrayRegexpSQLR67(fmt.Sprintf("`%s`", arrCol), rawPat)
+		} else {
+			safePred = fmt.Sprintf("array_exists(_x -> _x IS NOT NULL AND _x REGEXP %s, `%s`)", rePat, arrCol)
+		}
 	} else {
 		col := t.sqlColumnRef(field, false, nctx)
 		safePred = fmt.Sprintf("(%s IS NOT NULL AND %s REGEXP %s)", col, col, rePat)
@@ -2238,7 +2246,11 @@ func (t *Transpiler) multiTokenExactPhraseWithStemSQLR66(field string, b schema.
 	var pred string
 	if !t.isBoundToNestedCtx(field, b, nctx) && (b.Kind == schema.StoragePromotedArray || b.Kind == schema.StorageNestedSubfield) {
 		arrCol := b.EffectiveArrayColumn(false)
-		pred = fmt.Sprintf("array_exists(_x -> _x IS NOT NULL AND _x REGEXP %s, `%s`)", qPat, arrCol)
+		if isInLambdaCtxR67(nctx) {
+			pred = flatArrayRegexpSQLR67(fmt.Sprintf("`%s`", arrCol), rePat)
+		} else {
+			pred = fmt.Sprintf("array_exists(_x -> _x IS NOT NULL AND _x REGEXP %s, `%s`)", qPat, arrCol)
+		}
 	} else {
 		col := t.sqlColumnRef(field, false, nctx)
 		pred = fmt.Sprintf("(%s IS NOT NULL AND %s REGEXP %s)", col, col, qPat)

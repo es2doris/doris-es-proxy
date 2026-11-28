@@ -230,6 +230,7 @@ type pitContextEntry struct {
 	ExpiresAt      time.Time
 	IndexFilter    *esast.Query
 	SnapshotDocIDs map[string]map[string]struct{}
+	OwnerPrincipal string
 }
 
 type scrollContextEntry struct {
@@ -340,6 +341,7 @@ func (s *Server) handlePITRound58(w http.ResponseWriter, r *http.Request) {
 			writeESError(w, http.StatusMethodNotAllowed, "illegal_argument_exception", "unsupported method ["+r.Method+"]")
 			return
 		}
+		caller, callerIsAdmin := s.requestPrincipalIdentityR67(r)
 		s.mu.Lock()
 		s.ensurePITStoreLocked()
 		pitResults := make([]map[string]any, 0, len(s.pits))
@@ -351,12 +353,15 @@ func (s *Server) handlePITRound58(w http.ResponseWriter, r *http.Request) {
 		sort.Strings(ids)
 		for _, id := range ids {
 			entry := s.pits[id]
+			if entry != nil && entry.OwnerPrincipal != "" && !callerIsAdmin && caller != entry.OwnerPrincipal {
+				continue
+			}
+			delete(s.pits, id)
 			if entry != nil && !now.After(entry.ExpiresAt) {
 				freed++
 				pitResults = append(pitResults, map[string]any{"pit_id": id, "successful": true})
 			}
 		}
-		s.pits = make(map[string]*pitContextEntry)
 		s.mu.Unlock()
 		writeJSON(w, http.StatusOK, map[string]any{
 			"succeeded": true,
@@ -434,6 +439,7 @@ func (s *Server) handlePITRound58(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		caller, callerIsAdmin := s.requestPrincipalIdentityR67(r)
 		s.mu.Lock()
 		s.ensurePITStoreLocked()
 		if deleteAll {
@@ -445,12 +451,16 @@ func (s *Server) handlePITRound58(w http.ResponseWriter, r *http.Request) {
 			}
 			sort.Strings(allIDs)
 			for _, id := range allIDs {
-				if e := s.pits[id]; e != nil && !now.After(e.ExpiresAt) {
+				e := s.pits[id]
+				if e != nil && e.OwnerPrincipal != "" && !callerIsAdmin && caller != e.OwnerPrincipal {
+					continue
+				}
+				delete(s.pits, id)
+				if e != nil && !now.After(e.ExpiresAt) {
 					freed++
 					pitResults = append(pitResults, map[string]any{"pit_id": id, "successful": true})
 				}
 			}
-			s.pits = make(map[string]*pitContextEntry)
 			s.mu.Unlock()
 			writeJSON(w, http.StatusOK, map[string]any{
 				"succeeded": true,
@@ -465,6 +475,11 @@ func (s *Server) handlePITRound58(w http.ResponseWriter, r *http.Request) {
 		pitResults := make([]map[string]any, 0, len(ids))
 		for _, id := range ids {
 			entry, exists := s.pits[id]
+			if exists && entry != nil && entry.OwnerPrincipal != "" && !callerIsAdmin && caller != entry.OwnerPrincipal {
+				allSucceeded = false
+				pitResults = append(pitResults, map[string]any{"pit_id": id, "successful": false})
+				continue
+			}
 			delete(s.pits, id)
 			if exists && entry != nil && !now.After(entry.ExpiresAt) {
 				numFreed++
@@ -548,6 +563,7 @@ func (s *Server) handlePITRound58(w http.ResponseWriter, r *http.Request) {
 	if len(aliasFilters) == 0 && len(targets) > 0 {
 		pitPattern = strings.Join(targets, ",")
 	}
+	ownerPrincipal, _ := s.requestPrincipalIdentityR67(r)
 	now = time.Now()
 	s.mu.Lock()
 	s.ensurePITStoreLocked()
@@ -562,9 +578,10 @@ func (s *Server) handlePITRound58(w http.ResponseWriter, r *http.Request) {
 		}
 		snapDocs[t] = set
 	}
-	s.pitSeq++
-	seq := s.pitSeq
-	pitID := base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf("pit:%s#%d", pitPattern, seq)))
+	pitID := base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf("pit:%s#%s", pitPattern, randomCryptoTokenB64R67(24))))
+	for s.pits[pitID] != nil {
+		pitID = base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf("pit:%s#%s", pitPattern, randomCryptoTokenB64R67(24))))
+	}
 	s.pits[pitID] = &pitContextEntry{
 		ID:             pitID,
 		Targets:        append([]string(nil), targets...),
@@ -572,6 +589,7 @@ func (s *Server) handlePITRound58(w http.ResponseWriter, r *http.Request) {
 		ExpiresAt:      now.Add(ttl),
 		IndexFilter:    pitIndexFilter,
 		SnapshotDocIDs: snapDocs,
+		OwnerPrincipal: ownerPrincipal,
 	}
 	s.mu.Unlock()
 	writeJSON(w, http.StatusOK, map[string]any{"id": pitID})

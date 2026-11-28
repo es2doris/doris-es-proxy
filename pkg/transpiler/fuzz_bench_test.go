@@ -83,7 +83,7 @@ func TestSQLInjectionEscapingAndSubAggregations(t *testing.T) {
 	if !strings.Contains(plan.HitsSQL, `['a\\''']['b']`) {
 		t.Fatalf("expected escaped backslash and quote in collapse variant path, got:\n%s", plan.HitsSQL)
 	}
-	if !strings.Contains(plan.AggsSQL, `'$.x'') FROM mysql.user --'`) {
+	if !strings.Contains(plan.AggsSQL, `'$."x'') FROM mysql"."user --"'`) {
 		t.Fatalf("expected escaped nested terms relKey in AggsSQL, got:\n%s", plan.AggsSQL)
 	}
 	if !strings.Contains(plan.AggsSQL, `'by_service.avg_updated'`) {

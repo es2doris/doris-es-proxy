@@ -16,12 +16,16 @@ import (
 func TestRunEmbeddedSuite(t *testing.T) {
 	backend := proxy.NewMemoryBackend(false)
 	srv := proxy.NewServer("es_compat", backend, transpiler.TranspilerOptions{})
+	srv.SetAllowTestFixtureAuth(true)
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
 
 	RunEmbeddedSuite(t, ts.URL)
 
-	report := RunSuiteFS(t, EmbeddedSpecsFS, ts.URL)
+	report := RunSuiteFSWithOptions(t, EmbeddedSpecsFS, ts.URL, RunOptions{
+		DefaultAuthUser: DefaultFixtureAuthUser,
+		DefaultAuthPass: DefaultFixtureAuthPass,
+	})
 	if report.FilesRun != 15 {
 		t.Fatalf("expected 15 embedded spec files, got %d", report.FilesRun)
 	}

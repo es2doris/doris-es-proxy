@@ -68,9 +68,15 @@ type sdkOrderDoc struct {
 
 // --- elastic/elasticsearch-specification schema.json Wire Validator (via compliance.SpecSchemaValidator) ---
 
-const minValidatedEndpointsTarget = 495
+const minValidatedEndpointsTarget = 518
 
 var targetValidatedEndpoints = []string{
+	"_internal.delete_desired_balance",
+	"_internal.delete_desired_nodes",
+	"_internal.get_desired_balance",
+	"_internal.get_desired_nodes",
+	"_internal.prevalidate_node_removal",
+	"_internal.update_desired_nodes",
 	"info",
 	"ping",
 	"exists",
@@ -713,12 +719,14 @@ func TestOfficialElasticGoSDKv8_Conformance(t *testing.T) {
 
 	targetURL := strings.TrimSpace(os.Getenv("DORIS_ES_PROXY_URL"))
 	targetMode := "live-doris-proxy"
-	if targetURL == "" {
+	isInProcess := targetURL == ""
+	if isInProcess {
 		targetMode = "in-process-memory-backend"
 		srv := proxy.NewServer("es_compat", proxy.NewMemoryBackend(false), transpiler.TranspilerOptions{})
 		if v, ok := any(srv).(interface{ SetTargetESVersion(string) }); ok {
 			v.SetTargetESVersion("8.15.5")
 		}
+		srv.SetAuth("elastic", "sdk-conformance-pass", "")
 		ts := httptest.NewServer(srv.Handler())
 		t.Cleanup(ts.Close)
 		targetURL = ts.URL
@@ -729,6 +737,17 @@ func TestOfficialElasticGoSDKv8_Conformance(t *testing.T) {
 	esCfg := elasticsearch.Config{
 		Addresses: []string{targetURL},
 		Transport: wireTransport,
+	}
+	if isInProcess {
+		esCfg.Username = "elastic"
+		esCfg.Password = "sdk-conformance-pass"
+	} else {
+		if u := strings.TrimSpace(os.Getenv("DORIS_ES_PROXY_USER")); u != "" {
+			esCfg.Username = u
+		}
+		if p := os.Getenv("DORIS_ES_PROXY_PASS"); p != "" {
+			esCfg.Password = p
+		}
 	}
 
 	esClient, err := elasticsearch.NewClient(esCfg)
@@ -2414,10 +2433,11 @@ func TestOfficialElasticGoSDKv8_Conformance(t *testing.T) {
 		wireTransport.assertNoViolations(t, "Round62_08_TypedKnn_IfSeqNo409_ErrorSchemas_And_BulkIndexerOnFailure")
 	})
 
-	runRound63SDKConformanceSubtests(t, ctx, targetURL, idx, aliasName, esClient, wireTransport)
+	runRound63SDKConformanceSubtests(t, ctx, esCfg, idx, aliasName, esClient, wireTransport)
 	runRound64SDKConformanceSubtests(t, ctx, idx, aliasName, esClient, wireTransport)
 	runRound65SDKConformanceSubtests(t, ctx, idx, aliasName, esClient, wireTransport)
 	runRound66SDKConformanceSubtests(t, ctx, idx, aliasName, esClient, wireTransport)
+	runRound67InternalEndpointsSubtest(t, ctx, esClient, wireTransport)
 
 	ubqBody := `{"query":{"term":{"category":"storage"}},"script":{"source":"ctx._source.quantity = ctx._source.quantity + params.bump","lang":"painless","params":{"bump":6}}}`
 	ubqRes, err := esClient.UpdateByQuery(

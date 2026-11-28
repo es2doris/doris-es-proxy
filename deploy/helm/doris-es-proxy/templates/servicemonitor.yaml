@@ -21,20 +21,33 @@ spec:
         insecureSkipVerify: true
       {{- end }}
       {{- $authSecretName := default (include "doris-es-proxy.fullname" .) .Values.auth.existingSecret }}
-      {{- if or .Values.auth.existingSecret (and .Values.auth.basicAuthUser .Values.auth.basicAuthPass) }}
+      {{- $basicUserKey := .Values.auth.existingSecretBasicAuthUserKey | default "BASIC_AUTH_USER" }}
+      {{- $basicPassKey := .Values.auth.existingSecretBasicAuthPassKey | default "BASIC_AUTH_PASS" }}
+      {{- $apiKeyKey := .Values.auth.existingSecretApiKeyKey | default "API_KEY" }}
+      {{- $hasBasic := or (and .Values.auth.basicAuthUser .Values.auth.basicAuthPass) (and .Values.auth.existingSecret (or .Values.auth.existingSecretBasicAuthUserKey .Values.auth.existingSecretBasicAuthPassKey)) }}
+      {{- $hasApiKey := or .Values.auth.apiKey (and .Values.auth.existingSecret .Values.auth.existingSecretApiKeyKey) }}
+      {{- if $hasBasic }}
       basicAuth:
         username:
           name: {{ $authSecretName }}
-          key: BASIC_AUTH_USER
+          key: {{ $basicUserKey }}
         password:
           name: {{ $authSecretName }}
-          key: BASIC_AUTH_PASS
-      {{- else if .Values.auth.apiKey }}
+          key: {{ $basicPassKey }}
+      {{- else if $hasApiKey }}
       authorization:
         type: ApiKey
         credentials:
           name: {{ $authSecretName }}
-          key: API_KEY
+          key: {{ $apiKeyKey }}
+      {{- else if .Values.auth.existingSecret }}
+      basicAuth:
+        username:
+          name: {{ $authSecretName }}
+          key: {{ $basicUserKey }}
+        password:
+          name: {{ $authSecretName }}
+          key: {{ $basicPassKey }}
       {{- end }}
       interval: {{ .Values.serviceMonitor.interval }}
       scrapeTimeout: {{ .Values.serviceMonitor.scrapeTimeout }}

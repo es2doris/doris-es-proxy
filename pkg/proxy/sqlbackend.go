@@ -18,14 +18,18 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"math"
+	"net"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -105,7 +109,16 @@ type DorisSQLBackend struct {
 	db         *sql.DB
 	streamLoad *StreamLoadClient
 	logSQL     atomic.Bool
+	ddlOptsMu  sync.RWMutex
+	ddlOpts    schema.DorisDDLOptions
 }
+
+var (
+	_ IncrementalCatalogBackend = (*DorisSQLBackend)(nil)
+	_ VersionProbeBackend       = (*DorisSQLBackend)(nil)
+	_ ClusterHealthBackend      = (*DorisSQLBackend)(nil)
+	_ DBStatsBackend            = (*DorisSQLBackend)(nil)
+)
 
 func NewDorisSQLBackend(db *sql.DB, streamLoad *StreamLoadClient) *DorisSQLBackend {
 	if db != nil {
@@ -118,6 +131,73 @@ func NewDorisSQLBackend(db *sql.DB, streamLoad *StreamLoadClient) *DorisSQLBacke
 		db:         db,
 		streamLoad: streamLoad,
 	}
+}
+
+// SetDDLOptions configures cluster replication and table DDL properties used when
+// provisioning internal tables (such as `_es_catalog`).
+func (b *DorisSQLBackend) SetDDLOptions(opts schema.DorisDDLOptions) {
+	if b == nil {
+		return
+	}
+	b.ddlOptsMu.Lock()
+	b.ddlOpts = opts
+	b.ddlOptsMu.Unlock()
+}
+
+// DDLOptions returns a snapshot of configured cluster DDL options.
+func (b *DorisSQLBackend) DDLOptions() schema.DorisDDLOptions {
+	if b == nil {
+		return schema.DorisDDLOptions{}
+	}
+	b.ddlOptsMu.RLock()
+	opts := b.ddlOpts
+	b.ddlOptsMu.RUnlock()
+	return opts
+}
+
+// DBStats exposes database/sql connection pool metrics for /_prometheus.
+func (b *DorisSQLBackend) DBStats() (sql.DBStats, bool) {
+	if b == nil || b.db == nil {
+		return sql.DBStats{}, false
+	}
+	return b.db.Stats(), true
+}
+
+// ProbeDorisVersion queries the connected Apache Doris FE SQL version string via `SELECT VERSION()`.
+func (b *DorisSQLBackend) ProbeDorisVersion(ctx context.Context) (string, error) {
+	if b == nil || b.db == nil {
+		return "", nil
+	}
+	var ver sql.NullString
+	if err := b.db.QueryRowContext(ctx, "SELECT VERSION()").Scan(&ver); err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(ver.String), nil
+}
+
+// CheckClusterHealth verifies both Doris BE liveness (via `SHOW BACKENDS`) and FE HTTP
+// reachability (via StreamLoadClient /api/health when configured).
+func (b *DorisSQLBackend) CheckClusterHealth(ctx context.Context) (int, bool, error) {
+	if b == nil || b.db == nil {
+		return 0, false, nil
+	}
+	nodes, err := b.ShowBackendsTelemetry(ctx)
+	if err != nil {
+		return 0, false, err
+	}
+	aliveBEs := 0
+	for _, n := range nodes {
+		if n.Alive {
+			aliveBEs++
+		}
+	}
+	feHTTPOK := true
+	if b.streamLoad != nil && strings.TrimSpace(b.streamLoad.cfg.FEHTTPEndpoint) != "" {
+		feHTTPOK = b.streamLoad.ProbeFEHealth(ctx)
+	} else if err := b.Ping(ctx); err != nil {
+		feHTTPOK = false
+	}
+	return aliveBEs, feHTTPOK, nil
 }
 
 func (b *DorisSQLBackend) Ping(ctx context.Context) error {
@@ -194,8 +274,10 @@ func NormalizeDorisSQL(q string) string {
 }
 
 func normalizeDorisSQL(q string) string {
-	q = strings.ReplaceAll(q, "`__DORIS_DELETE_SIGN__` = 0 AND ", "")
-	q = strings.ReplaceAll(q, "`__DORIS_DELETE_SIGN__` = 0", "1=1")
+	if strings.Contains(q, "__DORIS_DELETE_SIGN__") {
+		q = strings.ReplaceAll(q, "`__DORIS_DELETE_SIGN__` = 0 AND ", "")
+		q = strings.ReplaceAll(q, "`__DORIS_DELETE_SIGN__` = 0", "1=1")
+	}
 	q = rewriteDorisUnitSepLiterals(q)
 	return rewriteDorisArrayExists(q)
 }
@@ -1373,6 +1455,91 @@ func classifyHitsRowScanLayout(cols []string) hitsRowScanLayout {
 	}
 }
 
+func isMissingColumnSQLError(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	var myErr *mysql.MySQLError
+	if errors.As(err, &myErr) && myErr.Number == 1054 {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	if strings.Contains(msg, "unknown column") ||
+		strings.Contains(msg, "error 1054") ||
+		strings.Contains(msg, "(1054)") ||
+		strings.Contains(msg, "can not found column") ||
+		strings.Contains(msg, "cannot find column") {
+		return true
+	}
+	return strings.Contains(msg, "column") &&
+		(strings.Contains(msg, "does not exist") ||
+			strings.Contains(msg, "not found") ||
+			strings.Contains(msg, "no such column"))
+}
+
+func isDorisVariantRawDocProjectionError(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "nullable mismatch") ||
+		strings.Contains(msg, "e-7412") ||
+		(strings.Contains(msg, "columnnullable") && strings.Contains(msg, "columnstr"))
+}
+
+func resolveHitRawSourceR67(src json.RawMessage, nullRawDoc sql.NullString) json.RawMessage {
+	if !nullRawDoc.Valid {
+		return nil
+	}
+	rawTrim := strings.TrimSpace(nullRawDoc.String)
+	if rawTrim == "" {
+		return nil
+	}
+	if rawTrim == "{}" || rawTrim == "null" {
+		if len(bytes.TrimSpace(src)) > 0 {
+			return src
+		}
+		if rawTrim == "{}" {
+			return json.RawMessage("{}")
+		}
+		return nil
+	}
+	if bytes.Equal(bytes.TrimSpace(src), []byte(rawTrim)) {
+		return src
+	}
+	return mergeSourceWithDocVariantJSON(src, json.RawMessage(nullRawDoc.String))
+}
+
+func (b *DorisSQLBackend) queryWithMissingColumnFallback(ctx context.Context, candidates []string, args ...any) (*sql.Rows, error) {
+	var firstErr error
+	skipRawDocCast := false
+	for _, q := range candidates {
+		if strings.TrimSpace(q) == "" {
+			continue
+		}
+		hasRawDocCast := strings.Contains(q, "CAST(`_doc` AS STRING)")
+		if skipRawDocCast && hasRawDocCast {
+			continue
+		}
+		// #nosec G701 -- parameterized SQL query on strictly sanitized identifiers
+		rows, err := b.db.QueryContext(ctx, q, args...)
+		if err == nil {
+			return rows, nil
+		}
+		if firstErr == nil {
+			firstErr = err
+		}
+		if hasRawDocCast && isDorisVariantRawDocProjectionError(err) {
+			skipRawDocCast = true
+			continue
+		}
+		if !isMissingColumnSQLError(err) {
+			return nil, err
+		}
+	}
+	return nil, firstErr
+}
+
 func (b *DorisSQLBackend) QueryHits(ctx context.Context, querySQL string) ([]HitRow, error) {
 	normSQL := normalizeDorisSQL(querySQL)
 	withDocRoutingSQL, hasDocRoutingCols := injectRawDocAndRoutingSelectIntoHitsSQL(normSQL)
@@ -1383,25 +1550,15 @@ func (b *DorisSQLBackend) QueryHits(ctx context.Context, querySQL string) ([]Hit
 	if b.db == nil {
 		return nil, nil
 	}
-	rows, err := b.db.QueryContext(ctx, execSQL)
-	if err != nil && hasDocRoutingCols {
-		// Graceful fallback 1: table has `_doc` VARIANT but lacks `_routing` (legacy/external Doris table).
+	candidates := make([]string, 0, 3)
+	candidates = append(candidates, execSQL)
+	if hasDocRoutingCols {
 		if withRawDocSQL, hasRawDoc := injectRawDocSelectIntoHitsSQL(normSQL); hasRawDoc {
-			fbDocSQL := prependSQLTraceComment(ctx, withRawDocSQL)
-			if fbRows, fbErr := b.db.QueryContext(ctx, fbDocSQL); fbErr == nil {
-				rows = fbRows
-				err = nil
-			}
+			candidates = append(candidates, prependSQLTraceComment(ctx, withRawDocSQL))
 		}
-		// Graceful fallback 2: bare `normSQL` when external table lacks both `_routing` and `_doc`.
-		if err != nil {
-			fallbackSQL := prependSQLTraceComment(ctx, normSQL)
-			if fbRows2, fbErr2 := b.db.QueryContext(ctx, fallbackSQL); fbErr2 == nil {
-				rows = fbRows2
-				err = nil
-			}
-		}
+		candidates = append(candidates, prependSQLTraceComment(ctx, normSQL))
 	}
+	rows, err := b.queryWithMissingColumnFallback(ctx, candidates)
 	if err != nil {
 		return nil, err
 	}
@@ -1456,9 +1613,7 @@ func (b *DorisSQLBackend) QueryHits(ctx context.Context, querySQL string) ([]Hit
 			h.Score = math.NaN()
 		}
 		h.Source = json.RawMessage(nullSrc.String)
-		if nullRawDoc.Valid && strings.TrimSpace(nullRawDoc.String) != "" {
-			h.RawSource = mergeSourceWithDocVariantJSON(h.Source, json.RawMessage(nullRawDoc.String))
-		}
+		h.RawSource = resolveHitRawSourceR67(h.Source, nullRawDoc)
 		hits = append(hits, h)
 	}
 	return hits, rows.Err()
@@ -1621,20 +1776,7 @@ func (b *DorisSQLBackend) GetDocByID(ctx context.Context, dbName, table, id stri
 		fmt.Sprintf("SELECT `_id`, `_version`, `_source`, `__DORIS_DELETE_SIGN__` FROM `%s`.`%s` WHERE `_id` = ? ORDER BY `_version` DESC LIMIT 1", safeDB, safeTable),
 		fmt.Sprintf("SELECT `_id`, `_version`, `_source` FROM `%s`.`%s` WHERE `_id` = ? ORDER BY `_version` DESC LIMIT 1", safeDB, safeTable),
 	}
-	var rows *sql.Rows
-	var err error
-	for i, q := range candidates {
-		// #nosec G701 -- parameterized _id query on strictly sanitized identifier
-		r, qErr := b.db.QueryContext(ctx, q, id)
-		if qErr == nil {
-			rows = r
-			err = nil
-			break
-		}
-		if i == 0 {
-			err = qErr
-		}
-	}
+	rows, err := b.queryWithMissingColumnFallback(ctx, candidates, id)
 	if err != nil {
 		return nil, false, err
 	}
@@ -1664,9 +1806,7 @@ func (b *DorisSQLBackend) GetDocByID(ctx context.Context, dbName, table, id stri
 		hasRow = true
 		best = h
 		best.Source = json.RawMessage(srcStr)
-		if nullRawDoc.Valid && strings.TrimSpace(nullRawDoc.String) != "" {
-			best.RawSource = mergeSourceWithDocVariantJSON(best.Source, json.RawMessage(nullRawDoc.String))
-		}
+		best.RawSource = resolveHitRawSourceR67(best.Source, nullRawDoc)
 		best.Score = 1.0
 		if hasDelSignCol && delSign.Valid {
 			bestDeleted = delSign.Int64 != 0 || (!nullSrc.Valid && !nullRawDoc.Valid)
@@ -1731,20 +1871,7 @@ func (b *DorisSQLBackend) queryDocsBatchChunk(
 		fmt.Sprintf("SELECT `_id`, `_version`, `_source`, `__DORIS_DELETE_SIGN__` FROM `%s`.`%s` WHERE `_id` IN (%s) ORDER BY `_version` ASC", safeDB, safeTable, inClause),
 		fmt.Sprintf("SELECT `_id`, `_version`, `_source` FROM `%s`.`%s` WHERE `_id` IN (%s) ORDER BY `_version` ASC", safeDB, safeTable, inClause),
 	}
-	var rows *sql.Rows
-	var err error
-	for i, q := range candidates {
-		// #nosec G701 -- parameterized IN query on strictly sanitized identifier
-		r, qErr := b.db.QueryContext(ctx, q, args...)
-		if qErr == nil {
-			rows = r
-			err = nil
-			break
-		}
-		if i == 0 {
-			err = qErr
-		}
-	}
+	rows, err := b.queryWithMissingColumnFallback(ctx, candidates, args...)
 	if err != nil {
 		return err
 	}
@@ -1780,9 +1907,7 @@ func (b *DorisSQLBackend) queryDocsBatchChunk(
 			continue
 		}
 		h.Source = json.RawMessage(srcStr)
-		if nullRawDoc.Valid && strings.TrimSpace(nullRawDoc.String) != "" {
-			h.RawSource = mergeSourceWithDocVariantJSON(h.Source, json.RawMessage(nullRawDoc.String))
-		}
+		h.RawSource = resolveHitRawSourceR67(h.Source, nullRawDoc)
 		h.Score = 1.0
 		out[h.ID] = h
 	}
@@ -1801,6 +1926,16 @@ func (b *DorisSQLBackend) InitCatalog(ctx context.Context, dbName string) error 
 		return nil
 	}
 	safeDB := escapeDorisDBIdent(dbName)
+	props := make([]string, 0, 6)
+	for _, repProp := range schema.FormatReplicationPropertyLines(b.DDLOptions()) {
+		props = append(props, "  "+repProp)
+	}
+	props = append(props,
+		`  "enable_unique_key_merge_on_write" = "true"`,
+		`  "store_row_column" = "true"`,
+		`  "compression" = "zstd"`,
+		`  "function_column.sequence_col" = "updated_epoch_ms"`,
+	)
 	ddl := fmt.Sprintf(
 		"CREATE TABLE IF NOT EXISTS `%s`.`_es_catalog` (\n"+
 			"  `entity_type` VARCHAR(32) NOT NULL COMMENT 'index | alias | template',\n"+
@@ -1812,13 +1947,10 @@ func (b *DorisSQLBackend) InitCatalog(ctx context.Context, dbName string) error 
 			"UNIQUE KEY(`entity_type`, `entity_key`)\n"+
 			"DISTRIBUTED BY HASH(`entity_key`) BUCKETS 1\n"+
 			"PROPERTIES (\n"+
-			"  \"replication_num\" = \"1\",\n"+
-			"  \"enable_unique_key_merge_on_write\" = \"true\",\n"+
-			"  \"store_row_column\" = \"true\",\n"+
-			"  \"compression\" = \"zstd\",\n"+
-			"  \"function_column.sequence_col\" = \"updated_epoch_ms\"\n"+
+			"%s\n"+
 			");",
 		safeDB,
+		strings.Join(props, ",\n"),
 	)
 	return b.ExecDDL(ctx, ddl)
 }
@@ -1851,6 +1983,19 @@ func (b *DorisSQLBackend) DeleteCatalogEntry(ctx context.Context, dbName, entity
 	return err
 }
 
+func scanCatalogEntryRows(rows *sql.Rows) ([]CatalogEntry, error) {
+	defer func() { _ = rows.Close() }()
+	var out []CatalogEntry
+	for rows.Next() {
+		var e CatalogEntry
+		if err := rows.Scan(&e.EntityType, &e.EntityKey, &e.PayloadJSON, &e.UpdatedEpochMs); err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
 func (b *DorisSQLBackend) LoadCatalogEntries(ctx context.Context, dbName string) ([]CatalogEntry, error) {
 	if b.db == nil {
 		return nil, nil
@@ -1865,17 +2010,29 @@ func (b *DorisSQLBackend) LoadCatalogEntries(ctx context.Context, dbName string)
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = rows.Close() }()
+	return scanCatalogEntryRows(rows)
+}
 
-	var out []CatalogEntry
-	for rows.Next() {
-		var e CatalogEntry
-		if err := rows.Scan(&e.EntityType, &e.EntityKey, &e.PayloadJSON, &e.UpdatedEpochMs); err != nil {
-			return nil, err
-		}
-		out = append(out, e)
+// LoadCatalogEntriesSince fetches `_es_catalog` rows with `updated_epoch_ms >= sinceEpochMs`
+// ordered ascending for incremental catalog sync and lightweight readiness verification.
+func (b *DorisSQLBackend) LoadCatalogEntriesSince(ctx context.Context, dbName string, sinceEpochMs int64) ([]CatalogEntry, error) {
+	if b == nil || b.db == nil {
+		return nil, nil
 	}
-	return out, rows.Err()
+	if sinceEpochMs <= 0 {
+		return b.LoadCatalogEntries(ctx, dbName)
+	}
+	safeDB := escapeDorisDBIdent(dbName)
+	// #nosec G201 -- safeDB is strictly sanitized via sanitizeAndEscapeDorisIdent
+	q := fmt.Sprintf(
+		"SELECT `entity_type`, `entity_key`, `payload_json`, `updated_epoch_ms` FROM `%s`.`_es_catalog` WHERE `updated_epoch_ms` >= ? ORDER BY `updated_epoch_ms` ASC",
+		safeDB,
+	)
+	rows, err := b.db.QueryContext(ctx, q, sinceEpochMs)
+	if err != nil {
+		return nil, err
+	}
+	return scanCatalogEntryRows(rows)
 }
 
 // DeleteDocsByIDs physically deletes rows by _id from a Doris UNIQUE KEY MoW table
@@ -2176,13 +2333,28 @@ func (b *DorisSQLBackend) ShowBackendsTelemetry(ctx context.Context) ([]DorisBac
 	}
 	if b.streamLoad != nil && len(nodes) > 0 {
 		beHosts := make([]string, 0, len(nodes))
+		var discoveredBEs []string
+		feScheme := "http"
+		if feURL, feErr := b.streamLoad.parseConfiguredFEURL(); feErr == nil && feURL.Scheme != "" {
+			feScheme = strings.ToLower(feURL.Scheme)
+		}
+		sawHTTPPort := false
 		for _, node := range nodes {
 			if node.Host != "" {
 				beHosts = append(beHosts, node.Host)
+				if node.HttpPort > 0 {
+					sawHTTPPort = true
+					if node.Alive {
+						discoveredBEs = append(discoveredBEs, fmt.Sprintf("%s://%s", feScheme, net.JoinHostPort(node.Host, strconv.Itoa(node.HttpPort))))
+					}
+				}
 			}
 		}
 		if len(beHosts) > 0 {
 			b.streamLoad.AllowBEHosts(beHosts)
+		}
+		if sawHTTPPort {
+			b.streamLoad.SetDiscoveredBEs(discoveredBEs)
 		}
 	}
 	return nodes, nil
