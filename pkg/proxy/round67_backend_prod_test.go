@@ -864,8 +864,9 @@ func TestRound67_DorisSQLBackend_CatalogHealthVersionDDLAndErrorGates(t *testing
 		t.Fatalf("CloudMode InitCatalog DDL must omit replication properties: err=%v ddl=%s", err, capturedDDL)
 	}
 
-	// 2. Fallback candidate gating: NEVER retry timeouts/non-missing-column errors; DO retry 1054/Unknown column.
-	var errMode atomic.Int32 // 1 = timeout, 2 = mysql 1054
+	// 2. Fallback candidate gating: NEVER retry timeouts/non-missing-column errors; DO retry 1054/Unknown column
+	// and Doris 4.1.3 VARIANT CAST(_doc AS STRING) E-7412/Nullable mismatch errors (jumping straight past _raw_doc).
+	var errMode atomic.Int32 // 1 = timeout, 2 = mysql 1054, 3 = E-7412 ColumnNullable, 4 = INTERNAL_ERROR Nullable mismatch
 	var qCalls atomic.Int64
 	dbGate := openRound67MockDB(t, func(query string, _ []driver.NamedValue) round67SQLQuerySpec {
 		n := qCalls.Add(1)
@@ -879,6 +880,22 @@ func TestRound67_DorisSQLBackend_CatalogHealthVersionDDLAndErrorGates(t *testing
 			return round67SQLQuerySpec{
 				cols: []string{"_id", "_version", "_source", "_raw_doc", "_score", "_total_hits"},
 				rows: [][]driver.Value{{"id1", int64(1), `{"k":1}`, `{}`, float64(1.0), int64(1)}},
+			}
+		case 3:
+			if strings.Contains(query, "CAST(`_doc` AS STRING)") {
+				return round67SQLQuerySpec{err: errors.New("Error 1105 (HY000): errCode = 2, detailMessage = (127.0.0.1)[E-7412]assert cast err:[E-7412] Bad cast from type:doris::ColumnNullable to doris::ColumnStr<unsigned int>")}
+			}
+			return round67SQLQuerySpec{
+				cols: []string{"_id", "_version", "_source", "_score", "_total_hits"},
+				rows: [][]driver.Value{{"id1", int64(1), `{"k":1}`, float64(1.0), int64(1)}},
+			}
+		case 4:
+			if strings.Contains(query, "CAST(`_doc` AS STRING)") {
+				return round67SQLQuerySpec{err: errors.New("Error 1105 (HY000): errCode = 2, detailMessage = (127.0.0.1)[INTERNAL_ERROR]Nullable mismatch")}
+			}
+			return round67SQLQuerySpec{
+				cols: []string{"_id", "_version", "_source", "_routing", "__DORIS_DELETE_SIGN__"},
+				rows: [][]driver.Value{{"id1", int64(1), `{"k":1}`, "", int64(0)}},
 			}
 		}
 		return round67SQLQuerySpec{}
@@ -905,6 +922,27 @@ func TestRound67_DorisSQLBackend_CatalogHealthVersionDDLAndErrorGates(t *testing
 	hits, err := bGate.QueryHits(ctx, "SELECT `_id`, `_version`, `_source`, CAST(1 AS DOUBLE) AS `_score`, COUNT(*) OVER() AS `_total_hits` FROM `es_compat`.`t` LIMIT 10")
 	if err != nil || len(hits) != 1 || qCalls.Load() < 2 || string(hits[0].RawSource) != `{"k":1}` {
 		t.Fatalf("expected 1054 missing-column fallback + raw_doc fast-path, got hits=%+v calls=%d err=%v", hits, qCalls.Load(), err)
+	}
+
+	// Doris 4.1.3 E-7412 ColumnNullable -> ColumnStr jumps straight past _raw_doc candidates in 2 SQL calls.
+	errMode.Store(3)
+	qCalls.Store(0)
+	hits, err = bGate.QueryHits(ctx, "SELECT `_id`, `_version`, `_source`, CAST(1 AS DOUBLE) AS `_score`, COUNT(*) OVER() AS `_total_hits` FROM `es_compat`.`t` LIMIT 10")
+	if err != nil || len(hits) != 1 || qCalls.Load() != 2 || string(hits[0].Source) != `{"k":1}` {
+		t.Fatalf("expected E-7412 fallback in 2 SQL calls, got hits=%+v calls=%d err=%v", hits, qCalls.Load(), err)
+	}
+
+	// Doris 4.1.3 [INTERNAL_ERROR]Nullable mismatch skips remaining _raw_doc candidates in 2 SQL calls for GetDocByID and GetDocsByIDs.
+	errMode.Store(4)
+	qCalls.Store(0)
+	docHit, found, err := bGate.GetDocByID(ctx, "es_compat", "t", "id1")
+	if err != nil || !found || docHit == nil || qCalls.Load() != 2 || string(docHit.Source) != `{"k":1}` {
+		t.Fatalf("GetDocByID Nullable mismatch fallback failed: hit=%+v found=%v calls=%d err=%v", docHit, found, qCalls.Load(), err)
+	}
+	qCalls.Store(0)
+	batchHits, err := bGate.GetDocsByIDs(ctx, "es_compat", "t", []string{"id1"})
+	if err != nil || len(batchHits) != 1 || qCalls.Load() != 2 || string(batchHits["id1"].Source) != `{"k":1}` {
+		t.Fatalf("GetDocsByIDs Nullable mismatch fallback failed: hits=%+v calls=%d err=%v", batchHits, qCalls.Load(), err)
 	}
 }
 

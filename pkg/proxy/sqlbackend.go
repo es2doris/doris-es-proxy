@@ -1477,6 +1477,16 @@ func isMissingColumnSQLError(err error) bool {
 			strings.Contains(msg, "no such column"))
 }
 
+func isDorisVariantRawDocProjectionError(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "nullable mismatch") ||
+		strings.Contains(msg, "e-7412") ||
+		(strings.Contains(msg, "columnnullable") && strings.Contains(msg, "columnstr"))
+}
+
 func resolveHitRawSourceR67(src json.RawMessage, nullRawDoc sql.NullString) json.RawMessage {
 	if !nullRawDoc.Valid {
 		return nil
@@ -1502,8 +1512,13 @@ func resolveHitRawSourceR67(src json.RawMessage, nullRawDoc sql.NullString) json
 
 func (b *DorisSQLBackend) queryWithMissingColumnFallback(ctx context.Context, candidates []string, args ...any) (*sql.Rows, error) {
 	var firstErr error
+	skipRawDocCast := false
 	for _, q := range candidates {
 		if strings.TrimSpace(q) == "" {
+			continue
+		}
+		hasRawDocCast := strings.Contains(q, "CAST(`_doc` AS STRING)")
+		if skipRawDocCast && hasRawDocCast {
 			continue
 		}
 		// #nosec G701 -- parameterized SQL query on strictly sanitized identifiers
@@ -1513,6 +1528,10 @@ func (b *DorisSQLBackend) queryWithMissingColumnFallback(ctx context.Context, ca
 		}
 		if firstErr == nil {
 			firstErr = err
+		}
+		if hasRawDocCast && isDorisVariantRawDocProjectionError(err) {
+			skipRawDocCast = true
+			continue
 		}
 		if !isMissingColumnSQLError(err) {
 			return nil, err
